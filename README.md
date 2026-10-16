@@ -18,10 +18,10 @@ In-house ERP for the Almiras group. Python / Django / PostgreSQL, all open sourc
 ```bash
 pip install -r requirements.txt
 python manage.py migrate
-python manage.py setup_almiras        # Almiras entity, 55 accounts, 2027 periods
+python manage.py setup_almiras        # Almiras entity (registration + address from core/setup_data/almiras.json), 55 accounts, 2027 periods
 python manage.py createsuperuser
 python manage.py runserver            # admin at /admin
-python -m pytest -q                   # 16 tests
+python -m pytest -q                   # 52 tests
 ```
 Set `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST` to use PostgreSQL.
 
