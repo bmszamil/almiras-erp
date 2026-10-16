@@ -1103,7 +1103,7 @@ def get_rate(entity, from_currency, to_currency, on, rate_type=ExchangeRate.Rate
 
 
 def _group_parent(group):
-    """The group parent entity global rates are checked against (access.md R6)."""
+    """The top-level group parent entity global rates are checked against (access.md R6, ledger-fx R28)."""
     if group is None:
         parents = list(Entity.objects.filter(consolidation=Entity.Consolidation.PARENT, parent__isnull=True)[:2])
         if len(parents) != 1:
@@ -1112,8 +1112,10 @@ def _group_parent(group):
                 "حدّد الكيان الأم للمجموعة (group=...) لسعر المجموعة.",
             )
         group = parents[0]
-    if group.consolidation != Entity.Consolidation.PARENT:
-        raise error(f"{group.code} is not a group parent entity.", f"{group.code} ليس الكيان الأم للمجموعة.")
+    if group.consolidation != Entity.Consolidation.PARENT or group.parent_id is not None:
+        # Global rates are used by every entity: only the top-level group parent's treasury writes them (R28).
+        raise error(f"{group.code} is not the top-level group parent entity.",
+                    f"{group.code} ليس الكيان الأم الأعلى للمجموعة.")
     return group
 
 

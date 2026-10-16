@@ -922,8 +922,28 @@ def test_r28_at16_who_may_maintain_rates(w):
     fx_import = access.system_user("fx_import")
     member(fx_import, w.alm, "system_fx_import")
     assert services.create_rate(user=fx_import, source="file", **kw).entity is None
-    with pytest.raises(LedgerError, match="not a group parent"):
+    with pytest.raises(LedgerError, match="not the top-level group parent"):
         services.create_rate(user=w.treasury, group=w.lzm, **kw)
+
+
+def test_global_rates_only_through_the_top_level_group_parent(w):
+    """Item 14: a sub-group's treasury (group role on a nested parent entity) cannot write group-wide rates."""
+    sub_group = setup_entity("SGP", "parent", w.alm)
+    sub_treasury = make_user("sub.treasury")
+    member(sub_treasury, sub_group, "group_treasury")
+    kw = dict(from_currency="EUR", to_currency="SAR", on=date(2027, 3, 1), rate="4.1")
+    with pytest.raises(LedgerError, match="not the top-level group parent"):
+        services.create_rate(user=sub_treasury, group=sub_group, **kw)
+    with pytest.raises(access.AccessDenied):  # and nothing on the top-level group
+        services.create_rate(user=sub_treasury, group=w.alm, **kw)
+    from io import StringIO
+
+    with pytest.raises(LedgerError, match="not the top-level group parent"):
+        services.import_rates(StringIO("date,from_currency,to_currency,rate\n2027-03-01,EUR,SAR,4.1\n"), user=sub_treasury,
+                              group=sub_group)
+    assert not ExchangeRate.objects.exists()
+    assert services.create_rate(user=sub_treasury, entity=sub_group, **kw).entity == sub_group  # its own override
+    assert services.create_rate(user=w.treasury, group=w.alm, **kw).entity is None
 
 
 def test_r28_rate_lists_are_filtered_by_entity(w):
