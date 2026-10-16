@@ -1,6 +1,6 @@
 # Access: users, roles and permissions per entity (user × entity × role)
 
-Django app: `core` (package `core/access/`: `models.py`, `services.py`, `catalogue.py`, `backends.py`). Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (A11, A12: billing versions/corrections, unseal delegation).
+Django app: `core` (package `core/access/`: `models.py`, `services.py`, `catalogue.py`, `backends.py`). Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (A11, A12: billing versions/corrections, unseal delegation). Amended 2026-10-16 (A13, R27, R30 to R33, AT-29 to AT-32: build decisions and reviewer hardening).
 Depended on by: `docs/specs/invoicing.md` (OQ-25, OQ-42), `docs/specs/billing.md` §7, `docs/specs/zatca.md` §7, R-41, OQ-14, OQ-25, `docs/specs/ledger-fx.md` §7. Gateway design: `docs/ai-agent-gateway.md`.
 Role names and permission codenames in this spec replace the provisional names in those four specs (reconciliation table in §3.1).
 
@@ -24,6 +24,7 @@ The access module decides who may do what, in which entity. It holds the role ca
 | A10 | Grants and revocations of access are logged. | Project owner (task brief), zatca R-41 | 2026-10-16 |
 | A11 | Contracts are amended, terminated or cancelled (also retroactively) through CFO-approved versions; correction credit/debit notes are drafted by the billing system user, reviewed and submitted by a person, and approved by the CFO. Auto-generated invoices from a CFO-approved contract need no per-invoice approval. | Project owner (billing D8, D9; invoicing D20, D21) | 2026-10-16 |
 | A12 | The ZATCA master key stays with the Managing Partner; no Shamir shares. The MP may delegate key access, including unsealing the secret store, to named custodians. | Project owner (zatca D-10) | 2026-10-16 |
+| A13 | *Added 2026-10-16.* Hardening adopted during the build from code-reviewer findings: (a) posting grants are tied to one document and are single-use; (b) a grant is verified against its `AccessLog` row before use; (c) sensitive entity settings (`sharia_enforced`, `consolidation`, `parent`, `base_currency`, `is_active`) change only through logged, permission-checked services, never Django admin; (d) `AccessLog` and `Membership` are append-only, also at database level on PostgreSQL; (e) `permission_denied` rows are written durably outside the caller's transaction (R27). | Build decision (code-reviewer, caller brief); human approval at merge | 2026-10-16 |
 
 Not decided (in §9): who approves when the CFO is absent or is the creator (OQ-1), who may grant memberships (OQ-2), which entities group-wide roles cover (OQ-3), and others.
 
@@ -129,7 +130,7 @@ Active at time *t* ⇔ `valid_from ≤ t < valid_to` (or `valid_to` null) and `r
 | details | JSON | Y | Before/after values; never passwords, tokens, keys or OTPs |
 | request_id / ip / source | Char | N | `source` = `human`, `system:<code>`, `agent:<name>` |
 
-`save` refuses updates, `delete` refuses always; the DB role of the app has no UPDATE/DELETE on this table (OQ-10).
+`save` refuses updates, `delete` refuses always; the DB role of the app has no UPDATE/DELETE on this table (OQ-10). *Amended 2026-10-16 (A13):* append-only is also enforced at database level on PostgreSQL for `AccessLog` and `Membership` (R33). `permission_denied` rows are written through a separate `access_log` database connection (R27).
 
 ### 3.6 Permission catalogue (`core/access/catalogue.py`, code, not data)
 
@@ -207,7 +208,7 @@ revoke_membership(actor, membership, reason) -> Membership
 delegate_approval(actor, delegate, entity, valid_from, valid_to, reason) -> Membership
 ```
 
-`Grant` is a frozen dataclass: `user, entity, permission, membership_ids, checked_at, log_id`. `AccessDenied` subclasses `django.core.exceptions.PermissionDenied` and carries `message_en` / `message_ar`.
+`Grant` is a frozen dataclass: `user, entity, permission, membership_ids, checked_at, log_id`. `AccessDenied` subclasses `django.core.exceptions.PermissionDenied` and carries `message_en` / `message_ar`. *Amended 2026-10-16 (A13):* a grant for a **P** permission also records the document it was issued for and can be used once only (R30, R31).
 
 ## 4. Rules
 
@@ -256,9 +257,16 @@ Enforcement: **S** = `core/access/services.py`; **M** = model `save`/`delete`/`c
 26. Bootstrap: the management command `access_bootstrap` grants the first `managing_partner` membership only while no active `managing_partner` membership exists; it logs a `bootstrap` event with the operator's OS user. **[S; test AT-23]**
 
 **Logging, language, privacy**
-27. Every grant, revocation, delegation, dual-control step, profile change and denied `require` writes one `AccessLog` row in the same transaction as the change. **[S + M; test AT-15, AT-16]**
+27. Every grant, revocation, delegation, dual-control step, profile change and denied `require` writes one `AccessLog` row. **[S + M; test AT-15, AT-16, AT-29]**
+    *Amended 2026-10-16 (A13):* grant, membership, delegation, dual-control, profile and all other rows are written in the caller's transaction (they roll back with the change). `permission_denied` rows are written durably **outside** the caller's transaction, through a separate `access_log` database connection, so a refusal survives a rollback of the caller's work. Fallback: if that write cannot happen (the actor or entity row is not yet committed and so not visible to the other connection, or a lock wait exceeds 2 s), the row is written in the caller's transaction instead. **Known limitation:** a refusal written by the fallback is lost if the caller's transaction rolls back.
 28. `AccessDenied` messages, role names and permission labels exist in English and Arabic; the user's `preferred_language` is used. **[T: catalogue and role fixture scan; test AT-25]**
 29. Personal data fields (R51 in invoicing, `employee_ref` in billing) are masked unless the user holds the matching `view_personal_data` / `view_employee_ref` permission; each unmasked view is logged (PDPL). **[S in modules using `has`]**
+
+**Hardening (added 2026-10-16, A13)**
+30. A grant for a **P** permission is tied to one document: `post_entry` / `reverse_entry` refuse it for any other document (or entry derived from another document). It is single-use: a second use is refused. **[S in core + ledger; test AT-30]**
+31. Before a grant is honoured, it is verified against its `AccessLog` row (`log_id`): the row must exist and match user, entity, permission and document. A forged or altered `Grant` is refused. **[S; test AT-30]**
+32. `Entity.sharia_enforced`, `consolidation`, `parent`, `base_currency` and `is_active` change only through services in `core` that call `require` and write an `AccessLog` row with before/after values. Django admin shows these fields read-only. Permission codename and holders: OQ-18. **[S + admin; test AT-31]**
+33. `AccessLog` and `Membership` are append-only: model guards (R9, 3.5) and, on PostgreSQL, a database-level guard that rejects UPDATE (except the single revocation write on `Membership`) and DELETE. **[M + DB; test AT-32 (PostgreSQL only)]**
 
 ## 5. Accounting
 
@@ -322,6 +330,10 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 | AT-26 | Code scan | Run the test listing public service functions | Every function calls `require` or is on the reviewed allow-list (R1) |
 | AT-27 | *Added 2026-10-16 (A11).* In ALM: accountant S drafts and submits a contract version; approver C; `system_billing`; agent user | C approves S's version; S approves it; `system_billing` creates a correction draft, then submits it; S submits it; S approves the note; C approves it; agent edits a version draft | C's approval allowed; S refused (A, R14). Draft creation allowed; `system_billing` submit refused (R13); S submit allowed; S approve refused (submitter, R14); C approve allowed. Agent refused (R12). |
 | AT-28 | *Added 2026-10-16 (A12).* Group parent ALM, child SUB; K is `zatca_admin` in ALM and SUB; K2 has no `zatca_admin` | MP grants K `unseal` on ALM; MP grants K `unseal` on SUB; MP grants K2 `unseal` on ALM; an `access_admin` grants `unseal` on ALM | First allowed, `delegation_granted` in `AccessLog`; second refused (not the group parent); third refused (no `zatca_admin`); fourth refused (`zatca.grant_key_delegation` is MP only) (R17) |
+| AT-29 | *Added 2026-10-16 (R27).* U is `accountant` in ALM only | Inside `transaction.atomic()`, U calls a service needing `require(U, SUB, ...)`; the caller catches `AccessDenied` and the block is rolled back | `permission_denied` row for U, SUB exists after the rollback (written on the `access_log` connection). A `membership_granted` row written in a rolled-back block does not exist. Fallback case (actor created in the same uncommitted transaction): refusal row written in the caller's transaction and gone after rollback (known limitation) |
+| AT-30 | *Added 2026-10-16 (R30, R31).* Approver P holds a grant from approving bill X in ALM | Pass it to `post_entry` for X; again for X; for bill Y; pass a `Grant` with changed `log_id` or permission | First posts; second refused (used); Y refused (other document); altered grant refused (no matching `AccessLog` row) |
+| AT-31 | *Added 2026-10-16 (R32).* Superuser S; MP in ALM; accountant A | S edits `sharia_enforced` on ALM in admin; A calls the entity-settings service; MP calls it | Admin edit refused (field read-only); A refused with `permission_denied` row; MP change applied with an `AccessLog` row holding before/after |
+| AT-32 | *Added 2026-10-16 (R33), PostgreSQL only.* Existing `AccessLog` and `Membership` rows | Raw SQL UPDATE and DELETE on both tables; raw UPDATE of `Membership.revoked_at` on an unrevoked row | UPDATE/DELETE rejected by the database; the single revocation write allowed once |
 
 ## 9. Open questions
 
@@ -346,6 +358,7 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 | OQ-15 | Should `billing.approve_termination` be "not own"? billing §7 does not say so; invoicing does for all approvals. | Managing Partner | D | Yes, all **A** permissions are segregated. Billing R39/R40 (D9) now state CFO ≠ creator/submitter for every version, terminations included |
 | OQ-16 | Maximum delegation length (CFO and key custody; zatca OQ-25). | Managing Partner | D | No maximum; `valid_to` required for CFO delegates, optional for key custody (zatca default) |
 | OQ-17 | Should WHT entry and verification be separate people (enter ≠ verify)? | Accountant | D | No rule; same person may do both |
+| OQ-18 | *Added 2026-10-16.* Who may change sensitive entity settings (R32): `sharia_enforced`, `consolidation`, `parent`, `base_currency`, `is_active`? Should turning Sharia enforcement off need dual control? | Managing Partner | D | `managing_partner` only (`base_currency` also per ledger-fx R5); no dual control |
 
 **Blocking:** OQ-13 blocks wiring zatca onboarding permissions (not the access module itself). **Go-live:** OQ-3, OQ-4, OQ-10. This spec also unblocks invoicing OQ-25 (views/APIs) once built.
 
