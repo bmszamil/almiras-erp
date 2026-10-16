@@ -21,6 +21,9 @@ All by Badr Alzamil, Managing Partner (MP), 16 Oct 2026.
 | D7 | Every approval and action is logged (who, when, before/after). Segregation of duties: the creator of a payment cannot approve it. |
 | D8 | Future AI agents act as named service users through the gateway, may only create drafts, and their records carry `source = "agent:<name>"`. |
 | D9 | Approvable documents: manual journal entries, supplier bills, payments, intercompany invoices, purchase requests, contracts — through one generic approval that any module plugs into. |
+| D10 | (16 Oct 2026, answers to OQ2/OQ4/OQ5) **MP self-approval allowed, logged:** when the MP creates a document and is the only eligible approver, he may approve it himself. The action is recorded as `self_approval_override` in the audit log and listed in a monthly self-approval report for the Chairman and auditor. No other user may self-approve. Replaces the "never self-approves" outcome in R9. |
+| D11 | **Approval posts automatically:** when the final approval is given, the owning module posts/executes the document in the same transaction (e.g. `ledger.services.post_entry`). If posting fails a ledger rule, the approval is rolled back and the approver sees the reason. |
+| D12 | **Access is per entity:** a role at Almiras gives no access to subsidiaries; each entity is granted separately through `EntityAccess`. |
 
 ## 3. Data model
 
@@ -145,7 +148,7 @@ Note: `ledger.JournalEntry` today has no `source` field and no `pending_approval
 | R6 | Initial data: one group-wide policy per spending document type (`is_spending=True`), any amount, one step, approver = role `managing_partner` (D2). | Data migration; test |
 | R7 | Changing the approval matrix (tiers, entities, escalation to Chairman/board) needs only data changes in `ApprovalPolicy`/`ApprovalStep`, no code. | Admin/API for policies; test that adds a tier and routes correctly |
 | R8 | Segregation of duties: the user who created the document, or who submitted it, cannot approve any step of its request — also not as a delegate. | `approvals.services.act` checks `document_created_by` and `submitted_by` against actor and `on_behalf_of` |
-| R9 | If no eligible approver remains after R8 (e.g. MP created a payment and is the only approver), the request stays pending and an alert `no_eligible_approver` goes to the MP; the system never self-approves. Who approves instead is OQ2. | `act` + `submit` check; alert |
+| R9 | If no eligible approver remains after R8 (e.g. MP created a payment and is the only approver), the request stays pending and an alert `no_eligible_approver` goes to the MP; the system never self-approves. Exception: MP self-approval with a logged override (D10). | `act` + `submit` check; alert |
 | R10 | Lifecycle: `pending` → `approved` (all steps done) / `rejected` / `returned` / `cancelled` / `expired`. `approved`, `rejected`, `cancelled`, `expired` are final. `returned` sends the document back to `draft`; resubmission creates a new request. | State machine in `approvals.services`; DB check on status |
 | R11 | An approved document is locked: no edits to amount, lines, counterparty, dates or entity. Changes require the module's correction path (e.g. reversal for posted entries, or cancel + new document). | Module `save()` guard (like `JournalEntry.save`) checking approval status; test per module |
 | R12 | If the document changed after submission (`document_version` hash differs), approval is refused and the request is set to `returned`. | Hash check in `act` |
@@ -188,7 +191,7 @@ Enforced by front-end tests (component + Playwright, both languages) and API per
 
 ## 5. Accounting
 
-This module produces no journal entries. Approving a document only changes its approval status; any posting is done by the owning module through its own service (`ledger.services.post_entry` for journal entries). Whether approval auto-posts or a separate post step is needed is OQ4.
+This module produces no journal entries. Approving a document only changes its approval status; any posting is done by the owning module through its own service (`ledger.services.post_entry` for journal entries). Final approval triggers the owning module's post in the same transaction (D11).
 
 | Event | Debit | Credit |
 | --- | --- | --- |
@@ -278,7 +281,7 @@ The Chairman role exists from day one for escalation, but no policy routes to it
 | T3 | Initial data loaded | Accountant submits a payment of SAR 1,000 in ALM | Request `pending`, step 1 approver role `managing_partner`, MP gets in-app + email in his language |
 | T4 | T3 pending | MP approves | Status `approved`, `ApprovalAction` + `AuditLog` rows with before/after, document locked |
 | T5 | Approved payment | Anyone edits its amount | Rejected with bilingual error; no change saved |
-| T6 | MP created a payment himself and is the only approver | MP submits and tries to approve | Approve refused (R8); request stays pending; alert `no_eligible_approver` |
+| T6 | MP created a payment himself and is the only approver | MP submits and approves | Approved via self-approval override (D10); audit log records `self_approval_override`; appears in monthly self-approval report. Any other user doing the same is refused (R8). |
 | T7 | MP delegated to D for ALM payments ≤ SAR 50,000, 1–10 Nov | D approves a SAR 20,000 payment on 5 Nov | Approved; action shows actor D, on_behalf_of MP |
 | T8 | Same delegation | D approves SAR 60,000, or on 11 Nov | Refused 403 |
 | T9 | D created the payment | D tries to approve it as delegate | Refused (R8) |
@@ -289,7 +292,7 @@ The Chairman role exists from day one for escalation, but no policy routes to it
 | T14 | Pending request | MP returns with comment | Status `returned`; document back to `draft`; resubmission creates a new request |
 | T15 | Agent user `agent:invoice-reader` | Agent creates and submits a bill draft | Bill and request carry `source="agent:invoice-reader"` |
 | T16 | Same agent | Agent calls approve | Refused 403 regardless of roles |
-| T17 | Approved manual journal entry that is unbalanced after a data change attempt | `on_approved` posts | Posting refused by `post_entry`; alert raised; entry stays unposted |
+| T17 | Approved manual journal entry that is unbalanced after a data change attempt | Final approval triggers posting (D11) | Posting refused by `post_entry`; whole approval rolled back; approver sees the reason; entry stays unposted and pending |
 | T18 | Any audit row | App user tries update/delete | Refused |
 | T19 | User language `ar` | Opens inbox | `dir="rtl"`, Arabic labels, amounts LTR with currency; switching to `en` persists after re-login |
 | T20 | Two policies for same type with overlapping ranges, same entity and priority | Second saved | Refused |
@@ -301,10 +304,10 @@ The Chairman role exists from day one for escalation, but no policy routes to it
 ## 9. Open questions
 
 1. **Custom user model now?** `AUTH_USER_MODEL` is still Django's default; switching later is costly. Confirm a custom `access.User` before the first production migration.
-2. **Segregation vs "MP approves all":** if the MP creates a payment himself, who approves it — Chairman, a second partner, or a named finance person? Or is MP self-approval allowed with a logged override?
+2. ~~**Segregation vs "MP approves all":**~~ **Answered — D10.** if the MP creates a payment himself, who approves it — Chairman, a second partner, or a named finance person? Or is MP self-approval allowed with a logged override?
 3. **Ledger plug-in:** confirm adding `source` and an approval state (`pending_approval`, `approved`) to `JournalEntry`. Which manual entries need approval — all, or above an amount? Are system-generated entries (from approved bills/payments) exempt?
-4. **Approve vs post:** does approval auto-post/execute (journal entry posted, payment released), or does a separate person post? Can an accountant post after MP approval?
-5. **Roles at go-live:** which roles beyond MP, Chairman, accountant, viewer (e.g. finance manager, CFO, board member)? Does a role held at the parent entity (Almiras) give access to all subsidiaries, or must access be granted per entity?
+4. ~~**Approve vs post:**~~ **Answered — D11.** does approval auto-post/execute (journal entry posted, payment released), or does a separate person post? Can an accountant post after MP approval?
+5. **Roles at go-live:** which roles beyond MP, Chairman, accountant, viewer (e.g. finance manager, CFO, board member)? Parent-entity access: **answered — per entity (D12).**
 6. **Currency for thresholds:** compare amounts in document currency, entity base currency, or SAR at which rate?
 7. **Parallel approvals:** needed (e.g. two board members in parallel), or sequential only?
 8. **Timeouts:** default escalation and expiry periods; does `expired` apply at all, or do requests wait indefinitely?

@@ -20,6 +20,7 @@ All by Badr Alzamil, Managing Partner, 16 Oct 2026.
 | D8 | Subsidiaries join the same ERP later. When both entities are in the ERP, the receiving entity's bill is created automatically as a draft mirroring the invoice. When the counterparty is not on the ERP yet, only Almiras's side is booked. |
 | D9 | The rental assets module (leases, vehicles with fuel/mileage logs) is a later wave. Billing agreements must be able to take lines from rental leases later. |
 | D10 | Records created by future AI agents carry a `source` field (human / import / agent) and are drafts only. |
+| D11 | (16 Oct 2026, answer to Q1) **No late-payment penalties** on intercompany invoices. The penalty feature is not built. |
 
 ## 3. Data model
 All models: `entity` FK (the issuing entity unless stated), `source` (choice: `human`, `import`, `agent`; plus `source_agent` char, required when `agent`), `created_by`, `created_at`. Money is `Decimal(18,2)` with explicit `currency` (default entity `base_currency`). "Bilingual" = `_en` and `_ar` fields, both required.
@@ -139,7 +140,7 @@ For lines supplied by other modules (later: rental leases, fuel/mileage recharge
 | R15 | On issue, if `counterparty.books_in_erp` and issue date ≥ `books_in_erp_from`: create a draft `IntercompanyBill` in the counterparty with identical net, VAT and gross per line. Otherwise create no bill and post nothing in the counterparty. | Service; two tests |
 | R16 | The receiver may change expense account and cost centre on the mirror bill, never amounts, dates or VAT. A disagreement is set `disputed` and resolved by a credit note from the issuer. | `IntercompanyBill.clean()`; service |
 | R17 | A credit note on an invoice that has a mirror bill creates a mirror draft debit-side document (bill credit) the same way. | Service |
-| R18 | No interest, finance charge or time-value uplift can be configured on agreements. Late-payment penalty is disabled until Q1 is answered; if enabled, it posts only to 2600 Charity payable, never to income. | No field for interest; penalty setting off by default; Sharia account checks in `ledger.services.validate_entry` |
+| R18 | No interest, finance charge or time-value uplift can be configured on agreements. No late-payment penalty exists (D11). | No field for interest; penalty setting off by default; Sharia account checks in `ledger.services.validate_entry` |
 | R19 | Users see and act only on agreements, invoices and bills of entities they have permission for. The issuer cannot see the receiver's bill expense coding unless it also has rights on the receiver. | Queryset filter by entity + permission; test |
 | R20 | Agent-created records (`source=agent`) can only be `draft` (agreements, timesheets, invoices). Agents cannot approve or issue. | Gateway permissions + service check on `source` |
 | R21 | All printed text (agreement, invoice, credit note) is bilingual Arabic/English. | Required `_en`/`_ar` fields; ZATCA module renders both |
@@ -181,13 +182,8 @@ Receiver bill credit: Dr 2110, Cr expense, Cr 1310 (all cp = issuer).
 | Issuer | 1100 Cash and bank | 1210 (cp receiver) |
 | Receiver | 2110 (cp issuer) | 1100 Cash and bank |
 
-### 5.5 Late-payment penalty (disabled; only if Sharia board approves, Q1)
-| Account | Dr | Cr | cp |
-| --- | --- | --- | --- |
-| 1210 Due from group entities | amount | | receiver |
-| 2600 Charity payable (purification) | | amount | receiver |
-
-Never to any 4xxx account.
+### 5.5 Late-payment penalty
+Not used (D11).
 
 ### 5.6 Default receiver expense accounts (proposed, accountant to confirm, Q8)
 | Category | Issuer income | Receiver expense |
@@ -264,7 +260,7 @@ Per entity; a role on ALM gives nothing on LFN.
 ## 9. Open questions
 | # | Question | Owner |
 | --- | --- | --- |
-| Q1 | Are late-payment penalties used at all? If yes: amount basis, and confirmation they go to 2600 Charity payable and then to which charity, and whether a fixed penalty (not time-based) is acceptable. | Sharia adviser + MP |
+| Q1 | **Answered — none (D11).** ~~Are late-payment penalties used at all? If yes: amount basis, and confirmation they go to 2600 Charity payable and then to which charity, and whether a fixed penalty (not time-based) is acceptable. | Sharia adviser + MP |
 | Q2 | Are any group entities in, or planned for, a ZATCA VAT group? Intra-group supplies inside a VAT group are outside VAT, which conflicts with "VAT invoice on every recharge". | Tax adviser |
 | Q3 | Saudi transfer pricing bylaws: do they apply to these transactions given Zakat (not income tax) status of entities and any foreign shareholders? Required methods, documentation, benchmark and disclosure form. | Tax adviser |
 | Q4 | Equity-method associates: how to treat unrealised profit on recharges in consolidation, and do associates get the same pricing as subsidiaries? | Accountant / auditor |
