@@ -20,10 +20,18 @@ pip install -r requirements.txt
 python manage.py migrate
 python manage.py setup_almiras        # Almiras entity, 55 accounts, 2027 periods
 python manage.py createsuperuser
-python manage.py runserver            # admin at /admin
-python -m pytest -q                   # 16 tests
+python manage.py grant_access <user> ALM managing_partner
+python manage.py setup_totp <user>    # authenticator app; admin and API need password + code
+python manage.py runserver            # admin at /admin, API at /api/v1/
+python -m pytest -q
 ```
 Set `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST` to use PostgreSQL.
+
+## Approvals and access (wave 1, step 2)
+- `access`: custom user, roles and permissions, per-entity access, append-only audit log, TOTP two-factor.
+- `approvals`: approval matrix as data, request lifecycle, delegation, escalation, in-app notifications, REST API.
+- Manual journal entries are posted by approval only. Cron: `run_escalations` every 15 min, `send_notifications`.
+- Details and build choices: `docs/specs/approvals-and-web-ui.md` (Build notes).
 
 ## Build agents
 Six Claude Code agents in `.claude/agents/` (spec-writer, module-builder, test-engineer, code-reviewer, compliance-checker, migration-agent). Shared rules in `CLAUDE.md`. Future in-ERP AI agents: `docs/ai-agent-gateway.md`.

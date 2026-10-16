@@ -17,6 +17,17 @@ def _is_service_agent(user):
     return getattr(user, "user_type", None) == "service_agent"
 
 
+def _audit(user, action, entry, before=None):
+    """R19 / D7: audit ledger actions made by a user (system calls without a user are not audited here)."""
+    if user is None:
+        return
+    from access.services import audit
+
+    after = {"status": entry.status, "number": entry.number, "source": entry.source,
+             "total_debit": str(sum((l.debit for l in entry.lines.all()), ZERO))}
+    audit(user, action, entry, entity=entry.entity, before=before, after=after)
+
+
 def _find_open_period(entity, date):
     period = FiscalPeriod.objects.filter(entity=entity, start_date__lte=date, end_date__gte=date).first()
     if period is None:
@@ -83,8 +94,10 @@ def post_entry(entry, user=None):
     entry.status = JournalEntry.Status.POSTED
     entry.posted_by = user
     entry.posted_at = timezone.now()
+    before = {"status": JournalEntry.objects.filter(pk=entry.pk).values_list("status", flat=True).first()}
     entry._posting = True  # the one allowed transition into "posted"
     entry.save(update_fields=sorted(JournalEntry.POSTING_FIELDS))
+    _audit(user, "entry.post", entry, before=before)
     return entry
 
 
@@ -116,6 +129,7 @@ def reverse_entry(entry, date=None, user=None, reason=""):
     post_entry(reversal, user=user)
     entry.status = JournalEntry.Status.REVERSED
     entry.save(update_fields=["status"])
+    _audit(user, "entry.reverse", entry, before={"status": JournalEntry.Status.POSTED})
     reversal.refresh_from_db()
     return reversal
 
@@ -153,6 +167,7 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
             description=spec.get("description", ""),
             counterparty_entity=counterparty,
         )
+    _audit(user, "entry.create", entry)
     if post:
         entry = post_entry(entry, user=user)
     return entry

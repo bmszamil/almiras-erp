@@ -85,7 +85,8 @@ class User(AbstractUser):
             raise ValidationError({"agent_name": "Service agents need an agent name."})
 
     def delete(self, *args, **kwargs):
-        if AuditLog.objects.filter(models.Q(actor=self) | models.Q(on_behalf_of=self)).exists():
+        about_me = models.Q(object_type="access.user", object_id=str(self.pk))
+        if AuditLog.objects.filter(models.Q(actor=self) | models.Q(on_behalf_of=self) | about_me).exists():
             raise BilingualError(
                 "user_has_audit",
                 "Users with audit history cannot be deleted. Deactivate the user instead.",

@@ -327,3 +327,29 @@ The Chairman role exists from day one for escalation, but no policy routes to it
 20. **Document thresholds per type:** do purchase requests and contracts follow the same "MP approves all", or other rules?
 21. **REST framework:** confirm Django REST Framework (open source) and the API package choices as allowed dependencies.
 22. **Sharia review step:** should any document type (e.g. contracts, financing payments) need a Sharia reviewer step in the matrix?
+
+## Build notes
+
+Backend build on branch `module/approvals` (16 Oct 2026). Where the spec and D1–D14 did not decide, the most conservative choice was taken:
+
+1. **Custom user (OQ1):** `access.User` is `AUTH_USER_MODEL`; `core` and `ledger` initial migrations were regenerated (no production DB exists). `keycloak_id` is nullable until Keycloak is connected.
+2. **Sign-in (R4, D14):** Keycloak is not built. Today humans sign in with password + TOTP (django-otp). The admin is an `OTPAdminSite`; every API call needs an OTP-verified session. The seam is `settings.ERP_IDENTITY_ADAPTER` / `access.identity.IdentityAdapter`. Service users use revocable hashed bearer tokens (`manage.py issue_service_token`), never passwords.
+3. **CFO role (D13):** not in the §7.2 table. Built as accountant rights plus audit read; no approve or post until a policy names the CFO and the MP grants it.
+4. **Auditor / business analyst / PA (D13):** auditor is read-only (entity, requests, ledger, reports, audit); analyst has `investments`, `deals`, `reports` view only; PA (`pa_drafter`) creates drafts, uploads documents, submits, sees only own requests. Permission codes for not-yet-built modules (`investments.*`, `deals.*`, `reports.*`, `documents.*`) are placeholders.
+5. **Which journal entries need approval (OQ3):** every manual entry (`create_entry(..., manual=True)`, admin-created, or agent-created) goes through approval with one MP step (D2). System entries made by module services (`manual=False`) and reversals of already-posted entries are exempt. New statuses: `pending_approval`, `approved`, `rejected` (rejected entries are locked and never post). `post_entry` refuses unapproved manual entries and any call by a service agent.
+6. **Submit = own drafts only:** a user can submit only documents they created (§7.1 "own drafts").
+7. **Self-approval (D10):** allowed only when the approver holds `managing_partner` in the document's entity, created *and* submitted the document, is an eligible approver of the step, and no other user is eligible. Never via delegation. Recorded as `ApprovalAction.self_approval_override` and audit action `approval.self_approval_override`. Report: `approvals.services.self_approval_report` and `GET /api/v1/approvals/self-approval-report?year=&month=` (needs `access.audit.view`: MP, Chairman, auditor, CFO).
+8. **Posting failure (D11):** the approval, its action, its audit row and the post are rolled back together; afterwards an `approval.posting_failed` audit row and a `posting_failed` alert are kept, and the API returns 422 with the ledger reasons.
+9. **Changed document (R12):** compared by SHA-256 of document content (for entries: header + lines). The request is set to `returned` (committed), then 409.
+10. **Currency (OQ6):** policies match only requests in the same currency; no conversion. Delegation amount limits also apply only in their own currency.
+11. **Parallel steps (OQ7):** supported (equal `sequence`); a person counts once per request across all steps.
+12. **Timeouts (OQ8):** no default. Escalation only when a step sets `escalate_after_hours` and a target; expiry only when the policy sets `expire_after_hours`. Expired/cancelled requests return the document to draft. Escalation targets join the eligible approvers; original approvers stay eligible.
+13. **Jobs (OQ10):** management commands for cron: `run_escalations` (every 15 min) and `send_notifications` (email retry). No Celery.
+14. **Email (R21, OQ11):** sent after commit through Django mail (console backend by default); failures are recorded on the notification and retried up to 3 times. Push is a hook only (`PushDevice` stored, `channels_sent.push = hook_inactive`).
+15. **Policy overlap (T20):** enforced in `ApprovalPolicy.save` (same entity, type, currency, priority, overlapping amount and date ranges). A PostgreSQL exclusion constraint is left for the Postgres hardening step. Used policies cannot be edited or deleted, only retired (`is_active`, `valid_to`); their steps are frozen.
+16. **Group-wide policies and global audit rows:** need the permission in a root (parent) entity.
+17. **`returned` is final for the request** (resubmission makes a new request), so the model treats it as final alongside the R10 list.
+18. **Audit append-only (R19):** enforced in the model and queryset. The database-role restriction (no UPDATE/DELETE grant) is a deployment step. Role/permission edits through Django admin are not yet audited; grants, revokes, user create/deactivate, profile changes, approvals, delegations, policies, ledger create/post/reverse and sign-ins are.
+19. **Testing other modules:** a test-only app `testdocs` (sample payment and bill) is installed only by `config.settings_test` to test the plug-in contract until payables/payments exist.
+
+Left for later: Keycloak adapter; React web UI (§4.2, T19 front-end part); PostgreSQL triggers, exclusion constraint and DB role grants; mobile push sending; audit retention (OQ18); audit for admin role edits.
