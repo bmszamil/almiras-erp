@@ -897,3 +897,29 @@ def test_reversal_of_an_entry_booked_before_sharia_enforcement_is_allowed(w):
         post(w, new)
     rev = services.reverse_entry(interest, access.require(w.clerk, conv, "ledger.reverse_entry", document=interest))
     assert rev.status == "posted" and status(interest) == "reversed"  # undoing the old income is allowed
+
+
+# --- R14 / nit: changes outside the services still count as changes of the draft ------------------
+
+@pytest.mark.parametrize("change", [
+    lambda e: JournalEntry.objects.filter(pk=e.pk).update(description="changed in bulk"),
+    lambda e: JournalEntry.objects.filter(pk=e.pk).update(description="backdated", modified_at=None),
+    lambda e: JournalLine.objects.filter(entry=e).update(description="changed in bulk"),
+    lambda e: JournalLine.objects.filter(entry=e, debit__gt=0).update(debit=D("10.00")),
+    lambda e: JournalLine.objects.filter(entry=e, account__code="4110").delete(),
+    lambda e: _edit_one_line(e),
+])
+def test_draft_changed_after_approval_needs_a_new_approval(w, change):
+    entry = draft(w, [{"account": "1100", "debit": 12}, {"account": "3100", "credit": 10}, {"account": "4110", "credit": 2}])
+    grant = access.require(w.cfo, w.alm, "ledger.post_entry", document=entry)
+    change(entry)
+    assert JournalEntry.objects.get(pk=entry.pk).modified_at > grant.checked_at
+    with pytest.raises(access.AccessDenied) as exc:
+        services.post_entry(entry, grant)
+    assert exc.value.code == "grant_document_changed" and status(entry) == "draft"
+
+
+def _edit_one_line(entry):
+    line = JournalLine.objects.filter(entry=entry).first()
+    line.description = "edited through the ORM"
+    line.save()

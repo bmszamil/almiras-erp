@@ -10,7 +10,7 @@ the one place the lock is bypassed, and only for the new columns: debit,
 credit, account, counterparty and the entry (status, number, date) are not
 touched, so functional amounts and trial balances are identical before and
 after. The code-reviewer must approve this bypass (R38). Covered by
-ledger/tests_fx_migration.py.
+ledger/test_fx_migration.py.
 """
 from decimal import Decimal
 

@@ -515,3 +515,19 @@ def test_concurrent_bootstraps_grant_one_managing_partner():
         t.join(timeout=20)
     assert sorted(outcomes) == ["granted", "refused"]
     assert Membership.objects.filter(role__code="managing_partner").count() == 1
+
+
+# --- R31 / nit 22: the grant age setting is checked at start-up ---------------------------------
+
+@pytest.mark.parametrize("value, ok", [
+    (900, True), (timedelta(minutes=5), True), (None, True),
+    (0, False), (-1, False), (timedelta(0), False), ("900", False), (True, False),
+])
+def test_grant_max_age_system_check(settings, value, ok):
+    from core.access.checks import grant_max_age_is_positive
+
+    settings.ACCESS_GRANT_MAX_AGE = value
+    errors = grant_max_age_is_positive()
+    assert (errors == []) is ok
+    if not ok:
+        assert errors[0].id == "access.E002"

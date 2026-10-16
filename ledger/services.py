@@ -482,8 +482,8 @@ def _post(entry, posted_by):
     flagged = set(_purification_flags(entry, lines))
     wrong = [l.pk for l in lines if l.requires_purification != (l.pk in flagged)]
     if wrong:  # still a draft here, so the line lock allows it; flags are set only here
-        for pk in wrong:
-            JournalLine.objects.filter(pk=pk).update(requires_purification=pk in flagged)
+        for pk in wrong:  # base update: the posting itself is not a change of the approved draft
+            models.QuerySet.update(JournalLine.objects.filter(pk=pk), requires_purification=pk in flagged)
     entry.number = _next_number(entry.entity, entry.date.year)
     entry.status = JournalEntry.Status.POSTED
     entry.posted_by = posted_by
@@ -560,7 +560,7 @@ def _reverse(entry, user, date, reason):
         document_id=entry.document_id,
     )
     for line in entry.lines.all():
-        JournalLine.objects.create(
+        copy = JournalLine(
             entry=reversal,
             account=line.account,
             description=line.description,
@@ -577,6 +577,8 @@ def _reverse(entry, user, date, reason):
             manual_rate_reason=line.manual_rate_reason,
             line_kind=line.line_kind,
         )
+        copy._service_write = True
+        copy.save()
     _post(reversal, user)  # authorised by the reversal grant checked in reverse_entry
     entry.status = JournalEntry.Status.REVERSED
     entry._allow_transition(JournalEntry.Status.POSTED, JournalEntry.Status.REVERSED)
@@ -662,6 +664,7 @@ def _create(entity, date, description, lines, user, reference, post, posted_by, 
     )
     for line in built:
         line.entry = entry
+        line._service_write = True
         line.save()
     if kind_of(user) == Kind.AGENT:  # gateway rule: every agent action is logged (access.md R21)
         access_log(
@@ -711,6 +714,7 @@ def _update_draft(entry, user, date, description, reference, lines):
         entry.lines.all().delete()
         for line in built:
             line.entry = entry
+            line._service_write = True
             line.save()
     entry.modified_by = user
     entry.modified_at = timezone.now()
@@ -1297,6 +1301,7 @@ def rerate_entry(entry, *, user):
         )
     functional = entry.entity.base_currency_id
     for line in lines:
+        line._service_write = True  # modified_by / modified_at are set below
         if line.line_kind == Kind_.ROUNDING:
             line.delete()
             continue
@@ -1308,6 +1313,7 @@ def rerate_entry(entry, *, user):
     rounding = _rounding_line(entry.entity, [l for l in lines if l.line_kind != Kind_.ROUNDING])
     if rounding is not None:
         rounding.entry = entry
+        rounding._service_write = True
         rounding.save()
     entry.modified_by, entry.modified_at = user, timezone.now()  # a re-rater cannot approve the draft (R14)
     entry.save(update_fields=["modified_by", "modified_at"])
@@ -1497,6 +1503,7 @@ def _revalue(entity, period, user):
     )
     for line in lines:
         line.entry = entry
+        line._service_write = True
         line.save()
     run.entry = entry
     run.save()

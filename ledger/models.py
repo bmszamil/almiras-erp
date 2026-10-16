@@ -12,6 +12,7 @@ from decimal import Decimal
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.utils import timezone
 
 from core.models import Currency, Entity, bi
 
@@ -119,6 +120,8 @@ class JournalEntryQuerySet(models.QuerySet):
             raise LedgerError(STATUS_THROUGH_SERVICES)
         if self.exclude(status=JournalEntry.Status.DRAFT).exists():
             raise LedgerError(POSTING_LOCK)
+        # A bulk change is a change of the draft: an approval given before it no longer covers it (R14).
+        kwargs["modified_at"] = timezone.now()
         return super().update(**kwargs)
 
     def delete(self):
@@ -258,16 +261,36 @@ class JournalLineQuerySet(models.QuerySet):
         if self._touches_booked():
             raise LedgerError(POSTING_LOCK)
         target = kwargs.get("entry", kwargs.get("entry_id"))
+        entry_ids = set(self.values_list("entry_id", flat=True))
         if target is not None:
             target_id = getattr(target, "pk", target)
             if JournalEntry.objects.filter(pk=target_id).exclude(status=JournalEntry.Status.DRAFT).exists():
                 raise LedgerError(POSTING_LOCK)
-        return super().update(**kwargs)
+            entry_ids.add(target_id)
+        result = super().update(**kwargs)
+        touch_drafts(entry_ids)
+        return result
 
     def delete(self):
         if self._touches_booked():
             raise LedgerError(POSTING_LOCK)
-        return super().delete()
+        entry_ids = set(self.values_list("entry_id", flat=True))
+        result = super().delete()
+        touch_drafts(entry_ids)
+        return result
+
+
+def touch_drafts(entry_ids):
+    """Record that the lines of these drafts changed outside ledger.services (modified_at, R14).
+
+    An approval (``ledger.post_entry`` grant) issued before the change then
+    no longer covers the draft (grant_document_changed).
+    """
+    ids = [i for i in entry_ids if i is not None]
+    if ids:
+        models.QuerySet.update(
+            JournalEntry.objects.filter(pk__in=ids, status=JournalEntry.Status.DRAFT), modified_at=timezone.now()
+        )
 
 
 class JournalLine(models.Model):
@@ -369,7 +392,10 @@ class JournalLine(models.Model):
         if self._entry_locked():
             raise LedgerError("Lines of a posted entry cannot be changed. / لا تُعدَّل بنود القيد المرحّل.")
         self._fill_functional_defaults()
+        stored_entry = self._stored_entry_id()
         super().save(*args, **kwargs)
+        if not getattr(self, "_service_write", False):  # ledger.services set modified_by / modified_at themselves
+            touch_drafts({self.entry_id, stored_entry})
 
     def _fill_functional_defaults(self):
         """R1: a line saved without currency fields is in the entity's functional currency at rate 1.
@@ -391,7 +417,11 @@ class JournalLine(models.Model):
     def delete(self, *args, **kwargs):
         if self._entry_locked():
             raise LedgerError("Lines of a posted entry cannot be deleted. / لا تُحذف بنود القيد المرحّل.")
-        return super().delete(*args, **kwargs)
+        entry_id = self._stored_entry_id()
+        result = super().delete(*args, **kwargs)
+        if not getattr(self, "_service_write", False):
+            touch_drafts({entry_id})
+        return result
 
     def __str__(self):
         return f"{self.account.code} Dr {self.debit} Cr {self.credit}"

@@ -39,3 +39,27 @@ def models_q():
     from django.db.models import Q
 
     return Q(groups__isnull=False) | Q(user_permissions__isnull=False)
+
+
+@register("access")
+def grant_max_age_is_positive(app_configs=None, **kwargs):
+    """R31: ACCESS_GRANT_MAX_AGE (seconds or timedelta) must be above zero, else no grant could ever be used
+    (or, if negative, the expiry check would be meaningless)."""
+    from datetime import timedelta
+
+    from django.conf import settings
+
+    value = getattr(settings, "ACCESS_GRANT_MAX_AGE", None)
+    if value is None:
+        return []
+    if isinstance(value, bool) or not isinstance(value, (int, float, timedelta)):
+        seconds = None
+    else:
+        seconds = value.total_seconds() if isinstance(value, timedelta) else value
+    if seconds is None or seconds <= 0:
+        return [Error(
+            f"ACCESS_GRANT_MAX_AGE must be a positive number of seconds or a positive timedelta, not {value!r}.",
+            hint="Set ACCESS_GRANT_MAX_AGE_SECONDS to e.g. 900 (15 minutes, access.md R31).",
+            id="access.E002",
+        )]
+    return []
