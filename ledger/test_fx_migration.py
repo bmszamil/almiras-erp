@@ -28,7 +28,7 @@ def _migrate(targets):
 
 def _leaf_targets():
     executor = MigrationExecutor(connection)
-    return [node for node in executor.loader.graph.leaf_nodes() if node[0] in ("core", "ledger")]
+    return executor.loader.graph.leaf_nodes()  # every app, so apps depending on core (testdocs) come back too
 
 
 def _snapshot(apps):

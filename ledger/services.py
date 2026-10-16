@@ -15,7 +15,7 @@ from pathlib import Path
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import models, transaction
+from django.db import connection, models, transaction
 from django.db.models import Case, F, Q, Sum, When
 from django.utils import timezone
 
@@ -384,15 +384,41 @@ def _purification_flags(entry, lines):
     ]
 
 
+def _lock_for_posting(entry):
+    """Locks taken before an entry is validated and posted (rules 1 and 4, R11, R18).
+
+    Order: the entry (by the caller), its period, its own lines, the lines it
+    settles (sorted by pk), then the rate rows its lines use. The period lock
+    serialises postings into one period with close_period; the settled-item
+    locks serialise two settlements of one item, so they cannot together
+    clear more than is open; the rate rows are held FOR SHARE so a rate used
+    here cannot be changed before this posting commits.
+    """
+    period = _find_open_period(entry.entity, entry.date, lock=True)
+    lines = list(JournalLine.objects.select_for_update(of=("self",)).filter(entry=entry).order_by("pk"))
+    settled = sorted({l.settles_line_id for l in lines if l.settles_line_id})
+    if settled:
+        list(JournalLine.objects.select_for_update(of=("self",)).filter(pk__in=settled).order_by("pk"))
+    rates = sorted({l.exchange_rate_id for l in lines if l.exchange_rate_id})
+    if rates:
+        if connection.vendor == "postgresql":
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT id FROM ledger_exchangerate WHERE id = ANY(%s) ORDER BY id FOR SHARE", [rates])
+        else:
+            list(ExchangeRate.objects.select_for_update().filter(pk__in=rates).order_by("pk"))
+    return period
+
+
 @transaction.atomic
 def _post(entry, posted_by):
     entry = JournalEntry.objects.select_for_update(of=("self",)).select_related("entity").get(pk=entry.pk)
     if entry.status != JournalEntry.Status.DRAFT:
-        raise LedgerError("Only draft entries can be posted.")
+        raise error("Only draft entries can be posted.", "يمكن ترحيل المسودات فقط.")
+    period = _lock_for_posting(entry)
     problems = validate_entry(entry)
     if problems:
         raise LedgerError(problems)
-    entry.period = _find_open_period(entry.entity, entry.date, lock=True)
+    entry.period = period
     flagged = _purification_flags(entry, list(entry.lines.select_related("account")))
     if flagged:  # still a draft here, so the line lock allows it
         JournalLine.objects.filter(pk__in=flagged).update(requires_purification=True)
@@ -400,6 +426,7 @@ def _post(entry, posted_by):
     entry.status = JournalEntry.Status.POSTED
     entry.posted_by = posted_by
     entry.posted_at = timezone.now()
+    entry._allow_transition(JournalEntry.Status.DRAFT, JournalEntry.Status.POSTED)
     entry.save()  # stored status is still draft, so the lock allows this one transition
     return entry
 
@@ -487,6 +514,7 @@ def _reverse(entry, user, date, reason):
         )
     _post(reversal, user)  # authorised by the reversal grant checked in reverse_entry
     entry.status = JournalEntry.Status.REVERSED
+    entry._allow_transition(JournalEntry.Status.POSTED, JournalEntry.Status.REVERSED)
     entry.save(update_fields=["status"])
     reversal.refresh_from_db()
     return reversal

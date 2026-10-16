@@ -10,7 +10,7 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
-        ("core", "0010_append_only_triggers"),
+        ("core", "0001_initial"),  # only Entity is needed; keeps it clear of core rewinds
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

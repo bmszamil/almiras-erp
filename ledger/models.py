@@ -99,12 +99,24 @@ POSTING_LOCK = (
 )
 
 
+STATUS_THROUGH_SERVICES = (
+    "An entry's status changes only through ledger.services (post_entry, reverse_entry). / "
+    "تتغير حالة القيد من خلال خدمات الدفتر فقط (الترحيل والعكس)."
+)
+
+
 class JournalEntryQuerySet(models.QuerySet):
     """Bulk writes skip ``save()``/``delete()``, so they get the posting lock here (CLAUDE.md rules 1 and 3)."""
 
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        if any(obj.status != JournalEntry.Status.DRAFT for obj in objs):
+            raise LedgerError(STATUS_THROUGH_SERVICES)
+        return super().bulk_create(objs, *args, **kwargs)
+
     def update(self, **kwargs):
         if "status" in kwargs:
-            raise LedgerError("An entry's status changes only through ledger.services. / تتغير حالة القيد من خلال خدمات الدفتر فقط.")
+            raise LedgerError(STATUS_THROUGH_SERVICES)
         if self.exclude(status=JournalEntry.Status.DRAFT).exists():
             raise LedgerError(POSTING_LOCK)
         return super().update(**kwargs)
@@ -192,15 +204,31 @@ class JournalEntry(models.Model):
             return None
         return JournalEntry.objects.filter(pk=self.pk).values_list("status", flat=True).first()
 
+    def _allow_transition(self, before, after):
+        """Set only by ledger.services._post / _reverse right before their save (CLAUDE.md rule 3)."""
+        self._status_transition = (before, after)
+
     def save(self, *args, **kwargs):
         stored = self._stored_status()
+        allowed, self._status_transition = getattr(self, "_status_transition", None), None
         # A posted entry may only change to "reversed"; a reversed entry never changes.
         if stored == self.Status.REVERSED:
-            raise LedgerError("Reversed entries are locked.")
+            raise LedgerError("Reversed entries are locked. / القيود المعكوسة مقفلة.")
         if stored == self.Status.POSTED and not (
             self.status == self.Status.REVERSED and kwargs.get("update_fields") == ["status"]
         ):
-            raise LedgerError("Posted entries cannot be edited. Reverse the entry instead.")
+            raise LedgerError(
+                "Posted entries cannot be edited. Reverse the entry instead. / لا تُعدَّل القيود المرحّلة؛ اعكس القيد."
+            )
+        # Rule 3: every status change (and any entry stored as non-draft) comes from ledger.services.
+        if (stored or self.Status.DRAFT) != self.status and allowed != (stored, self.status):
+            raise LedgerError(STATUS_THROUGH_SERVICES)
+        if stored is None and self.status != self.Status.DRAFT:
+            raise LedgerError(STATUS_THROUGH_SERVICES)
+        if self.status == self.Status.POSTED and stored == self.Status.DRAFT and not (
+            self.number and self.period_id and self.posted_at and self.posted_by_id
+        ):
+            raise LedgerError(STATUS_THROUGH_SERVICES)
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):

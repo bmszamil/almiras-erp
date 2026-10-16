@@ -564,11 +564,119 @@ def test_database_rejects_raw_changes_to_posted_entries_and_lines(w):
     ):
         with pytest.raises(DatabaseError):
             _raw(sql, params)
-    # The one change a posted row allows: posted -> reversed, nothing else (what reverse_entry writes).
-    _raw("UPDATE ledger_journalentry SET status = 'reversed' WHERE id = %s", [posted.pk])
+    # posted -> reversed alone is not enough: the posted reversal must exist (what reverse_entry writes).
+    with pytest.raises(DatabaseError):
+        _raw("UPDATE ledger_journalentry SET status = 'reversed' WHERE id = %s", [posted.pk])
+    services.reverse_entry(posted, access.require(w.clerk, w.alm, "ledger.reverse_entry", document=posted))
     with pytest.raises(DatabaseError):
         _raw("UPDATE ledger_journalentry SET status = 'posted' WHERE id = %s", [posted.pk])
     _raw("UPDATE ledger_journalline SET description = 'ok' WHERE entry_id = %s", [open_draft.pk])  # drafts are free
+
+
+# --- rule 3: status changes only through ledger.services (P2) ------------------------------
+
+def test_p2_draft_cannot_be_posted_or_reversed_by_save(w):
+    """P2 (reviewer probe): draft.status = "posted"; save() booked an unnumbered entry; "reversed" too."""
+    for target in ("posted", "reversed"):
+        entry = draft(w)
+        entry.status = target
+        with pytest.raises(LedgerError, match="only through ledger.services"):
+            entry.save()
+        assert status(entry) == "draft"
+    entry = draft(w)
+    entry.status, entry.number, entry.posted_by, entry.posted_at = "posted", "ALM-JE-2027-999999", w.cfo, access_services.now()
+    entry.period = FiscalPeriod.objects.get(entity=w.alm, name="2027-01")
+    with pytest.raises(LedgerError):  # all the fields of a posting, still not through the service
+        entry.save()
+    assert status(entry) == "draft"
+    assert services._trial_balance(w.alm, date(2027, 12, 31)) == []
+
+
+def test_entries_are_created_as_drafts_only(w):
+    with pytest.raises(LedgerError):
+        JournalEntry.objects.create(entity=w.alm, date=date(2027, 1, 10), description="x", status="posted")
+    with pytest.raises(LedgerError):
+        JournalEntry.objects.bulk_create([JournalEntry(entity=w.alm, date=date(2027, 1, 10), description="x", status="reversed")])
+    assert not JournalEntry.objects.exists()
+
+
+def test_posted_entry_marked_reversed_only_by_reverse_entry(w):
+    posted = post(w, draft(w))
+    posted.status = "reversed"
+    with pytest.raises(LedgerError):
+        posted.save(update_fields=["status"])
+    posted._allow_transition("draft", "posted")  # a flag for another transition does not help
+    with pytest.raises(LedgerError):
+        posted.save(update_fields=["status"])
+    assert status(posted) == "posted"
+    services.reverse_entry(posted, access.require(w.clerk, w.alm, "ledger.reverse_entry", document=posted))
+    assert status(posted) == "reversed"
+
+
+@postgres_only
+def test_p2_database_rejects_status_changes_outside_the_services(w):
+    entry = draft(w)
+    unbalanced = draft(w, [{"account": "1100", "debit": 10}, {"account": "3100", "credit": 9}])
+    jan = FiscalPeriod.objects.get(entity=w.alm, name="2027-01")
+    for sql, params in (
+        ("UPDATE ledger_journalentry SET status = 'posted' WHERE id = %s", [entry.pk]),
+        ("UPDATE ledger_journalentry SET status = 'reversed' WHERE id = %s", [entry.pk]),
+        ("UPDATE ledger_journalentry SET status = 'posted', number = 'X-1', period_id = %s, posted_at = now() "
+         "WHERE id = %s", [jan.pk, entry.pk]),  # no posted_by
+        ("UPDATE ledger_journalentry SET status = 'posted', number = 'X-2', period_id = %s, posted_at = now(), "
+         "posted_by_id = %s WHERE id = %s", [jan.pk, w.cfo.pk, unbalanced.pk]),  # does not balance
+        ("INSERT INTO ledger_journalentry (entity_id, number, date, description, reference, status, created_at, source, "
+         "document_type) VALUES (%s, 'X-3', '2027-01-10', 'x', '', 'posted', now(), 'human', '')", [w.alm.pk]),
+    ):
+        with pytest.raises(DatabaseError):
+            _raw(sql, params)
+    assert status(entry) == status(unbalanced) == "draft"
+    assert post(w, entry).status == "posted"  # the service path passes the trigger
+
+
+@postgres_only
+@pytest.mark.django_db(transaction=True)
+def test_line_write_waits_for_a_posting_in_flight():
+    """Item 8: a draft-line edit racing a posting waits for it (FOR SHARE) and is then refused."""
+    from core.access.models import Role, RolePermission
+    from core.access.seed import apply_seed
+    from core.currency_seed import apply_currency_seed
+    from core.models import Currency
+
+    apply_seed(Role, RolePermission)
+    apply_currency_seed(Currency)
+    alm = setup_entity("ALM", "parent")
+    clerk = make_user("clerk")
+    member(clerk, alm, "accountant")
+    entry = services.create_entry(alm, date(2027, 1, 10), "x", CASH, user=clerk)
+    line = entry.lines.first()
+    result = {}
+
+    def editor():
+        try:
+            with transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute("UPDATE ledger_journalline SET description = 'late edit' WHERE id = %s", [line.pk])
+            result["outcome"] = "edited"
+        except DatabaseError as exc:
+            result["outcome"] = str(exc)
+        finally:
+            connections.close_all()
+
+    with transaction.atomic():
+        JournalEntry.objects.select_for_update().get(pk=entry.pk)  # as _post holds it
+        thread = threading.Thread(target=editor)
+        thread.start()
+        thread.join(timeout=1.5)
+        assert thread.is_alive(), "the line write should wait for the entry lock"
+        with connection.cursor() as cursor:  # stands in for the posting's own write (all the fields _post sets)
+            cursor.execute(
+                "UPDATE ledger_journalentry SET status = 'posted', number = 'ALM-JE-2027-000001', period_id = %s, "
+                "posted_at = now(), posted_by_id = %s WHERE id = %s",
+                [FiscalPeriod.objects.get(entity=alm, name="2027-01").pk, clerk.pk, entry.pk],
+            )
+    thread.join(timeout=10)
+    assert "posted entry" in result["outcome"]
+    assert JournalLine.objects.get(pk=line.pk).description == ""
 
 
 @postgres_only
