@@ -388,7 +388,10 @@ def _authorise_document_post(entity, grant, posted_by, document, created_by):
         _deny_grant(grant, entity, "grant_wrong_permission")
     doc_type, stored = _resolve_document(entity, grant, document)
     user = access.verify_grant(grant, entity, doc_type.post_permissions, document=stored, use=False)
-    if user.pk in access_services._document_people(stored):
+    creator_id = doc_type.creator_id_of(stored)
+    if creator_id is None:  # nobody recorded as creator: segregation could not keep the creator out (R35)
+        access.deny(user, entity, grant.permission, "document_no_creator")
+    if user.pk in access_services._document_people(stored) | {creator_id}:
         access.deny(user, entity, grant.permission, "self_approval")
     if _document_booked(entity, stored):
         raise _document_booked_error((doc_type.label, stored.pk))
@@ -688,11 +691,13 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
     """
     entry_source = _source_for(user, source)
     ref = None
+    check_lines = None
     if post:
         posted_by, document = _authorise_document_post(entity, grant, posted_by, document, user)
         if not (getattr(user, "pk", None) is not None and user == grant.user):
             access.require(user, entity, "ledger.create_entry")
         ref = (document._meta.label_lower, document.pk)
+        lines, check_lines = _document_lines(documents.get(ref[0]), document, lines)
     else:
         if grant is not None or posted_by is not None or document is not None:
             raise error("A grant, posted_by or document is only used with post=True.",
@@ -702,7 +707,8 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
     with transaction.atomic():
         if post:
             access.use_grant(grant, target=document)
-        entry = _create(entity, date, description, lines, user, reference, post, posted_by, entry_source, ref)
+        entry = _create(entity, date, description, lines, user, reference, post, posted_by, entry_source, ref,
+                        check_lines)
         if post and grant.permission == CLEARANCE_PERMISSION:  # zatca D-8: who posted for whom, logged
             access_log(
                 AccessLog.Event.PERMISSION_GRANTED, actor=grant.user, entity=entity, permission=CLEARANCE_PERMISSION,
@@ -712,10 +718,41 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
         return entry
 
 
+def _document_lines(doc_type, document, lines):
+    """(line dicts, check) for a document's posting through its registered hooks (ledger.documents).
+
+    ``build_lines``: the type supplies the lines; the caller passes none.
+    ``validate_lines``: ``check(built)`` runs it on the priced, unsaved lines before anything is written.
+    """
+    if doc_type.build_lines is not None:
+        if lines is not None:
+            raise error(
+                f"{doc_type.label} builds its own lines; pass lines=None.",
+                f"المستند {doc_type.label} يبني بنوده بنفسه؛ لا تمرّر بنودًا.", code="document_builds_lines",
+            )
+        lines = list(doc_type.build_lines(document))
+    elif lines is None:
+        raise error("An entry needs its lines.", "يحتاج القيد إلى بنوده.")
+    if doc_type.validate_lines is None:
+        return lines, None
+
+    def check(built):
+        problems = [str(p) for p in (doc_type.validate_lines(document, list(built)) or [])]
+        if problems:
+            exc = LedgerError([_bi(f"The lines do not match {doc_type.label} {document.pk}.",
+                                   f"البنود لا تطابق المستند {doc_type.label} {document.pk}."), *problems])
+            exc.code = "document_lines_rejected"
+            raise exc
+
+    return lines, check
+
+
 @transaction.atomic
 def _create(entity, date, description, lines, user, reference, post, posted_by, source=JournalEntry.Source.HUMAN,
-            document_ref=None):
+            document_ref=None, check_lines=None):
     built = _build_lines(entity, date, lines, user)
+    if check_lines is not None:  # the document type's own rule for its lines, before any write
+        check_lines(built)
     entry = JournalEntry(
         entity=entity, date=date, description=description, reference=reference, created_by=user, source=source,
         document_type=document_ref[0] if document_ref else "", document_id=document_ref[1] if document_ref else None,

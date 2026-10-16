@@ -144,6 +144,10 @@ MESSAGES = {
         "The document belongs to another entity.",
         "المستند يخص كيانًا آخر.",
     ),
+    "document_no_creator": (
+        "The document has no recorded creator, so it cannot be checked that someone else posts it.",
+        "لا يوجد منشئ مسجل لهذا المستند، فلا يمكن التحقق من أن شخصًا آخر يرحّله.",
+    ),
     "delegation_dates": (
         "A delegation starts now or later, and not before the delegator's own membership.",
         "يبدأ التفويض الآن أو لاحقًا، ولا يبدأ قبل عضوية المفوِّض نفسه.",

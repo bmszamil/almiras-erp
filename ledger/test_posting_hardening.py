@@ -37,7 +37,7 @@ def setup_entity(code, consolidation="full", parent=None, **extra):
     return e
 
 
-def doc(model, entity, created_by=None):
+def doc(model, entity, created_by):
     """A stored test document (testdocs; invoicing is not built yet), registered in ledger.documents."""
     return model.objects.create(entity=entity, created_by=created_by)
 
@@ -220,21 +220,19 @@ def test_document_registry_validates_registrations():
     from testdocs.models import Unregistered
 
     with pytest.raises(documents.DocumentRegistryError):
-        documents.register(Entry, post_permissions={"invoicing.approve_bill"})
+        documents._register(Entry, post_permissions={"invoicing.approve_bill"})
     for perms in (set(), {"ledger.post_entry"}, {"invoicing.reverse_document"}, {"invoicing.view"}):
         with pytest.raises(documents.DocumentRegistryError):
-            documents.register(Unregistered, post_permissions=perms)
+            documents._register(Unregistered, post_permissions=perms)
     with pytest.raises(documents.DocumentRegistryError):
-        documents.register(Unregistered, post_permissions={"invoicing.post_receipt"}, reverse_permissions={"ledger.reverse_entry"})
+        documents._register(Unregistered, post_permissions={"invoicing.post_receipt"}, reverse_permissions={"ledger.reverse_entry"})
     with pytest.raises(documents.DocumentRegistryError):  # another registration for a registered type
-        documents.register(Bill, post_permissions={"invoicing.post_receipt"})
+        documents._register(Bill, post_permissions={"invoicing.post_receipt"})
     assert documents.get("testdocs.unregistered") is None
     assert all(label.startswith("testdocs.") for label in documents.registered())  # nothing else registers yet
-    try:
-        documents.register(Unregistered, post_permissions={"invoicing.post_receipt"})
-        assert documents.get("testdocs.unregistered").post_permissions == {"invoicing.post_receipt"}
-    finally:
-        documents.unregister(Unregistered)
+    with documents._registered_for_tests(Unregistered, post_permissions={"invoicing.post_receipt"}) as doc_type:
+        assert doc_type.post_permissions == {"invoicing.post_receipt"}
+    assert documents.get("testdocs.unregistered") is None
 
 
 def test_approve_bill_grant_for_bill_7_cannot_post_an_unrelated_draft(w):
@@ -246,7 +244,7 @@ def test_approve_bill_grant_for_bill_7_cannot_post_an_unrelated_draft(w):
     assert exc.value.code == "grant_wrong_permission" and status(unrelated) == "draft"
     before = JournalEntry.objects.count()
     for other, code in ((doc(Bill, w.alm, created_by=w.clerk), "grant_wrong_document"),
-                        (doc(Receipt, w.alm), "grant_wrong_permission"),
+                        (doc(Receipt, w.alm, created_by=w.clerk), "grant_wrong_permission"),
                         (unrelated, "document_not_registered")):
         with pytest.raises(access.AccessDenied) as exc:
             services.create_entry(w.alm, date(2027, 1, 10), "Bill", CASH, user=w.clerk, post=True, grant=grant, document=other)
@@ -305,21 +303,15 @@ def test_reverse_document_grant_needs_a_registered_reversal_right(w):
     receipt = doc(Receipt, w.alm, created_by=w.cfo)
     booked = services.create_entry(w.alm, date(2027, 1, 10), "Receipt", CASH, user=w.clerk, post=True, document=receipt,
                                    grant=access.require(w.clerk, w.alm, "invoicing.post_receipt", document=receipt))
-    original = documents.get("testdocs.receipt")
-    documents.unregister(Receipt)
-    try:
-        documents.register(Receipt, post_permissions={"invoicing.post_receipt"})  # no reversal right registered
+    with documents._registered_for_tests(Receipt, post_permissions={"invoicing.post_receipt"}):  # no reversal right
         with pytest.raises(access.AccessDenied) as exc:
             services.reverse_entry(booked, access.require(w.clerk, w.alm, "invoicing.reverse_document", document=receipt))
         assert exc.value.code == "grant_wrong_permission"
-        documents.unregister(Receipt)
+    with documents._registered_for_tests(Receipt, unregistered=True):
         with pytest.raises(access.AccessDenied) as exc:
             services.reverse_entry(booked, access.require(w.clerk, w.alm, "invoicing.reverse_document", document=receipt))
         assert exc.value.code == "document_not_registered"
-    finally:
-        documents.unregister(Receipt)
-        documents.register(Receipt, post_permissions=original.post_permissions,
-                           reverse_permissions=original.reverse_permissions)
+    assert documents.get("testdocs.receipt").reverse_permissions == {"invoicing.reverse_document"}
     assert status(booked) == "posted"
 
 
