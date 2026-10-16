@@ -3,6 +3,7 @@ from django.contrib import admin
 from core import access
 
 from .models import Currency, Entity
+from .services import SENSITIVE_ENTITY_FIELDS
 
 
 class EntityScopedAdmin(admin.ModelAdmin):
@@ -70,6 +71,12 @@ class EntityScopedAdmin(admin.ModelAdmin):
 
 @admin.register(Entity)
 class EntityAdmin(admin.ModelAdmin):
+    """Registration and address fields are edited here. Sensitive settings are read-only once the entity
+    exists: they change through core.services.change_entity_settings and ledger.services.set_functional_currency,
+    which check rights and write the access log (access.md R32). A new entity's settings are logged."""
+
+    LOCKED_FIELDS = (*SENSITIVE_ENTITY_FIELDS, "base_currency")
+
     list_display = ["code", "name_en", "name_ar", "parent", "ownership_pct", "consolidation", "reporting_standard"]
     search_fields = ["code", "name_en", "name_ar", "legal_name_en", "legal_name_ar", "cr_number", "vat_number"]
     fieldsets = [
@@ -109,6 +116,31 @@ class EntityAdmin(admin.ModelAdmin):
             },
         ),
     ]
+
+    def get_readonly_fields(self, request, obj=None):
+        fields = list(super().get_readonly_fields(request, obj))
+        if obj is not None:
+            fields += [f for f in self.LOCKED_FIELDS if f not in fields]
+        return fields
+
+    def save_model(self, request, obj, form, change):
+        if change:  # read-only in the form; a crafted POST cannot change them either
+            stored = Entity.objects.get(pk=obj.pk)
+            for attr in ("sharia_enforced", "consolidation", "parent_id", "is_active", "base_currency_id"):
+                setattr(obj, attr, getattr(stored, attr))
+        super().save_model(request, obj, form, change)
+        if not change:
+            from core.access.models import AccessLog
+            from core.access.services import log
+
+            log(
+                AccessLog.Event.ENTITY_SETTINGS_CHANGED, actor=request.user, entity=obj,
+                details={"created": True, "before": None, "after": {
+                    "sharia_enforced": obj.sharia_enforced, "consolidation": obj.consolidation,
+                    "parent": obj.parent.code if obj.parent_id else None, "is_active": obj.is_active,
+                    "base_currency": obj.base_currency_id,
+                }},
+            )
 
 
 @admin.register(Currency)

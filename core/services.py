@@ -155,3 +155,74 @@ def apply_entity_setup(entity, fields):
     if changed or entity.pk is None:
         entity.save()
     return changed
+
+
+# --- sensitive entity settings (access.md R32, A13, OQ-18) ----------------------------
+
+# Changed only through change_entity_settings (base_currency: ledger.services.set_functional_currency).
+SENSITIVE_ENTITY_FIELDS = ("sharia_enforced", "consolidation", "parent", "is_active")
+ENTITY_SETTINGS_PERMISSION = "core.change_entity_settings"
+
+
+def _setting_value(entity, name):
+    if name == "parent":
+        return entity.parent.code if entity.parent_id else None
+    return getattr(entity, name)
+
+
+def change_entity_settings(entity, *, user, reason, **changes):
+    """Change ``sharia_enforced``, ``consolidation``, ``parent`` or ``is_active`` of ``entity`` (R32).
+
+    ``user`` needs ``core.change_entity_settings`` on the group parent of the
+    entity (OQ-18 default: managing_partner only); moving the entity to
+    another group needs it on that group too. Writes one
+    ``entity_settings_changed`` AccessLog row with before and after values.
+    """
+    from core.access import services as access
+
+    unknown = set(changes) - set(SENSITIVE_ENTITY_FIELDS)
+    if "base_currency" in unknown:
+        raise ValidationError(
+            "The functional currency is changed with ledger.services.set_functional_currency. / "
+            "تُغيَّر العملة الوظيفية من خلال خدمة تغيير العملة الوظيفية."
+        )
+    if unknown:
+        raise ValidationError(f"Not an entity setting: {', '.join(sorted(unknown))}. / ليس من إعدادات الكيان.")
+    if not reason or not str(reason).strip():
+        raise ValidationError("A reason is required. / السبب مطلوب.")
+    entity = Entity.objects.get(pk=entity.pk)
+    access.require(user, access.group_parent_of(entity), ENTITY_SETTINGS_PERMISSION)
+    new_parent = changes.get("parent", entity.parent)
+    if "parent" in changes and new_parent is not None:
+        node = new_parent
+        while node is not None:  # no cycles: the new parent is not the entity or below it
+            if node.pk == entity.pk:
+                raise ValidationError("An entity cannot be placed under itself. / لا يمكن وضع الكيان تحت نفسه.")
+            node = node.parent
+        access.require(user, access.group_parent_of(new_parent), ENTITY_SETTINGS_PERMISSION)
+    return _change_entity_settings(entity, user, reason, changes)
+
+
+@transaction.atomic
+def _change_entity_settings(entity, user, reason, changes):
+    from core.access.models import AccessLog
+    from core.access.services import log
+
+    entity = Entity.objects.select_for_update().get(pk=entity.pk)
+    before = {name: _setting_value(entity, name) for name in changes}
+    for name, value in changes.items():
+        setattr(entity, name, value)
+    after = {name: _setting_value(entity, name) for name in changes}
+    changed = [name for name in changes if before[name] != after[name]]
+    if not changed:
+        return entity
+    entity.clean_fields(exclude=[f.name for f in Entity._meta.fields if f.name not in changed and f.attname not in changed])
+    entity.clean()
+    entity.save(update_fields=changed)
+    log(
+        AccessLog.Event.ENTITY_SETTINGS_CHANGED, actor=user, entity=entity, permission=ENTITY_SETTINGS_PERMISSION,
+        details={
+            "before": {k: before[k] for k in changed}, "after": {k: after[k] for k in changed}, "reason": reason,
+        },
+    )
+    return entity

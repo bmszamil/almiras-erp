@@ -68,8 +68,13 @@ def bi(en, ar):
 
 
 def label_part(label, language):
-    """The English (``"en"``) or Arabic (``"ar"``) half of a :func:`bi` label."""
-    en, _, ar = str(label).partition(" / ")
+    """The English (``"en"``) or Arabic (``"ar"``) half of a :func:`bi` label.
+
+    Split at the last " / ": the English half may itself contain one ("Debit / credit").
+    """
+    en, _, ar = str(label).rpartition(" / ")
+    if not _:
+        en, ar = ar, ""
     return ar if language == "ar" and ar else en
 
 

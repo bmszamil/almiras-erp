@@ -8,6 +8,7 @@ from django.contrib import admin, messages
 from django.contrib.auth import get_user_model
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 from django.core.exceptions import PermissionDenied, ValidationError
+from django.db.models import Q
 
 from . import services
 from .models import AccessLog, DualControlRequest, Membership, Role, RolePermission, UserProfile
@@ -29,7 +30,16 @@ class MembershipAddForm(forms.ModelForm):
         super().__init__(*args, **kwargs)
         self.actor = actor
         if actor is not None and "entity" in self.fields:
-            self.fields["entity"].queryset = services.entities_for(actor, GRANT)
+            entities = services.entities_for(actor, GRANT)
+            self.fields["entity"].queryset = entities
+        if actor is not None and "user" in self.fields:
+            # People already in the admin's entities, plus people with no membership anywhere (new hires);
+            # users who belong only to other entities are not listed.
+            self.fields["user"].queryset = (
+                get_user_model().objects.filter(
+                    Q(memberships__entity__in=services.entities_for(actor, GRANT)) | Q(memberships__isnull=True)
+                ).exclude(pk=actor.pk).distinct().order_by("username")
+            )
 
     def clean(self):
         data = super().clean()
@@ -66,7 +76,7 @@ class MembershipRevokeForm(forms.ModelForm):
 @admin.register(Membership)
 class MembershipAdmin(admin.ModelAdmin):
     list_display = ["user", "entity", "role", "valid_from", "valid_to", "delegated_from", "revoked_at", "granted_by"]
-    list_filter = ["entity", "role"]
+    list_filter = [("entity", admin.RelatedOnlyFieldListFilter), "role"]
     search_fields = ["user__username", "role__code", "reason"]
 
     def get_queryset(self, request):
@@ -148,25 +158,26 @@ class ReadOnlyAdmin(admin.ModelAdmin):
 @admin.register(AccessLog)
 class AccessLogAdmin(ReadOnlyAdmin):
     list_display = ["at", "event", "actor", "actor_kind", "entity", "subject_user", "role", "permission"]
-    list_filter = ["event", "entity", "actor_kind"]
+    list_filter = ["event", ("entity", admin.RelatedOnlyFieldListFilter), "actor_kind"]
     search_fields = ["permission", "actor__username", "subject_user__username"]
 
     def get_queryset(self, request):
-        return services.scope(super().get_queryset(request), request.user, VIEW)
+        # Entity rows by core.view_access; rows without an entity for view_access on the group parent.
+        return services.visible_access_log(request.user)
 
     def has_module_permission(self, request):
         return _any(request, VIEW)
 
     def has_view_permission(self, request, obj=None):
-        if obj is None or obj.entity is None:
-            return _any(request, VIEW) and (obj is None)
-        return services.has(request.user, obj.entity, VIEW)
+        if obj is None:
+            return _any(request, VIEW)
+        return services.visible_access_log(request.user).filter(pk=obj.pk).exists()
 
 
 @admin.register(DualControlRequest)
 class DualControlRequestAdmin(ReadOnlyAdmin):
     list_display = ["requested_at", "entity", "permission", "target_type", "target_id", "status", "requested_by", "decided_by"]
-    list_filter = ["status", "entity"]
+    list_filter = ["status", ("entity", admin.RelatedOnlyFieldListFilter)]
 
     def get_queryset(self, request):
         return services.scope(super().get_queryset(request), request.user, VIEW)
@@ -216,12 +227,25 @@ if admin.site.is_registered(User):
 
 @admin.register(User)
 class UserAdmin(DjangoUserAdmin):
-    """Django's user admin, recording who changed superuser / staff flags (R25)."""
+    """Django's user admin, recording who changed superuser / staff flags (R25).
+
+    ``is_active`` is read-only on existing users: it changes only through
+    core.access.services.set_user_active, which checks ``core.manage_users``
+    and writes the access log (R32).
+    """
 
     def get_inlines(self, request, obj=None):
         return [UserProfileInline] if obj is not None else []
 
+    def get_readonly_fields(self, request, obj=None):
+        fields = list(super().get_readonly_fields(request, obj))
+        if obj is not None and "is_active" not in fields:
+            fields.append("is_active")
+        return fields
+
     def save_model(self, request, obj, form, change):
+        if change:  # a crafted POST cannot change it either
+            obj.is_active = User.objects.filter(pk=obj.pk).values_list("is_active", flat=True).get()
         obj._access_actor = request.user
         try:
             super().save_model(request, obj, form, change)
