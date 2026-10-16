@@ -158,7 +158,13 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 
 **VatExemptionReason**: `code` (ZATCA `VATEX-SA-…`), `name_en`, `name_ar`. Required on lines with category Z, E or O.
 
-**DocumentSequence** (unique `(entity, doc_type, year)`): `entity`, `doc_type` (`INV`, `CN`, `DN`, `BILL`, `VCN`, `RCPT`, `PAY`), `year`, `last_number`. Locked with `select_for_update`, the same pattern as `EntrySequence`.
+**DocumentSequence** (unique `(entity, doc_type, year)`): `entity`, `doc_type` (`INV`, `CN`, `DN`, `PRE`, `BILL`, `VCN`, `RCPT`, `PAY`), `year`, `last_number`. Locked with `select_for_update`, the same pattern as `EntrySequence`. `PRE` = prepayment invoice 386 (R65); whether it shares the `INV` sequence: OQ-4 note **[CC-verify]**.
+
+**IncomeType** (global reference, D16): `code` (`rent_commercial`, `rent_residential`, `management_fee`, `service_charge`, `service_fee`, `secondment`, `car_rental`, `ip_licence`, `other`), `name_en/_ar` (Bi), `default_vat_category` (FK VatRate category; residential rent `E`, others `S` **[CC-verify]**), `default_exemption_reason` (null), `art51_class` (`taxable` / `exempt`), `default_account_code` (§5 proposals). Dividends are not an income type here (out of scope, D16). Sales lines carry `income_type` (required); it prefills account and VAT category and feeds the Art. 51 ratio (OQ-9).
+
+**WhtCategory** (global statutory table, D14; values **[CC-verify]** + tax adviser sign-off): `code`, `name_en/_ar` (Bi), `rate` Decimal(5,2), `valid_from` / `valid_to`, `return_line_code`. Rates are data with effective dates, never constants.
+
+**TreatyCertificate** (per entity and vendor): `entity`, `vendor` (same entity, non-resident), `country`, `treaty_rate` Decimal(5,2) (0.00 = exempt), `wht_category` (null = all), `valid_from` / `valid_to`, `document` (File), `received_on`, `verified_by` / `verified_at`. Never edited after verification; a new certificate replaces it.
 
 ### 3.3 Sales documents
 
@@ -166,33 +172,39 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | Field | Type | Req | Bi | Notes |
 |---|---|---|---|---|
 | entity | FK Entity | Y | | Seller |
-| doc_type | Choice | Y | | Maps to ZATCA type code 388 / 381 / 383 |
+| doc_type | Choice (+ `prepayment_invoice`, D15) | Y | | Maps to ZATCA type code 388 / 381 / 383 / 386 |
 | zatca_profile | Choice: `standard` (B2B/B2G, clearance) or `simplified` (B2C, reporting) | Y | | |
 | zatca_flags | JSON / bool set: third_party, nominal, export, summary, self_billed | N | | ZATCA invoice transaction code positions 3 to 7 |
 | number | Char(40), blank until issue | | | Gap-free; format undecided (OQ-4) |
 | uuid | UUID | Y | | Generated at creation, never changed (ZATCA) |
-| status | Choice: `draft`, `issued`, `final`, `rejected` | Y | | See R10 |
+| status | Choice: `draft`, `submitted`, `issued`, `final`, `rejected` | Y | | See R57 (`submitted` added by D17) |
+| approved_by / approved_at | FK User / DateTime | Y at issue | | CFO approval (R57), or the approved contract for `source=system` (R60) |
+| billing_item | FK billing schedule item (model per billing.md), null | Y if `source=system` | | R60 |
+| contract | FK billing contract (per billing.md), null | Y for 386 | | R65 |
 | customer | FK Customer (same entity) | Y | | |
 | buyer snapshot: name_en, name_ar, vat_number, other_id_scheme, other_id, full address | Char | Y for standard | Bi | Copied from the Customer at issue and frozen after |
-| seller snapshot: name_en, name_ar, vat_number, cr_number, full address | Char | Y | Bi | Copied from Entity at issue. **Entity has no address fields yet** (OQ-1). |
+| seller snapshot: legal_name_en, legal_name_ar, vat_number, cr_number, full national address (§3.0) | Char | Y | Bi | Copied from Entity at issue (D10; OQ-1 resolved) |
 | issue_date / issue_time | Date / Time | Y at issue | | ZATCA needs both |
 | supply_date / supply_end_date | Date / Date null | Y for standard | | Actual supply date or period |
 | due_date | Date | Y | | Default rule undecided (OQ-3) |
-| currency | Char(3) | Y | | Must equal entity base currency for now (OQ-6) |
+| currency | Char(3) ISO 4217 | Y | | Document currency, any active currency (D13, R56) |
+| fx_rate / fx_rate_date / fx_rate_source | per ledger-fx.md | Y if currency ≠ base | | Rate to `entity.base_currency`, fixed at issue |
+| total_vat_sar | Money (SAR) | computed | | VAT in SAR for ZATCA (R56) **[CC-verify]** |
+| prepayment_deductions | through `PrepaymentDeduction` (prepayment doc, net, vat) | N | | On a 388 settling 386 documents (R65) |
 | payment_means_code | Char(3) (UNCL4461: 10, 30, 42, 48, 1) | N | | |
 | original_document | FK SalesDocument (invoice), null | Y for CN/DN | | ZATCA BillingReference |
 | reason_ar / reason_en | Char(300) | `reason_ar` Y for CN/DN; `reason_en` N | Bi | ZATCA instruction note **[CC-verify]** |
 | retention_class / retention_until | Choice (`standard`, `capital_asset_real_estate`) / Date | Y at issue | | Same computation as zatca.md R-38; drives PDPL anonymisation (R52) |
 | document_discount | Money | N | | Document-level allowance |
 | total_net / total_vat / total_gross | Money | computed | | Stored at issue. `total_vat` = sum of category VAT (R9) |
-| vat_breakdown | JSON: per (category, rate): taxable, vat | computed | | Document-level VAT per category (R9) |
+| vat_breakdown | JSON: per (category, rate): taxable, vat, vat_sar | computed | | Document-level VAT per category (R9, R56) |
 | amount_allocated | Money | computed | | Sum of allocations |
 | payment_state | Choice: `unpaid`, `partial`, `paid`, `credited` | computed | | |
 | requires_purification | Bool | computed | | True if any line hits an account with `requires_purification` |
 | is_intercompany | Bool | computed | | `customer.group_entity` is set |
 | journal_entry | FK ledger.JournalEntry, null, PROTECT | | | Draft at issue, posted at final (R41) |
 | notes_en / notes_ar | Text | N | Bi | |
-| **ZATCA fields (written only by `zatca.services`, read-only here)** | | | | Ownership to be agreed with zatca.md (OQ-2) |
+| **ZATCA fields (written only by `zatca.services`, read-only here)** | | | | Ownership to be agreed with zatca.md (OQ-2, still open) |
 | zatca_icv | PositiveInt, null | | | Invoice counter value |
 | zatca_previous_hash | Char, null | | | PIH link |
 | zatca_hash | Char, null | | | |
@@ -211,6 +223,7 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | unit_price | Decimal(18,2) | Y | | ≥ 0. Precision undecided (OQ-12) |
 | line_discount | Money | N | | |
 | net_amount | Money | computed | | round(qty × unit_price − discount) |
+| income_type | FK IncomeType | Y | | D16; prefills `income_account`, `vat_category` |
 | vat_category | FK VatRate | Y | | Rate effective on `supply_date` (or `issue_date`) |
 | vat_exemption_reason | FK VatExemptionReason | Y if Z/E/O | | |
 | vat_amount | Money | computed | | Display only; not summed into header VAT (R9) |
@@ -228,8 +241,8 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | vendor_vat_number | Char(15) | N | | Snapshot. Needed to recover input VAT (R29) |
 | accounting_date | Date | Y | | JE date |
 | due_date | Date | Y | | |
-| currency | Char(3) | Y | | = base currency for now (OQ-6) |
-| status | Choice: `draft`, `submitted`, `approved`, `posted`, `reversed` | Y | | |
+| currency, fx_rate, fx_rate_date, fx_rate_source | Char(3) / per ledger-fx.md | Y | | Any currency (D13, R56) |
+| status | Choice: `draft`, `submitted`, `posted`, `reversed` | Y | | `approved` removed: CFO approval posts at once (R58, D17) |
 | original_document | FK PurchaseDocument, null | Y for vendor credit note (default, OQ-10) | | |
 | reverse_charge | Bool | computed | | `not vendor.is_resident` |
 | totals, amount_allocated, payment_state, is_intercompany, requires_purification | as for SalesDocument | | | |
@@ -237,7 +250,7 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | approved_by / approved_at | FK User / DateTime | | | |
 | journal_entry / reversal_entry | FK JournalEntry, null, PROTECT | | | |
 
-**PurchaseDocumentLine**: `description_en/_ar` (Bi, at least one), `quantity`, `unit_price`, `line_discount`, `net_amount`, `vat_category`, `vat_amount`, `vat_attribution` (Choice `taxable` / `exempt` / `mixed`, required, R29), `supply_kind` (Choice `goods` / `services`, required for non-resident vendors, R30), `vat_recoverable` (computed from R29/R30, not user-set), `account` (FK Account, same entity; type expense or asset; postable).
+**PurchaseDocumentLine**: `description_en/_ar` (Bi, at least one), `quantity`, `unit_price`, `line_discount`, `net_amount`, `vat_category`, `vat_amount`, `vat_attribution` (Choice `taxable` / `exempt` / `mixed`, required, R29), `supply_kind` (Choice `goods` / `services`, required for non-resident vendors, R30), `vat_recoverable` (computed from R29/R30, not user-set), `account` (FK Account, same entity; type expense or asset; postable), `wht_category` (FK WhtCategory, required for non-resident vendors, default `vendor.wht_category`, R61).
 
 **VatRecoveryRatio** (unique `(entity, year)`): `entity`, `year`, `ratio` Decimal(5,4), `kind` (`provisional` / `final`), `approved_by`, `approved_at`. Used only after OQ-9 sign-off; annual true-up compares provisional with final.
 
@@ -250,14 +263,19 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | number | Char(40) | at posting | Gap-free |
 | date | Date | Y | |
 | amount | Money | Y | > 0 |
-| purpose | Choice: `settlement`, `advance`, `deposit` | Y (receipts) | Default `settlement`. `advance` / `deposit` blocked (R55) |
+| purpose | Choice: `settlement`, `advance`, `deposit` | Y (receipts) | Default `settlement`. `advance` / `deposit` per R65 to R67 |
+| contract | FK billing contract (billing.md), null | Y for `advance` / `deposit` | Contract must state that advance / deposit applies (D15) |
 | bank_charge | Money | N | Receipts only. Booked to 5700 |
-| currency | Char(3) | Y | = base currency for now |
+| currency, fx_rate, fx_rate_date | Char(3) / per ledger-fx.md | Y | Any currency (D13) |
+| status (payments) | Choice: `draft`, `submitted`, `posted`, `reversed` | Y | Vendor payments need CFO approval (R59) |
+| wht_amount, wht_gross_up (payments) | Money / Bool snapshot | computed | R61 to R63. Detail rows in `WhtDeduction` |
 | bank_account | FK ledger.Account (same entity, asset) | Y | Default 1100 (OQ-20) |
 | reference_en / _ar, bank_reference | Char | N | |
-| status | Choice: `draft`, `posted`, `reversed` | Y | |
+| status (receipts) | Choice: `draft`, `posted`, `reversed` | Y | Receipts post at once (R33; OQ-41) |
 | journal_entry / reversal_entry | FK JournalEntry | | |
-| amount_allocated / amount_unallocated | Money | computed | |
+| amount_allocated / amount_unallocated | Money | computed | For payments, AP settled = `amount + wht_amount` unless gross-up (R62, R63) |
+
+**WhtDeduction** (one per payment × allocated bill line category): `entity`, `payment`, `bill`, `wht_category`, `base_amount` (doc currency) and `base_amount_sar`, `rate_applied`, `treaty_certificate` (null), `wht_amount` and `wht_amount_sar`, `gross_up` (Bool), `return_month`. Immutable; reversed with the payment. Source of the monthly WHT return data (R64).
 
 **Allocation** (`ReceivableAllocation`, `PayableAllocation`)
 | Field | Type | Req | Notes |
@@ -285,13 +303,13 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 7. No interest, late-payment penalty or time-value charge can be posted as income in a Sharia-enforcing entity. No late-payment charge feature is built until OQ-15 is decided. **[svc: no such feature; account checks per R5]**
 
 ### Money and VAT
-8. Every amount is `Decimal` with 2 decimal places. A float input is rejected with an error, not converted. Currency is stored on every document and must equal `entity.base_currency` until OQ-6 is decided. **[svc input validation; DB decimal fields; test AT-14]**
+8. *Withdrawn — see Decision D13 (replaced by R56).*
 9. Line `net_amount` = `quantity × unit_price − line_discount`, rounded to 2 dp. Header VAT is computed **per VAT category and rate at document level**: category VAT = round(sum of line net amounts in that category (after document discount) × rate, 2). `total_vat` = sum of category VAT. It is **not** the sum of rounded line VAT. Line `vat_amount` = round(net × rate, 2) is for display only. The allowed line-vs-document difference follows ZATCA BR-KSA rules **[CC-verify]**; doc-level method **[CC-verify: search excerpt 2026-10-16]**. Rounding mode ROUND_HALF_UP (OQ-11). The 2200 / 1310 JE line equals `total_vat`. **[svc; test AT-1, AT-35]**
 10. The VAT rate is taken from `VatRate` effective on the supply date (or the issue date if no supply date). Lines with category Z, E or O need an exemption reason. **[svc; test AT-15]**
-11. An entity with an empty `vat_number` cannot issue sales documents with category S lines. **[svc; default pending OQ-17; test AT-16]**
+11. An entity with an empty `vat_number` cannot issue sales documents with category S lines. **[svc; D19 (OQ-17); test AT-16]**
 
 ### Sales document lifecycle
-12. Sales document status runs `draft → issued → final`, or `issued → rejected`. No other transitions exist. **[svc state machine; test AT-2]**
+12. *Withdrawn — see Decision D17 (replaced by R57).*
 13. Only drafts can be edited or deleted. Issued, final and rejected documents are immutable except for fields written by `zatca.services` and the computed payment fields. **[model `save` guard like `JournalEntry.save`; svc; test AT-5]**
 14. On issue, the system assigns the number from `DocumentSequence(entity, doc_type, year of issue_date)`. The number is gap-free and never reused. Assigning the number and changing the status happen in one transaction. A failure rolls back both. **[svc `select_for_update`; DB unique `(entity, doc_type, number)`; test AT-6]**
 15. On issue, the buyer and seller snapshots are frozen. Later edits to the Customer or Entity do not change issued documents. **[svc; test AT-7]**
@@ -299,10 +317,10 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 17. Issued invoices are never cancelled or deleted. A final invoice is corrected only by a credit note or debit note that references it. **[svc: no cancel path; ZATCA requirement; test AT-9]**
 18. A credit note must reference a `final` invoice of the same entity and customer, and it needs a reason in Arabic (`reason_ar` required; English optional) **[CC-verify]**. Its gross amount cannot exceed the invoice gross amount minus credit notes already issued against that invoice. **[svc; test AT-10]**
 19. A debit note must reference a `final` invoice of the same entity and customer, and it needs a reason in Arabic (`reason_ar` required; English optional) **[CC-verify]**. **[svc; test AT-11]**
-20. A rejected document keeps its number and has no posted GL effect. The correction is a new document. **[svc; test AT-19]**
+20. A rejected document keeps its number (the number stays used) and has no posted GL effect. The correction is a new document under a new number (confirmed by D12). **[svc; test AT-19]**
 
 ### Purchase document lifecycle
-21. Vendor bill status runs `draft → submitted → approved → posted`, then `posted → reversed`. Approval thresholds are undecided (OQ-5). By default every bill needs one approval by a user other than its creator. **[svc; test AT-21]**
+21. *Withdrawn — see Decision D17 (replaced by R58).*
 22. A document created by an agent (`source=agent:*`) stays a draft until a human submits it. **[svc; D8; test AT-22]**
 23. `(entity, vendor, vendor_document_number)` is unique among non-reversed purchase documents (duplicate-bill guard, default pending OQ-10). **[DB partial unique + svc; test AT-23]**
 24. A posted bill is never edited. It is corrected by a vendor credit note, or (when it has no allocations) by reversal through `ledger.services.reverse_entry`, which sets the status to `reversed`. **[svc; ledger lock; test AT-24]**
@@ -314,7 +332,7 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 28. The JE date is `issue_date` for sales documents, `accounting_date` for purchase documents and `date` for receipts and payments. Posting fails when no open period covers that date. The document stays in its previous status and no number is consumed. **[ledger `_find_open_period`; svc single transaction; test AT-17]**
 29. Input VAT recovery follows VAT Implementing Regulations Art. 51 **[CC-verify: search excerpt 2026-10-16]**. Each bill line has `vat_attribution`: `taxable` (used for taxable supplies), `exempt` (used for exempt supplies) or `mixed`. For a resident vendor, VAT goes to 1310 only when attribution is `taxable` **and** the vendor document has a vendor VAT number. `exempt` VAT is added to the line's expense or asset account. `mixed`: once OQ-9 is signed off, the recoverable share uses the entity's `VatRecoveryRatio` for the year, with an annual true-up; **until then, mixed VAT is posted fully to the line account (cost)**. This is the conservative default: it never claims more than allowed, and posting is not blocked. **Needs expert sign-off** (tax adviser). **[svc; test AT-25, AT-39]**
 30. Reverse charge applies only to **standard-rated services imported** from a non-resident vendor (`supply_kind=services`). It does not apply to goods (import VAT on goods is paid at customs, outside this module; OQ-29) **[CC-verify: search excerpt 2026-10-16]**. RC lines post Dr 1310 and Cr 2200 for the same amount, and AP holds net only. R30 takes precedence over R29's vendor-VAT-number requirement (a non-resident has none), but R29 attribution still applies to the 1310 side: `exempt` → cost, `mixed` → cost by default. VAT-return box mapping: OQ-29. **[svc; KSA VAT reverse-charge; test AT-26, AT-40]**
-31. Payment posting to a non-resident vendor is blocked until OQ-8 (withholding tax) is decided. **[svc; test AT-27]**
+31. *Withdrawn — see Decision D14 (replaced by R61 to R64).*
 32. Reversals use `reverse_entry(entry, date=..., user=..., reason=...)`. If the original period is closed, the service passes a date in the current open period. It never relies on the default `date=None`. **[svc; test AT-24]**
 
 ### Receipts, payments and allocation
@@ -323,7 +341,7 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 35. Allocation has no GL effect (both sides sit on the same control account). It changes `payment_state` only. **[svc]**
 36. Allocations are never edited or deleted. An un-allocation is a new row with negative amount and `reverses` set. **[model `save/delete` guard; test AT-30]**
 37. On reaching `final`, a credit note is automatically allocated to its original invoice up to the invoice's open amount. Any remainder stays as customer credit. **[svc; test AT-10]**
-38. Unallocated receipts with `purpose=settlement` (overpayments, unidentified cash awaiting allocation) are allowed. They stay as a credit balance on the customer and appear on the unallocated-cash report. Advances and deposits: R55. **[svc + report]**
+38. Unallocated receipts with `purpose=settlement` (overpayments, unidentified cash awaiting allocation) are allowed. They stay as a credit balance on the customer and appear on the unallocated-cash report. Advances and deposits: R65 to R67. **[svc + report]**
 39. The open amounts in the sub-ledger tie out to the GL: the sum of open customer balances per entity equals the trial balance of 1200, plus 1210 per counterparty for intercompany customers. The same holds for AP against 2100 and 2110. **[svc `reconcile_subledger(entity, as_of)`; test AT-31]**
 
 ### ZATCA hand-off (details in `docs/specs/zatca.md`; service names provisional, OQ-2)
@@ -348,7 +366,34 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 
 ### Purification and advances
 54. Purification moves the flagged amount from 4900 to 2600 Charity payable, and the payout clears 2600 against a bank account (E14, E15). Both go through `create_entry` + `post_entry`, carry `reference`, and need a human user; never an agent. Amount and approval: OQ-30. **[svc; ledger; test AT-45]**
-55. Customer receipts with `purpose=advance` or `deposit`, and advance invoices, are blocked until the prepayment invoice (type 386) flow is built with zatca.md R-39 (OQ-16). **[svc; test AT-41]**
+55. *Withdrawn — see Decision D15 (replaced by R65 to R67).*
+
+### Added 2026-10-16 (project-owner decisions D10 to D18)
+
+**Currency (D13)**
+56. Every amount is `Decimal` with 2 dp; a float input is rejected, not converted. Every document, receipt and payment stores its currency (any active ISO 4217 code) and, when it differs from `entity.base_currency`, the rate, rate date and source defined in `ledger-fx.md`. The JE is created per ledger-fx.md (document and functional amounts). For ZATCA, document VAT is also expressed in SAR: `total_vat_sar` and `vat_breakdown.vat_sar` = round(category VAT × rate to SAR, 2) **[CC-verify]** (ZATCA rule for tax amount in SAR when the invoice currency differs). Non-SAR documents cannot be issued or posted until ledger-fx.md is approved and built. **[svc; DB decimal fields; test AT-46, AT-47]**
+
+**Approval and posting (D17)**
+57. Sales documents run `draft → submitted → issued → final`, or `issued → rejected`; `submitted → draft` returns it for edits. Accounting staff create and submit. CFO approval of a `submitted` document issues it (number, snapshots, ZATCA hand-off R40) in one transaction; posting then follows automatically on ZATCA `cleared` / `reported` / `*_with_warnings` (R41). The approver must differ from the creator when `InvoicingSettings.segregation_required` (D19/OQ-5). No other transitions. **[svc state machine; test AT-2, AT-51]**
+58. Vendor bills run `draft → submitted → posted`, then `posted → reversed`. CFO approval of a `submitted` bill posts it in the same transaction (`create_entry` + `post_entry`); if posting fails (e.g. closed period) the approval rolls back and the bill stays `submitted`. Creator ≠ approver per R57. **[svc; test AT-52]**
+59. Vendor payments run `draft → submitted → posted` with CFO approval posting at once, as R58. Customer receipts keep R33 (OQ-41). **[svc; test AT-52]**
+60. `invoicing.services.create_from_billing(billing_item, user)` creates a sales document with `source="system"` and `billing_item` set, using the same validation, numbering, ZATCA and posting rules. If the item's contract is CFO-approved and `InvoicingSettings.auto_issue_from_approved_contract` is True, the document is issued without per-invoice approval (`approved_by` = the contract approver); otherwise it waits as `submitted` for the CFO (OQ-36). Only the billing system user may call it; agent-gateway users cannot (D8). One document per billing item (idempotent). **[svc; DB unique `billing_item`; test AT-53]**
+
+**Withholding tax (D14; rates and categories [CC-verify] + tax adviser sign-off)**
+61. Every bill line from a non-resident vendor carries a `wht_category`. A payment allocated to a non-resident bill with a line lacking a category is rejected. **[svc; test AT-57]**
+62. On a payment to a non-resident vendor, WHT = round(allocated base × rate, 2) per category, where rate = `WhtCategory.rate` effective on the payment date, or the `treaty_rate` of a verified `TreatyCertificate` valid on the payment date for that vendor and category. One `WhtDeduction` row per category. Without gross-up, cash paid = settled amount − WHT; the AP settled is the full amount. WHT is recognised at payment **[CC-verify]**. **[svc; test AT-54, AT-56]**
+63. With `wht_gross_up` (vendor or contract, OQ-8), the vendor receives the full amount and WHT = round(amount × rate / (1 − rate), 2) **[CC-verify]**, booked as an expense of the entity (E21). **[svc; test AT-55]**
+64. `wht_return_data(entity, month)` returns, per category and vendor, base, rate, WHT (SAR), treaty reference and country, from `WhtDeduction`; it ties to the 2220 movements for the month. Remittance (E22) is a CFO-approved payment. **[svc report; test AT-58]**
+
+**Advances and security deposits (D15)**
+65. An advance is invoiced with a prepayment invoice (`doc_type=prepayment_invoice`, ZATCA 386, zatca.md R-39) referencing a contract that states an advance applies; VAT is due on the advance **[CC-verify]**. The 386 posts to 2310 Deferred income (E16). The final 388 lists its `prepayment_deductions` (same entity, customer and contract) and cannot deduct more than the 386 net and VAT not yet deducted (E17). **[svc; test AT-59]**
+66. A receipt with `purpose=deposit` needs a contract stating a deposit applies and posts to 2320 Security deposits received (E18). Deposit receipts are blocked while `InvoicingSettings.deposit_vat_treatment` is null; it is set only after tax-adviser sign-off (OQ-16). Application or forfeiture of a deposit is not built (OQ-16). **[svc; test AT-60]**
+67. A receipt with `purpose=advance` or `deposit` without a qualifying contract is rejected. **[svc; test AT-60]**
+
+**Intercompany and identity (D10, D11)**
+68. An invoice to a customer with `group_entity` (subsidiary, associate or minority holding) is a normal standard VAT invoice: VAT per R9 to R11, ZATCA clearance, buyer snapshot from the buyer entity's §3.0 fields, counterparty on 1210 (R4). The buyer entity books its own bill in its own books; invoicing never creates or posts records in another entity (CLAUDE.md rule 4; mirror drafts: OQ-37). **[svc; test AT-50]**
+69. Issuing needs the seller's §3.0 fields complete (legal names en/ar, CR, VAT if S lines, full national address). **[svc at issue; test AT-48]**
+70. Real Almiras identifiers (D10) exist only in setup data, never in test fixtures or sample data. **[test AT-49 scans fixtures]**
 
 ## 5. Accounting
 
@@ -365,9 +410,9 @@ Example amounts are SAR. Account codes come from `ledger/coa_template.py`. The i
 | Account | Dr | Cr | Counterparty |
 |---|---|---|---|
 | 1210 Due from group entities | 11,500.00 | | SUB |
-| 4110 / 4210 (per line) | | 10,000.00 | |
+| 4110 / 4210 / 4310 (per line) | | 10,000.00 | |
 | 2200 VAT output | | 1,500.00 | |
-VAT inside the group is subject to OQ-13 (VAT group). There is no intercompany IP income account yet (OQ-22).
+VAT is charged on intercompany invoices (no VAT group, D11). 4310 is proposed (D18).
 
 **E3. Zero-rated, exempt or out-of-scope lines**: same as E1/E2 with no 2200 line. A document with all lines at zero VAT produces a 2-line entry.
 
@@ -384,7 +429,7 @@ VAT inside the group is subject to OQ-13 (VAT group). There is no intercompany I
 | 1100 Cash and bank | 11,475.00 | | |
 | 5700 Bank charges | 25.00 | | |
 | 1200 (or 1210) | | 11,500.00 | (SUB) |
-VAT on bank charges: OQ-23.
+VAT on bank charges: none split (D19, OQ-23).
 
 **E6. Customer refund**: Dr 1200 (or 1210 + counterparty) / Cr 1100.
 
@@ -404,7 +449,7 @@ VAT on bank charges: OQ-23.
 | 1310 VAT input | 1,500.00 | |
 | 2100 Trade payables | | 10,000.00 |
 | 2200 VAT output | | 1,500.00 |
-Withholding tax is not booked: there is no WHT payable account (OQ-8).
+Withholding tax is booked at payment (E20, E21).
 
 **E10. Vendor credit note**: Dr 2100 (or 2110 + counterparty) / Cr expense or asset / Cr 1310 (mirror of E7).
 
@@ -428,7 +473,52 @@ Withholding tax is not booked: there is no WHT payable account (OQ-8).
 
 Both accounts exist in `ledger/coa_template.py` (4900 with `purify`, 2600). If a late-payment charge is ever built (OQ-15), it is Dr 1200 / Cr 2600, never income.
 
-**Accounts missing from the template** (not invented here, see OQ-22): retention receivable and payable, withholding tax payable, customer advances and deferred income (unearned revenue for 386 prepayments), vendor advances, FX gain/loss, rounding difference, ECL allowance and bad-debt expense, separate reverse-charge VAT accounts, intercompany IP income. The template also has no "control account" flag that would stop manual journals hitting 1200, 2100, 1210 and 2110.
+**E16. Prepayment invoice 386, final** (advance net 10,000.00, VAT 1,500.00; R65): Dr 1200 11,500.00 / Cr 2310 10,000.00 / Cr 2200 1,500.00. The receipt is E5, allocated to the 386.
+
+**E17. Final invoice 388 deducting that prepayment** (total net 40,000.00, VAT 6,000.00) **[CC-verify]** presentation
+| Account | Dr | Cr |
+|---|---|---|
+| 1200 Trade receivables (balance due) | 34,500.00 | |
+| 2310 Deferred income | 10,000.00 | |
+| 4100 / 4200 / … (per line) | | 40,000.00 |
+| 2200 VAT output (6,000.00 − 1,500.00 already declared) | | 4,500.00 |
+
+**E18. Security deposit received** (R66, only once `deposit_vat_treatment` is set; VAT lines per that sign-off): Dr 1100 5,000.00 / Cr 2320 5,000.00. **E19. Deposit refund**: Dr 2320 / Cr 1100.
+
+**E20. Vendor payment with WHT, vendor bears it** (bill 10,000.00, example rate 5% **[CC-verify]**; R62)
+| Account | Dr | Cr |
+|---|---|---|
+| 2100 Trade payables | 10,000.00 | |
+| 1100 Cash and bank | | 9,500.00 |
+| 2220 Withholding tax payable | | 500.00 |
+
+**E21. Vendor payment with WHT gross-up** (R63; 10,000 × 5/95 = 526.32 **[CC-verify]**)
+| Account | Dr | Cr |
+|---|---|---|
+| 2100 Trade payables | 10,000.00 | |
+| 5920 Withholding tax borne (gross-up) | 526.32 | |
+| 1100 Cash and bank | | 10,000.00 |
+| 2220 Withholding tax payable | | 526.32 |
+
+**E22. WHT remittance**: Dr 2220 / Cr 1100.
+
+**E23. Foreign-currency documents**: every entry above is built in document currency with functional amounts at the document rate; realised FX differences on allocation and revaluation are per `ledger-fx.md` (accounts defined there).
+
+**Proposed accounts (D18; resolves OQ-22 at decision level; proposed, accountant to review before `coa_template.py` changes merge)**
+| Code | English | Arabic | Type | Flags | Used by |
+|---|---|---|---|---|---|
+| 1330 | Advances to vendors | دفعات مقدمة للموردين | asset | | OQ-40 |
+| 2220 | Withholding tax payable | ضريبة الاستقطاع المستحقة | liability | | E20 to E22 |
+| 2310 | Deferred income (customer advances) | إيرادات مؤجلة (دفعات مقدمة من العملاء) | liability | | E16, E17 |
+| 2320 | Security deposits received | تأمينات مستلمة | liability | | E18, E19 |
+| 4120 | Residential rental income (VAT-exempt) | إيرادات الإيجار السكني (معفاة) | income | | D16; 4100 used for commercial rent |
+| 4220 | Management fee income | إيرادات رسوم الإدارة | income | | D16 |
+| 4230 | Service charge income | إيرادات رسوم الخدمات المشتركة | income | | D16 |
+| 4240 | Service fee income | إيرادات أتعاب الخدمات | income | | D16 |
+| 4310 | Intercompany IP and licence income | إيرادات ملكية فكرية من شركات المجموعة | income | | E2 |
+| 5910 | Rounding differences | فروقات التقريب | expense | | OQ-11 vendor-total differences, if allowed |
+| 5920 | Withholding tax borne (gross-up) | ضريبة استقطاع محملة على الشركة | expense | | E21 |
+Plus an `is_control` flag on 1200, 2100, 1210, 2110 (and 2310, 2320) to block manual journals. FX gain/loss codes are left to `ledger-fx.md`. Still not proposed (features not in scope): retention, ECL / bad debt, split reverse-charge VAT accounts. Intercompany variants of 4220 to 4240 for management fees between group entities use 4210.
 
 ## 6. Integrations
 
@@ -441,7 +531,11 @@ Both accounts exist in `ledger/coa_template.py` (4900 with `purify`, 2600). If a
 | GOSI / Mudad | none | Payroll is out of scope | n/a |
 | SAP B1 / Daftra | In (one-off) | Open AR/AP items at cutover as `source=import` documents. No ZATCA resubmission. They must tie to the opening balances in 1200/2100 | migration-agent. Method in OQ-24 |
 | Agent gateway | In | Draft bills from the "invoice reader" agent (`source=agent:invoice-reader`) | Drafts only (R22). If the agent's model runs outside KSA, bill attachments with personal data need the R53 transfer assessment |
-| ZATCA VAT return | Out (report only) | Box totals per entity and period | Box mapping undecided (OQ-29) |
+| ZATCA VAT return | Out (report only) | Box totals per entity and period | Not built (D19, OQ-29) |
+| ZATCA WHT return | Out (report only) | Monthly WHT data per entity (R64); filed manually | D14 |
+| `billing` (billing.md) | In | Billing items from approved contracts (rent, annual car rental, secondments until HR ends them) → `create_from_billing` (R60); contract terms for advances/deposits (R65 to R67) | D17, D15 |
+| `ledger-fx` (ledger-fx.md) | Both | Rates in; document-currency JEs and FX differences out | D13 |
+| Hosting | n/a | DB, backups, logs in KSA | D12 |
 
 ## 7. Permissions
 
