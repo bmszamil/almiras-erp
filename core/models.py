@@ -253,16 +253,18 @@ class Entity(models.Model):
         """R4: the functional currency has 2 minor units. R5: it is locked once the entity has a posted entry."""
         if self.base_currency_id is None:
             return
+        stored = Entity.objects.filter(pk=self.pk).values_list("base_currency", flat=True).first() if self.pk else None
+        changed = stored != self.base_currency_id
         currency = Currency.objects.filter(code=self.base_currency_id).first()
-        if currency is None or currency.minor_units != 2 or not currency.is_active:
+        # A currency deactivated later does not block saving entities that already use it.
+        if currency is None or currency.minor_units != 2 or (changed and not currency.is_active):
             raise ValidationError(
                 {"base_currency": f"Functional currency {self.base_currency_id} must be an active currency with 2 minor units. / "
                  f"يجب أن تكون العملة الوظيفية {self.base_currency_id} عملة نشطة بخانتين عشريتين."},
                 code="functional_currency_decimals",
             )
         if self.pk:
-            stored = Entity.objects.filter(pk=self.pk).values_list("base_currency", flat=True).first()
-            if stored is not None and stored != self.base_currency_id and self.has_posted_entries():
+            if stored is not None and changed and self.has_posted_entries():
                 raise ValidationError(
                     {"base_currency": f"{self.code} already has posted entries; its functional currency cannot change. / "
                      f"للكيان {self.code} قيود مرحّلة؛ لا يمكن تغيير عملته الوظيفية."},

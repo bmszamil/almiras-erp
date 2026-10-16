@@ -1043,6 +1043,7 @@ def record_currency_exchange(entity, on, from_account, from_amount, to_account, 
     received, ``rate_source=manual``), so no FX gain or loss arises. Legs on
     two dates (deferred exchange) are refused (R35, R36).
     """
+    access.require(user, entity, "ledger.create_entry")  # before reading any of the entity's data
     if to_date is not None and to_date != on:
         raise error(
             "Both legs of a currency exchange are on the same date (spot only).",

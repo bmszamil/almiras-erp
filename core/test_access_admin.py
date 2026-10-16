@@ -119,3 +119,39 @@ def test_access_log_admin_is_read_only(client, w):
     client.force_login(w.aa)
     assert client.get("/admin/core/accesslog/").status_code == 200
     assert client.get("/admin/core/accesslog/add/").status_code == 403
+
+
+def test_admin_line_edit_keeps_functional_txn_amount_in_sync(w):
+    """ledger-fx R6: editing a functional line's amount in admin also updates its transaction amount."""
+    from django.forms import modelform_factory
+
+    from ledger.admin import JournalLineForm, JournalLineInline
+    from ledger.models import JournalLine
+
+    line = JournalLine.objects.filter(entry=w.alm_draft, debit__gt=0).get()
+    editable = [f for f in JournalLineInline.fields if f not in JournalLineInline.readonly_fields]
+    Form = modelform_factory(JournalLine, form=JournalLineForm, fields=editable)
+    form = Form(
+        data={"account": line.account_id, "description": "", "debit": "12.00", "credit": "0", "counterparty_entity": ""},
+        instance=line,
+    )
+    assert form.is_valid(), form.errors
+    form.save()
+    line.refresh_from_db()
+    assert (line.debit, line.txn_amount) == (12, 12)
+
+
+def test_rate_admin_lists_only_visible_rates_and_is_read_only(client, w):
+    from decimal import Decimal
+
+    from ledger.models import ExchangeRate
+
+    ExchangeRate.objects.create(from_currency_id="EUR", to_currency_id="SAR", date=date(2027, 1, 5), rate=Decimal("4.1"), created_by=w.cfo)
+    ExchangeRate.objects.create(entity=w.sub, from_currency_id="EUR", to_currency_id="SAR", date=date(2027, 1, 5),
+                                rate=Decimal("4.2"), created_by=w.cfo)
+    client.force_login(w.clerk)
+    body = client.get("/admin/ledger/exchangerate/").content.decode()
+    assert "4.1000000000" in body and "4.2000000000" not in body
+    assert client.get("/admin/ledger/exchangerate/add/").status_code == 403
+    client.force_login(w.root)
+    assert client.get("/admin/ledger/exchangerate/").status_code == 403

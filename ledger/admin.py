@@ -1,16 +1,20 @@
+from django import forms
 from django.contrib import admin, messages
 
 from core import access
 from core.admin import EntityScopedAdmin
 
 from . import services
-from .models import Account, FiscalPeriod, JournalEntry, JournalLine
+from .models import Account, ExchangeRate, FiscalPeriod, JournalEntry, JournalLine, RevaluationRun
 
 
 @admin.register(Account)
 class AccountAdmin(EntityScopedAdmin):
-    list_display = ["code", "name_en", "name_ar", "type", "entity", "is_postable", "is_intercompany", "sharia_prohibited"]
-    list_filter = ["entity", "type", "sharia_prohibited", "is_intercompany"]
+    list_display = [
+        "code", "name_en", "name_ar", "type", "entity", "is_postable", "is_intercompany", "sharia_prohibited",
+        "is_monetary", "currency",
+    ]
+    list_filter = ["entity", "type", "sharia_prohibited", "is_intercompany", "is_monetary"]
     search_fields = ["code", "name_en", "name_ar"]
     access_view_permission = "ledger.view"
 
@@ -24,10 +28,25 @@ class FiscalPeriodAdmin(EntityScopedAdmin):
     access_view_permission = "ledger.view"
 
 
+class JournalLineForm(forms.ModelForm):
+    """Admin edits functional amounts only. Foreign-currency lines are created through
+    ledger.services.create_entry (rates, R14); here their amounts are checked at posting (R7)."""
+
+    def save(self, commit=True):
+        line = super().save(commit=False)
+        if line.pk and line.rate_source == JournalLine.RateSource.FUNCTIONAL:
+            line.txn_amount = line.debit + line.credit  # R6: keep a functional line's txn equal to its amount
+        if commit:
+            line.save()
+        return line
+
+
 class JournalLineInline(admin.TabularInline):
     model = JournalLine
+    form = JournalLineForm
     extra = 2
-    fields = ["account", "description", "debit", "credit", "counterparty_entity"]
+    fields = ["account", "description", "debit", "credit", "counterparty_entity", "currency", "txn_amount", "fx_rate", "line_kind"]
+    readonly_fields = ["currency", "txn_amount", "fx_rate", "line_kind"]
 
     def has_change_permission(self, request, obj=None):
         if obj is None:
@@ -84,3 +103,44 @@ class JournalEntryAdmin(EntityScopedAdmin):
                 self.message_user(request, f"Reversed {entry.number} with {rev.number}.")
             except Exception as exc:
                 self.message_user(request, f"{entry.number or entry.pk}: {exc}", messages.ERROR)
+
+
+@admin.register(ExchangeRate)
+class ExchangeRateAdmin(admin.ModelAdmin):
+    """Read-only list: rates are entered with ledger.services.create_rate / import_rates (R11, R28).
+
+    Shows the user's entities' overrides plus group-wide rows (rates_visible_to).
+    """
+
+    list_display = ["date", "from_currency", "to_currency", "rate", "rate_type", "source", "entity", "import_batch"]
+    list_filter = ["rate_type", "source", "from_currency", "to_currency"]
+    date_hierarchy = "date"
+
+    def get_queryset(self, request):
+        return services.rates_visible_to(request.user).select_related("entity")
+
+    def has_module_permission(self, request):
+        return access.entities_for(request.user, "ledger.view_rates").exists()
+
+    def has_view_permission(self, request, obj=None):
+        if obj is None:
+            return self.has_module_permission(request)
+        return services.rates_visible_to(request.user).filter(pk=obj.pk).exists()
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(RevaluationRun)
+class RevaluationRunAdmin(EntityScopedAdmin):
+    """Read-only: runs are made by ledger.services.revalue_period and posted by post_revaluation."""
+
+    list_display = ["entity", "period", "rate_date", "entry", "reversal", "run_by", "run_at"]
+    list_filter = ["entity"]
+    access_view_permission = "ledger.view"
