@@ -11,9 +11,6 @@ ALLOW = {
     "core/services.py:load_setup_data": "reads a setup file; operator command only",
     "core/services.py:apply_entity_setup": "setup_almiras command only (operator, not a user action)",
     "ledger/services.py:validate_entry": "pure validation, called inside post",
-    "ledger/services.py:close_period": "PENDING: appendix asks for require(ledger.close_period); not in this build",
-    "ledger/services.py:trial_balance": "PENDING: callers must require ledger.view (appendix); no callers yet",
-    "ledger/services.py:intercompany_balances": "PENDING: group report; needs a group-level ledger.view check",
     "core/access/services.py:now": "clock",
     "core/access/services.py:profile_of": "helper",
     "core/access/services.py:kind_of": "helper",
@@ -81,5 +78,5 @@ def test_at26_every_public_service_checks_rights_or_is_allow_listed():
 
 def test_ledger_posting_services_are_checked():
     unchecked, _ = unchecked_functions()
-    for name in ("post_entry", "reverse_entry", "create_entry"):
+    for name in ("post_entry", "reverse_entry", "create_entry", "close_period", "trial_balance", "intercompany_balances"):
         assert f"ledger/services.py:{name}" not in unchecked

@@ -209,11 +209,92 @@ def test_only_clearance_may_set_another_posted_by(w):
 
 
 def test_at24_full_rights_do_not_override_ledger_rules(w):  # R7
-    sharia = draft(w, w.alm, [{"account": "5610", "debit": 50}, {"account": "1100", "credit": 50}])
+    sharia = draft(w, w.alm, [{"account": "5610", "debit": 50}, {"account": "1100", "credit": 50}], d=date(2027, 2, 10))
     with pytest.raises(LedgerError, match="Sharia-prohibited"):
         services.post_entry(sharia, access.require(w.mp, w.alm, "ledger.post_entry", document=sharia))
-    services.close_period(w.alm.periods.get(name="2027-01"))
+    services.close_period(w.alm.periods.get(name="2027-01"), user=w.cfo)
     late = draft(w, w.alm, d=date(2027, 1, 20))
     with pytest.raises(LedgerError, match="closed"):
         services.post_entry(late, access.require(w.mp, w.alm, "ledger.post_entry", document=late))
     assert status(sharia) == status(late) == "draft"
+
+
+# --- access.md 3.6: close_period, draft creation and ledger views -------------
+
+def test_close_period_needs_close_permission_in_that_entity(w):
+    alm_jan, sub_jan = w.alm.periods.get(name="2027-01"), w.sub.periods.get(name="2027-01")
+    for user, period in ((w.clerk, alm_jan), (w.cfo, sub_jan), (None, alm_jan), (make_agent(), alm_jan)):
+        with pytest.raises(access.AccessDenied):
+            services.close_period(period, user=user)
+    assert alm_jan.__class__.objects.get(pk=alm_jan.pk).status == "open"
+    assert sub_jan.__class__.objects.get(pk=sub_jan.pk).status == "open"
+    assert services.close_period(alm_jan, user=w.cfo).status == "closed"
+
+
+def test_close_period_permission_does_not_skip_draft_check(w):  # R7
+    draft(w, w.alm, d=date(2027, 1, 31))
+    draft(w, w.sub, d=date(2027, 2, 1))  # another entity / next month: does not block
+    jan = w.alm.periods.get(name="2027-01")
+    with pytest.raises(LedgerError, match="Draft entries"):
+        services.close_period(jan, user=w.cfo)
+    assert jan.__class__.objects.get(pk=jan.pk).status == "open"
+    JournalEntry.objects.filter(entity=w.alm).delete()
+    assert services.close_period(jan, user=w.cfo).status == "closed"
+
+
+def test_draft_entry_needs_create_permission_in_that_entity(w):
+    outsider, viewer = make_user("outsider"), make_user("viewer")
+    member(viewer, w.alm, "viewer")
+    member(outsider, w.sub, "accountant")
+    for user in (None, viewer, outsider, w.cfo):
+        with pytest.raises(access.AccessDenied) as exc:
+            services.create_entry(w.alm, date(2027, 1, 10), "x", CASH, user=user)
+        assert AccessLog.objects.filter(
+            event="permission_denied", entity=w.alm, permission="ledger.create_entry", details__reason=exc.value.code
+        ).exists()
+    assert not JournalEntry.objects.exists()
+    assert draft(w, w.alm).status == "draft"
+
+
+def test_trial_balance_needs_ledger_view_in_that_entity(w):
+    viewer, outsider = make_user("viewer"), make_user("outsider")
+    member(viewer, w.alm, "viewer")
+    member(outsider, w.sub, "viewer")
+    assert services.trial_balance(w.alm, date(2027, 12, 31), user=viewer) == []
+    for user in (outsider, None):
+        with pytest.raises(access.AccessDenied):
+            services.trial_balance(w.alm, date(2027, 12, 31), user=user)
+    assert AccessLog.objects.filter(event="permission_denied", actor=outsider, entity=w.alm, permission="ledger.view").exists()
+
+
+def _intercompany_world(w):
+    """ALM <-> SUB and ALM <-> MIN (equity-method minority holding) balances, both sides booked."""
+    mn = setup_entity("MIN", "equity", w.alm)
+    member(w.clerk, mn, "accountant")
+    member(w.cfo, w.sub, "approver")
+    member(w.cfo, mn, "approver")
+    for entity, other in ((w.alm, w.sub), (w.sub, w.alm), (w.alm, mn), (mn, w.alm)):
+        lines = [
+            {"account": "1210", "debit": 10, "counterparty": other} if entity == w.alm else {"account": "5200", "debit": 10},
+            {"account": "4110", "credit": 10} if entity == w.alm else {"account": "2110", "credit": 10, "counterparty": other},
+        ]
+        entry = draft(w, entity, lines)
+        services.post_entry(entry, access.require(w.cfo, entity, "ledger.post_entry", document=entry))
+    return mn
+
+
+def test_intercompany_balances_are_limited_to_what_the_user_may_see(w):
+    mn = _intercompany_world(w)
+    gv, alm_only, sub_only = make_user("gv"), make_user("alm.viewer"), make_user("sub.viewer")
+    member(gv, w.alm, "group_viewer")  # covers ALM and full subsidiary SUB, not the equity holding (R6, OQ-3)
+    member(alm_only, w.alm, "viewer")
+    member(sub_only, w.sub, "viewer")
+    as_of = date(2027, 1, 31)
+    assert set(services.intercompany_balances(as_of, user=gv, group=w.alm)) == {("ALM", "SUB"), ("ALM", "MIN"), ("SUB", "ALM")}
+    assert set(services.intercompany_balances(as_of, user=alm_only, group=w.alm)) == {("ALM", "SUB"), ("ALM", "MIN")}
+    member(gv, mn, "viewer")
+    assert ("MIN", "ALM") in services.intercompany_balances(as_of, user=gv, group=w.alm)
+    with pytest.raises(access.AccessDenied):  # no ledger.view on the group parent
+        services.intercompany_balances(as_of, user=sub_only, group=w.alm)
+    with pytest.raises(LedgerError, match="not a group parent"):
+        services.intercompany_balances(as_of, user=gv, group=w.sub)

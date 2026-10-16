@@ -152,6 +152,7 @@ def _reverse(entry, user, date, reason):
 def create_entry(entity, date, description, lines, user=None, reference="", post=False, grant=None, posted_by=None):
     """lines: iterable of dicts with account (code or Account), debit, credit, description, counterparty.
 
+    Without ``post``, ``user`` needs ``ledger.create_entry`` in ``entity``.
     With ``post=True`` a P grant for ``entity`` is required and checked before
     anything is written (R23). A ``ledger.post_entry`` grant cannot be used
     here: manual journals are drafted first and posted by an approver who is
@@ -159,6 +160,9 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
     """
     if post:
         posted_by = _authorise_post(entity, grant, posted_by)
+    else:
+        # A draft is still a business record in ``entity``: ledger.create_entry there (access.md 3.6).
+        access.require(user, entity, "ledger.create_entry")
     return _create(entity, date, description, lines, user, reference, post, posted_by)
 
 
@@ -187,16 +191,35 @@ def _create(entity, date, description, lines, user, reference, post, posted_by):
     return entry
 
 
-def close_period(period):
-    if JournalEntry.objects.filter(period=period, status=JournalEntry.Status.DRAFT).exists():
+@transaction.atomic
+def close_period(period, *, user):
+    """Close a fiscal period. ``user`` needs ``ledger.close_period`` in the period's entity (access.md 3.6)."""
+    period = FiscalPeriod.objects.select_for_update().select_related("entity").get(pk=period.pk)
+    access.require(user, period.entity, "ledger.close_period")
+    # Drafts get their period only when posted, so match them by entity and date.
+    drafts = JournalEntry.objects.filter(
+        entity=period.entity, status=JournalEntry.Status.DRAFT,
+        date__gte=period.start_date, date__lte=period.end_date,
+    )
+    if drafts.exists():
         raise LedgerError("Draft entries exist in this period.")
     period.status = FiscalPeriod.Status.CLOSED
     period.save(update_fields=["status"])
     return period
 
 
-def trial_balance(entity, as_of):
-    """Balances of posted (and reversed) entries up to a date. Reversals net to zero by design."""
+def trial_balance(entity, as_of, *, user):
+    """Trial balance of ``entity`` for ``user``, who needs ``ledger.view`` there (access.md 3.6, AT-3)."""
+    access.require(user, entity, "ledger.view")
+    return _trial_balance(entity, as_of)
+
+
+def _trial_balance(entity, as_of):
+    """Balances of posted (and reversed) entries up to a date. Reversals net to zero by design.
+
+    No rights check: for internal callers (closing, consolidation) that have
+    already checked the user. User-facing code calls :func:`trial_balance`.
+    """
     rows = (
         JournalLine.objects.filter(
             entry__entity=entity,
@@ -225,10 +248,39 @@ def trial_balance(entity, as_of):
     return result
 
 
-def intercompany_balances(as_of):
-    """Net intercompany position by (entity, counterparty); pairs should mirror for elimination."""
+def _group_tree(group):
+    """``group`` and every entity below it through ``parent`` links, whatever the consolidation."""
+    ids, frontier = {group.pk}, [group.pk]
+    while frontier:
+        frontier = list(Entity.objects.filter(parent_id__in=frontier).exclude(pk__in=ids).values_list("pk", flat=True))
+        ids.update(frontier)
+    return ids
+
+
+def intercompany_balances(as_of, *, user, group):
+    """Intercompany positions in ``group`` (a parent entity) that ``user`` may see.
+
+    ``user`` needs ``ledger.view`` on the group parent (a group report is
+    checked against the group parent, access.md R6). Rows are then limited to
+    the group entities in which the user holds ``ledger.view`` (R2): a group
+    role covers full subsidiaries; associates and minority holdings need their
+    own membership (OQ-3).
+    """
+    if group.consolidation != Entity.Consolidation.PARENT:
+        raise LedgerError(f"{group.code} is not a group parent entity.")
+    access.require(user, group, "ledger.view")
+    visible = access.entities_for(user, "ledger.view").filter(pk__in=_group_tree(group))
+    return _intercompany_balances(as_of, visible)
+
+
+def _intercompany_balances(as_of, entities):
+    """Net intercompany position by (entity, counterparty) for ``entities``; pairs should mirror for elimination.
+
+    No rights check: internal callers pass the entities they have checked.
+    """
     rows = (
         JournalLine.objects.filter(
+            entry__entity__in=entities,
             account__is_intercompany=True,
             entry__date__lte=as_of,
             entry__status__in=[JournalEntry.Status.POSTED, JournalEntry.Status.REVERSED],

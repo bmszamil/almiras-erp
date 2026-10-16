@@ -35,8 +35,10 @@ def w():
     member(clerk, alm, "accountant")
     member(cfo, alm, "approver")
     member(aa, alm, "access_admin")
+    sub_clerk = make_user("sub.clerk")  # no admin access; drafts SUB's entry (ledger.create_entry in SUB)
+    member(sub_clerk, sub, "accountant")
     alm_draft = ledger.create_entry(alm, date(2027, 1, 5), "ALM draft", CASH, user=clerk)
-    sub_draft = ledger.create_entry(sub, date(2027, 1, 5), "SUB draft", CASH, user=clerk)
+    sub_draft = ledger.create_entry(sub, date(2027, 1, 5), "SUB draft", CASH, user=sub_clerk)
     return SimpleNamespace(alm=alm, sub=sub, clerk=clerk, cfo=cfo, root=root, aa=aa, alm_draft=alm_draft, sub_draft=sub_draft)
 
 

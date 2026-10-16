@@ -119,14 +119,14 @@ def test_reversal_nets_to_zero_and_locks_original(alm, sub):
     e.refresh_from_db()
     assert e.status == JournalEntry.Status.REVERSED
     assert rev.reversal_of == e and rev.status == JournalEntry.Status.POSTED
-    assert services.trial_balance(alm, date(2027, 12, 31)) == []
+    assert services.trial_balance(alm, date(2027, 12, 31), user=clerk_and_cfo()[0]) == []
     with pytest.raises(LedgerError):
         reverse(e)
 
 
 def test_closed_period_rejects_posting(alm):
     period = alm.periods.get(name="2027-01")
-    services.close_period(period)
+    services.close_period(period, user=clerk_and_cfo()[1])
     with pytest.raises(LedgerError, match="closed"):
         book(alm, date(2027, 1, 20), "late", [{"account": "1100", "debit": 1}, {"account": "3100", "credit": 1}])
 
@@ -175,7 +175,7 @@ def test_line_must_be_one_sided():
 
 def test_trial_balance_balances(alm, sub):
     rent_invoice(alm, counterparty=sub)
-    tb = services.trial_balance(alm, date(2027, 1, 31))
+    tb = services.trial_balance(alm, date(2027, 1, 31), user=clerk_and_cfo()[0])
     assert sum(r["debit"] for r in tb) == sum(r["credit"] for r in tb) == D("1150.00")
 
 
@@ -185,7 +185,7 @@ def test_intercompany_balances_mirror(alm, sub):
         sub, date(2027, 1, 15), "Warehouse rent Jan from ALM",
         [{"account": "5200", "debit": 1000}, {"account": "1310", "debit": 150}, {"account": "2110", "credit": 1150, "counterparty": alm}],
     )
-    ic = services.intercompany_balances(date(2027, 1, 31))
+    ic = services.intercompany_balances(date(2027, 1, 31), user=clerk_and_cfo()[0], group=alm)
     assert ic[("ALM", "LZM")] == -ic[("LZM", "ALM")] == D("1150.00")
 
 
