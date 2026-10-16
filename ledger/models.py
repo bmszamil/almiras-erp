@@ -93,11 +93,39 @@ class FiscalPeriod(models.Model):
         return f"{self.entity.code} {self.name} ({self.status})"
 
 
+POSTING_LOCK = (
+    "Posted entries and their lines cannot be changed or deleted, also not in bulk. Reverse the entry instead. / "
+    "لا يمكن تعديل القيود المرحّلة أو بنودها أو حذفها، ولا جماعيًا. اعكس القيد بدلًا من ذلك."
+)
+
+
+class JournalEntryQuerySet(models.QuerySet):
+    """Bulk writes skip ``save()``/``delete()``, so they get the posting lock here (CLAUDE.md rules 1 and 3)."""
+
+    def update(self, **kwargs):
+        if "status" in kwargs:
+            raise LedgerError("An entry's status changes only through ledger.services. / تتغير حالة القيد من خلال خدمات الدفتر فقط.")
+        if self.exclude(status=JournalEntry.Status.DRAFT).exists():
+            raise LedgerError(POSTING_LOCK)
+        return super().update(**kwargs)
+
+    def delete(self):
+        if self.exclude(status=JournalEntry.Status.DRAFT).exists():
+            raise LedgerError(POSTING_LOCK)
+        return super().delete()
+
+
 class JournalEntry(models.Model):
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"
         POSTED = "posted", "Posted"
         REVERSED = "reversed", "Reversed"
+
+    class Source(models.TextChoices):
+        HUMAN = "human", bi("Entered by a person", "أدخله شخص")
+        IMPORT = "import", bi("Imported (migration, opening balances)", "مستورد (ترحيل بيانات، أرصدة افتتاحية)")
+        AGENT = "agent", bi("Drafted by an AI agent", "أعدّه وكيل ذكاء اصطناعي")
+        SYSTEM = "system", bi("Created by a system user", "أنشأه مستخدم النظام")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="journal_entries")
     number = models.CharField(max_length=40, blank=True, help_text="Assigned on posting, never reused")
@@ -117,6 +145,23 @@ class JournalEntry(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     posted_at = models.DateTimeField(null=True, blank=True)
+    # Segregation (access.md R14): none of these people may approve the draft.
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Submitted by", "قدّمه"),
+    )
+    submitted_at = models.DateTimeField(bi("Submitted at", "تاريخ التقديم"), null=True, blank=True)
+    modified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Last modified by", "آخر من عدّله"),
+    )
+    modified_at = models.DateTimeField(bi("Last modified at", "تاريخ آخر تعديل"), null=True, blank=True)
+    source = models.CharField(bi("Source", "المصدر"), max_length=6, choices=Source.choices, default=Source.HUMAN)
+    # The sub-ledger document this entry books (access.md R30), e.g. ("invoicing.bill", 7).
+    document_type = models.CharField(bi("Document type", "نوع المستند"), max_length=100, blank=True)
+    document_id = models.PositiveBigIntegerField(bi("Document id", "رقم المستند"), null=True, blank=True)
+
+    objects = JournalEntryQuerySet.as_manager()
 
     class Meta:
         verbose_name_plural = "journal entries"
@@ -124,8 +169,17 @@ class JournalEntry(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=["entity", "number"], condition=~models.Q(number=""), name="unique_entry_number_per_entity"
-            )
+            ),
+            models.CheckConstraint(
+                condition=(models.Q(document_type="") & models.Q(document_id__isnull=True))
+                | (~models.Q(document_type="") & models.Q(document_id__isnull=False)),
+                name="entry_document_ref_complete",
+            ),
         ]
+
+    @property
+    def document_ref(self):
+        return (self.document_type, self.document_id) if self.document_type else None
 
     def _stored_status(self):
         if not self.pk:
@@ -158,6 +212,28 @@ class JournalEntry(models.Model):
 
     def __str__(self):
         return f"{self.number or 'DRAFT'} {self.date} {self.description}"
+
+
+class JournalLineQuerySet(models.QuerySet):
+    """Bulk writes on lines of posted entries are refused, as ``save()``/``delete()`` refuse them (rule 1)."""
+
+    def _touches_booked(self):
+        return self.exclude(entry__status=JournalEntry.Status.DRAFT).exists()
+
+    def update(self, **kwargs):
+        if self._touches_booked():
+            raise LedgerError(POSTING_LOCK)
+        target = kwargs.get("entry", kwargs.get("entry_id"))
+        if target is not None:
+            target_id = getattr(target, "pk", target)
+            if JournalEntry.objects.filter(pk=target_id).exclude(status=JournalEntry.Status.DRAFT).exists():
+                raise LedgerError(POSTING_LOCK)
+        return super().update(**kwargs)
+
+    def delete(self):
+        if self._touches_booked():
+            raise LedgerError(POSTING_LOCK)
+        return super().delete()
 
 
 class JournalLine(models.Model):
@@ -209,6 +285,13 @@ class JournalLine(models.Model):
     )
     manual_rate_reason = models.CharField(bi("Manual rate reason", "سبب السعر اليدوي"), max_length=300, blank=True)
     line_kind = models.CharField(bi("Line kind", "نوع البند"), max_length=12, choices=LineKind.choices, default=LineKind.NORMAL)
+    requires_purification = models.BooleanField(
+        bi("Requires purification", "يتطلب التطهير"), default=False,
+        help_text=bi("Set at posting: non-compliant income to be purified (CLAUDE.md rule 5)",
+                     "يُحدَّد عند الترحيل: دخل غير متوافق يجب تطهيره"),
+    )
+
+    objects = JournalLineQuerySet.as_manager()
 
     class Meta:
         ordering = ["entry", "id"]
@@ -234,12 +317,21 @@ class JournalLine(models.Model):
             ),
         ]
 
-    def _entry_locked(self):
-        return self.entry_id and JournalEntry.objects.filter(pk=self.entry_id).exclude(
-            status=JournalEntry.Status.DRAFT
-        ).exists()
+    def _stored_entry_id(self):
+        if self.pk is None:
+            return None
+        return JournalLine.objects.filter(pk=self.pk).values_list("entry_id", flat=True).first()
+
+    def _entry_locked(self, *, include_stored=True):
+        """True if the line's entry, or the entry it is stored on now, is not a draft (rule 1)."""
+        ids = {self.entry_id}
+        if include_stored:
+            ids.add(self._stored_entry_id())
+        ids.discard(None)
+        return bool(ids) and JournalEntry.objects.filter(pk__in=ids).exclude(status=JournalEntry.Status.DRAFT).exists()
 
     def save(self, *args, **kwargs):
+        # Both the new entry and the stored one: a line is never moved off (or onto) a posted entry.
         if self._entry_locked():
             raise LedgerError("Lines of a posted entry cannot be changed.")
         self._fill_functional_defaults()

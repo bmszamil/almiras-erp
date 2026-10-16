@@ -63,7 +63,7 @@ def book(entity, entry_date, description, lines, post=True):
 
 def reverse(entry, **kw):
     clerk, _ = clerk_and_cfo()
-    return services.reverse_entry(entry, access.require(clerk, entry.entity, "ledger.reverse_entry"), **kw)
+    return services.reverse_entry(entry, access.require(clerk, entry.entity, "ledger.reverse_entry", document=entry), **kw)
 
 
 def rent_invoice(entity, counterparty=None, post=True, amount="1000"):

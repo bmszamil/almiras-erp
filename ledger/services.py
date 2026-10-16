@@ -22,6 +22,7 @@ from django.utils import timezone
 from core import access
 from core.access import catalogue
 from core.access.models import AccessLog, Kind
+from core.access import services as access_services
 from core.access.services import kind_of
 from core.access.services import log as access_log
 from core.models import Currency, Entity
@@ -41,6 +42,7 @@ from .models import (
 
 ZERO = Decimal("0")
 CLEARANCE_PERMISSION = "invoicing.post_on_clearance"
+APPROVE_SALES_PERMISSION = "invoicing.approve_sales_document"
 BOOKED = (JournalEntry.Status.POSTED, JournalEntry.Status.REVERSED)
 Kind_ = JournalLine.LineKind
 Src = JournalLine.RateSource
@@ -54,8 +56,18 @@ FX_ROUNDING = "5770"
 ACTUAL_BANK_RATE = "Actual bank rate / سعر البنك الفعلي"
 
 
-def _find_open_period(entity, date):
-    period = FiscalPeriod.objects.filter(entity=entity, start_date__lte=date, end_date__gte=date).first()
+def _find_open_period(entity, date, *, lock=False):
+    """The open period of ``entity`` covering ``date``, else LedgerError.
+
+    With ``lock`` (posting) the period row is locked FOR UPDATE until the
+    posting commits, the same row close_period locks, so a period cannot be
+    closed between this check and the posting (rule 4). Lock order in both
+    paths: entry (posting only), then period.
+    """
+    qs = FiscalPeriod.objects.filter(entity=entity, start_date__lte=date, end_date__gte=date)
+    if lock:
+        qs = qs.select_for_update(of=("self",))
+    period = qs.first()
     if period is None:
         raise LedgerError(f"No fiscal period covers {date} for {entity.code}. / لا توجد فترة مالية تغطي {date} للكيان {entity.code}.")
     if period.status != FiscalPeriod.Status.OPEN:
@@ -242,38 +254,86 @@ def _settlement_problems(entry, line, where, is_reversal, consumed):
     return problems
 
 
-def _authorise_post(entity, grant, posted_by, document=None):
-    """R23: a Grant for a P permission in the entry's own entity, checked again now.
+def _deny_grant(grant, entity, code):
+    access.deny(getattr(grant, "user", None) if getattr(getattr(grant, "user", None), "pk", None) else None,
+                entity, getattr(grant, "permission", ""), code)
 
-    A ``ledger.post_entry`` grant must have been issued for this very draft and
-    never covers the entry's creator (A permission, R14; the ledger has no
-    self-approval switch). Only ``invoicing.post_on_clearance`` may record a
-    different ``posted_by`` (the approver on the document, zatca D-8).
+
+def _authorise_draft_post(entry, grant, posted_by):
+    """R23 / R30: posting an existing draft needs a ``ledger.post_entry`` grant issued for that very draft.
+
+    The grant's user may not be the draft's creator, submitter or last
+    modifier (A permission, R14; the ledger has no self-approval switch).
+    Sub-ledger grants never post an existing draft: they post only the entry
+    created for their document (create_entry(post=True, document=...)).
+    The grant is checked here and used inside the posting transaction.
     """
-    if getattr(grant, "permission", None) == "ledger.post_entry":
-        if document is None:  # create_entry(post=True): there is no draft yet to approve
-            access.deny(grant.user, entity, grant.permission, "grant_needs_draft")
-        user = access.verify_grant(grant, entity, catalogue.POST_PERMISSIONS, document=document)
-    else:
-        user = access.verify_grant(grant, entity, catalogue.POST_PERMISSIONS)
+    if not isinstance(grant, access.Grant):
+        _deny_grant(grant, entry.entity, "grant_missing")
+    user = access.verify_grant(grant, entry.entity, catalogue.DRAFT_POST_PERMISSIONS, document=entry, use=False)
+    if posted_by is not None and posted_by != user:
+        raise LedgerError("posted_by is set from the grant; only posting on clearance records another approver.")
+    return user
+
+
+def _authorise_document_post(entity, grant, posted_by, document, created_by):
+    """R23 / R30: create_entry(post=True) needs a sub-ledger P grant issued for ``document``.
+
+    Only ``invoicing.post_on_clearance`` records a different ``posted_by``:
+    the approver recorded in the access log for the grant's document (zatca
+    D-8), a human who is not the entry's creator.
+    """
+    if not isinstance(grant, access.Grant):
+        _deny_grant(grant, entity, "grant_missing")
+    if grant.permission in catalogue.DRAFT_POST_PERMISSIONS:  # a manual journal: draft first, then post_entry
+        _deny_grant(grant, entity, "grant_needs_draft")
+    if access_services._document_ref(document) is None:
+        _deny_grant(grant, entity, "grant_needs_document")
+    user = access.verify_grant(grant, entity, catalogue.DOCUMENT_POST_PERMISSIONS, document=document, use=False)
     if grant.permission == CLEARANCE_PERMISSION:
         if posted_by is None:
             raise LedgerError("Posting on clearance needs the approver recorded on the document (posted_by).")
+        approver_ok = (
+            getattr(posted_by, "pk", None) is not None
+            and posted_by.is_active
+            and kind_of(posted_by) == Kind.HUMAN
+            and posted_by.pk != getattr(created_by, "pk", None)
+            and posted_by.pk in access_services.recorded_approvers(entity, APPROVE_SALES_PERMISSION, document)
+        )
+        if not approver_ok:
+            access.deny(user, entity, grant.permission, "posted_by_not_approver")
         return posted_by
     if posted_by is not None and posted_by != user:
         raise LedgerError("posted_by is set from the grant; only posting on clearance records another approver.")
     return user
 
 
+def _purification_flags(entry, lines):
+    """CLAUDE.md rule 5: lines on purification accounts, or Sharia-prohibited income, are flagged at posting.
+
+    Per entity: an entity that does not enforce Sharia flags nothing.
+    """
+    if not entry.entity.sharia_enforced:
+        return []
+    return [
+        line.pk for line in lines
+        if line.account.requires_purification
+        or (line.account.sharia_prohibited and line.account.type == Account.Type.INCOME)
+    ]
+
+
 @transaction.atomic
 def _post(entry, posted_by):
-    entry = JournalEntry.objects.select_for_update().get(pk=entry.pk)
+    entry = JournalEntry.objects.select_for_update(of=("self",)).select_related("entity").get(pk=entry.pk)
     if entry.status != JournalEntry.Status.DRAFT:
         raise LedgerError("Only draft entries can be posted.")
     problems = validate_entry(entry)
     if problems:
         raise LedgerError(problems)
-    entry.period = _find_open_period(entry.entity, entry.date)
+    entry.period = _find_open_period(entry.entity, entry.date, lock=True)
+    flagged = _purification_flags(entry, list(entry.lines.select_related("account")))
+    if flagged:  # still a draft here, so the line lock allows it
+        JournalLine.objects.filter(pk__in=flagged).update(requires_purification=True)
     entry.number = _next_number(entry.entity, entry.date.year)
     entry.status = JournalEntry.Status.POSTED
     entry.posted_by = posted_by
@@ -283,26 +343,44 @@ def _post(entry, posted_by):
 
 
 def post_entry(entry, grant=None, *, posted_by=None):
-    """Post a draft. ``grant`` comes from ``core.access.require`` for the entry's entity (R23).
+    """Post a draft with ``require(approver, entity, "ledger.post_entry", document=entry)`` (R23, R30).
 
-    The grant is checked before any write, so a refusal changes nothing.
-    Sharia, period, balance and entity rules apply whatever the grant (R7).
+    The grant is checked before any write, so a refusal changes nothing; it is
+    used (once) in the posting transaction, so a posting refused by a ledger
+    rule leaves it unused. Sharia, period, balance and entity rules apply
+    whatever the grant (R7).
     """
     entry = JournalEntry.objects.select_related("entity").get(pk=entry.pk)
-    user = _authorise_post(entry.entity, grant, posted_by, document=entry)
-    return _post(entry, user)
+    user = _authorise_draft_post(entry, grant, posted_by)
+    with transaction.atomic():
+        access.use_grant(grant, target=entry)
+        return _post(entry, user)
 
 
 def reverse_entry(entry, grant=None, date=None, reason=""):
-    """Reverse a posted entry with a ``ledger.reverse_entry`` or ``invoicing.reverse_document`` grant (R23)."""
+    """Reverse a posted entry (R23, R30).
+
+    ``grant`` is ``require(user, entity, "ledger.reverse_entry", document=entry)``,
+    or ``invoicing.reverse_document`` issued for the document the entry books.
+    """
     entry = JournalEntry.objects.select_related("entity").get(pk=entry.pk)
-    user = access.verify_grant(grant, entry.entity, catalogue.REVERSE_PERMISSIONS)
-    return _reverse(entry, user, date, reason)
+    if not isinstance(grant, access.Grant):
+        _deny_grant(grant, entry.entity, "grant_missing")
+    if grant.permission == "invoicing.reverse_document":
+        if entry.document_ref is None:
+            _deny_grant(grant, entry.entity, "grant_wrong_document")
+        document = entry.document_ref
+    else:
+        document = entry
+    user = access.verify_grant(grant, entry.entity, catalogue.REVERSE_PERMISSIONS, document=document, use=False)
+    with transaction.atomic():
+        access.use_grant(grant, target=entry)
+        return _reverse(entry, user, date, reason)
 
 
 @transaction.atomic
 def _reverse(entry, user, date, reason):
-    entry = JournalEntry.objects.select_for_update().get(pk=entry.pk)
+    entry = JournalEntry.objects.select_for_update(of=("self",)).get(pk=entry.pk)
     if entry.status != JournalEntry.Status.POSTED:
         raise LedgerError("Only posted entries can be reversed.")
     date = date or entry.date
@@ -313,6 +391,9 @@ def _reverse(entry, user, date, reason):
         reference=entry.number,
         reversal_of=entry,
         created_by=user,
+        source=_source_for(user),
+        document_type=entry.document_type,  # derived from the same document (R30)
+        document_id=entry.document_id,
     )
     for line in entry.lines.all():
         JournalLine.objects.create(
@@ -339,7 +420,22 @@ def _reverse(entry, user, date, reason):
     return reversal
 
 
-def create_entry(entity, date, description, lines, user=None, reference="", post=False, grant=None, posted_by=None):
+def _source_for(user, requested=None):
+    """JournalEntry.source from the user's kind (gateway rule 4); a person may mark an entry as an import."""
+    kind = kind_of(user) if getattr(user, "pk", None) else Kind.HUMAN
+    if kind == Kind.AGENT:
+        return JournalEntry.Source.AGENT
+    if kind == Kind.SYSTEM:
+        return JournalEntry.Source.SYSTEM
+    if requested == JournalEntry.Source.IMPORT:
+        return JournalEntry.Source.IMPORT
+    if requested not in (None, JournalEntry.Source.HUMAN):
+        raise error(f"Source {requested!r} is set from the user, not chosen.", f"المصدر {requested!r} يُحدَّد من المستخدم.")
+    return JournalEntry.Source.HUMAN
+
+
+def create_entry(entity, date, description, lines, user=None, reference="", post=False, grant=None, posted_by=None,
+                 document=None, source=None):
     """lines: iterable of dicts with account (code or Account), debit, credit, description, counterparty.
 
     Multi-currency keys (ledger-fx.md): ``currency`` (code or Currency, default
@@ -353,30 +449,41 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
     their rounded functional amounts differ by a few cents (R17).
 
     Without ``post``, ``user`` needs ``ledger.create_entry`` in ``entity``.
-    With ``post=True`` a P grant for ``entity`` is required and checked before
-    anything is written (R23). A ``ledger.post_entry`` grant cannot be used
-    here: manual journals are drafted first and posted by an approver who is
-    not the creator, through ``post_entry``.
+
+    With ``post=True`` (a sub-ledger document is approved and posts at once,
+    access A1) ``grant`` is a sub-ledger P grant issued for ``document``, which
+    the entry records (R30); ``user`` is the grant's user or holds
+    ``ledger.create_entry`` in ``entity``. Everything is checked before
+    anything is written (R23), and the grant is used once. A
+    ``ledger.post_entry`` grant cannot be used here: manual journals are
+    drafted first and posted by an approver who is not the creator, through
+    ``post_entry``. ``source`` may be ``"import"`` for a person's import;
+    otherwise it follows the user's kind.
     """
+    entry_source = _source_for(user, source)
     if post:
-        posted_by = _authorise_post(entity, grant, posted_by)
+        posted_by = _authorise_document_post(entity, grant, posted_by, document, user)
+        if not (getattr(user, "pk", None) is not None and user == grant.user):
+            access.require(user, entity, "ledger.create_entry")
     else:
+        if grant is not None or posted_by is not None:
+            raise LedgerError("A grant or posted_by is only used with post=True.")
         # A draft is still a business record in ``entity``: ledger.create_entry there (access.md 3.6).
         access.require(user, entity, "ledger.create_entry")
-    return _create(entity, date, description, lines, user, reference, post, posted_by)
+    ref = access_services._document_ref(document)
+    with transaction.atomic():
+        if post:
+            access.use_grant(grant, target=document)
+        return _create(entity, date, description, lines, user, reference, post, posted_by, entry_source, ref)
 
 
 @transaction.atomic
-def _create(entity, date, description, lines, user, reference, post, posted_by):
-    built = [_build_line(entity, date, spec, user) for spec in lines]
-    consumed = defaultdict(lambda: [ZERO, ZERO])
-    for line in built:
-        _price_settlement(line, consumed)
-    rounding = _rounding_line(entity, built)
-    if rounding is not None:
-        built.append(rounding)
+def _create(entity, date, description, lines, user, reference, post, posted_by, source=JournalEntry.Source.HUMAN,
+            document_ref=None):
+    built = _build_lines(entity, date, lines, user)
     entry = JournalEntry.objects.create(
-        entity=entity, date=date, description=description, reference=reference, created_by=user
+        entity=entity, date=date, description=description, reference=reference, created_by=user, source=source,
+        document_type=document_ref[0] if document_ref else "", document_id=document_ref[1] if document_ref else None,
     )
     for line in built:
         line.entry = entry
@@ -388,6 +495,65 @@ def _create(entity, date, description, lines, user, reference, post, posted_by):
         )
     if post:
         entry = _post(entry, posted_by)
+    return entry
+
+
+def _build_lines(entity, date, lines, user):
+    built = [_build_line(entity, date, spec, user) for spec in lines]
+    consumed = defaultdict(lambda: [ZERO, ZERO])
+    for line in built:
+        _price_settlement(line, consumed)
+    rounding = _rounding_line(entity, built)
+    if rounding is not None:
+        built.append(rounding)
+    return built
+
+
+def update_draft(entry, *, user, date=None, description=None, reference=None, lines=None):
+    """Change a draft's header and, with ``lines``, replace its lines (same line dicts as create_entry).
+
+    ``user`` needs ``ledger.create_entry`` in the entry's entity and becomes
+    the draft's last modifier, so they cannot approve it (access.md R14).
+    Posted entries are never changed (rule 1).
+    """
+    entry = JournalEntry.objects.select_related("entity").get(pk=entry.pk)
+    access.require(user, entry.entity, "ledger.create_entry")
+    return _update_draft(entry, user, date, description, reference, lines)
+
+
+@transaction.atomic
+def _update_draft(entry, user, date, description, reference, lines):
+    entry = JournalEntry.objects.select_for_update(of=("self",)).select_related("entity").get(pk=entry.pk)
+    if entry.status != JournalEntry.Status.DRAFT:
+        raise LedgerError("Posted entries cannot be edited. Reverse the entry instead.")
+    if _is_revaluation_entry(entry):
+        raise error("A revaluation draft is changed by discarding and re-running it.", "تُعدَّل مسودة إعادة التقييم بإلغائها وإعادة تشغيلها.")
+    for name, value in (("date", date), ("description", description), ("reference", reference)):
+        if value is not None:
+            setattr(entry, name, value)
+    if lines is not None:
+        built = _build_lines(entry.entity, entry.date, lines, user)
+        entry.lines.all().delete()
+        for line in built:
+            line.entry = entry
+            line.save()
+    entry.modified_by = user
+    entry.modified_at = timezone.now()
+    entry.save()
+    return entry
+
+
+def submit_entry(entry, *, user):
+    """Record that ``user`` submits the draft for approval; the submitter cannot approve it (access.md R14)."""
+    entry = JournalEntry.objects.select_related("entity").get(pk=entry.pk)
+    access.require(user, entry.entity, "ledger.create_entry")
+    with transaction.atomic():
+        entry = JournalEntry.objects.select_for_update(of=("self",)).get(pk=entry.pk)
+        if entry.status != JournalEntry.Status.DRAFT:
+            raise LedgerError("Only draft entries can be submitted.")
+        entry.submitted_by = user
+        entry.submitted_at = timezone.now()
+        entry.save(update_fields=["submitted_by", "submitted_at"])
     return entry
 
 
@@ -430,6 +596,8 @@ def _build_line(entity, on, spec, user):
     account = spec["account"]
     if not isinstance(account, Account):
         account = Account.objects.get(entity=entity, code=account)
+    elif account.entity_id != entity.pk:  # rule 4: never another entity's account
+        raise error(f"Account {account.code} belongs to another entity.", f"الحساب {account.code} يخص كيانًا آخر.")
     counterparty = spec.get("counterparty")
     if counterparty is not None and not isinstance(counterparty, Entity):
         counterparty = Entity.objects.get(code=counterparty)
@@ -647,6 +815,21 @@ def _group_tree(group):
         frontier = list(Entity.objects.filter(parent_id__in=frontier).exclude(pk__in=ids).values_list("pk", flat=True))
         ids.update(frontier)
     return ids
+
+
+def counterparty_choices(user, entity=None):
+    """Entities that may be the counterparty on lines of ``entity`` (rule 6): the other entities of its group.
+
+    Without ``entity`` (a new entry in admin): the groups of the entities ``user`` drafts in.
+    Choices only; posting still checks every line (validate_entry).
+    """
+    bases = [entity] if entity is not None else list(access.entities_for(user, "ledger.create_entry"))
+    ids = set()
+    for e in bases:
+        ids |= _group_tree(access_services.group_parent_of(e))
+    if entity is not None:
+        ids.discard(entity.pk)
+    return Entity.objects.filter(pk__in=ids)
 
 
 def intercompany_balances(as_of, *, user, group, by_currency=False):
@@ -942,6 +1125,8 @@ def rerate_entry(entry, *, user):
     if rounding is not None:
         rounding.entry = entry
         rounding.save()
+    entry.modified_by, entry.modified_at = user, timezone.now()  # a re-rater cannot approve the draft (R14)
+    entry.save(update_fields=["modified_by", "modified_at"])
     return entry
 
 
@@ -1191,8 +1376,10 @@ def post_revaluation(run, grant):
         access.deny(getattr(grant, "user", None), run.entity, getattr(grant, "permission", ""), "grant_wrong_permission")
     if run.entry is None:
         raise error("This revaluation found no differences; nothing to post.", "لم تظهر فروقات في إعادة التقييم؛ لا شيء للترحيل.")
-    user = _authorise_post(run.entity, grant, None, document=run.entry)
-    return _post_revaluation(run, user)
+    user = _authorise_draft_post(run.entry, grant, None)
+    with transaction.atomic():
+        access.use_grant(grant, target=run.entry)
+        return _post_revaluation(run, user)
 
 
 @transaction.atomic
@@ -1201,7 +1388,7 @@ def _post_revaluation(run, user):
     if run.reversal_id is not None:
         raise error("This revaluation is already posted.", "إعادة التقييم هذه مرحّلة مسبقًا.")
     next_start = run.period.end_date + timedelta(days=1)
-    _find_open_period(run.entity, next_start)
+    _find_open_period(run.entity, next_start, lock=True)
     entry = _post(run.entry, user)
     reversal = _reverse(
         entry, user, next_start, "Automatic reversal of FX revaluation / عكس تلقائي لإعادة تقييم العملات",
@@ -1254,9 +1441,16 @@ def set_functional_currency(entity, currency, *, user):
     """Change ``entity``'s functional currency before its first posting (R4, R5); Managing Partner only (3.6)."""
     access.require(user, entity, "ledger.change_functional_currency")
     entity = Entity.objects.select_for_update().get(pk=entity.pk)
+    before = entity.base_currency_id
     entity.base_currency = _currency(currency)
     try:
         entity.save(update_fields=["base_currency"])
     except ValidationError as exc:
         raise LedgerError(exc.messages) from None
+    if before != entity.base_currency_id:  # access.md R32: logged with before / after
+        access_log(
+            AccessLog.Event.ENTITY_SETTINGS_CHANGED, actor=user, entity=entity,
+            permission="ledger.change_functional_currency",
+            details={"before": {"base_currency": before}, "after": {"base_currency": entity.base_currency_id}},
+        )
     return entity

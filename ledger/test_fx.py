@@ -85,7 +85,7 @@ def book(w, entity, d, lines, **kw):
 
 
 def reverse(w, entry, **kw):
-    return services.reverse_entry(entry, access.require(w.clerk, entry.entity, "ledger.reverse_entry"), **kw)
+    return services.reverse_entry(entry, access.require(w.clerk, entry.entity, "ledger.reverse_entry", document=entry), **kw)
 
 
 def lines_of(entry):

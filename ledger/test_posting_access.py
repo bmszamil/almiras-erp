@@ -41,8 +41,13 @@ def draft(w, entity, lines=CASH, d=date(2027, 1, 10)):
     return services.create_entry(entity, d, "Manual journal", lines, user=w.clerk)
 
 
-def bill(entity, created_by):
-    return SimpleNamespace(pk=7, _meta=SimpleNamespace(label_lower="invoicing.bill"), created_by_id=created_by.pk, submitted_by_id=None)
+def bill(entity, created_by, pk=7):
+    return SimpleNamespace(pk=pk, _meta=SimpleNamespace(label_lower="invoicing.bill"), created_by_id=created_by.pk, submitted_by_id=None)
+
+
+def sales_invoice(created_by, pk=11):
+    return SimpleNamespace(pk=pk, _meta=SimpleNamespace(label_lower="invoicing.salesdocument"), created_by_id=created_by.pk,
+                           submitted_by_id=None)
 
 
 def status(entry):
@@ -50,15 +55,20 @@ def status(entry):
 
 
 def test_at21_grant_for_alm_refused_for_sub_entry_and_accepted_for_alm(w):
-    grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill(w.alm, w.clerk))
-    sub_entry, alm_entry = draft(w, w.sub), draft(w, w.alm)
+    b7 = bill(w.alm, w.clerk)
+    grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=b7)
+    sub_entry = draft(w, w.sub)
     with pytest.raises(access.AccessDenied) as exc:
         services.post_entry(sub_entry, grant)
     assert exc.value.code == "grant_other_entity"
     assert status(sub_entry) == "draft"
     assert AccessLog.objects.filter(event="permission_denied", entity=w.sub, details__reason="grant_other_entity").exists()
-    posted = services.post_entry(alm_entry, grant)
-    assert posted.status == "posted" and posted.posted_by == w.cfo
+    before = JournalEntry.objects.count()
+    with pytest.raises(access.AccessDenied) as exc:  # nor a SUB entry for the bill
+        services.create_entry(w.sub, date(2027, 1, 10), "Bill 7", CASH, user=w.clerk, post=True, grant=grant, document=b7)
+    assert exc.value.code == "grant_other_entity" and JournalEntry.objects.count() == before
+    posted = services.create_entry(w.alm, date(2027, 1, 10), "Bill 7", CASH, user=w.clerk, post=True, grant=grant, document=b7)
+    assert posted.status == "posted" and posted.posted_by == w.cfo and posted.document_ref == ("invoicing.bill", 7)
 
 
 def test_post_without_grant_refused(w):
@@ -112,7 +122,11 @@ def test_forged_grant_refused(w):
                                    checked_at=access_services.now())
     with pytest.raises(access.AccessDenied) as exc:
         services.post_entry(entry, forged)
-    assert exc.value.code == "no_membership" and status(entry) == "draft"
+    assert exc.value.code == "grant_wrong_permission" and status(entry) == "draft"
+    forged = replace(forged, permission="ledger.post_entry", document_ref=("ledger.journalentry", entry.pk))
+    with pytest.raises(access.AccessDenied) as exc:  # no AccessLog row behind it (R31)
+        services.post_entry(entry, forged)
+    assert exc.value.code == "grant_forged" and status(entry) == "draft"
 
 
 def test_grant_rechecked_after_revocation(w):  # R4
@@ -132,7 +146,7 @@ def test_non_posting_grant_refused(w):
     with pytest.raises(access.AccessDenied) as exc:
         services.post_entry(entry, grant)
     assert exc.value.code == "grant_wrong_permission"
-    reverse_grant = access.require(w.clerk, w.alm, "ledger.reverse_entry")
+    reverse_grant = access.require(w.clerk, w.alm, "ledger.reverse_entry", document=entry)
     with pytest.raises(access.AccessDenied):  # a reversal right does not post new entries
         services.post_entry(entry, reverse_grant)
 
@@ -145,7 +159,8 @@ def test_agent_never_obtains_a_posting_grant(w):
     forged = replace(access.require(w.cfo, w.alm, "ledger.post_entry", document=entry), user=agent)
     with pytest.raises(access.AccessDenied) as exc:
         services.post_entry(entry, forged)
-    assert exc.value.code == "agent_forbidden"
+    assert exc.value.code == "grant_forged"  # the log row names the CFO, not the agent (R31)
+    assert status(entry) == "draft"
 
 
 def test_reverse_needs_reverse_grant_for_same_entity(w):
@@ -154,13 +169,17 @@ def test_reverse_needs_reverse_grant_for_same_entity(w):
     with pytest.raises(access.AccessDenied):
         services.reverse_entry(posted)
     with pytest.raises(access.AccessDenied) as exc:
-        services.reverse_entry(posted, access.require(w.clerk, w.sub, "ledger.reverse_entry"))
+        services.reverse_entry(posted, access.require(w.clerk, w.sub, "ledger.reverse_entry", document=posted))
     assert exc.value.code == "grant_other_entity"
     with pytest.raises(access.AccessDenied) as exc:
         services.reverse_entry(posted, access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill(w.alm, w.clerk)))
     assert exc.value.code == "grant_wrong_permission"
+    other = draft(w, w.alm)
+    with pytest.raises(access.AccessDenied) as exc:  # a reversal grant names the entry it reverses (R30)
+        services.reverse_entry(posted, access.require(w.clerk, w.alm, "ledger.reverse_entry", document=other))
+    assert exc.value.code == "grant_wrong_document"
     assert status(posted) == "posted"
-    rev = services.reverse_entry(posted, access.require(w.clerk, w.alm, "ledger.reverse_entry"), reason="typo")
+    rev = services.reverse_entry(posted, access.require(w.clerk, w.alm, "ledger.reverse_entry", document=posted), reason="typo")
     assert rev.status == "posted" and rev.posted_by == w.clerk and status(posted) == "reversed"
 
 
@@ -168,9 +187,18 @@ def test_create_entry_post_true_requires_grant_and_writes_nothing_when_refused(w
     before = JournalEntry.objects.count()
     with pytest.raises(access.AccessDenied):
         services.create_entry(w.alm, date(2027, 1, 10), "x", CASH, user=w.clerk, post=True)
-    other_grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill(w.alm, w.clerk))
-    with pytest.raises(access.AccessDenied):
-        services.create_entry(w.sub, date(2027, 1, 10), "x", CASH, user=w.clerk, post=True, grant=other_grant)
+    b7 = bill(w.alm, w.clerk)
+    other_grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=b7)
+    with pytest.raises(access.AccessDenied) as exc:
+        services.create_entry(w.sub, date(2027, 1, 10), "x", CASH, user=w.clerk, post=True, grant=other_grant, document=b7)
+    assert exc.value.code == "grant_other_entity"
+    with pytest.raises(access.AccessDenied) as exc:  # the document is required and must be the grant's
+        services.create_entry(w.alm, date(2027, 1, 10), "x", CASH, user=w.clerk, post=True, grant=other_grant)
+    assert exc.value.code == "grant_needs_document"
+    with pytest.raises(access.AccessDenied) as exc:
+        services.create_entry(w.alm, date(2027, 1, 10), "x", CASH, user=w.clerk, post=True, grant=other_grant,
+                              document=bill(w.alm, w.clerk, pk=8))
+    assert exc.value.code == "grant_wrong_document"
     assert JournalEntry.objects.count() == before
 
 
@@ -184,20 +212,35 @@ def test_create_entry_post_true_refuses_manual_journal_grant(w):
 
 
 def test_create_entry_post_true_with_document_approval_grant(w):  # A1: approval posts automatically
-    grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill(w.alm, w.clerk))
-    e = services.create_entry(w.alm, date(2027, 1, 10), "Bill 7", CASH, user=w.clerk, post=True, grant=grant)
+    b7 = bill(w.alm, w.clerk)
+    grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=b7)
+    e = services.create_entry(w.alm, date(2027, 1, 10), "Bill 7", CASH, user=w.clerk, post=True, grant=grant, document=b7)
     assert e.status == "posted" and e.posted_by == w.cfo and e.created_by == w.clerk
+    assert (e.document_type, e.document_id, e.source) == ("invoicing.bill", 7, "human")
 
 
 def test_post_on_clearance_records_document_approver(w):  # R23, zatca D-8
     queue = access.system_user("zatca_queue")
     member(queue, w.alm, "system_zatca_queue")
-    grant = access.require(queue, w.alm, "invoicing.post_on_clearance")
-    entry = draft(w, w.alm)
+    invoice = sales_invoice(w.clerk)
+    access.require(w.cfo, w.alm, "invoicing.approve_sales_document", document=invoice)  # the approval, logged
+    grant = access.require(queue, w.alm, "invoicing.post_on_clearance", document=invoice)
+
+    def clear(**kw):
+        return services.create_entry(w.alm, date(2027, 1, 10), "Invoice 11", CASH, user=queue, post=True, grant=grant,
+                                     document=invoice, **kw)
+
     with pytest.raises(LedgerError, match="posted_by"):
-        services.post_entry(entry, grant)
-    posted = services.post_entry(entry, grant, posted_by=w.cfo)
-    assert posted.posted_by == w.cfo
+        clear()
+    with pytest.raises(access.AccessDenied) as exc:  # MP holds the right but did not approve this invoice
+        clear(posted_by=w.mp)
+    assert exc.value.code == "posted_by_not_approver"
+    with pytest.raises(access.AccessDenied) as exc:  # a clearance grant never posts an existing draft
+        services.post_entry(draft(w, w.alm), grant, posted_by=w.cfo)
+    assert exc.value.code == "grant_wrong_permission"
+    posted = clear(posted_by=w.cfo)
+    assert (posted.posted_by, posted.created_by, posted.source) == (w.cfo, queue, "system")
+    assert posted.document_ref == ("invoicing.salesdocument", 11)
 
 
 def test_only_clearance_may_set_another_posted_by(w):
