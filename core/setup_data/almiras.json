@@ -1,0 +1,25 @@
+{
+  "_comment": "Almiras setup data (invoicing.md §3.0, D10). Real identifiers, authorised by the project owner for setup data only. Never load this file from tests or fixtures (R70, AT-49). Country is stored as ISO code SA (Saudi Arabia / المملكة العربية السعودية).",
+  "code": "ALM",
+  "fields": {
+    "legal_name_en": "Almiras Holding Company",
+    "legal_name_ar": "شركة المراس القابضة",
+    "legal_form": "llc",
+    "unified_number": "7023761708",
+    "cr_number": "4030419505",
+    "vat_number": "310960118600003",
+    "vat_effective_date": "2024-04-01",
+    "vat_return_period": "quarterly",
+    "building_no": "7547",
+    "street_en": "Prince Sultan St",
+    "street_ar": "شارع الامير سلطان",
+    "district_en": "As Salamah District",
+    "district_ar": "حي السلامة",
+    "additional_no": "2111",
+    "postal_code": "23437",
+    "city_en": "Jeddah",
+    "city_ar": "جدة",
+    "country": "SA",
+    "short_address": "JESA7547"
+  }
+}
