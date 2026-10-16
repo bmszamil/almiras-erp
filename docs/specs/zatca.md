@@ -2,8 +2,8 @@
 
 **Compliance status: reviewed 2026-10-16 from search excerpts only; official documents not yet read; re-check required before go-live.** (Record: `docs/compliance/track-a-2026-10-16.md`.)
 
-Status: draft for review · Written: 2026-10-16 · Revised: 2026-10-16 (compliance review applied) · Author: spec-writer agent
-Depends on: `core` (Entity), `docs/specs/invoicing.md` (AR/AP documents, written in parallel)
+Status: draft for review · Written: 2026-10-16 · Revised: 2026-10-16 (compliance review applied; project-owner decisions D-1 to D-9 recorded) · Author: spec-writer agent
+Depends on: `core` (Entity, incl. national-address fields in `invoicing.md` §3.0), `docs/specs/invoicing.md` (AR/AP documents), `docs/specs/ledger-fx.md` (currency, D-6)
 
 > **Verification tag.** Statements marked **[CC-verify]** are ZATCA technical requirements written from memory without access to the official documents. The compliance-checker agent must verify each one against the current official ZATCA publications (E-Invoicing Regulation, Implementing Resolution, XML Implementation Standard, Security Features Implementation Standard, Data Dictionary, Developer Portal / Fatoora API docs) before module-builder starts. Where the official text differs, the official text wins and this spec is amended.
 > **[CC-verify: search excerpt 2026-10-16]** marks a finding adopted from the 2026-10-16 compliance review. The reviewer could not open official ZATCA/SDAIA pages (DNS blocked) and worked from search-result excerpts. These items are **not verified** and must be re-checked against the official text like any other [CC-verify] item.
@@ -16,10 +16,20 @@ The `zatca` app is the e-invoicing layer between the `invoicing` app and ZATCA's
 
 ## 2. Decisions
 
-| Date | Who | Decision |
-| --- | --- | --- |
-| — | — | **No business decisions have been recorded for this module yet.** The only binding rules are those in `CLAUDE.md` (open source only; connections to outside systems only through the integration layer; no real credentials or production data for agents or tests; every record has an `entity` FK; bilingual user-facing text; business logic in `services.py`; spec before code). |
-| 2026-10-16 | Caller (task brief) | Scope: e-invoicing layer only. Business documents are in `invoicing.md`. Tests use mocks/fixtures of the ZATCA sandbox/simulation only. Secret storage left open. This module creates no journal entries. |
+Binding from `CLAUDE.md`: open source only; outside systems only through the integration layer; no real credentials or production data for agents or tests; every record has an `entity` FK; bilingual text; logic in `services.py`; spec before code.
+
+| # | Date | Who | Decision |
+| --- | --- | --- | --- |
+| — | 2026-10-16 | Caller (task brief) | Scope: e-invoicing layer only. Business documents are in `invoicing.md`. Tests use mocks/fixtures of the ZATCA sandbox/simulation only. This module creates no journal entries. (Secret storage: now D-3.) |
+| D-1 | 2026-10-16 | Project owner | Build in-house with open-source libraries. Not yet live on Phase 2; must be ready. Go-live date still open (OQ-1), non-blocking for build. |
+| D-2 | 2026-10-16 | Project owner | No entity is in a VAT group: each entity is a separate VAT taxpayer. **Confirmed:** each subsidiary is its own company with its own VAT number and its own EGS unit(s); partly-owned and minority-stake entities are also separate taxpayers issuing their own invoices. Intercompany invoices are normal VAT invoices (standard, clearance) with the counterparty entity carried. |
+| D-3 | 2026-10-16 | Project owner | Secret store: **OpenBao** (open source), hosted in KSA. The Managing Partner holds the master key and can delegate access to named key custodians. Delegation is **per entity, logged and revocable** (R-41). The ERP stores references only. |
+| D-4 | 2026-10-16 | Project owner | A rejected invoice is corrected and re-issued under a new number; the rejected number stays used (R-42). |
+| D-5 | 2026-10-16 | Project owner | All hosting in KSA: DB, archive, backups, logs, secret store (R-43). PDPL offshore processors still need legal sign-off (invoicing OQ-31). |
+| D-6 | 2026-10-16 | Project owner | Multi-currency invoices are in scope (invoicing D13, `ledger-fx.md`); VAT amounts for ZATCA are also expressed in SAR (R-40). |
+| D-7 | 2026-10-16 | Project owner | Almiras: one branch (Jeddah), one EGS unit; identity and national address as in `invoicing.md` §3.0 (setup data only, never fixtures); VAT returns quarterly. |
+| D-8 | 2026-10-16 | Project owner | Sales posting is automatic after CFO approval and ZATCA clearance/reporting (invoicing D17): `invoicing` posts only on `cleared*` / `reported*`, for both categories (§5). |
+| D-9 | 2026-10-16 | Project owner | Safe defaults in §9 not contradicted by D-1 to D-8 are approved: OQ-4 (refined by D-7), OQ-7 (expert sign-off still open), OQ-8, OQ-9, OQ-10, OQ-11, OQ-13, OQ-14, OQ-15, OQ-16, OQ-18, OQ-19, OQ-21. |
 
 Everything else is listed in §9 Open questions. The 2026-10-16 compliance review is a technical input, not a business decision; its proposals that need approval (e.g. data residency) are in §9.
 
@@ -33,10 +43,10 @@ All models: `entity = FK(core.Entity, on_delete=PROTECT)`, required. `created_at
 | --- | --- | --- | --- | --- |
 | entity | OneToOne(Entity) | Y | — | One profile per entity |
 | vat_number | read from `Entity.vat_number` | Y | — | Not duplicated; profile cannot be enabled if blank. Format **[CC-verify]**: 15 digits, starts and ends with 3 |
-| legal_name_en / legal_name_ar | Char(200) | Y | Y | Seller name on XML/QR; default from `Entity.name_en/ar` |
-| seller_id_scheme / seller_id_value | Char | Y | — | e.g. CRN (from `Entity.cr_number`) **[CC-verify]** allowed schemes |
-| address: building_no, street_en/ar, district_en/ar, city_en/ar, postal_code, additional_no, country (default SA) | Char | Y | Y (names) | Saudi national address fields **[CC-verify]** required set |
-| vat_group | FK(VatGroup), null | N | — | Only if VAT-group registration is confirmed (OQ-5) |
+| legal name en/ar | read from `Entity.legal_name_en/_ar` | Y | Y | Seller name on XML/QR; not duplicated (D-7) |
+| seller_id_scheme / seller_id_value | Char | Y | — | Default CRN = `Entity.cr_number`; `700` = `Entity.unified_number` is the alternative (OQ-24) **[CC-verify]** allowed schemes |
+| address | read from `Entity` national-address fields (`invoicing.md` §3.0) | Y | Y (names) | Not duplicated (OQ-12 hand-off). Required set **[CC-verify]** |
+| vat_group | *Withdrawn — see Decision D-2* (no VAT groups) | | | |
 | environment | Choice: `sandbox`, `simulation`, `production` | Y | — | Default `sandbox`. `production` settable only by permission in §7 and only outside test settings |
 | go_live_date | Date, null | N | — | Wave date for this entity (OQ-1). Null = not live; documents are not submitted |
 | is_enabled | Bool | Y | — | Default False |
@@ -55,7 +65,7 @@ All models: `entity = FK(core.Entity, on_delete=PROTECT)`, required. `created_at
 | status | Choice: `draft`, `csr_ready`, `compliance_csid`, `compliance_passed`, `active`, `renewal_due`, `expired`, `revoked` | Y | — | See R-5 |
 | last_icv | PositiveBigInteger | Y | — | Default 0. Updated only by `services.stamp_document` |
 | last_invoice_hash | Char(64+), | Y | — | PIH for next document. Initial value **[CC-verify]**: base64 of SHA-256 of the string "0". The sandbox skips the PIH check on single-XML validation, so a sandbox pass does not prove this seed |
-| private_key_ref | Char | Y once `csr_ready` | — | **Reference** to a secret store entry, never the key (OQ-3) |
+| private_key_ref | Char | Y once `csr_ready` | — | **Reference** to an OpenBao path, never the key (D-3), e.g. `zatca/<entity.code>/<egs.code>/private_key` |
 
 Constraint: unique (`entity`, `code`).
 
@@ -68,7 +78,7 @@ Constraint: unique (`entity`, `code`).
 | kind | Choice: `compliance`, `production` | Y | |
 | environment | Choice: `sandbox`, `simulation`, `production` | Y | Environment that issued it; usable only there (R-36) |
 | certificate_pem | Text | Y | Public certificate; not secret |
-| secret_ref | Char | Y | Reference to the API secret in the secret store (OQ-3) |
+| secret_ref | Char | Y | Reference (OpenBao path + version) to the CSID API secret (D-3) |
 | zatca_request_id | Char | Y | Returned by ZATCA on issue **[CC-verify]** |
 | valid_from / valid_to | DateTime | Y | Parsed from the certificate |
 | status | Choice: `active`, `superseded`, `expired`, `revoked` | Y | |
@@ -135,7 +145,7 @@ Append-only: no update or delete after `finished_at` is set.
 
 ### 3.7 `OnboardingEvent` (audit)
 
-`entity`, `egs_unit`, `action` (csr_generated, otp_entered, otp_rejected, compliance_csid_issued, compliance_checks_passed, pcsid_issued, pcsid_renewed, revoked, environment_changed), `actor`, `at`, `detail` JSON (never secrets, never OTP values). Append-only.
+`entity`, `egs_unit`, `action` (csr_generated, otp_entered, otp_rejected, compliance_csid_issued, compliance_checks_passed, pcsid_issued, pcsid_renewed, revoked, environment_changed, delegation_granted, delegation_revoked), `actor`, `at`, `detail` JSON (never secrets, never OTP values). Append-only.
 
 ### 3.8 `ComplianceTask` (human follow-up)
 
@@ -153,6 +163,22 @@ Append-only: no update or delete after `finished_at` is set.
 
 Cannot be deleted; `done` is final.
 
+### 3.9 `KeyCustodianDelegation` (D-3; register of who may access an entity's ZATCA secrets)
+
+| Field | Type | Req | Notes |
+| --- | --- | --- | --- |
+| entity | FK(Entity) | Y | Delegation is per entity, never group-wide |
+| custodian | FK User | Y | Named person |
+| scope | Choice: `onboard_renew` (generate CSR, write key/secret), `revoke`, `restore` | Y | |
+| granted_by | FK User | Y | The Managing Partner (or as OQ-25 decides) |
+| granted_at / valid_until | DateTime / DateTime, null | Y / N | |
+| openbao_policy_ref | Char | Y | Name of the OpenBao policy/entity alias granted; no token or secret |
+| revoked_at / revoked_by / revoke_reason | DateTime / FK User / Char | N | Set once; revocation is final |
+
+Append-only except the single revocation write. Each grant and revocation also writes an `OnboardingEvent`-style audit row (`delegation_granted`, `delegation_revoked`).
+
+**What the ERP stores about secrets (D-3):** only OpenBao paths and versions (`private_key_ref`, `secret_ref`), policy names (`openbao_policy_ref`), the OpenBao address (configuration) and the ERP's own OpenBao auth role name (configuration). Never keys, CSID secrets, OTPs, tokens, unseal keys or the master key.
+
 ## 4. Rules
 
 Enforcement column: **S** = `zatca/services.py`; **M** = model `save`/`delete` guard; **DB** = database constraint; **Q** = queryset/permission filter; **T** = test settings guard.
@@ -164,7 +190,7 @@ Enforcement column: **S** = `zatca/services.py`; **M** = model `save`/`delete` g
 | R-3 | All views/APIs list `zatca` records filtered by entity and user permission. | Q |
 | R-4 | A profile cannot be enabled while `Entity.vat_number` or a required address field is blank. | S |
 | R-5 | EGS status transitions only along: draft → csr_ready → compliance_csid → compliance_passed → active ⇄ renewal_due → expired; any → revoked. No skipping. | S |
-| R-6 | A key pair is generated inside the ERP per EGS unit; the private key is written only to the secret store and the DB holds only `private_key_ref`. Private keys, CSID secrets and OTPs never appear in the DB, logs, `OnboardingEvent.detail`, error messages or fixtures. | S + test that scans logs/DB dumps |
+| R-6 | A key pair is generated inside the ERP per EGS unit; the private key is written only to the secret store (OpenBao, D-3) and the DB holds only `private_key_ref`. Private keys, CSID secrets and OTPs never appear in the DB, logs, `OnboardingEvent.detail`, error messages or fixtures. | S + test that scans logs/DB dumps |
 | R-7 | The OTP is entered by a human with the onboarding permission; it is used once and not stored. OTP validity is about 1 hour **[CC-verify: search excerpt 2026-10-16]** (shown as a hint on the form). If ZATCA rejects the OTP as expired or invalid, the request fails, EGS status is unchanged, an `otp_rejected` event is logged (no OTP value), a bilingual message asks for a new OTP, and the ERP never resubmits the same OTP. | S |
 | R-8 | An EGS unit becomes `active` only after all required compliance checks for its supported document types pass **[CC-verify]** (set of sample documents per type) and a PCSID is issued. | S |
 | R-9 | A document can be stamped only by an `active` EGS unit holding a non-expired production credential (or the matching compliance credential in `compliance_check` mode). | S |
@@ -188,7 +214,7 @@ Enforcement column: **S** = `zatca/services.py`; **M** = model `save`/`delete` g
 | R-27 | Submission is serialised per EGS unit in ICV order for clearance; a document is not submitted while an earlier ICV of the same unit is still `queued`/`submitting` **[CC-verify]** whether ZATCA requires ordering. | S (queue worker) |
 | R-28 | Documents of an entity whose `go_live_date` is null or in the future are not submitted; `invoicing` must treat them per pre-Phase-2 rules (OQ-1). | S |
 | R-29 | Only the integration layer's ZATCA client performs HTTP calls. In test settings the client is replaced by a mock; any attempt to reach a real ZATCA host from tests fails. `environment=production` cannot be set when `settings.TESTING` or an agent service user is the actor. | S + T |
-| R-30 | Archive (signed XML, cleared XML, responses, attempts, messages) is kept until `retention_until` (R-38) and cannot be purged earlier. No purge job is enabled (OQ-8). Storage location: OQ-20 (proposed default, needs approval). | S + M |
+| R-30 | Archive (signed XML, cleared XML, responses, attempts, messages) is kept until `retention_until` (R-38) and cannot be purged earlier. No purge job is enabled (OQ-8). Storage location: KSA (D-5, R-43). | S + M |
 | R-31 | Amounts in XML are taken from the `invoicing` document as `Decimal`. VAT per category is computed at **document level** (round(taxable amount per category × rate, 2)) by `invoicing`; line VAT is for display only **[CC-verify: search excerpt 2026-10-16]**. Locally the module rejects a document whose header net ≠ sum of line net amounts, whose category VAT ≠ round(category taxable amount × rate), or whose line VAT deviates from the document VAT beyond the tolerance in ZATCA's BR-KSA rules **[CC-verify]**. Never floats. | S |
 | R-32 | Sharia: this module does not validate Sharia compliance; it accepts only documents that `invoicing` has already validated (including Sharia checks). It has no path to issue a document that bypasses `invoicing` services. | S (single entry point `submit_document`) |
 | R-33 | Bilingual: seller name/address in Arabic are always present in XML; buyer-facing invoice output (PDF in `invoicing`) is Arabic, optionally with English **[CC-verify]** Arabic requirement. All statuses, errors and UI labels have en/ar. | S + translations |
@@ -197,7 +223,11 @@ Enforcement column: **S** = `zatca/services.py`; **M** = model `save`/`delete` g
 | R-36 | A credential is usable only in the environment that issued it: sandbox/simulation CSIDs work only in their environment **[CC-verify: search excerpt 2026-10-16]**; stamping/submitting requires `credential.environment == profile.environment`. Changing environment requires new onboarding. | S |
 | R-37 | The QR base64 string is at most 700 characters (Security Features Std v1.2; an older guide said 500) **[CC-verify: search excerpt 2026-10-16]**. Longer → stamping transaction rolls back (no ICV consumed), bilingual error. | S |
 | R-38 | `retention_until` is computed per record: end of the tax period containing `issue_datetime` + at least 6 years for `standard`; + 15 years (cited) for `capital_asset_real_estate` **[CC-verify: search excerpt 2026-10-16]**. `invoicing` sets the class to `capital_asset_real_estate` when any line uses account 1510 (investment property) or the document is rent on investment property (default per OQ-8). A record's `retention_until` is never shortened. | S + M |
-| R-39 | Type 386 prepayment invoices are in scope, standard and simplified, submitted like 388. A 388 that settles prepayments references its 386 documents (same entity, same buyer) and shows the prepaid amounts and VAT as deducted **[CC-verify]** (fields and BR-KSA rules). Produced only by the `invoicing` advances flow (invoicing OQ-16). | S |
+| R-39 | Type 386 prepayment invoices are in scope, standard and simplified, submitted like 388. A 388 that settles prepayments references its 386 documents (same entity, same buyer) and shows the prepaid amounts and VAT as deducted **[CC-verify]** (fields and BR-KSA rules). Produced only by the `invoicing` advances flow (invoicing R65, D15). | S |
+| R-40 | Documents may be in any currency (D-6). The XML carries amounts in the document currency and, when it is not SAR, the VAT total also in SAR, taken from `invoicing` (`total_vat_sar`); the SAR amount is never recomputed here. The exact ZATCA rule (second TaxTotal in SAR, rate representation, QR tags 4/5 currency) is **[CC-verify]**. A non-SAR document without a SAR VAT amount is rejected locally (no ICV consumed). | S |
+| R-41 | Onboarding, renewal, revocation and restore actions for an entity need, besides the §7 role, an active `KeyCustodianDelegation` for that entity and scope. The ERP's runtime signing identity in OpenBao reads only the paths of entities it signs for. Grants and revocations are logged; a revoked delegation blocks the next action at once. | S + OpenBao policy |
+| R-42 | After `rejected`, the corrected document is a new `EInvoice` for a new `invoicing` document with a new number, UUID and ICV; the rejected number and UUID are never reused (D-4). Whether the rejected document's hash stays in the PIH chain follows the official standard **[CC-verify]**; until verified the chain continues from the last stamped document, including rejected ones. | S |
+| R-43 | Database, archive, backups, logs and the secret store run in KSA (D-5). Configuration pointing any of them to a non-KSA host is a deployment error caught by the release checklist. | Process + code-reviewer |
 
 ## 5. Accounting
 
@@ -208,11 +238,12 @@ What `invoicing` must and must not do based on this module's status:
 | Case | `invoicing` must not | `invoicing` may |
 | --- | --- | --- |
 | Standard (B2B) invoice/note, status before `cleared*` | Post the journal entry, mark as issued, send to buyer, count it in AR ageing or VAT returns | Keep it as "awaiting clearance" |
-| Standard, `rejected` | Post or issue it; reuse its number/UUID/ICV | Cancel it and create a new corrected document (new ICV) — OQ-6 |
+| Standard, `rejected` | Post or issue it; reuse its number/UUID/ICV | Create a new corrected document under a new number (new UUID, ICV); the rejected number stays used (D-4, R-42) |
 | Standard, `failed_final` (could not reach ZATCA) | Post or issue it | Await human decision (OQ-7) |
 | Standard, `cleared*` | Edit it | Post it (date = issue date), issue the **cleared** XML/QR to buyer |
-| Simplified (B2C), `stamped` onward | Edit it | Post and issue at stamping |
-| Simplified, `rejected` after issue | Edit or delete the posted entry | Correction per OQ-6 (likely credit note + new invoice via `reverse_entry`) |
+| Simplified (B2C), `stamped` / `queued` / `submitting` | Edit it; post the journal entry (D-8) | Give the stamped document to the buyer (issued at stamping, R-23) |
+| Simplified, `reported*` | Edit it | Post it (D-8) |
+| Simplified, `rejected` after hand-over to the buyer | Edit it; post its draft entry | Re-issue a corrected document under a new number (D-4); no GL effect to reverse since nothing was posted. Whether the buyer copy also needs a credit note **[CC-verify]** (OQ-6 remainder) |
 | 386 prepayment | Treat differently from 388 for issue/post timing | Same rows as above by category; its accounts are set in `invoicing.md` (OQ-16, OQ-22 there) |
 
 ## 6. Integrations
@@ -227,13 +258,14 @@ All calls go through the integration layer (`integrations/zatca/client.py` — l
 | ZATCA — clearance API **[CC-verify]** | Signed XML (base64), invoice hash, UUID | Status, cleared XML (ZATCA-stamped), warnings/errors |
 | ZATCA — reporting API **[CC-verify]** | Signed XML, invoice hash, UUID | Status, warnings/errors |
 | `invoicing` app (internal) | `is_issued`, status, cleared XML, QR, messages | Validated document via `zatca.services.submit_document(doc, user)` |
-| Secret store (OQ-3) | Private key, CSID secret (write once) | Same (read at signing/submission only) |
+| Secret store: OpenBao, hosted in KSA (D-3, D-5) | Private key, CSID secret (write once, under custodian delegation R-41) | Same (read at signing/submission only, by the ERP signing identity) |
+| `ledger-fx` (via `invoicing`) | None | SAR VAT amounts on non-SAR documents (R-40) |
 | ZATCA website — late-reporting notification form **[CC-verify: search excerpt 2026-10-16]** | None automated: filed manually by the entity's ZATCA admin (R-35) | Reference/screenshot uploaded to `ComplianceTask` |
 | Banks, GOSI, Mudad, SAP B1 | None | None |
 
 Environments: sandbox (developer portal), simulation, production **[CC-verify]** names and base URLs; URLs are configuration, not code.
 
-Candidate open-source libraries (options, not decisions — OQ-11):
+Open-source libraries (in-house build, D-1; default set approved by D-9 / OQ-11):
 
 | Need | Options |
 | --- | --- |
@@ -259,6 +291,8 @@ Role names are provisional (no role model exists yet; OQ-14). All grants are **p
 | View e-invoices, XML, messages | Yes | Yes | Own documents | Yes (read-only) | — | Status only, if granted |
 | Download archive / export | Yes | Yes | No | Yes | No | No |
 | Close a `late_reporting_notice` task | Yes | No | No | View only | Opens it only | No |
+| Key actions (CSR/key write, renew, revoke, restore) | Only with an active `KeyCustodianDelegation` for the entity and scope (R-41) | No | No | No | No | No |
+| Grant / revoke key custodian delegation | Managing Partner only (holds the master key, D-3) | No | No | No | No | No |
 
 ## 8. Acceptance tests
 
@@ -307,6 +341,11 @@ All tests use fixtures, a fake entity pair (`TST1`, `TST2`, made-up VAT numbers)
 | AT-39 | Seller name long enough that QR base64 = 701 chars | Stamp | Rejected; transaction rolled back; `last_icv` unchanged. 700 chars passes (R-37) |
 | AT-40 | Issue date 2027-03-10, monthly tax period; doc A lines on 4200; doc B line on 1510 | Stamp | A: `retention_until` = 2033-03-31; B: class `capital_asset_real_estate`, 2042-03-31 (R-38) |
 | AT-41 | Cleared 386 for buyer X in TST1 | Final 388 references it; then a 388 in TST2 references it | First: XML carries prepayment reference and deduction; second rejected (R-39, R-1) |
+| AT-42 | TST1 USD invoice with `total_vat_sar` 562.50; a second USD invoice without it | Stamp | First: XML has VAT total in USD and in SAR 562.50 (shape per verified rule); second rejected locally, `last_icv` unchanged (R-40) |
+| AT-43 | Admin A with delegation `onboard_renew` for TST1 only; then the delegation is revoked | A generates CSR for TST1, then for TST2; after revocation A renews TST1 | TST1 CSR allowed; TST2 rejected; after revocation rejected; `delegation_granted` / `delegation_revoked` events exist with no secret values (R-41, D-3) |
+| AT-44 | Standard invoice INV-1 rejected by the mock | `invoicing` creates the correction | New document with new number, UUID and ICV; INV-1's number and UUID never reused (R-42) |
+| AT-45 | TST1 with full national address on `Entity`, profile enabled | Stamp a document | Seller name/address in XML come from `Entity` §3.0 fields in ar (and en where allowed); no address fields exist on `ZatcaProfile` (3.1) |
+| AT-46 | Intercompany standard invoice TST1 → TST2 (TST2 as buyer) | Submit | Sent for clearance as a normal B2B invoice with TST2's VAT number as buyer; signed with TST1's EGS only (D-2, R-2) |
 
 ## 9. Open questions
 
@@ -314,26 +353,30 @@ All tests use fixtures, a fake entity pair (`TST1`, `TST2`, made-up VAT numbers)
 
 | # | Question | Blocks? | Safe default if D |
 | --- | --- | --- | --- |
-| OQ-1 | Which entities are in which ZATCA integration wave, and their go-live dates? What does `invoicing` do for an entity before its go-live (Phase 1 only)? | D for build, B for go-live | `go_live_date` null → no submission; Phase 1 QR generated by `invoicing` |
-| OQ-2 | Build in-house (this spec) vs connect to an external ZATCA middleware/provider through the integration layer? | **B** | — |
-| OQ-3 | Secret storage for private keys and CSID secrets: HashiCorp Vault / OpenBao, PostgreSQL with envelope encryption (key from env/KMS), HSM, or OS keyring? Who holds the master key; backup/restore? | **B** | (dev/tests: in-memory fake store only) |
-| OQ-4 | How many EGS units per entity (one per entity, per branch, per POS/till, per server)? | D | One EGS unit per entity |
-| OQ-5 | Are any group entities registered as a VAT group (shared VAT number)? If so, whose name/VAT appears on invoices and how are EGS units assigned? | **B** if yes; D if all registered separately | Each entity has its own VAT number |
-| OQ-6 | Correction path after rejection: for B2B, cancel and re-issue as a new document; for B2C already issued and posted, credit note + new invoice or resubmit corrected? Does a rejected document stay in the PIH chain? **[CC-verify]** | **B** | — |
-| OQ-7 | Behaviour when ZATCA is unreachable for B2B clearance for an extended time. A guideline excerpt suggests a fallback may exist **[CC-verify: search excerpt 2026-10-16]**. **Needs expert sign-off** (tax adviser). | D | Wait; never issue uncleared; alert |
-| OQ-8 | Retention: confirm 6 years / 15 years and the start point **[CC-verify: search excerpt 2026-10-16]**; which records are `capital_asset_real_estate` (default: any line on 1510, and rent invoices for investment property); where each entity's tax-period frequency (monthly/quarterly) is held; who may approve purging. Location moved to OQ-20. | D | R-38 computation; no purge job enabled |
+| OQ-1 | Which entities are in which ZATCA integration wave, and their go-live dates? What does `invoicing` do for an entity before its go-live (Phase 1 only)? | D for build, **B for go-live** | Default approved (D-9): `go_live_date` null → no submission; Phase 1 QR generated by `invoicing`. Almiras not yet live; must be ready (D-1); date open |
+| OQ-2 | Build in-house (this spec) vs connect to an external ZATCA middleware/provider through the integration layer? | — | **Resolved by D-1**: in-house, open source |
+| OQ-3 | Secret storage for private keys and CSID secrets; who holds the master key; backup/restore? | D for build, **B for go-live** (remainder) | **Resolved by D-3**: OpenBao in KSA, Managing Partner master key, per-entity delegation (3.9, R-41). Still open: unseal model (sole holder vs Shamir shares among custodians vs KSA-hosted auto-unseal) so a restart does not stop signing and B2C 24 h reporting while the Managing Partner is unavailable; OpenBao backup/restore and DR test. Dev/tests: in-memory fake store only |
+| OQ-4 | How many EGS units per entity (one per entity, per branch, per POS/till, per server)? | D | Resolved by D-7 / D-9: Almiras 1 (one branch); other entities default one per branch (invoicing OQ-35) |
+| OQ-5 | Are any group entities registered as a VAT group (shared VAT number)? | — | **Resolved by D-2**: no VAT group; each entity (incl. associates and minority holdings) has its own VAT number and EGS unit(s) |
+| OQ-6 | Correction path after rejection; does a rejected document stay in the PIH chain? **[CC-verify]** | D | **Resolved by D-4**: corrected and re-issued under a new number; rejected number stays used (R-42). Remainder **[CC-verify]**: PIH chain treatment (default R-42) and whether a delivered simplified copy also needs a credit note |
+| OQ-7 | Behaviour when ZATCA is unreachable for B2B clearance for an extended time. A guideline excerpt suggests a fallback may exist **[CC-verify: search excerpt 2026-10-16]**. **Needs expert sign-off** (tax adviser). | D | Default approved (D-9): wait; never issue uncleared; alert. Expert sign-off still open |
+| OQ-8 | Retention: confirm 6 years / 15 years and the start point **[CC-verify: search excerpt 2026-10-16]**; which records are `capital_asset_real_estate`; who may approve purging. | D | Default approved (D-9): R-38; no purge job. Tax-period frequency now held on `Entity.vat_return_period` (Almiras quarterly, D-7) |
 | OQ-9 | Renewal lead time N and PCSID validity length **[CC-verify]**. | D | N = 30 days |
 | OQ-10 | Retry policy limits and alert recipients. | D | R-24 defaults; alert entity ZATCA admins |
 | OQ-11 | Library choice for signing, C14N, schematron and QR (§6 options). Is the ZATCA SDK acceptable in CI only? | D | `cryptography` + `lxml` + `segno`; schematron choice deferred to builder with reviewer sign-off |
-| OQ-12 | Exact handover contract with `invoicing.md`: model name(s), who assigns the human invoice number, when `submit_document` is called, buyer data fields. | **B** (needs `invoicing.md` final) | — |
+| OQ-12 | Exact handover contract with `invoicing.md`: model name(s), who assigns the human invoice number, when `submit_document` is called, buyer data fields; ownership of ICV/PIH/hash/QR fields (invoicing OQ-2). | **B** | — (seller data now settled: read from `Entity`, D-7) |
 | OQ-13 | 386 prepayment is now in scope (R-39), linked to `invoicing.md` advances (OQ-16 there). Still open: export, third-party, nominal, summary, self-billed invoices. | D | 388/381/383/386 standard and simplified only |
 | OQ-14 | Role model and approvers: who is ZATCA admin per entity; is a second approver needed to switch to production or revoke? | D | Superuser only for onboarding; second approver required for production |
 | OQ-15 | Offline B2C behaviour: may a POS/branch issue simplified invoices while offline and report later within 24 h; local stamping on device or central server? | D | Central server stamping only; no offline POS |
 | OQ-16 | Arabic translations of ZATCA error codes: who maintains the table? | D | Show English text with Arabic "untranslated" label |
-| OQ-17 | Intercompany invoices between group entities (rentals, IP, secondments): standard B2B clearance with counterparty entity as buyer — confirm no special treatment, and VAT-group effect (OQ-5). | D | Treated as normal B2B |
+| OQ-17 | Intercompany invoices between group entities: confirm no special treatment. | — | **Resolved by D-2**: normal B2B clearance, counterparty entity as buyer (AT-46) |
 | OQ-18 | Time source and timezone for `issue_datetime` (server NTP, Asia/Riyadh) and tolerance ZATCA accepts **[CC-verify]**. | D | Server UTC stored, Asia/Riyadh rendered |
 | OQ-19 | Should the module back-fill Daftra-era invoices? (Likely no; confirm with migration plan.) | D | No back-fill |
-| OQ-20 | Data residency. **Proposed default, needs approval** (Managing Partner + legal, PDPL): DB, archive, backups, logs and secret store all hosted in KSA. | D for build, **B for go-live** | Dev/test: fixtures only, no real data |
-| OQ-21 | Late-reporting notice (R-35): who files the ZATCA website form per entity, and what evidence is kept. | D | Entity ZATCA admin; date + reference + screenshot on the task |
+| OQ-20 | Data residency. | — | **Resolved by D-5**: DB, archive, backups, logs and secret store in KSA (R-43). PDPL offshore processors: legal sign-off still open (invoicing OQ-31, go-live) |
+| OQ-21 | Late-reporting notice (R-35): who files the ZATCA website form per entity, and what evidence is kept. | D | Default approved (D-9) |
+| OQ-22 | ZATCA rule for VAT in SAR on non-SAR invoices (R-40) **[CC-verify]**. | D | SAR VAT total from `invoicing`; local rejection if missing |
+| OQ-23 | *Withdrawn — see Decision D-2* (subsidiaries' own VAT numbers and EGS units: confirmed). | — | — |
+| OQ-24 | Seller ID scheme on XML: `CRN` (branch CR) or `700` (unified number) **[CC-verify]** (invoicing OQ-33). | D | `CRN` from `Entity.cr_number` |
+| OQ-25 | Who may grant delegations if the Managing Partner is unavailable; maximum delegation length. | D | Managing Partner only; no expiry unless `valid_until` set |
 
-**Before building:** compliance-checker verifies every **[CC-verify]** item against the official documents (the 2026-10-16 review used search excerpts only); OQ-2, OQ-3, OQ-5, OQ-6 and OQ-12 are answered by the Managing Partner / accountant and recorded in §2 with dates. **Before go-live:** OQ-1, OQ-20, and expert sign-off on OQ-7.
+**Before building:** compliance-checker verifies every **[CC-verify]** item against the official documents (the 2026-10-16 review used search excerpts only); OQ-12 (hand-off contract with `invoicing.md`) is the only remaining build blocker. **Before go-live:** OQ-1 (go-live date), OQ-3 remainder (OpenBao unseal/backup), expert sign-off on OQ-7, PDPL legal sign-off (invoicing OQ-31).

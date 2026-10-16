@@ -539,28 +539,30 @@ Plus an `is_control` flag on 1200, 2100, 1210, 2110 (and 2310, 2320) to block ma
 
 ## 7. Permissions
 
-No entity-scoped role model exists in `core` yet (OQ-25). The proposed roles below are defaults, granted **per entity**. A user who is AP Clerk in ALM and Viewer in SUB has exactly those rights in each.
+Business roles decided by D17: accounting staff create, the CFO approves, posting is automatic. Roles are granted **per entity** (a user who is AP Clerk in ALM and Viewer in SUB has exactly those rights in each). The `core` user × entity × role model is still to be built (OQ-25). "CFO" = the entity's approver role (OQ-42 for delegation).
 
-| Action | AR Clerk | AP Clerk | Accountant | Approver | Viewer / Auditor | Agent service user |
-|---|---|---|---|---|---|---|
-| Create/edit customer or vendor | C (customer) | C (vendor) | Y | | | |
-| Create/edit draft sales document | Y | | Y | | | Draft only, if granted |
-| Issue sales invoice or debit note | | | Y | Y | | No |
-| Issue credit note | | | Y (approval OQ-7) | Y | | No |
-| Create/submit draft bill | | Y | Y | | | Draft only |
-| Approve bill | | | | Y (not own) | | No |
-| Post bill / reverse bill | | | Y | | | No |
-| Post receipt or payment | Y (receipt) | | Y | Y (payment) | | No |
-| Allocate / un-allocate | Y | Y | Y | | | No |
-| View documents and reports | Y | Y | Y | Y | Y | Scoped |
-| View/export individuals' personal data (R51) | Y (logged) | Y (vendor, logged) | Y (logged) | | Masked unless granted | No |
-| Post purification transfer / payout (R54) | | | Y | Y (payout) | | No |
+| Action | AR Clerk | AP Clerk | Accountant | CFO (approver) | Viewer / Auditor | Billing system user | Agent service user |
+|---|---|---|---|---|---|---|---|
+| Create/edit customer or vendor | C (customer) | C (vendor) | Y | | | | |
+| Create/edit/submit draft sales document | Y | | Y | | | | Draft only, if granted |
+| Approve (= issue) sales invoice, debit note, credit note, 386 (R57) | | | | Y (not own) | | | No |
+| Create sales document from billing item (R60) | | | | | | Y | No |
+| Create/submit draft bill or vendor payment | | Y | Y | | | | Draft only (bills) |
+| Approve (= post) bill or vendor payment (R58, R59) | | | | Y (not own) | | | No |
+| Reverse bill, receipt or payment | | | Y | | | | No |
+| Post receipt (R33) | Y | | Y | | | | No |
+| Allocate / un-allocate | Y | Y | Y | | | | No |
+| Maintain WHT categories, treaty certificates (verify) | | Y (enter) | Y (verify) | | | | No |
+| Set `InvoicingSettings` (incl. `deposit_vat_treatment` after sign-off) | | | | Y | | | No |
+| View documents and reports | Y | Y | Y | Y | Y | | Scoped |
+| View/export individuals' personal data (R51) | Y (logged) | Y (vendor, logged) | Y (logged) | Y (logged) | Masked unless granted | | No |
+| Post purification transfer / payout (R54) | | | Y | Y (payout) | | | No |
 
-Segregation of duties (creator ≠ approver) is on by default and configurable per entity (OQ-5).
+Segregation of duties (creator ≠ approver) is on by default and configurable per entity (D19, OQ-5).
 
 ## 8. Acceptance tests
 
-Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, Sharia enforced), each with the template chart and 2027 periods. Customers and vendors are anonymised. All amounts are Decimal.
+Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, Sharia enforced), each with the template chart and 2027 periods, made-up VAT/CR numbers and national addresses (never the D10 values), users per role. Customers and vendors are anonymised. All amounts are Decimal. From D17, "Issue" in AT-1 to AT-45 means CFO approval of a submitted document, and "Post" of a bill or payment means CFO approval.
 
 | # | Given | When | Then |
 |---|---|---|---|
@@ -577,20 +579,20 @@ Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, 
 | AT-11 | Credit or debit note without reason, with an English-only reason, or referencing another customer's invoice | Issue | Rejected. With `reason_ar` only: accepted. |
 | AT-12 | ALM (Sharia enforced) bill line on 5610 conventional interest | Save line / post | Rejected "Sharia-prohibited". Same bill in an entity with `sharia_enforced=False`: posts. |
 | AT-13 | Invoice line on 4900 non-compliant income | Final | Posts. Document `requires_purification=True`. Appears on the purification report. |
-| AT-14 | Line `unit_price` given as float `0.1`, or currency `USD` on an ALM (SAR) document | Save | Rejected. |
+| AT-14 | *Withdrawn — see Decision D13 (float case now AT-46; USD now AT-47).* | | |
 | AT-15 | VatRate S 15% valid from 2020-07-01; line category E with no exemption reason | Save | Rejected. With a reason: VAT 0.00 and no 2200 line in the JE. |
 | AT-16 | Entity with blank `vat_number`, invoice with an S line | Issue | Rejected. |
 | AT-17 | Invoice dated in a closed period (2027-01 closed) | Issue | Rejected "Period … is closed". Document stays draft, no number used, no JE. |
 | AT-18 | Issued standard invoice, ZATCA stub `pending` | Try to allocate a receipt, or post the JE | Allocation rejected. JE is still draft. After the stub returns `cleared_with_warnings`: JE posted, status `final`. |
 | AT-19 | Issued invoice, ZATCA stub `rejected` | Callback | Status `rejected`. Draft JE deleted. Number not reused. Trial balance unchanged. |
 | AT-20 | ALM customer with `group_entity`=SUB | Invoice final | JE has 1210 with counterparty SUB. `intercompany_balances` shows (ALM, SUB). A customer with `group_entity`=ALM in ALM: rejected. |
-| AT-21 | Bill submitted by user U | U approves | Rejected (segregation). Approver V approves, accountant posts: JE as E7. |
+| AT-21 | *Withdrawn — see Decision D17 (now AT-52).* | | |
 | AT-22 | Bill created with `source=agent:invoice-reader` | Agent calls submit or post | Rejected. Stays draft. |
 | AT-23 | Posted bill, vendor X, vendor number "A-17" | Second bill with the same vendor and number | Rejected as duplicate. Allowed after the first is reversed. |
 | AT-24 | Posted bill in 2027-02 (now closed), no allocations | Reverse | `reverse_entry` called with a date in the open 2027-03. Bill `reversed`. Balances net to zero. A bill with an allocation: reversal rejected. |
 | AT-25 | Bill from a resident vendor with no VAT number, S line 1,000 + 150 | Post | E8: Dr expense 1,150.00 / Cr 2100 1,150.00. No 1310 line. |
 | AT-26 | Bill from a non-resident vendor, services 10,000 S | Post | JE as E9. AP open 10,000.00. |
-| AT-27 | Non-resident vendor bill posted | Post payment | Rejected pending the WHT decision (OQ-8). |
+| AT-27 | *Withdrawn — see Decision D14 (now AT-54 to AT-58).* | | |
 | AT-28 | Posted receipt with an allocation | Reverse | Rejected. After un-allocation: reversal posts, status `reversed`. |
 | AT-29 | Receipt 5,000 for customer A; invoice for customer B; invoice of SUB | Allocate | Both rejected. Allocation above the open amount rejected. |
 | AT-30 | Allocation row | Edit or delete | Rejected. Un-allocate creates a negative row. Open amounts are restored. |
@@ -604,11 +606,26 @@ Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, 
 | AT-38 | VAT-registered business customer | Issue as `simplified` with gross 1,000.00; then 999.99 | First rejected; second allowed (R48, threshold pending verification). |
 | AT-39 | Resident vendor with VAT number; bill lines each net 1,000 + VAT 150: `taxable`, `exempt`, `mixed`; no ratio approved | Post | Dr expense 1,000 + Dr 1310 150; Dr expense 1,150; Dr expense 1,150; Cr 2100 3,450.00 (R29). |
 | AT-40 | Non-resident vendor, no VAT number: line A services S 10,000 `taxable`; line B goods 5,000 | Post | Line A as E9 (Dr 1310 1,500 / Cr 2200 1,500) despite no VAT number. Line B: Dr expense 5,000, no RC lines. AP 15,000.00 (R30). |
-| AT-41 | ALM customer | Post receipt with `purpose=advance`, then `deposit`, then `settlement` with no allocation | First two rejected "blocked until prepayment invoice flow" (en/ar). Third posts and shows as unallocated (R38, R55). |
+| AT-41 | *Withdrawn — see Decision D15 (now AT-59, AT-60).* | | |
 | AT-42 | Simplified invoice to an individual; user enters `other_id` | Issue | Snapshot has no `other_id`; the field is not stored (R50). |
 | AT-43 | Test setting with anonymisation job enabled; final simplified invoice to an individual with `retention_until` yesterday; another with it tomorrow | Run job | First: names, address, ID replaced by token; number, amounts, VAT, ZATCA hash unchanged; JE untouched. Second unchanged. Default settings: job disabled (R52). |
 | AT-44 | Individual customer in ALM | Viewer opens it; accountant opens and exports it | Viewer sees masked data. Accountant sees it; one access-log row per view/export with user, entity, time (R51). |
 | AT-45 | ALM final invoice with 1,200.00 on 4900 | Post purification transfer, then payout; agent user tries the same | E14 then E15 posted with references; 4900 and 2600 net to zero for that amount. Agent rejected (R54). |
+| AT-46 | Line `unit_price` given as float `0.1` | Save | Rejected (R56). |
+| AT-47 | ledger-fx built; ALM (SAR) invoice in USD, rate 3.75, net 1,000.00 S 15%; second USD invoice with no rate | Issue, stub `cleared` | First: totals USD 1,000.00 / 150.00 / 1,150.00; `total_vat_sar` 562.50; JE per ledger-fx with 2200 = SAR 562.50. Second rejected "rate required" (en/ar). Before ledger-fx is built: any non-SAR issue rejected (R56). |
+| AT-48 | Entity with blank `building_no` or `street_ar` | Issue a standard invoice | Rejected, listing missing seller fields. Complete fields: seller snapshot holds the national address en/ar (R69, R15). |
+| AT-49 | Repository fixtures and test data | Scan for `310960118600003`, `7023761708`, `4030419505` | None found; the setup-data file is not loaded by any test (R70). |
+| AT-50 | ALM customer with `group_entity`=SUB (and one with `group_entity`=an equity-method associate ASC) | Issue S-rated invoice, stub `cleared` | Standard profile, VAT 15% charged, buyer snapshot = SUB's legal names/address/VAT, Dr 1210 counterparty SUB. Same for ASC. No record created in SUB or ASC (R68). |
+| AT-51 | Sales draft created and submitted by staff user U | U approves; CFO C approves; stub `cleared` | U rejected (segregation). C: number assigned, status `issued`, `approved_by`=C; on clearance JE posted automatically, `final` (R57). |
+| AT-52 | Bill submitted by U; second bill dated in closed 2027-01 | U approves; CFO approves both | U rejected. First: posted, JE as E7. Second: approval rolled back, stays `submitted`, no number used (R58). Same for a vendor payment (R59). |
+| AT-53 | Billing item on a CFO-approved contract; item on an unapproved contract; agent user | `create_from_billing` each; call twice for the first; agent calls it | First: `source=system`, issued without per-invoice approval. Second: `submitted`, awaits CFO. Repeat call: no duplicate. Agent: rejected (R60). |
+| AT-54 | Non-resident vendor, bill 10,000.00 category with rate 5% (fixture value), no treaty | CFO approves payment | E20; one `WhtDeduction` 500.00; bill `paid` (R62). |
+| AT-55 | Same vendor with `wht_gross_up=True` | Pay | E21: cash 10,000.00, WHT 526.32 to 2220, 5920 526.32 (R63). |
+| AT-56 | Verified treaty certificate 0% valid to 2027-06-30 | Pay on 2027-06-30, then on 2027-07-01 | First WHT 0.00 with certificate referenced; second at the statutory rate (R62). |
+| AT-57 | Non-resident bill line with no `wht_category` | Pay | Rejected (R61). |
+| AT-58 | Payments in 2027-03 with WHT in two categories | `wht_return_data(ALM, 2027-03)` | Rows per category/vendor; total equals 2220 credits for March; SUB data excluded (R64). |
+| AT-59 | Contract with advance terms; 386 for net 10,000.00 S 15% cleared; final 388 net 40,000.00 deducting it | Issue both; try a second 388 deducting the same 386 | E16, then E17 (AR 34,500.00). Second deduction rejected (R65). |
+| AT-60 | Contract with deposit terms; `deposit_vat_treatment` null; receipt `purpose=advance` with no contract | Post deposit receipt; set treatment, post again; post the advance receipt | First rejected (en/ar "pending tax adviser sign-off"); second E18; third rejected (R66, R67). |
 
 ## 9. Open questions
 
@@ -616,36 +633,47 @@ Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, 
 
 | # | Question | Owner | Status |
 |---|---|---|---|
-| OQ-1 | Where do seller addresses (street, building no., additional no., district, city, postal code) live: new fields on `core.Entity` or a zatca config? `Entity` has none today. | Dev + zatca.md | **BLOCKING** for issuing standard invoices. Drafts can be built. |
+| OQ-1 | Where do seller addresses (street, building no., additional no., district, city, postal code) live: new fields on `core.Entity` or a zatca config? `Entity` has none today. | Dev + zatca.md | **Resolved by D10**: fields on `core.Entity` (§3.0). |
 | OQ-2 | Exact zatca service names, the callback contract, and which model owns ICV/PIH/hash/QR (invoice fields vs `zatca.Submission`). | zatca.md author | **BLOCKING** for R40 to R45. Build against a stub interface. |
-| OQ-3 | Payment terms: standard terms per customer/vendor, due-date rules, early-payment discounts. | Accountant | Default: due date entered manually, prefilled = document date. |
-| OQ-4 | Document number format and prefixes (INV, CN, DN, BILL, VCN, RCPT, PAY), and whether CN/DN share the invoice sequence. ZATCA requires uniqueness. | Accountant | Default: `{entity.code}-{TYPE}-{year}-{000001}`, separate sequence per type, gap-free. |
-| OQ-5 | Approval thresholds for bills, payments and invoices (amounts, who approves, the Managing Partner's limit). Is segregation of duties mandatory for small entities? | Managing Partner | Default: one approval on every bill and payment, creator ≠ approver, configurable per entity. |
-| OQ-6 | Multi-currency: foreign-currency invoices and bills, FX rate source, realised/unrealised FX. `JournalLine` has no currency field and the template has no FX account. | Accountant + Dev | **BLOCKING** for non-SAR documents. Default: base currency only, others rejected. |
-| OQ-7 | Do credit notes (and debit notes) need approval, and above what amount? | Managing Partner | Default: accountant or approver role only, no threshold. |
-| OQ-8 | Withholding tax on payments to non-resident vendors. Needed before unblocking: WHT category per vendor and per bill line (service type → rate); a WHT payable account (OQ-22); treaty-relief certificates per vendor with validity dates; gross-up rule (who bears the tax); monthly WHT return data. **Needs expert sign-off** (tax adviser). | Accountant / tax adviser | **BLOCKING** for non-resident payments (R31). Bills can be posted. |
-| OQ-9 | Input VAT recovery per Art. 51 **[CC-verify: search excerpt 2026-10-16]**: which entities make exempt supplies (e.g. residential rent), how `mixed` lines are apportioned (`VatRecoveryRatio` per entity per year, provisional vs final), and the annual true-up method and account. **Needs expert sign-off** (tax adviser). | Accountant / tax adviser | Default (R29): `taxable` + vendor VAT number → 1310; `exempt` → cost; `mixed` → fully to cost (conservative, no over-claim). |
-| OQ-10 | Duplicate-bill rule and whether a vendor credit note must reference an original bill. | Accountant | Default: unique vendor + number. Reference required. |
-| OQ-11 | Rounding policy (per line vs per document, half-up vs half-even) and how to absorb a 0.01 difference against vendor totals. There is no rounding account. | Accountant | Sales: decided by compliance input, not open (R9: document-level VAT per category, ROUND_HALF_UP; tolerance per BR-KSA **[CC-verify]**). Still open: half-up vs half-even confirmation and vendor-total differences. Default for bills: totals must match the vendor document exactly. |
-| OQ-12 | Unit price precision beyond 2 dp (e.g. hourly rates). | Accountant | Default: 2 dp. |
-| OQ-13 | Are any group entities in a KSA VAT group (no VAT on intra-group supplies)? | Accountant / tax adviser | Default: no VAT group. VAT is charged on intercompany invoices. |
-| OQ-14 | Shared party master across entities (one customer for ALM and SUB) or per entity. | Managing Partner | Default: per entity. |
-| OQ-15 | Late payment: are any late charges contracted, and what is their VAT treatment? Sharia allows no penalty income. If built later: Dr 1200 / Cr 2600, never income. **Needs Sharia board sign-off.** | Managing Partner + Sharia board | Default: no late-charge feature. |
-| OQ-16 | Customer advances and deposits (e.g. rent in advance): build the prepayment invoice (386) flow with zatca.md R-39 (VAT at receipt of the advance **[CC-verify]**, deduction on the final invoice, deferred income account in OQ-22). Security deposits (refundable, VAT treatment): **Needs expert sign-off** (tax adviser). | Accountant / tax adviser | **BLOCKING** for advances and deposits. Default: receipts with `purpose=advance`/`deposit` and advance invoices blocked until the 386 flow is built (R55). |
-| OQ-17 | Can a non-VAT-registered group entity issue invoices, and in what form? | Accountant | Default: S lines blocked (R11). Z/E/O allowed. |
-| OQ-18 | Must every sales line description be in Arabic (ZATCA/VAT regulations), or is English-only acceptable on B2B? | compliance-checker | Default: Arabic required on sales documents, English optional. |
-| OQ-19 | Which entities issue simplified (B2C) invoices, e.g. rentals to individuals? | Managing Partner | Default: standard unless customer_kind = individual; R48 guard applies. |
-| OQ-20 | Bank accounts: one sub-account per bank or IBAN under 1100? | Accountant | Default: 1100, selectable asset account. |
-| OQ-21 | Bank payment file format and bank (SARIE, bulk upload, H2H). | Accountant | Not in scope for this module. |
-| OQ-22 | Missing accounts: retention receivable/payable, WHT payable, customer advances, deferred income (unearned revenue for 386 prepayments), VAT true-up (if not 1310), vendor advances, FX gain/loss, rounding, ECL allowance/bad debt, reverse-charge VAT split, intercompany IP income. Also add an `is_control` flag on 1200/2100/1210/2110 to block manual journals. | Accountant | **BLOCKING** for the related features (retention, write-off, FX, advances). Core AR/AP is not blocked. |
-| OQ-23 | VAT on bank charges deducted from receipts. | Accountant | Default: booked gross to 5700, no VAT split. |
-| OQ-24 | Migration: how open Daftra/SAP B1 AR/AP items are loaded (per-document vs per-party balance), and whether their ZATCA data (hash chain) carries over. | Accountant + migration-agent | Default: per-document `source=import`, status `final`, no ZATCA call, tie-out to opening TB. |
-| OQ-25 | Entity-scoped role/permission model (user × entity × role) is missing from `core`. Role names and who holds them. | Managing Partner + Dev | **BLOCKING** for views/APIs. Services can be built and tested now. |
-| OQ-26 | Retention on contracts (percentage held, release terms). | Managing Partner | Default: not built. |
-| OQ-27 | Bad-debt write-off and ECL policy. | Accountant | Default: not built. Use credit notes only. |
-| OQ-28 | Ledger protection: should `ledger.services.reverse_entry` refuse entries owned by a sub-ledger (needs a `source_module` field on `JournalEntry`), so a final invoice can't be reversed outside invoicing? | Dev + code-reviewer | Default: invoicing services refuse it. The code-reviewer checks there is no direct call. |
-| OQ-29 | VAT-return box mapping per line type (standard, zero, exempt, RC imported services, imports of goods via customs, adjustments, Art. 51 true-up) **[CC-verify]**; how customs import VAT on goods is recorded. | Accountant / tax adviser | Default: no VAT-return report; customs VAT entered as a manual JE outside this module. |
-| OQ-30 | Purification: who decides the amount and timing, approval before payout, recipient charities. | Managing Partner + Sharia board | Default: E14/E15 by accountant only, human user, no automation. |
-| OQ-31 | PDPL: offshore processors (hosting, backup, e-mail, OCR, AI models) and the transfer assessment for each; privacy notice text en/ar; data-subject request handling. **Needs legal sign-off.** See zatca.md OQ-20 (residency). | Managing Partner + legal | **BLOCKING** for go-live with real personal data. Default: no offshore processor receives personal data. |
+| OQ-3 | Payment terms: standard terms per customer/vendor, due-date rules, early-payment discounts. | Accountant | Resolved by D19. |
+| OQ-4 | Document number format and prefixes (INV, CN, DN, BILL, VCN, RCPT, PAY), and whether CN/DN share the invoice sequence. ZATCA requires uniqueness. | Accountant | Resolved by D19. Still open: whether 386 (`PRE`) may have its own sequence **[CC-verify]**; default separate. |
+| OQ-5 | Approval thresholds for bills, payments and invoices (amounts, who approves, the Managing Partner's limit). Is segregation of duties mandatory for small entities? | Managing Partner | Resolved by D19 and D17 (approver = CFO). Amount thresholds: none. |
+| OQ-6 | Multi-currency: foreign-currency invoices and bills, FX rate source, realised/unrealised FX. `JournalLine` has no currency field and the template has no FX account. | Accountant + Dev | **Resolved by D13** (in scope). Rates, FX accounts and JE currency are owned by `ledger-fx.md`; non-SAR issue/posting **BLOCKED until ledger-fx.md is approved and built** (R56). |
+| OQ-7 | Do credit notes (and debit notes) need approval, and above what amount? | Managing Partner | Resolved by D17: CFO approval, no threshold. |
+| OQ-8 | Withholding tax on payments to non-resident vendors. **In scope by D14** (R61 to R64, E20 to E22, 2220/5920 proposed). Still open: category list and rates **[CC-verify]**; recognition at payment vs at bill **[CC-verify]**; gross-up per vendor or per contract; treaty certificate evidence required; return due date **[CC-verify]**. **Needs expert sign-off** (tax adviser). | Accountant / tax adviser | Buildable now with `WhtCategory` as data. **BLOCKING for go-live** of non-resident payments until rates/categories are signed off. |
+| OQ-9 | Input VAT recovery per Art. 51 **[CC-verify: search excerpt 2026-10-16]**: which entities make exempt supplies (e.g. residential rent), how `mixed` lines are apportioned (`VatRecoveryRatio` per entity per year, provisional vs final), and the annual true-up method and account. **Needs expert sign-off** (tax adviser). | Accountant / tax adviser | Default resolved by D19 (R29). Exempt supplies now known (D16: residential rent, via `IncomeType.art51_class`). Ratio method and true-up account still need tax adviser sign-off. |
+| OQ-10 | Duplicate-bill rule and whether a vendor credit note must reference an original bill. | Accountant | Resolved by D19. |
+| OQ-11 | Rounding policy (per line vs per document, half-up vs half-even) and how to absorb a 0.01 difference against vendor totals. There is no rounding account. | Accountant | Sales: decided by compliance input, not open (R9: document-level VAT per category, ROUND_HALF_UP; tolerance per BR-KSA **[CC-verify]**). Resolved by D19 (half-up; bills match exactly; 5910 proposed if a tolerance is ever allowed). |
+| OQ-12 | Unit price precision beyond 2 dp (e.g. hourly rates). | Accountant | Resolved by D19. |
+| OQ-13 | Are any group entities in a KSA VAT group (no VAT on intra-group supplies)? | Accountant / tax adviser | **Resolved by D11**: no VAT group; VAT charged on intercompany invoices (R68). |
+| OQ-14 | Shared party master across entities (one customer for ALM and SUB) or per entity. | Managing Partner | Resolved by D19. |
+| OQ-15 | Late payment: are any late charges contracted, and what is their VAT treatment? Sharia allows no penalty income. If built later: Dr 1200 / Cr 2600, never income. **Needs Sharia board sign-off.** | Managing Partner + Sharia board | Default resolved by D19; Sharia board sign-off still open if a feature is ever requested. |
+| OQ-16 | Customer advances and deposits. **In scope by D15** (R65 to R67, E16 to E19). Still open: deposit VAT treatment at receipt, on application to unpaid amounts and on forfeiture **Needs expert sign-off** (tax adviser); 386 VAT timing and 388 deduction presentation **[CC-verify]**. | Accountant / tax adviser | Advances buildable now. Deposits: build; posting blocked per entity until `deposit_vat_treatment` is set after sign-off (R66). Application/forfeiture not built. |
+| OQ-17 | Can a non-VAT-registered group entity issue invoices, and in what form? | Accountant | Resolved by D19. |
+| OQ-18 | Must every sales line description be in Arabic (ZATCA/VAT regulations), or is English-only acceptable on B2B? | compliance-checker | Resolved by D19. |
+| OQ-19 | Which entities issue simplified (B2C) invoices, e.g. rentals to individuals? | Managing Partner | Resolved by D19. |
+| OQ-20 | Bank accounts: one sub-account per bank or IBAN under 1100? | Accountant | Resolved by D19. |
+| OQ-21 | Bank payment file format and bank (SARIE, bulk upload, H2H). | Accountant | Resolved by D19: not in scope. |
+| OQ-22 | Missing accounts. | Accountant | **Resolved by D18** at decision level: proposed codes in §5, accountant to review before the `coa_template.py` change merges. |
+| OQ-23 | VAT on bank charges deducted from receipts. | Accountant | Resolved by D19. |
+| OQ-24 | Migration: how open Daftra/SAP B1 AR/AP items are loaded (per-document vs per-party balance), and whether their ZATCA data (hash chain) carries over. | Accountant + migration-agent | Resolved by D19. |
+| OQ-25 | Entity-scoped role/permission model (user × entity × role) is missing from `core`. Role names and who holds them. | Managing Partner + Dev | **Resolved by D17** at business level (staff create, CFO approves, per entity). The `core` user × entity × role model still needs a spec: **BLOCKING** for views/APIs; services can be built now. |
+| OQ-26 | Retention on contracts (percentage held, release terms). | Managing Partner | Resolved by D19: not built. |
+| OQ-27 | Bad-debt write-off and ECL policy. | Accountant | Resolved by D19: not built. |
+| OQ-28 | Ledger protection: should `ledger.services.reverse_entry` refuse entries owned by a sub-ledger (needs a `source_module` field on `JournalEntry`), so a final invoice can't be reversed outside invoicing? | Dev + code-reviewer | Resolved by D19. |
+| OQ-29 | VAT-return box mapping per line type **[CC-verify]**; how customs import VAT on goods is recorded. | Accountant / tax adviser | Resolved by D19: no VAT-return report for now. |
+| OQ-30 | Purification: who decides the amount and timing, approval before payout, recipient charities. | Managing Partner + Sharia board | Default resolved by D19; amount/charity choice and Sharia board sign-off still open. |
+| OQ-31 | PDPL: offshore processors (hosting, backup, e-mail, OCR, AI models) and the transfer assessment for each; privacy notice text en/ar; data-subject request handling. **Needs legal sign-off.** | Managing Partner + legal | Hosting in KSA decided (D12). Default "no offshore processor receives personal data" stands. **BLOCKING** for go-live with real personal data until legal sign-off. |
+| OQ-32 | Can an entity issue S-rated lines dated before `vat_effective_date` **[CC-verify]**? | Accountant | Default: rejected, as R11. |
+| OQ-33 | Which seller ID goes on the invoice: branch CR (`CRN`) or unified national number (`700`) **[CC-verify]**? | compliance-checker | Default: `CRN` = `Entity.cr_number`. |
+| OQ-34 | *Withdrawn — see Decision D11* (each subsidiary has its own VAT number and EGS unit(s): confirmed by the project owner). | | Resolved by D11. |
+| OQ-35 | Entities with more than one branch (CR per branch, EGS per branch): is a `Branch` model needed? | Managing Partner | Default: one branch per entity, CR on `Entity`. |
+| OQ-36 | Do auto-generated invoices from an approved contract need per-invoice CFO approval? | Managing Partner / CFO | Default (flagged): no, the CFO approved the contract (R60); per-entity switch `auto_issue_from_approved_contract`. |
+| OQ-37 | Should an intercompany sales invoice create a mirror draft bill in the buyer entity? | Accountant | Default: no; buyer enters the bill; `intercompany_balances` reconciles. |
+| OQ-38 | Consolidation treatment of intercompany balances with associates/minority holdings (not fully eliminated). | Accountant | Out of invoicing scope; consolidation spec. Default here: same 1210/2110 + counterparty. |
+| OQ-39 | Exemption reason code for residential rent and VAT category per `IncomeType` **[CC-verify]**. | compliance-checker | Default: residential rent `E`, others `S`. |
+| OQ-40 | Vendor-side advances and deposits paid by group entities: in scope? | Accountant | Default: not built; 1330 proposed. |
+| OQ-41 | Do customer receipts need CFO approval? | CFO | Default: R33, posted at once by accounting staff. |
+| OQ-42 | Who approves when the CFO is the creator or absent (delegate per entity)? | Managing Partner | Default: a named delegate approver per entity; Managing Partner otherwise. |
 
-**Blocking:** OQ-1, OQ-2, OQ-6 (non-SAR), OQ-8 (non-resident payments), OQ-16 (advances/deposits), OQ-22 (related features), OQ-25 (views/APIs), OQ-31 (go-live). **Expert sign-off:** tax adviser OQ-8, OQ-9, OQ-16 (deposits), R48 threshold; legal OQ-31 / R53; Sharia board OQ-15, OQ-30. Every **[CC-verify]** item is re-checked against official documents before go-live.
+**Blocking (build):** OQ-2 (zatca hand-off contract), OQ-25 (core role model, views/APIs only), non-SAR documents until `ledger-fx.md` is approved (OQ-6), `billing.md` contract/billing-item models for R60 and R65 to R67. **Blocking (go-live):** OQ-8 WHT rates/categories sign-off (non-resident payments), OQ-16 deposit VAT sign-off (deposit posting), OQ-31 legal. **Review before merge:** D18 proposed accounts (accountant). **Expert sign-off:** tax adviser OQ-8, OQ-9, OQ-16, R48 threshold; legal OQ-31 / R53; Sharia board OQ-15, OQ-30. Every **[CC-verify]** item is re-checked against official documents before go-live.
