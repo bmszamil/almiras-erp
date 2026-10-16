@@ -921,7 +921,7 @@ def rates_visible_to(user):
 @transaction.atomic
 def rerate_entry(entry, *, user):
     """R15: give a draft's table-rate lines the rate for its current date, and redo its rounding line."""
-    entry = JournalEntry.objects.select_for_update().select_related("entity").get(pk=entry.pk)
+    entry = JournalEntry.objects.select_for_update(of=("self",)).select_related("entity").get(pk=entry.pk)
     access.require(user, entry.entity, "ledger.create_entry")
     if entry.status != JournalEntry.Status.DRAFT:
         raise error("Only draft entries can be re-rated.", "يمكن إعادة تسعير المسودات فقط.")
@@ -1195,7 +1195,7 @@ def post_revaluation(run, grant):
 
 @transaction.atomic
 def _post_revaluation(run, user):
-    run = RevaluationRun.objects.select_for_update().select_related("entity", "period").get(pk=run.pk)
+    run = RevaluationRun.objects.select_for_update(of=("self",)).select_related("entity", "period").get(pk=run.pk)
     if run.reversal_id is not None:
         raise error("This revaluation is already posted.", "إعادة التقييم هذه مرحّلة مسبقًا.")
     next_start = run.period.end_date + timedelta(days=1)
@@ -1215,7 +1215,7 @@ def discard_revaluation(run, *, user):
 
     A posted revaluation cannot be re-run (R24, OQ-9 default): correct it with a manual journal before closing.
     """
-    run = RevaluationRun.objects.select_for_update().select_related("entity", "entry").get(pk=run.pk)
+    run = RevaluationRun.objects.select_for_update(of=("self",)).select_related("entity", "entry").get(pk=run.pk)
     access.require(user, run.entity, "ledger.revalue")
     if run.entry is not None and run.entry.status != JournalEntry.Status.DRAFT:
         raise error(
