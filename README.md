@@ -25,6 +25,9 @@ python -m pytest -q                   # 16 tests
 ```
 Set `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST` to use PostgreSQL.
 
+## Build agents
+Six Claude Code agents in `.claude/agents/` (spec-writer, module-builder, test-engineer, code-reviewer, compliance-checker, migration-agent). Shared rules in `CLAUDE.md`. Future in-ERP AI agents: `docs/ai-agent-gateway.md`.
+
 ## Next steps
 1. Load the Daftra chart and 31 Dec 2026 trial balance as opening balances.
 2. PostgreSQL triggers so bulk updates can't bypass the posting lock.
