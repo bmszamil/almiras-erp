@@ -26,6 +26,42 @@ D1 to D9 are fixed by CLAUDE.md, the README and existing code. D10 to D19 were g
 | D7 | Numbering is gap-free per entity and year (journal entries: `{entity.code}-JE-{year}-{000001}`, via `EntrySequence` with `select_for_update`). | `ledger.services._next_number`; README | same |
 | D8 | Agents create drafts only, act as named service users, and every action is logged. Business records carry a `source` field (human / import / agent). | `docs/ai-agent-gateway.md` | same |
 | D9 | Business logic lives in `services.py`. Every rule gets a test. | CLAUDE.md | same |
+| D10 | Almiras identity: EN "Almiras Holding Company", AR "شركة المراس القابضة"; LLC, holding; unified national number 7023761708; Jeddah branch CR 4030419505; VAT 310960118600003, effective 2024-04-01, quarterly VAT returns; one branch (Jeddah), one EGS unit. National address in §3.0. These real identifiers may be stored in the repo as Almiras **setup data only**, never in test fixtures (tests stay anonymised). `Entity` gets bilingual national-address fields plus CR and VAT numbers (§3.0). | Project owner | 2026-10-16 |
+| D11 | All group entities issue invoices and invoice each other often. No entity is in a VAT group: each entity is a separate VAT taxpayer. **Confirmed:** each subsidiary is its own company with its own VAT number and its own EGS unit(s); the holding owns it fully or holds a share. Partly-owned and minority-stake entities are also separate taxpayers issuing their own invoices. Intercompany invoices (with any of them) are normal VAT invoices carrying the counterparty entity (CLAUDE.md rule 6). | Project owner | 2026-10-16 |
+| D12 | ZATCA is built in-house with open-source libraries (zatca.md). A rejected invoice is corrected and re-issued under a new number; the rejected number stays used. All hosting (DB, backups, logs, secret store) is in KSA. | Project owner | 2026-10-16 |
+| D13 | Multi-currency is needed now (CNY, EGP, GBP, EUR, USD, AED, etc.). Functional/reporting currency per entity is SAR unless set otherwise (`Entity.base_currency`). The ledger is extended by `docs/specs/ledger-fx.md`: documents carry currency and rate; VAT for ZATCA is also expressed in SAR. | Project owner | 2026-10-16 |
+| D14 | Withholding tax is in scope: Almiras pays non-resident suppliers and service providers. WHT per vendor/line category, WHT payable account, treaty certificates, gross-up option, monthly WHT return data. Rates and categories: **[CC-verify]** + tax adviser sign-off. | Project owner | 2026-10-16 |
+| D15 | Advances and security deposits both occur, varying by arrangement; some contracts have neither. The contract states which applies. Advance receipt → prepayment invoice (386) and deferred income. Security deposit → liability; VAT treatment **needs tax adviser sign-off**. | Project owner | 2026-10-16 |
+| D16 | Income types: commercial rent, residential rent (VAT-exempt), dividends (out of scope for invoicing), management fees, service charges, service fees, and others. They feed Art. 51 apportionment (OQ-9); the ratio method keeps tax-adviser sign-off. | Project owner | 2026-10-16 |
+| D17 | Accounting staff create documents; the CFO approves; posting is automatic on approval (for sales, after ZATCA clearance/reporting). Roles are assigned per entity. Recurring invoicing (annual car-rental contracts, rent, seconded staff billed until HR ends the secondment) is specified in `docs/specs/billing.md`; invoicing exposes a service to create a document from a billing schedule (`source="system"`) under the same approval/posting rules (approval of auto-generated invoices: OQ-36). | Project owner | 2026-10-16 |
+| D18 | Missing accounts may be added to `ledger/coa_template.py` by the builder. Proposed codes in §5 ("proposed, accountant to review"). | Project owner | 2026-10-16 |
+| D19 | The safe defaults below are approved as decisions (not those superseded by D10 to D18). | Project owner | 2026-10-16 |
+
+**D19, approved defaults** (each OQ is marked "Resolved by D19"; expert sign-offs listed stay open)
+| From | Approved default |
+|---|---|
+| OQ-3 | Due date entered manually, prefilled = document date. |
+| OQ-4 | Number `{entity.code}-{TYPE}-{year}-{000001}`, separate gap-free sequence per type. |
+| OQ-5 | One approval on every bill and vendor payment, creator ≠ approver, configurable per entity; the approver is the CFO (D17). |
+| OQ-9 | R29: `taxable` + vendor VAT number → 1310; `exempt` → cost; `mixed` → fully to cost. Tax adviser sign-off on Art. 51 still open. |
+| OQ-10 | Unique vendor + vendor document number; vendor credit note must reference a bill. |
+| OQ-11 | ROUND_HALF_UP; sales VAT per category at document level (R9); bill totals must match the vendor document exactly. |
+| OQ-12 | Unit price 2 dp. |
+| OQ-14 | Party master per entity. |
+| OQ-15 | No late-charge feature; if ever built, Dr 1200 / Cr 2600, never income. Sharia board sign-off still open. |
+| OQ-17 | Entity without VAT number: S lines blocked (R11); Z/E/O allowed. |
+| OQ-18 | Arabic required on sales line descriptions; English optional. |
+| OQ-19 | Standard unless `customer_kind = individual`; R48 guard applies. |
+| OQ-20 | Bank: 1100, selectable asset account. |
+| OQ-21 | Bank payment files not in scope for this module. |
+| OQ-23 | Bank charges booked gross to 5700, no VAT split. |
+| OQ-24 | Migration per document, `source=import`, status `final`, no ZATCA call, tie-out to opening TB. |
+| OQ-26 | Contract retention not built. |
+| OQ-27 | No bad-debt/ECL feature; credit notes only. |
+| OQ-28 | Invoicing services refuse direct reversal of sub-ledger JEs; code-reviewer checks no direct call. |
+| OQ-29 | No VAT-return report; customs import VAT as a manual JE outside this module. |
+| OQ-30 | Purification E14/E15 by accountant only, human user, no automation. Sharia board sign-off still open. |
+| OQ-7 | Superseded by D17: credit and debit notes are approved by the CFO like invoices; no threshold. |
 
 The 2026-10-16 compliance review is technical input, not a business decision. Rules it changed are tagged in section 4; choices it raised are in section 9.
 
@@ -40,7 +76,45 @@ The 2026-10-16 compliance review is technical input, not a business decision. Ru
 
 ## 3. Data model
 
-Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`, required). Money is `DecimalField(max_digits=18, decimal_places=2)`. Every model also has `created_by`, `created_at`, `updated_at` and `source` (choices `human` / `import` / `agent:<name>`, required, default `human`). "Bi" means the field exists as both `_en` and `_ar`.
+Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`, required). Money is `DecimalField(max_digits=18, decimal_places=2)`. Every model also has `created_by`, `created_at`, `updated_at` and `source` (choices `human` / `import` / `agent:<name>` / `system`, required, default `human`; `system` = billing schedule, D17). "Bi" means the field exists as both `_en` and `_ar`.
+
+### 3.0 Entity fields needed (added to `core.Entity`; D10, resolves OQ-1)
+
+| Field | Type | Req | Bi | Notes |
+|---|---|---|---|---|
+| legal_name_en / legal_name_ar | Char(200) | Y to issue | Bi | Seller name on documents and ZATCA XML |
+| legal_form | Choice: `llc`, `jsc`, `sole`, `branch_foreign`, `other` | Y | | Display text en/ar via translations |
+| unified_number | Char(10) | N | | Unified national number ("700" number) |
+| cr_number | Char(20) (exists) | Y to issue | | CR of the issuing branch (one branch per entity for now, OQ-35) |
+| vat_number | Char(15) (exists) | Y for S lines (R11) | | 15 digits, starts and ends with `3` |
+| vat_effective_date | Date, null | Y if `vat_number` | | OQ-32 |
+| vat_return_period | Choice: `monthly`, `quarterly` | Y if `vat_number` | | Also drives zatca.md R-38 retention dates |
+| building_no | Char(4) | Y to issue | | 4 digits |
+| street_en / street_ar | Char(200) | Y to issue | Bi | |
+| district_en / district_ar | Char(100) | Y to issue | Bi | |
+| additional_no | Char(4) | Y to issue | | Secondary number (الرقم الإضافي) |
+| postal_code | Char(5) | Y to issue | | 5 digits |
+| city_en / city_ar | Char(100) | Y to issue | Bi | |
+| country | Char(2) ISO | Y | | Default `SA` |
+| short_address | Char(8) | N | | e.g. 4 letters + 4 digits |
+| base_currency | Char(3) (exists) | Y | | Functional/reporting currency, default SAR (D13) |
+
+**Almiras setup data (D10).** Loaded by a setup command from `core/setup_data/almiras.*`, never by tests or fixtures (AT-49).
+| Field | Value |
+|---|---|
+| legal_name_en / _ar | Almiras Holding Company / شركة المراس القابضة |
+| legal_form | `llc` (holding) |
+| unified_number | 7023761708 |
+| cr_number | 4030419505 (Jeddah branch) |
+| vat_number / vat_effective_date / vat_return_period | 310960118600003 / 2024-04-01 / `quarterly` |
+| building_no / additional_no / postal_code | 7547 / 2111 / 23437 |
+| street_en / _ar | Prince Sultan St / شارع الامير سلطان |
+| district_en / _ar | As Salamah District / حي السلامة |
+| city_en / _ar, country | Jeddah / جدة, `SA` |
+| short_address | JESA7547 |
+| EGS units | 1 (Jeddah branch; zatca.md) |
+
+**InvoicingSettings** (OneToOne Entity): `segregation_required` (Bool, default True, OQ-5), `auto_issue_from_approved_contract` (Bool, default True, OQ-36), `deposit_vat_treatment` (Choice, null until tax-adviser sign-off, R66).
 
 ### 3.1 Parties
 
@@ -56,15 +130,18 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | other_id_scheme | Choice: `CRN`, `MOM`, `MLS`, `700`, `SAG`, `NAT`, `GCC`, `IQA`, `PAS`, `OTH` | N | | Buyer ID only for buyers **not** VAT-registered (ZATCA). Personal data for individuals (R49) |
 | other_id | Char(30) | N | | |
 | address: street, building_no, additional_no, district, city, postal_code, country (ISO-2, default `SA`) | Char | Y for standard invoices | Bi for street, district, city | ZATCA buyer address. `building_no` is 4 digits and `postal_code` 5 digits when country = SA |
-| group_entity | FK Entity, null | N | | Set when the customer is a group entity. Makes its invoices intercompany. Must not equal `entity`. |
-| payment_terms_days | PositiveInt, null | N | | Undecided (OQ-3) |
-| currency | Char(3) | Y | | Default `entity.base_currency` (OQ-6) |
+| group_entity | FK Entity, null | N | | Set when the customer is a group entity (subsidiary, associate or minority holding, D11). Makes its invoices intercompany. Must not equal `entity`. Buyer snapshot is taken from that entity's §3.0 fields. |
+| payment_terms_days | PositiveInt, null | N | | D19 (OQ-3): none by default |
+| currency | Char(3) | Y | | Default currency for new documents; default `entity.base_currency` (D13) |
 | is_active | Bool | Y | | |
 
 **Vendor** (unique `(entity, code)`). Same pattern as Customer, plus:
 | Field | Type | Req | Notes |
 |---|---|---|---|
-| is_resident | Bool | Y | False → reverse-charge VAT (R30) and possible withholding tax (OQ-8) |
+| is_resident | Bool | Y | False → reverse-charge VAT (R30) and withholding tax (R61 to R64) |
+| residence_country | Char(2) ISO | Y if not resident | Treaty lookup (R62) |
+| wht_category | FK WhtCategory, null | Y if not resident | Default for bill lines (R61) |
+| wht_gross_up | Bool | Y | Default False. True → the entity bears the WHT (R63; per-contract override OQ-8) |
 | vat_number | Char(15) | N | Needed to recover input VAT on resident vendors' bills (R29) |
 | bank_iban | Char(34) | N | For payment files (OQ-21). Store masked in fixtures. |
 | group_entity | FK Entity, null | N | Intercompany vendor |
