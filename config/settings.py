@@ -38,9 +38,16 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "django_otp",
+    "django_otp.plugins.otp_totp",
+    "rest_framework",
     "core",
+    "access",
     "ledger",
+    "approvals",
 ]
+
+AUTH_USER_MODEL = "access.User"
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
@@ -48,6 +55,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django_otp.middleware.OTPMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -138,3 +146,34 @@ MAILERS = {
         "BACKEND": "django.core.mail.backends.console.EmailBackend",
     },
 }
+
+
+# Authentication (D14: password + authenticator app for every human user)
+# Identity provider seam: today "local" (Django password + django-otp TOTP). Keycloak OIDC (D6, R4)
+# plugs in later by pointing ERP_IDENTITY_ADAPTER at an adapter implementing
+# access.identity.IdentityAdapter; it is not implemented in this step.
+ERP_IDENTITY_ADAPTER = os.environ.get("ERP_IDENTITY_ADAPTER", "access.identity.LocalTotpIdentity")
+OTP_TOTP_ISSUER = "Almiras ERP"
+LOGIN_URL = "/admin/login/"
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "access.api_auth.ServiceTokenAuthentication",
+        "rest_framework.authentication.SessionAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": ["access.api_auth.IsTwoFactorAuthenticated"],
+    "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    "EXCEPTION_HANDLER": "access.api_errors.exception_handler",
+    "COERCE_DECIMAL_TO_STRING": True,
+}
+
+# Approvals plug-in contract (spec §3.3): document type code -> adapter in the owning module.
+APPROVAL_ADAPTERS = {
+    "ledger.journal_entry": "ledger.approval.JournalEntryApproval",
+}
+
+ERP_BASE_URL = os.environ.get("ERP_BASE_URL", "")
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "erp@localhost")
