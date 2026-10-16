@@ -197,9 +197,14 @@ def test_database_refuses_a_second_entry_for_one_document(w):
     bill = doc(Bill, w.alm, created_by=w.clerk)
     services.create_entry(w.alm, date(2027, 1, 10), "Bill", CASH, user=w.clerk, post=True, document=bill,
                           grant=access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill))
-    with pytest.raises(IntegrityError), transaction.atomic():
+    with pytest.raises(LedgerError, match="links"):  # outside ledger.services a draft never claims a document
         JournalEntry.objects.create(entity=w.alm, date=date(2027, 1, 10), description="dup", document_type="testdocs.bill",
                                     document_id=bill.pk)
+    dup = JournalEntry(entity=w.alm, date=date(2027, 1, 10), description="dup", document_type="testdocs.bill",
+                       document_id=bill.pk)
+    dup._allow_links()  # as ledger.services._create would: then the database constraint refuses it
+    with pytest.raises(IntegrityError), transaction.atomic():
+        dup.save()
 
 
 def test_documents_without_post_are_refused(w):

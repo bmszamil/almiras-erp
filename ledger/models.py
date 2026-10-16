@@ -106,6 +106,15 @@ STATUS_THROUGH_SERVICES = (
 )
 
 
+LINKS_THROUGH_SERVICES = (
+    "An entry's reversal and document links are set only by ledger.services when it creates the entry, and never "
+    "change. / يحدد دفتر الأستاذ ارتباط القيد بالعكس وبالمستند عند إنشائه فقط، ولا يتغير بعد ذلك."
+)
+# Set only by ledger.services when it creates the entry (_create, _reverse); never changed afterwards.
+LINK_FIELDS = ("reversal_of_id", "document_type", "document_id")
+_LINK_KWARGS = frozenset({"reversal_of", "reversal_of_id", "document_type", "document_id"})
+
+
 class JournalEntryQuerySet(models.QuerySet):
     """Bulk writes skip ``save()``/``delete()``, so they get the posting lock here (CLAUDE.md rules 1 and 3)."""
 
@@ -113,11 +122,23 @@ class JournalEntryQuerySet(models.QuerySet):
         objs = list(objs)
         if any(obj.status != JournalEntry.Status.DRAFT for obj in objs):
             raise LedgerError(STATUS_THROUGH_SERVICES)
+        if any(obj.reversal_of_id is not None or obj.document_type or obj.document_id is not None for obj in objs):
+            raise LedgerError(LINKS_THROUGH_SERVICES)
         return super().bulk_create(objs, *args, **kwargs)
+
+    def bulk_update(self, objs, fields, *args, **kwargs):
+        # Refused before Django opens its transaction, so the caller's transaction stays usable.
+        if "status" in fields:
+            raise LedgerError(STATUS_THROUGH_SERVICES)
+        if _LINK_KWARGS & set(fields):
+            raise LedgerError(LINKS_THROUGH_SERVICES)
+        return super().bulk_update(objs, fields, *args, **kwargs)
 
     def update(self, **kwargs):
         if "status" in kwargs:
             raise LedgerError(STATUS_THROUGH_SERVICES)
+        if _LINK_KWARGS & set(kwargs):  # e.g. a forged reversal_of would skip the Sharia check (rule 5)
+            raise LedgerError(LINKS_THROUGH_SERVICES)
         if self.exclude(status=JournalEntry.Status.DRAFT).exists():
             raise LedgerError(POSTING_LOCK)
         # A bulk change is a change of the draft: an approval given before it no longer covers it (R14).
@@ -207,13 +228,34 @@ class JournalEntry(models.Model):
             return None
         return JournalEntry.objects.filter(pk=self.pk).values_list("status", flat=True).first()
 
+    def _stored_row(self):
+        """(status, reversal_of_id, document_type, document_id) as stored, or None for a new entry."""
+        if not self.pk:
+            return None
+        return JournalEntry.objects.filter(pk=self.pk).values_list("status", *LINK_FIELDS).first()
+
     def _allow_transition(self, before, after):
         """Set only by ledger.services._post / _reverse right before their save (CLAUDE.md rule 3)."""
         self._status_transition = (before, after)
 
+    def _allow_links(self):
+        """Set only by ledger.services._create / _reverse before the entry's first save (R30, rule 5)."""
+        self._links_allowed = True
+
+    def _links(self):
+        return tuple(getattr(self, name) for name in LINK_FIELDS)
+
     def save(self, *args, **kwargs):
-        stored = self._stored_status()
+        row = self._stored_row()
+        stored = row[0] if row else None
         allowed, self._status_transition = getattr(self, "_status_transition", None), None
+        links_allowed, self._links_allowed = getattr(self, "_links_allowed", False), False
+        if row is None:
+            # A new entry carries a reversal or document link only when ledger.services creates it.
+            if self._links() != (None, "", None) and not links_allowed:
+                raise LedgerError(LINKS_THROUGH_SERVICES)
+        elif self._links() != tuple(row[1:]):  # never changed after creation, also not on a draft
+            raise LedgerError(LINKS_THROUGH_SERVICES)
         # A posted entry may only change to "reversed"; a reversed entry never changes.
         if stored == self.Status.REVERSED:
             raise LedgerError("Reversed entries are locked. / القيود المعكوسة مقفلة.")

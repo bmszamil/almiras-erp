@@ -15,7 +15,7 @@ from pathlib import Path
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import connection, models, transaction
+from django.db import IntegrityError, connection, models, transaction
 from django.db.models import Case, F, Q, Sum, When
 from django.utils import timezone
 
@@ -124,8 +124,55 @@ def validate_entry(entry):
                                 f"حساب المعاملات بين الشركات {acc.code} يحتاج إلى كيان مقابل."))
         if line.counterparty_entity_id == entry.entity_id:
             problems.append(_bi("Counterparty cannot be the same entity.", "لا يكون الطرف المقابل هو الكيان نفسه."))
+    if entry.reversal_of_id is not None:  # the Sharia and rate checks above trust a reversal: prove it is one
+        problems += _reversal_problems(entry, lines)
     problems += _currency_problems(entry, lines)
     return problems
+
+
+def _mirrors(rev, orig):
+    """True if line ``rev`` undoes line ``orig`` exactly (what _reverse writes)."""
+    return (
+        rev.account_id == orig.account_id
+        and rev.debit == orig.credit
+        and rev.credit == orig.debit
+        and rev.currency_id == orig.currency_id
+        and rev.txn_amount == orig.txn_amount
+        and rev.fx_rate == orig.fx_rate
+        and rev.counterparty_entity_id == orig.counterparty_entity_id
+        and rev.rate_source == orig.rate_source
+        and rev.exchange_rate_id == orig.exchange_rate_id
+        and rev.settles_line_id == orig.settles_line_id
+        and rev.line_kind == orig.line_kind
+    )
+
+
+def _reversal_problems(entry, lines):
+    """A reversal undoes one posted entry of its entity and document, line by line (rules 1 and 5, R30).
+
+    Reversals skip the Sharia, inactive-currency and rate-date checks
+    because they only undo what was booked, so a draft that merely claims
+    to be a reversal must mirror its original exactly.
+    """
+    original = JournalEntry.objects.filter(pk=entry.reversal_of_id).first()
+    if (
+        original is None
+        or original.status != JournalEntry.Status.POSTED
+        or original.entity_id != entry.entity_id
+        or (original.document_type, original.document_id) != (entry.document_type, entry.document_id)
+    ):
+        return [_bi("A reversal undoes a posted entry of the same entity and document.",
+                    "العكس يلغي قيدًا مرحّلًا للكيان نفسه والمستند نفسه.")]
+    mine = sorted(lines, key=lambda l: l.pk)
+    theirs = list(JournalLine.objects.filter(entry_id=original.pk).order_by("pk"))
+    if len(mine) != len(theirs) or not all(_mirrors(r, o) for r, o in zip(mine, theirs)):
+        return [_bi(
+            f"A reversal mirrors every line of {original.number or original.pk}: account, side, currency, "
+            "transaction amount, rate and counterparty.",
+            f"العكس يقابل كل بنود القيد {original.number or original.pk}: الحساب والجانب والعملة ومبلغ المعاملة "
+            "والسعر والطرف المقابل.",
+        )]
+    return []
 
 
 def _is_revaluation_entry(entry):
@@ -344,17 +391,22 @@ def _authorise_document_post(entity, grant, posted_by, document, created_by):
     if user.pk in access_services._document_people(stored):
         access.deny(user, entity, grant.permission, "self_approval")
     if _document_booked(entity, stored):
-        raise error(
-            f"{doc_type.label} {stored.pk} is already booked; a document posts once (reverse it to correct it).",
-            f"المستند {doc_type.label} {stored.pk} مرحّل مسبقًا؛ يُرحَّل المستند مرة واحدة (اعكسه للتصحيح).",
-            code="document_booked",
-        )
+        raise _document_booked_error((doc_type.label, stored.pk))
     if grant.permission == CLEARANCE_PERMISSION:
         return _clearance_approver(entity, user, grant, posted_by, stored, doc_type, created_by), stored
     if posted_by is not None and posted_by != user:
         raise error("posted_by is set from the grant; only posting on clearance records another approver.",
                     "يُحدَّد المرحِّل من التفويض؛ الترحيل عند الاعتماد من الهيئة وحده يسجل معتمدًا آخر.")
     return user, stored
+
+
+def _document_booked_error(ref):
+    label, pk = ref
+    return error(
+        f"{label} {pk} is already booked; a document posts once (reverse it to correct it).",
+        f"المستند {label} {pk} مرحّل مسبقًا؛ يُرحَّل المستند مرة واحدة (اعكسه للتصحيح).",
+        code="document_booked",
+    )
 
 
 def _document_booked(entity, document):
@@ -505,6 +557,10 @@ def post_entry(entry, grant=None, *, posted_by=None):
     if _is_revaluation_entry(entry):  # posted with its automatic reversal, after a fresh check (R23, R44)
         raise error("A revaluation draft is posted with post_revaluation.", "تُرحَّل مسودة إعادة التقييم من خلال ترحيل إعادة التقييم.",
                     code="use_post_revaluation")
+    if entry.reversal_of_id is not None or entry.document_ref is not None:
+        # Reversals post in reverse_entry, document entries in create_entry(post=True); never as manual drafts.
+        raise error("This entry is posted by the service that created it (a reversal or a document's posting).",
+                    "يُرحَّل هذا القيد من خلال الخدمة التي أنشأته (عكس قيد أو ترحيل مستند).", code="draft_has_links")
     user = _authorise_draft_post(entry, grant, posted_by)
     with transaction.atomic():
         access.use_grant(grant, target=entry)
@@ -548,7 +604,7 @@ def _reverse(entry, user, date, reason):
     if entry.status != JournalEntry.Status.POSTED:
         raise error("Only posted entries can be reversed.", "يمكن عكس القيود المرحّلة فقط.")
     date = date or entry.date
-    reversal = JournalEntry.objects.create(
+    reversal = JournalEntry(
         entity=entry.entity,
         date=date,
         description=f"Reversal of {entry.number}" + (f": {reason}" if reason else ""),
@@ -559,6 +615,8 @@ def _reverse(entry, user, date, reason):
         document_type=entry.document_type,  # derived from the same document (R30)
         document_id=entry.document_id,
     )
+    reversal._allow_links()  # the only place a reversal link is written
+    reversal.save(force_insert=True)
     for line in entry.lines.all():
         copy = JournalLine(
             entry=reversal,
@@ -658,10 +716,21 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
 def _create(entity, date, description, lines, user, reference, post, posted_by, source=JournalEntry.Source.HUMAN,
             document_ref=None):
     built = _build_lines(entity, date, lines, user)
-    entry = JournalEntry.objects.create(
+    entry = JournalEntry(
         entity=entity, date=date, description=description, reference=reference, created_by=user, source=source,
         document_type=document_ref[0] if document_ref else "", document_id=document_ref[1] if document_ref else None,
     )
+    entry._allow_links()  # the only place a document link is written (R30)
+    try:
+        with transaction.atomic():
+            entry.save(force_insert=True)
+    except IntegrityError:
+        # A concurrent posting of the same document committed first (one_entry_per_document, R36).
+        if document_ref and JournalEntry.objects.filter(
+            entity=entity, document_type=document_ref[0], document_id=document_ref[1], reversal_of__isnull=True,
+        ).exists():
+            raise _document_booked_error(document_ref) from None
+        raise
     for line in built:
         line.entry = entry
         line._service_write = True
