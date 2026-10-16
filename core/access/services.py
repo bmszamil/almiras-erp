@@ -384,8 +384,12 @@ def _memberships_for(user, entity, permission, at):
     return [m for m in qs if catalogue.role_may_hold(m.role.kind, m.role.scope, m.role.system_code, perm) is None]
 
 
-def _evaluate(user, entity, permission, at):
-    """Return (memberships, None) when allowed, or ([], reason_code)."""
+def _evaluate(user, entity, permission, at, *, reactivation=False):
+    """Return (memberships, None) when allowed, or ([], reason_code).
+
+    On an inactive entity only view permissions pass, and **I** permissions
+    when the caller says it is reactivating (``reactivation=True``).
+    """
     perm = catalogue.get(permission)
     if user is None or not getattr(user, "pk", None) or not getattr(user, "is_authenticated", False):
         return [], "no_user"
@@ -394,7 +398,7 @@ def _evaluate(user, entity, permission, at):
     refusal = _kind_refusal(user, perm)
     if refusal:
         return [], refusal
-    if not entity.is_active and not (perm.is_view or perm.inactive_ok):
+    if not entity.is_active and not (perm.is_view or (perm.inactive_ok and reactivation)):
         return [], "inactive_entity"
     memberships = _memberships_for(user, entity, permission, at)
     if not memberships:
@@ -404,10 +408,14 @@ def _evaluate(user, entity, permission, at):
 
 # --- checking rights --------------------------------------------------------
 
-def require(user, entity, permission, *, document=None, allow_self_approval=False):
+def require(user, entity, permission, *, document=None, allow_self_approval=False, reactivation=False):
     """Return a Grant if ``user`` may use ``permission`` in ``entity`` now; else log and raise AccessDenied.
 
     Superuser, staff, Django groups and user_permissions give nothing (R3, R24).
+    ``reactivation=True`` lets an **I** permission pass on an inactive entity
+    (R38); only a caller that then allows nothing but reactivation passes it
+    (core.services._require_settings_right). Without it an inactive entity
+    refuses every permission that is not a view permission.
     """
     perm = catalogue.get(permission)
     if perm.is_approval and document is None:
@@ -417,7 +425,7 @@ def require(user, entity, permission, *, document=None, allow_self_approval=Fals
     if perm.is_dual_control:
         raise AccessUsageError(f"{permission} needs dual control; use require_dual_control (R19).")
     at = now()
-    memberships, reason = _evaluate(user, entity, permission, at)
+    memberships, reason = _evaluate(user, entity, permission, at, reactivation=reactivation)
     if reason:
         _deny(user, entity, permission, reason)
     self_approval = False

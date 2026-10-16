@@ -187,6 +187,24 @@ def test_inactive_group_parent_can_only_be_reactivated(w):
     assert row.details["before"] == {"is_active": False} and row.details["after"] == {"is_active": True}
 
 
+def test_probe_h_inactive_flag_needs_an_explicit_reactivation(w):
+    """R38: require() alone no longer lets the I permission through on an inactive entity."""
+    Entity.objects.filter(pk=w.alm.pk).update(is_active=False)
+    alm = Entity.objects.get(pk=w.alm.pk)
+    with pytest.raises(services.AccessDenied) as exc:
+        services.require(w.mp, alm, "core.change_entity_settings")
+    assert exc.value.code == "inactive_entity"
+    assert not services.has(w.mp, alm, "core.change_entity_settings")
+    assert services.require(w.mp, alm, "core.change_entity_settings", reactivation=True).user == w.mp
+    with pytest.raises(services.AccessDenied) as exc:  # reactivation=True does nothing for other permissions
+        services.require(w.mp, alm, "core.grant_membership", reactivation=True)
+    assert exc.value.code == "inactive_entity"
+    with pytest.raises(services.AccessDenied) as exc:  # the service still allows only reactivation
+        core_services.change_entity_settings(alm, user=w.mp, reason="x", consolidation="none")
+    assert exc.value.code == "inactive_entity_reactivate_only"
+    assert core_services.change_entity_settings(alm, user=w.mp, reason="Reopened", is_active=True).is_active
+
+
 def test_reactivate_entity_command_is_logged_and_only_for_inactive_entities(w):
     from django.core.management import CommandError, call_command
 

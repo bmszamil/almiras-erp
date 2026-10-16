@@ -209,8 +209,12 @@ def change_entity_settings(entity, *, user, reason, **changes):
 
 
 def _require_settings_right(access, user, group, changes):
-    """``core.change_entity_settings`` on ``group``; on an inactive group parent only reactivation (catalogue I)."""
-    grant = access.require(user, group, ENTITY_SETTINGS_PERMISSION)
+    """``core.change_entity_settings`` on ``group``; on an inactive group parent only reactivation (catalogue I).
+
+    ``reactivation=True`` lets the I permission pass on the inactive group
+    parent; the check below then refuses anything but ``is_active=True``.
+    """
+    grant = access.require(user, group, ENTITY_SETTINGS_PERMISSION, reactivation=True)
     if not group.is_active and changes != {"is_active": True}:
         access.deny(user, group, ENTITY_SETTINGS_PERMISSION, "inactive_entity_reactivate_only")
     return grant

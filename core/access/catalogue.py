@@ -7,7 +7,10 @@ Flags:
 - ``G``  group-level only (only group-scope roles may hold it)
 - ``Ag`` an agent role may hold it (R12)
 - ``P``  a grant for it authorises a ledger posting (R23)
-- ``I``  also checked on an inactive entity; the service then allows only reactivation (R32 recovery)
+- ``I``  also checked on an inactive entity, but only when the caller passes ``require(..., reactivation=True)``;
+         that caller then allows only reactivation (R38). ``require()`` on its own does not limit what an
+         I permission is used for, so without ``reactivation=True`` an inactive entity refuses it like any
+         other non-view permission (``inactive_entity``).
 ``system`` is set for "Sys:x" permissions: only system user ``x`` may hold them (R13).
 
 Arabic labels are marked for review [AR-review] like the role names in the spec.
@@ -90,7 +93,9 @@ _PERMS = [
     _p("core.grant_membership", "Grant and revoke memberships", "منح العضويات وإلغاؤها", SEGREGATED),
     _p("core.delegate_approval", "Delegate approval", "تفويض صلاحية الاعتماد", SEGREGATED),
     # R32, OQ-18 default: managing_partner only.
-    # I: an inactive group parent can still be reactivated (core.services.change_entity_settings allows only that).
+    # I: an inactive group parent can still be reactivated. require() alone would let this right through on an
+    # inactive entity for any change, so it passes there only with require(..., reactivation=True), which only
+    # core.services._require_settings_right passes; that function then allows nothing but is_active=True (R38).
     _p("core.change_entity_settings", "Change sensitive entity settings", "تغيير إعدادات الكيان الحساسة", GROUP_ONLY,
        INACTIVE_OK),
     _p("core.manage_users", "Activate and deactivate user accounts", "تفعيل حسابات المستخدمين وإيقافها", GROUP_ONLY),
