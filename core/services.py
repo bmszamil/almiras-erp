@@ -1,12 +1,13 @@
 """Entity services: issue readiness (invoicing.md R69) and setup data (D10)."""
 import json
+import re
 from datetime import date
 from pathlib import Path
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
 
-from .models import Entity, validate_vat_number
+from .models import Entity
 
 SETUP_DATA_DIR = Path(__file__).resolve().parent / "setup_data"
 ALMIRAS_SETUP_DATA = SETUP_DATA_DIR / "almiras.json"
@@ -17,6 +18,7 @@ ALMIRAS_CODE = "ALM"
 ISSUE_REQUIRED_FIELDS = (
     "legal_name_en",
     "legal_name_ar",
+    "legal_form",
     "cr_number",
     "building_no",
     "street_en",
@@ -36,8 +38,27 @@ VAT_REQUIRED_FIELDS = ("vat_effective_date", "vat_return_period")
 SETUP_FIELDS = frozenset(
     ISSUE_REQUIRED_FIELDS
     + VAT_REQUIRED_FIELDS
-    + ("legal_form", "unified_number", "vat_number", "short_address")
+    + ("unified_number", "vat_number", "short_address")
 )
+
+
+def _field_problem(entity, name):
+    """True if ``name`` on ``entity`` is blank (whitespace counts as blank) or fails its validators.
+
+    Values saved with ``objects.create()`` or ``update()`` skip ``full_clean``,
+    so the field validators are run again here (AT-48).
+    """
+    value = getattr(entity, name)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return True
+    field = Entity._meta.get_field(name)
+    try:
+        field.run_validators(value)
+        if field.choices and value not in {k for k, _ in field.flatchoices}:
+            raise ValidationError("invalid choice", code="invalid_choice")
+    except ValidationError:
+        return True
+    return False
 
 
 def entity_ready_to_issue(entity, standard_rated=False):
@@ -45,17 +66,15 @@ def entity_ready_to_issue(entity, standard_rated=False):
 
     An empty list means the entity may issue. ``standard_rated`` is True when
     the document has standard-rated (S) lines, which need a VAT number (R11).
+    Each field is checked with its model validators (format rules in §3.0),
+    so a bad value written without ``full_clean`` is reported, not issued.
     """
-    missing = [f for f in ISSUE_REQUIRED_FIELDS if not getattr(entity, f)]
-    if entity.vat_number:
-        try:
-            validate_vat_number(entity.vat_number)
-        except ValidationError:
-            missing.append("vat_number")
-    elif standard_rated:
-        missing.append("vat_number")
+    missing = [f for f in ISSUE_REQUIRED_FIELDS if _field_problem(entity, f)]
+    # Any stored VAT number, even whitespace, is checked: it would be copied to documents.
     if entity.vat_number or standard_rated:
-        missing += [f for f in VAT_REQUIRED_FIELDS if not getattr(entity, f)]
+        if _field_problem(entity, "vat_number"):
+            missing.append("vat_number")
+        missing += [f for f in VAT_REQUIRED_FIELDS if _field_problem(entity, f)]
     return missing
 
 
@@ -87,8 +106,20 @@ def load_setup_data(path, expected_code=ALMIRAS_CODE):
     return data
 
 
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+
+
 def _parse_date(name, value):
+    """Parse a setup-data date written as YYYY-MM-DD; anything else is a bilingual ValidationError.
+
+    ``date.fromisoformat`` alone also accepts forms such as ``20250101`` or
+    ``2025-W01-1``; setup data must use the one documented form.
+    """
+    if value is None or isinstance(value, date):
+        return value
     try:
+        if not isinstance(value, str) or not _ISO_DATE.match(value):
+            raise ValueError(value)
         return date.fromisoformat(value)
     except ValueError:
         raise ValidationError(
@@ -111,7 +142,7 @@ def apply_entity_setup(entity, fields):
             raise ValidationError(
                 f"Field {name!r} cannot be set from setup data. / لا يمكن تعيين الحقل {name!r} من بيانات الإعداد."
             )
-        if name == "vat_effective_date" and isinstance(value, str):
+        if name == "vat_effective_date":
             value = _parse_date(name, value)
         if getattr(entity, name) != value:
             changed.append(name)

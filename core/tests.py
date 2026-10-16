@@ -90,10 +90,48 @@ def test_invalid_vat_number_rejected(bad):
     with pytest.raises(ValidationError):
         validate_vat_number(bad)
     e = complete_entity(vat_number=bad[:15])
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as exc:
         e.full_clean()
+    # Reported once, on the field; clean() does not repeat it.
+    assert exc.value.message_dict == {"vat_number": [exc.value.message_dict["vat_number"][0]]}
+    assert "15" in exc.value.message_dict["vat_number"][0]
+    e.clean()  # model-level rules only
+
+
+def test_vat_error_is_reported_once():
+    e = complete_entity(vat_number="123")
+    with pytest.raises(ValidationError) as exc:
+        e.full_clean()
+    assert len(exc.value.messages) == 1
+
+
+@pytest.mark.parametrize("field,good", [("building_no", "1234"), ("additional_no", "5678"), ("postal_code", "12345")])
+def test_digit_validators_reject_trailing_newline(field, good):
+    # The RegexValidator alone (not max_length) must reject "1234\n": "$" would accept it, "\\Z" does not.
+    from django.core.validators import RegexValidator
+
+    regex = [v for v in Entity._meta.get_field(field).validators if isinstance(v, RegexValidator)]
+    assert len(regex) == 1
+    regex[0](good)
     with pytest.raises(ValidationError):
-        e.clean()
+        regex[0](good + "\n")
+
+
+@pytest.mark.parametrize("bad", ["6000000001", "70000A0001", "٧٠٠٠٠٠٠٠٠١"])
+def test_unified_number_must_be_digits_starting_with_7(bad):
+    e = complete_entity(unified_number=bad)
+    with pytest.raises(ValidationError) as exc:
+        e.full_clean()
+    assert "unified_number" in exc.value.message_dict
+    assert "7" in exc.value.message_dict["unified_number"][0]
+
+
+@pytest.mark.parametrize("bad", ["XX", "sa", "S", "ZZ"])
+def test_country_must_be_iso_code(bad):
+    e = complete_entity(country=bad)
+    with pytest.raises(ValidationError) as exc:
+        e.full_clean()
+    assert "country" in exc.value.message_dict
 
 
 @pytest.mark.parametrize(
@@ -115,10 +153,28 @@ def test_existing_style_entity_without_new_fields_still_valid():
 
 def test_bilingual_display_helpers():
     e = complete_entity(legal_form="llc", vat_return_period="quarterly")
-    assert e.get_legal_form_display() == "Limited liability company"
+    assert e.get_legal_form_display() == "Limited liability company / شركة ذات مسؤولية محدودة"
+    assert e.legal_form_en == "Limited liability company"
     assert e.legal_form_ar == "شركة ذات مسؤولية محدودة"
-    assert e.vat_return_period_ar == "ربع سنوي"
+    assert (e.vat_return_period_en, e.vat_return_period_ar) == ("Quarterly", "ربع سنوي")
+    assert make_entity("BLK").legal_form_ar == ""
     assert (e.country_name_en, e.country_name_ar) == ("Saudi Arabia", "المملكة العربية السعودية")
+
+
+def _has_arabic(text):
+    return any("\u0600" <= ch <= "\u06ff" for ch in str(text))
+
+
+def test_entity_field_labels_are_bilingual():
+    for field in Entity._meta.get_fields():
+        if not field.concrete or field.auto_created:
+            continue
+        en, sep, ar = str(field.verbose_name).partition(" / ")
+        assert sep and en.strip() and _has_arabic(ar), f"{field.name}: {field.verbose_name!r}"
+        for value, label in field.flatchoices:
+            en, sep, ar = str(label).partition(" / ")
+            assert sep and en.strip() and _has_arabic(ar), f"{field.name}={value}: {label!r}"
+    assert _has_arabic(Entity._meta.verbose_name) and _has_arabic(Entity._meta.verbose_name_plural)
 
 
 # --- R69 / AT-48: entity_ready_to_issue ----------------------------------
@@ -151,6 +207,41 @@ def test_standard_rated_needs_vat_registration():
 def test_vat_number_needs_effective_date_and_period():
     e = complete_entity(vat_effective_date=None, vat_return_period="")
     assert services.entity_ready_to_issue(e) == ["vat_effective_date", "vat_return_period"]
+
+
+def test_legal_form_is_required_to_issue():
+    assert "legal_form" in services.ISSUE_REQUIRED_FIELDS
+    assert services.entity_ready_to_issue(complete_entity("AAA", legal_form="")) == ["legal_form"]
+    assert services.entity_ready_to_issue(complete_entity("BBB", legal_form="corp")) == ["legal_form"]
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("building_no", "12a4"),
+        ("building_no", "123"),
+        ("building_no", "123\n"),
+        ("postal_code", "1234"),
+        ("additional_no", "99"),
+        ("country", "XX"),
+        ("country", "sa"),
+    ],
+)
+def test_invalid_stored_field_is_listed(field, bad):
+    # AT-48: objects.create() skips full_clean, so readiness runs the validators itself.
+    e = complete_entity(**{field: bad})
+    assert services.entity_ready_to_issue(e) == [field]
+
+
+@pytest.mark.parametrize("field", ["street_ar", "legal_name_en", "city_en", "cr_number"])
+def test_whitespace_only_field_is_missing(field):
+    e = complete_entity(**{field: "   "})
+    assert services.entity_ready_to_issue(e) == [field]
+
+
+def test_whitespace_vat_number_is_invalid():
+    e = complete_entity(vat_number="   ")
+    assert "vat_number" in services.entity_ready_to_issue(e)
 
 
 def test_invalid_stored_vat_number_is_listed():
@@ -207,6 +298,15 @@ def test_setup_command_rejects_invalid_date_bilingually(setup_file):
         call_command("setup_almiras", setup_data=setup_file(dict(FAKE_FIELDS, vat_effective_date="2025-13-01")))
     message = exc.value.message_dict["vat_effective_date"][0]
     assert "ISO date" in message and "تاريخ" in message
+    assert not Entity.objects.exists()
+
+
+@pytest.mark.parametrize("bad", ["20250101", "2025-W01-1", "2025-1-1", "2025-01-01T00:00", 20250101, ["2025-01-01"]])
+def test_setup_rejects_non_iso_dates_bilingually(setup_file, bad):
+    with pytest.raises(ValidationError) as exc:
+        call_command("setup_almiras", setup_data=setup_file(dict(FAKE_FIELDS, vat_effective_date=bad)))
+    message = exc.value.message_dict["vat_effective_date"][0]
+    assert "YYYY-MM-DD" in message and "تاريخ" in message
     assert not Entity.objects.exists()
 
 
