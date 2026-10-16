@@ -88,15 +88,39 @@ def test_at31_admin_cannot_change_sensitive_entity_fields(client, w):
         True, "full", w.alm.pk, "SAR", True)
 
 
-def test_admin_logs_a_new_entitys_settings(client, w):
-    client.force_login(w.root)
+def test_admin_creates_entities_through_the_service_and_logs_them(client, w):
     data = _entity_form(SimpleNamespace(code="NEW", name_en="New", name_ar="جديد", ownership_pct=100, reporting_standard="ifrs_sme"),
                         parent=w.alm.pk, consolidation="full", base_currency="SAR", is_active="on")
+    client.force_login(w.root)  # a superuser without a membership cannot add entities (R24)
+    assert client.get("/admin/core/entity/add/").status_code == 403
+    assert client.post("/admin/core/entity/add/", data).status_code == 403
+    assert not Entity.objects.filter(code="NEW").exists()
+    w.mp.is_staff = True
+    w.mp.save()
+    client.force_login(w.mp)
+    page = client.get("/admin/core/entity/add/")
+    assert set(page.context["adminform"].form.fields["parent"].queryset) == {w.alm, w.sub, w.min}
     resp = client.post("/admin/core/entity/add/", data)
     assert resp.status_code == 302, resp.content.decode()[:3000]
     new = Entity.objects.get(code="NEW")
     row = AccessLog.objects.get(event="entity_settings_changed", entity=new)
-    assert row.actor == w.root and row.details["after"]["sharia_enforced"] is False and row.details["created"] is True
+    assert row.actor == w.mp and row.permission == "core.change_entity_settings" and row.details["created"] is True
+    assert row.details["after"]["sharia_enforced"] is False and row.details["after"]["parent"] == "ALM"
+
+
+def test_create_entity_needs_the_right_on_the_chosen_group(w):
+    other = entity("OTH", "parent")
+    for user, parent in ((w.acc, w.alm), (w.mp, other), (w.root, w.alm)):
+        with pytest.raises(services.AccessDenied):
+            core_services.create_entity(Entity(code="X1", name_en="X", name_ar="س", parent=parent), user=user)
+    assert denied(w.mp, "core.change_entity_settings", other)
+    with pytest.raises(ValidationError, match="parent entity"):  # new groups are set up by operators
+        core_services.create_entity(Entity(code="X2", name_en="X", name_ar="س", consolidation="parent"), user=w.mp)
+    with pytest.raises(ValidationError):  # the entity's own rules still apply
+        core_services.create_entity(Entity(code="X3", name_en="X", name_ar="س", parent=w.sub, ownership_pct=0), user=w.mp)
+    made = core_services.create_entity(Entity(code="X4", name_en="X", name_ar="س", parent=w.min), user=w.mp)
+    assert made.pk and made.parent == w.min
+    assert not Entity.objects.filter(code__in=["X1", "X2", "X3"]).exists()
 
 
 def test_at31_entity_settings_service_needs_managing_partner_and_logs(w):

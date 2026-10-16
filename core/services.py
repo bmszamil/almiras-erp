@@ -264,3 +264,43 @@ def _change_entity_settings(entity, user, reason, changes):
         },
     )
     return entity
+
+
+def create_entity(entity, *, user, reason="Created in admin / أُنشئ من لوحة الإدارة"):
+    """Create ``entity`` (an unsaved Entity) as a member of an existing group (access.md R32, A13).
+
+    ``user`` needs ``core.change_entity_settings`` on the group parent of the
+    chosen parent entity; that group parent must be active. A new top-level
+    group (no parent) is set up by an operator, not here. Writes one
+    ``entity_settings_changed`` row with the new entity's sensitive settings.
+    """
+    from core.access import services as access
+
+    if entity.pk is not None:
+        raise ValidationError("This entity already exists. / هذا الكيان موجود بالفعل.")
+    if entity.parent_id is None:
+        raise ValidationError(
+            "A new entity is created under a parent entity of an existing group. / يُنشأ الكيان الجديد تحت كيان أم لمجموعة قائمة."
+        )
+    group = access.group_parent_of(Entity.objects.get(pk=entity.parent_id))
+    access.require(user, group, ENTITY_SETTINGS_PERMISSION)
+    if not group.is_active:
+        access.deny(user, group, ENTITY_SETTINGS_PERMISSION, "inactive_entity_reactivate_only")
+    return _create_entity(entity, user, reason)
+
+
+@transaction.atomic
+def _create_entity(entity, user, reason):
+    from core.access.models import AccessLog
+    from core.access.services import log
+
+    entity.full_clean()
+    entity.save()
+    log(
+        AccessLog.Event.ENTITY_SETTINGS_CHANGED, actor=user, entity=entity, permission=ENTITY_SETTINGS_PERMISSION,
+        details={"created": True, "before": None, "reason": reason, "after": {
+            **{name: _setting_value(entity, name) for name in SENSITIVE_ENTITY_FIELDS},
+            "base_currency": entity.base_currency_id,
+        }},
+    )
+    return entity

@@ -3,7 +3,7 @@ from django.contrib import admin
 from core import access
 
 from .models import Currency, Entity
-from .services import SENSITIVE_ENTITY_FIELDS
+from .services import SENSITIVE_ENTITY_FIELDS, create_entity
 
 
 class EntityScopedAdmin(admin.ModelAdmin):
@@ -123,24 +123,30 @@ class EntityAdmin(admin.ModelAdmin):
             fields += [f for f in self.LOCKED_FIELDS if f not in fields]
         return fields
 
+    def _settings_groups(self, request):
+        """Group parents where the user holds core.change_entity_settings (entities are added under them)."""
+        return access.entities_for(request.user, "core.change_entity_settings").filter(parent__isnull=True)
+
+    def has_add_permission(self, request):
+        # From memberships only, never Django permissions or is_superuser (access.md R3, R24).
+        return self._settings_groups(request).exists()
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == "parent":  # entities of the groups the user may change (create_entity checks again)
+            groups = set(self._settings_groups(request).values_list("pk", flat=True))
+            ids = [e.pk for e in Entity.objects.all() if access.group_parent_of(e).pk in groups]
+            kwargs["queryset"] = Entity.objects.filter(pk__in=ids)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
     def save_model(self, request, obj, form, change):
         if change:  # read-only in the form; a crafted POST cannot change them either
             stored = Entity.objects.get(pk=obj.pk)
             for attr in ("sharia_enforced", "consolidation", "parent_id", "is_active", "base_currency_id"):
                 setattr(obj, attr, getattr(stored, attr))
-        super().save_model(request, obj, form, change)
-        if not change:
-            from core.access.models import AccessLog
-            from core.access.services import log
-
-            log(
-                AccessLog.Event.ENTITY_SETTINGS_CHANGED, actor=request.user, entity=obj,
-                details={"created": True, "before": None, "after": {
-                    "sharia_enforced": obj.sharia_enforced, "consolidation": obj.consolidation,
-                    "parent": obj.parent.code if obj.parent_id else None, "is_active": obj.is_active,
-                    "base_currency": obj.base_currency_id,
-                }},
-            )
+            super().save_model(request, obj, form, change)
+            return
+        # A new entity: core.services.create_entity checks the right on the chosen group and logs it (R32).
+        create_entity(obj, user=request.user)
 
 
 @admin.register(Currency)
