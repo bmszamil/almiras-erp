@@ -91,6 +91,25 @@ if os.environ.get("POSTGRES_DB"):
 else:
     DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": BASE_DIR / "db.sqlite3"}}
 
+# Second connection to the same database, used only to write access-log
+# ``permission_denied`` rows (core.access.services.log_denial). It runs in
+# autocommit, outside the request's transaction, so a refusal is still logged
+# when ATOMIC_REQUESTS (or any caller's atomic block) rolls back. Same
+# database, so it is a test mirror of "default". A short lock timeout makes
+# the writer fall back to the main connection instead of waiting on it.
+ACCESS_LOG_DB = "access_log"
+DATABASES[ACCESS_LOG_DB] = {
+    **DATABASES["default"],
+    "ATOMIC_REQUESTS": False,
+    "AUTOCOMMIT": True,
+    "OPTIONS": (
+        {**DATABASES["default"].get("OPTIONS", {}), "options": "-c lock_timeout=2000"}
+        if DATABASES["default"]["ENGINE"].endswith("postgresql")
+        else {**DATABASES["default"].get("OPTIONS", {}), "timeout": 2}
+    ),
+    "TEST": {"MIRROR": "default"},
+}
+
 
 # Password validation
 # https://docs.djangoproject.com/en/6.1/ref/settings/#auth-password-validators

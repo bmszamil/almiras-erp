@@ -9,7 +9,8 @@ from datetime import datetime, timedelta
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import PermissionDenied, ValidationError
-from django.db import transaction
+from django.conf import settings
+from django.db import DatabaseError, connections, router, transaction
 from django.db.models import Q
 from django.http import Http404
 from django.utils import timezone
@@ -189,10 +190,14 @@ def _document_people(document):
     return people
 
 
-def log(event, *, actor=None, entity=None, subject_user=None, membership=None, role=None, permission="", details=None, source=None):
-    """Write one AccessLog row (R27). Never pass passwords, tokens, keys or OTPs in ``details``."""
+def log(event, *, actor=None, entity=None, subject_user=None, membership=None, role=None, permission="", details=None, source=None, using=None):
+    """Write one AccessLog row (R27). Never pass passwords, tokens, keys or OTPs in ``details``.
+
+    The row is written in the caller's transaction (``using`` picks another
+    connection; only :func:`log_denial` does that).
+    """
     actor = actor if getattr(actor, "pk", None) else None
-    return AccessLog.objects.create(
+    return AccessLog.objects.using(using or router.db_for_write(AccessLog)).create(
         at=now(),
         actor=actor,
         actor_kind=kind_of(actor),
@@ -207,6 +212,30 @@ def log(event, *, actor=None, entity=None, subject_user=None, membership=None, r
     )
 
 
+def log_denial(*, actor, entity, permission, details):
+    """Write a ``permission_denied`` row that survives the caller's rollback (R27, AT-1).
+
+    A refusal raises AccessDenied, which usually rolls back the caller's
+    transaction (ATOMIC_REQUESTS, service ``atomic`` blocks), and a row
+    written there would be lost. When the main connection is inside a
+    transaction, the row is written through the separate ``ACCESS_LOG_DB``
+    connection in its own short transaction instead. If that connection
+    cannot write it (for example the actor or entity were created in the
+    still-open transaction and are not visible to it, or a lock times out),
+    the row is written in the caller's transaction as before.
+    """
+    fields = dict(actor=actor, entity=entity, permission=permission, details=details)
+    main = router.db_for_write(AccessLog)
+    alias = getattr(settings, "ACCESS_LOG_DB", None)
+    if alias and alias in settings.DATABASES and alias != main and connections[main].in_atomic_block:
+        try:
+            with transaction.atomic(using=alias):
+                return log(AccessLog.Event.PERMISSION_DENIED, using=alias, **fields)
+        except DatabaseError:
+            pass
+    return log(AccessLog.Event.PERMISSION_DENIED, **fields)
+
+
 def _deny(user, entity, permission, code, **fmt):
     perm = catalogue.CATALOGUE.get(permission)
     values = dict(
@@ -218,7 +247,7 @@ def _deny(user, entity, permission, code, **fmt):
     )
     values.update(fmt)
     en, ar = MESSAGES[code]
-    log(AccessLog.Event.PERMISSION_DENIED, actor=user, entity=entity, permission=permission, details={"reason": code})
+    log_denial(actor=user, entity=entity, permission=permission, details={"reason": code})
     raise AccessDenied(code, en.format(**values), ar.format(**values), _language(user))
 
 

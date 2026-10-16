@@ -194,11 +194,15 @@ def _create(entity, date, description, lines, user, reference, post, posted_by):
 @transaction.atomic
 def close_period(period, *, user):
     """Close a fiscal period. ``user`` needs ``ledger.close_period`` in the period's entity (access.md 3.6)."""
-    period = FiscalPeriod.objects.select_for_update().select_related("entity").get(pk=period.pk)
-    access.require(user, period.entity, "ledger.close_period")
+    # Check rights before taking any lock, and lock only the period row: a lock
+    # on the entity row would block the access-log connection's FK check, so a
+    # refusal could not be logged outside this transaction.
+    entity = Entity.objects.get(pk=period.entity_id)
+    access.require(user, entity, "ledger.close_period")
+    period = FiscalPeriod.objects.select_for_update(of=("self",)).get(pk=period.pk)
     # Drafts get their period only when posted, so match them by entity and date.
     drafts = JournalEntry.objects.filter(
-        entity=period.entity, status=JournalEntry.Status.DRAFT,
+        entity=entity, status=JournalEntry.Status.DRAFT,
         date__gte=period.start_date, date__lte=period.end_date,
     )
     if drafts.exists():

@@ -16,6 +16,7 @@ ALLOW = {
     "core/access/services.py:kind_of": "helper",
     "core/access/services.py:source_of": "helper",
     "core/access/services.py:log": "writes the access log",
+    "core/access/services.py:log_denial": "writes the access log (denials, survives rollback)",
     "core/access/services.py:entities_for": "the scope mechanism itself",
     "core/access/services.py:scope": "the scope mechanism itself",
     "core/access/services.py:get_scoped_or_404": "the scope mechanism itself",
