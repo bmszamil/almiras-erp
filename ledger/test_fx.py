@@ -251,6 +251,9 @@ def test_r8_at20_decimals_per_currency_and_float_rejected(w):
         draft(w, w.alm, date(2027, 1, 15), [{"account": "1200", "currency": "KWD", "txn_debit": 0.1}, {"account": "4100", "credit": 1}])
     with pytest.raises(LedgerError, match="2 decimals"):
         draft(w, w.alm, date(2027, 1, 15), [{"account": "1100", "debit": "1.005"}, {"account": "3100", "credit": "1.005"}])
+    with pytest.raises(LedgerError, match="not negative"):
+        draft(w, w.alm, date(2027, 1, 15), [{"account": "1200", "currency": "KWD", "txn_debit": "-1"}, {"account": "4100", "credit": 1}])
+    assert not JournalEntry.objects.filter(entity=w.alm).exclude(pk=kwd.pk).exists()
 
 
 def test_at30_three_decimal_kwd_and_rejections_name_currency_in_both_languages(w):

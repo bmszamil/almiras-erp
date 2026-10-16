@@ -414,6 +414,8 @@ def _side_amount(spec, debit_key, credit_key, what):
     credit = spec.get(credit_key)
     debit = fx.to_decimal(debit, what) if debit not in (None, "") else ZERO
     credit = fx.to_decimal(credit, what) if credit not in (None, "") else ZERO
+    if debit < ZERO or credit < ZERO:
+        raise error(f"Amounts are not negative ({what}); use the other side.", f"المبالغ لا تكون سالبة ({what})؛ استخدم الجانب الآخر.")
     if debit and credit:
         raise error(f"A line is debit or credit, not both ({what}).", f"البند مدين أو دائن وليس كليهما ({what}).")
     if debit:
