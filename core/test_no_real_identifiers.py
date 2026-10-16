@@ -18,14 +18,20 @@ from core.services import ALMIRAS_SETUP_DATA, SETUP_DATA_DIR, SETUP_FIELDS
 REPO = Path(__file__).resolve().parent.parent
 ROOT_CONFTEST = (REPO / "conftest.py").resolve()
 IDENTIFIER_FIELDS = ("unified_number", "cr_number", "vat_number", "short_address")
-# Allowed homes for the real values: the setup data itself, the specs that
-# record the owner's decision (docs/specs/invoicing.md D10) and the compliance
-# reviews that check them. Nothing else under docs/ is exempt.
-ALLOWED_DIRS = (
-    SETUP_DATA_DIR.resolve(),
-    (REPO / "docs" / "specs").resolve(),
-    (REPO / "docs" / "compliance").resolve(),
-)
+# Allowed homes for the real values: the setup data itself, the spec that
+# records the owner's decision (docs/specs/invoicing.md D10) and the
+# compliance reviews (the *.md files directly in docs/compliance) that check
+# them. Everything else is scanned, including the other specs and the
+# docs/compliance/zatca-sdk-kit/ samples and scripts.
+ALLOWED_DIRS = (SETUP_DATA_DIR.resolve(),)
+ALLOWED_FILES = ((REPO / "docs" / "specs" / "invoicing.md").resolve(),)
+COMPLIANCE_REVIEWS_DIR = (REPO / "docs" / "compliance").resolve()
+
+
+def _allowed(resolved):
+    if resolved in ALLOWED_FILES or any(resolved.is_relative_to(d) for d in ALLOWED_DIRS):
+        return True
+    return resolved.parent == COMPLIANCE_REVIEWS_DIR and resolved.suffix == ".md"
 # Only used when git is unavailable (the git listing already leaves these out).
 FALLBACK_SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
 # Identifiers that are plain digit strings of these lengths get a second pass
@@ -76,8 +82,7 @@ def scanned_files(git_files=_git_files):
     for path in candidates:
         if path.is_symlink() or not path.is_file():  # e.g. deleted but still in the index
             continue
-        resolved = path.resolve()
-        if any(resolved.is_relative_to(d) for d in ALLOWED_DIRS):
+        if _allowed(path.resolve()):
             continue
         yield path
 
@@ -115,8 +120,12 @@ def test_no_real_identifiers_outside_setup_data():
 def test_scan_covers_test_files():
     files = {p.relative_to(REPO).as_posix() for p in scanned_files()}
     assert {"core/tests.py", "ledger/tests.py", "conftest.py", "core/test_no_real_identifiers.py"} <= files
-    assert "docs/ai-agent-gateway.md" in files  # docs/ outside specs and compliance is scanned
-    assert not any(f.startswith(("core/setup_data/", "docs/specs/", "docs/compliance/")) for f in files)
+    assert "docs/ai-agent-gateway.md" in files
+    assert {"docs/specs/access.md", "docs/specs/ledger-fx.md", "docs/specs/zatca.md"} <= files  # only invoicing.md is exempt
+    assert "docs/specs/invoicing.md" not in files
+    assert any(f.startswith("docs/compliance/zatca-sdk-kit/") for f in files)  # the kit is scanned
+    assert not any(f.startswith("docs/compliance/") and f.count("/") == 2 and f.endswith(".md") for f in files)
+    assert not any(f.startswith("core/setup_data/") for f in files)
 
 
 def test_scan_falls_back_to_walking_the_tree_without_git():
