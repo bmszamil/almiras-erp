@@ -13,7 +13,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 
-from core.models import Entity
+from core.models import Currency, Entity, bi
 
 
 class LedgerError(ValidationError):
@@ -43,6 +43,15 @@ class Account(models.Model):
         default=False, help_text="Income to be purified (donated); posting allowed but flagged"
     )
     is_active = models.BooleanField(default=True)
+    is_monetary = models.BooleanField(
+        bi("Monetary", "بند نقدي"), default=False,
+        help_text=bi("Included in period-end FX revaluation", "يدخل في إعادة تقييم العملات في نهاية الفترة"),
+    )
+    currency = models.ForeignKey(
+        Currency, to_field="code", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Account currency", "عملة الحساب"),
+        help_text=bi("Empty: any currency. Set: every line must be in this currency", "فارغ: أي عملة. محدد: يجب أن تكون كل البنود بهذه العملة"),
+    )
 
     class Meta:
         unique_together = [("entity", "code")]
@@ -152,6 +161,19 @@ class JournalEntry(models.Model):
 
 
 class JournalLine(models.Model):
+    class RateSource(models.TextChoices):
+        FUNCTIONAL = "functional", bi("Functional currency (rate 1)", "العملة الوظيفية (سعر 1)")
+        TABLE = "table", bi("Rate table", "جدول الأسعار")
+        MANUAL = "manual", bi("Manual rate", "سعر يدوي")
+        CARRYING = "carrying", bi("Carrying rate (settlement)", "السعر الدفتري (تسوية)")
+
+    class LineKind(models.TextChoices):
+        NORMAL = "normal", bi("Normal", "عادي")
+        SETTLEMENT = "settlement", bi("Settlement", "تسوية")
+        REALISED_FX = "realised_fx", bi("Realised FX gain/loss", "فروقات عملة محققة")
+        REVALUATION = "revaluation", bi("Revaluation", "إعادة تقييم")
+        ROUNDING = "rounding", bi("Currency rounding", "فروقات تقريب")
+
     entry = models.ForeignKey(JournalEntry, on_delete=models.CASCADE, related_name="lines")
     account = models.ForeignKey(Account, on_delete=models.PROTECT, related_name="lines")
     description = models.CharField(max_length=300, blank=True)
@@ -161,6 +183,32 @@ class JournalLine(models.Model):
         Entity, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
         help_text="Required on intercompany accounts, used for elimination",
     )
+    # Multi-currency (ledger-fx.md 3.5). debit / credit above are functional-currency amounts.
+    currency = models.ForeignKey(
+        Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Transaction currency", "عملة المعاملة"),
+    )
+    txn_amount = models.DecimalField(
+        bi("Transaction amount", "مبلغ المعاملة"), max_digits=21, decimal_places=3,
+        help_text=bi("In the transaction currency, same side as debit/credit", "بعملة المعاملة، في نفس جانب المدين/الدائن"),
+    )
+    fx_rate = models.DecimalField(
+        bi("Exchange rate", "سعر الصرف"), max_digits=20, decimal_places=10, null=True, blank=True,
+        help_text=bi("Functional units per 1 transaction unit", "وحدات العملة الوظيفية لكل وحدة من عملة المعاملة"),
+    )
+    rate_source = models.CharField(
+        bi("Rate source", "مصدر السعر"), max_length=10, choices=RateSource.choices, default=RateSource.FUNCTIONAL
+    )
+    exchange_rate = models.ForeignKey(
+        "ExchangeRate", null=True, blank=True, on_delete=models.PROTECT, related_name="lines",
+        verbose_name=bi("Rate row", "سجل السعر"),
+    )
+    settles_line = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.PROTECT, related_name="settled_by",
+        verbose_name=bi("Settles line", "يسوّي البند"),
+    )
+    manual_rate_reason = models.CharField(bi("Manual rate reason", "سبب السعر اليدوي"), max_length=300, blank=True)
+    line_kind = models.CharField(bi("Line kind", "نوع البند"), max_length=12, choices=LineKind.choices, default=LineKind.NORMAL)
 
     class Meta:
         ordering = ["entry", "id"]
@@ -172,6 +220,18 @@ class JournalLine(models.Model):
                 condition=(models.Q(debit=0) & models.Q(credit__gt=0)) | (models.Q(credit=0) & models.Q(debit__gt=0)),
                 name="line_one_side_only",
             ),
+            models.CheckConstraint(condition=models.Q(txn_amount__gte=0), name="line_txn_amount_not_negative"),
+            models.CheckConstraint(
+                condition=models.Q(fx_rate__isnull=True) | models.Q(fx_rate__gt=0), name="line_fx_rate_positive"
+            ),
+            # Revaluation lines, and only they, carry no transaction amount and no rate (3.5).
+            models.CheckConstraint(
+                condition=(
+                    models.Q(line_kind="revaluation", txn_amount=0, fx_rate__isnull=True)
+                    | (~models.Q(line_kind="revaluation") & ~models.Q(txn_amount=0, fx_rate__isnull=True))
+                ),
+                name="line_revaluation_kind",
+            ),
         ]
 
     def _entry_locked(self):
@@ -182,7 +242,25 @@ class JournalLine(models.Model):
     def save(self, *args, **kwargs):
         if self._entry_locked():
             raise LedgerError("Lines of a posted entry cannot be changed.")
+        self._fill_functional_defaults()
         super().save(*args, **kwargs)
+
+    def _fill_functional_defaults(self):
+        """R1: a line saved without currency fields is in the entity's functional currency at rate 1.
+
+        Only empty fields are filled; a value that was set is never changed, so
+        an inconsistent line is rejected by validate_entry rather than repaired.
+        """
+        if self.currency_id is None:
+            self.currency_id = JournalEntry.objects.filter(pk=self.entry_id).values_list(
+                "entity__base_currency", flat=True
+            ).first()
+        if self.line_kind == self.LineKind.REVALUATION:
+            return
+        if self.txn_amount is None:
+            self.txn_amount = (self.debit or Decimal("0")) + (self.credit or Decimal("0"))
+        if self.fx_rate is None and self.rate_source == self.RateSource.FUNCTIONAL:
+            self.fx_rate = Decimal("1")
 
     def delete(self, *args, **kwargs):
         if self._entry_locked():
@@ -202,3 +280,144 @@ class EntrySequence(models.Model):
 
     class Meta:
         unique_together = [("entity", "year")]
+
+
+class ExchangeRate(models.Model):
+    """Units of ``to_currency`` per 1 unit of ``from_currency`` (ledger-fx.md 3.3).
+
+    ``entity`` null = group-wide rate; set = that entity's override (OQ-4 default).
+    A row used by a posted line is locked; corrections are new rows (R11).
+    No ``forward`` rate type exists (R36).
+    """
+
+    class RateType(models.TextChoices):
+        SPOT = "spot", bi("Spot", "فوري")
+        AVERAGE = "average", bi("Average", "متوسط")
+
+    class Source(models.TextChoices):
+        MANUAL = "manual", bi("Manual entry", "إدخال يدوي")
+        SAMA = "sama", bi("Saudi Central Bank (SAMA)", "البنك المركزي السعودي")
+        ECB = "ecb", bi("European Central Bank", "البنك المركزي الأوروبي")
+        CBE = "cbe", bi("Central Bank of Egypt", "البنك المركزي المصري")
+        CBUAE = "cbuae", bi("Central Bank of the UAE", "مصرف الإمارات العربية المتحدة المركزي")
+        PBOC = "pboc", bi("People's Bank of China", "بنك الشعب الصيني")
+        DERIVED = "derived", bi("Derived cross rate", "سعر تقاطعي مشتق")
+        FILE = "file", bi("File import", "استيراد ملف")
+
+    entity = models.ForeignKey(
+        Entity, null=True, blank=True, on_delete=models.PROTECT, related_name="exchange_rates",
+        verbose_name=bi("Entity (empty = group-wide)", "الكيان (فارغ = للمجموعة)"),
+    )
+    date = models.DateField(bi("Rate date", "تاريخ السعر"))
+    from_currency = models.ForeignKey(
+        Currency, to_field="code", on_delete=models.PROTECT, related_name="+", verbose_name=bi("From", "من")
+    )
+    to_currency = models.ForeignKey(
+        Currency, to_field="code", on_delete=models.PROTECT, related_name="+", verbose_name=bi("To", "إلى")
+    )
+    rate = models.DecimalField(bi("Rate", "السعر"), max_digits=20, decimal_places=10)
+    rate_type = models.CharField(bi("Rate type", "نوع السعر"), max_length=8, choices=RateType.choices, default=RateType.SPOT)
+    source = models.CharField(bi("Source", "المصدر"), max_length=8, choices=Source.choices, default=Source.MANUAL)
+    source_reference = models.CharField(bi("Source reference", "مرجع المصدر"), max_length=200, blank=True)
+    period_start = models.DateField(bi("Average from", "المتوسط من"), null=True, blank=True)
+    period_end = models.DateField(bi("Average to", "المتوسط إلى"), null=True, blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
+    created_at = models.DateTimeField(auto_now_add=True)
+    import_batch = models.CharField(bi("Import batch", "دفعة الاستيراد"), max_length=40, blank=True)
+
+    class Meta:
+        verbose_name = bi("exchange rate", "سعر صرف")
+        verbose_name_plural = bi("exchange rates", "أسعار الصرف")
+        ordering = ["-date", "from_currency", "to_currency"]
+        constraints = [
+            models.CheckConstraint(condition=~models.Q(from_currency=models.F("to_currency")), name="rate_currencies_differ"),
+            models.CheckConstraint(condition=models.Q(rate__gt=0), name="rate_positive"),
+            models.CheckConstraint(condition=models.Q(rate_type__in=["spot", "average"]), name="rate_type_known"),
+            models.CheckConstraint(
+                condition=~models.Q(rate_type="average")
+                | (models.Q(period_start__isnull=False) & models.Q(period_end__isnull=False)),
+                name="average_rate_has_window",
+            ),
+            # One row per key; a null entity counts as one value (partial indexes work on SQLite and PostgreSQL).
+            models.UniqueConstraint(
+                fields=["entity", "date", "from_currency", "to_currency", "rate_type", "source"],
+                condition=models.Q(entity__isnull=False), name="unique_entity_rate",
+            ),
+            models.UniqueConstraint(
+                fields=["date", "from_currency", "to_currency", "rate_type", "source"],
+                condition=models.Q(entity__isnull=True), name="unique_global_rate",
+            ),
+        ]
+
+    def clean(self):
+        errors = []
+        if self.from_currency_id and self.from_currency_id == self.to_currency_id:
+            errors.append("From and to currency must differ. / يجب أن تختلف العملتان.")
+        for code in (self.from_currency_id, self.to_currency_id):
+            cur = Currency.objects.filter(code=code).first() if code else None
+            if cur is not None and (not cur.is_active or cur.minor_units > 3):
+                errors.append(f"Currency {code} cannot be used. / لا يمكن استخدام العملة {code}.")
+        if self.rate is not None and self.rate <= 0:
+            errors.append("The rate must be above zero. / يجب أن يكون السعر أكبر من صفر.")
+        if self.rate_type == self.RateType.AVERAGE and not (self.period_start and self.period_end):
+            errors.append("An average rate needs its period. / يحتاج السعر المتوسط إلى فترته.")
+        if self.period_start and self.period_end and self.period_end < self.period_start:
+            errors.append("The averaging period ends before it starts. / تنتهي فترة المتوسط قبل بدايتها.")
+        if errors:
+            raise ValidationError(errors)
+
+    def is_locked(self):
+        return self.pk is not None and JournalLine.objects.filter(exchange_rate_id=self.pk).exclude(
+            entry__status=JournalEntry.Status.DRAFT
+        ).exists()
+
+    def save(self, *args, **kwargs):
+        if self.is_locked():
+            raise LedgerError(
+                "This rate is used by posted entries and cannot be changed; add a new rate row. / "
+                "هذا السعر مستخدم في قيود مرحّلة ولا يمكن تعديله؛ أضف سجل سعر جديدًا."
+            )
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if self.is_locked():
+            raise LedgerError(
+                "This rate is used by posted entries and cannot be deleted. / "
+                "هذا السعر مستخدم في قيود مرحّلة ولا يمكن حذفه."
+            )
+        return super().delete(*args, **kwargs)
+
+    def __str__(self):
+        scope = self.entity.code if self.entity_id else "group"
+        return f"{self.date} {self.from_currency_id}->{self.to_currency_id} {self.rate} ({self.rate_type}, {self.source}, {scope})"
+
+
+class RevaluationRun(models.Model):
+    """One period-end FX revaluation per entity and period (ledger-fx.md 3.6, R21 to R26)."""
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="revaluation_runs")
+    period = models.ForeignKey(FiscalPeriod, on_delete=models.PROTECT, related_name="revaluation_runs")
+    rate_date = models.DateField(bi("Rate date", "تاريخ السعر"))
+    entry = models.OneToOneField(
+        JournalEntry, null=True, blank=True, on_delete=models.PROTECT, related_name="revaluation_run",
+        verbose_name=bi("Revaluation entry", "قيد إعادة التقييم"),
+    )
+    reversal = models.OneToOneField(
+        JournalEntry, null=True, blank=True, on_delete=models.PROTECT, related_name="revaluation_reversal_of",
+        verbose_name=bi("Automatic reversal", "العكس التلقائي"),
+    )
+    run_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
+    run_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = bi("FX revaluation run", "تشغيل إعادة تقييم العملات")
+        verbose_name_plural = bi("FX revaluation runs", "تشغيلات إعادة تقييم العملات")
+        constraints = [models.UniqueConstraint(fields=["entity", "period"], name="one_revaluation_per_period")]
+
+    def save(self, *args, **kwargs):
+        if self.period.entity_id != self.entity_id:
+            raise LedgerError("The period belongs to another entity. / الفترة تخص كيانًا آخر.")
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.entity.code} {self.period.name} revaluation"

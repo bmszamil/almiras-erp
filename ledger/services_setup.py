@@ -22,10 +22,11 @@ def install_chart_of_accounts(entity):
                 name_ar=ar,
                 type=typ,
                 parent=parent,
-                is_postable=not flags.get("header", False),
+                is_postable=not (flags.get("header", False) or flags.get("report_only", False)),
                 is_intercompany=flags.get("intercompany", False),
                 sharia_prohibited=flags.get("prohibited", False),
                 requires_purification=flags.get("purify", False),
+                is_monetary=flags.get("monetary", False),
             ),
         )
         if flags.get("header"):

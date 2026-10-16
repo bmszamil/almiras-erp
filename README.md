@@ -19,7 +19,7 @@ In-house ERP for the Almiras group. Python / Django / PostgreSQL, all open sourc
 ```bash
 pip install -r requirements.txt
 python manage.py migrate
-python manage.py setup_almiras        # Almiras entity (registration + address from core/setup_data/almiras.json), 55 accounts, 2027 periods
+python manage.py setup_almiras        # Almiras entity (registration + address from core/setup_data/almiras.json), 61 accounts, 2027 periods
 python manage.py createsuperuser      # technical admin only: no business rights (access.md R24)
 python manage.py access_bootstrap --username <user> --entity ALM --reason "Initial setup"  # first managing partner
 python manage.py runserver            # admin at /admin

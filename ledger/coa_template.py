@@ -3,19 +3,23 @@
 Draft for review by the Almiras accountant; to be reconciled with the Daftra chart
 before opening balances are loaded. Format: (code, English, Arabic, type, flags).
 Header accounts end in "000" and are not postable.
+
+Flags: header, intercompany, prohibited (Sharia), purify, monetary (included in FX
+revaluation, ledger-fx.md R21), report_only (not postable; used by reports such as
+currency translation, never posted to in an entity's own ledger).
 """
 
 A, L, E, I, X = "asset", "liability", "equity", "income", "expense"
 
 TEMPLATE = [
     ("1000", "Assets", "الأصول", A, {"header": True}),
-    ("1100", "Cash and bank", "النقد وما في حكمه", A, {}),
-    ("1110", "Petty cash", "العهد النقدية", A, {}),
-    ("1200", "Trade receivables", "الذمم المدينة التجارية", A, {}),
-    ("1210", "Due from group entities", "مستحق من شركات المجموعة", A, {"intercompany": True}),
-    ("1220", "Loans to group entities", "قروض لشركات المجموعة", A, {"intercompany": True}),
-    ("1300", "Sharia-compliant deposits (e.g. murabaha, wakala)", "ودائع متوافقة مع الشريعة", A, {}),
-    ("1310", "VAT input", "ضريبة القيمة المضافة - مدخلات", A, {}),
+    ("1100", "Cash and bank", "النقد وما في حكمه", A, {"monetary": True}),
+    ("1110", "Petty cash", "العهد النقدية", A, {"monetary": True}),
+    ("1200", "Trade receivables", "الذمم المدينة التجارية", A, {"monetary": True}),
+    ("1210", "Due from group entities", "مستحق من شركات المجموعة", A, {"intercompany": True, "monetary": True}),
+    ("1220", "Loans to group entities", "قروض لشركات المجموعة", A, {"intercompany": True, "monetary": True}),
+    ("1300", "Sharia-compliant deposits (e.g. murabaha, wakala)", "ودائع متوافقة مع الشريعة", A, {"monetary": True}),
+    ("1310", "VAT input", "ضريبة القيمة المضافة - مدخلات", A, {"monetary": True}),
     ("1320", "Prepayments", "مصروفات مدفوعة مقدماً", A, {}),
     ("1400", "Investments in subsidiaries", "استثمارات في شركات تابعة", A, {}),
     ("1410", "Investments in associates (equity method)", "استثمارات في شركات زميلة", A, {}),
@@ -26,19 +30,22 @@ TEMPLATE = [
     ("1590", "Accumulated depreciation", "مجمع الاستهلاك", A, {}),
     ("1600", "Intangible assets and IP", "الأصول غير الملموسة والملكية الفكرية", A, {}),
     ("2000", "Liabilities", "الالتزامات", L, {"header": True}),
-    ("2100", "Trade payables", "الذمم الدائنة التجارية", L, {}),
-    ("2110", "Due to group entities", "مستحق لشركات المجموعة", L, {"intercompany": True}),
-    ("2200", "VAT output", "ضريبة القيمة المضافة - مخرجات", L, {}),
-    ("2210", "Zakat payable", "الزكاة المستحقة", L, {}),
-    ("2300", "Accrued expenses", "مصروفات مستحقة", L, {}),
-    ("2400", "Islamic financing (murabaha, tawarruq)", "تمويل إسلامي", L, {}),
+    ("2100", "Trade payables", "الذمم الدائنة التجارية", L, {"monetary": True}),
+    ("2110", "Due to group entities", "مستحق لشركات المجموعة", L, {"intercompany": True, "monetary": True}),
+    ("2200", "VAT output", "ضريبة القيمة المضافة - مخرجات", L, {"monetary": True}),
+    ("2210", "Zakat payable", "الزكاة المستحقة", L, {"monetary": True}),
+    ("2300", "Accrued expenses", "مصروفات مستحقة", L, {"monetary": True}),
+    ("2400", "Islamic financing (murabaha, tawarruq)", "تمويل إسلامي", L, {"monetary": True}),
     ("2410", "Conventional interest-bearing loans", "قروض تقليدية بفائدة", L, {"prohibited": True}),
-    ("2500", "End-of-service provision", "مخصص مكافأة نهاية الخدمة", L, {}),
-    ("2600", "Charity payable (purification)", "مبالغ مستحقة للتطهير", L, {}),
+    ("2500", "End-of-service provision", "مخصص مكافأة نهاية الخدمة", L, {"monetary": True}),
+    ("2600", "Charity payable (purification)", "مبالغ مستحقة للتطهير", L, {"monetary": True}),
     ("3000", "Equity", "حقوق الملكية", E, {"header": True}),
     ("3100", "Share capital", "رأس المال", E, {}),
     ("3200", "Statutory reserve", "الاحتياطي النظامي", E, {}),
     ("3300", "Retained earnings", "الأرباح المبقاة", E, {}),
+    # PROPOSED (ledger-fx.md 5.0, OQ-6): FX accounts 3400, 4700, 4710, 5750, 5760, 5770 and the
+    # "monetary" flag list above are pending the accountant's approval.
+    ("3400", "Foreign currency translation reserve", "احتياطي ترجمة العملات الأجنبية", E, {"report_only": True}),
     ("3900", "Opening balance equity (migration)", "حقوق ملكية الأرصدة الافتتاحية", E, {}),
     ("4000", "Income", "الإيرادات", I, {"header": True}),
     ("4100", "Rental income", "إيرادات الإيجار", I, {}),
@@ -49,6 +56,8 @@ TEMPLATE = [
     ("4400", "Dividend income", "إيرادات توزيعات الأرباح", I, {}),
     ("4500", "Share of profit of associates", "الحصة من أرباح الشركات الزميلة", I, {}),
     ("4600", "Islamic deposit profit", "أرباح الودائع الإسلامية", I, {}),
+    ("4700", "Foreign exchange gain – realised", "أرباح فروقات العملة المحققة", I, {}),  # PROPOSED (OQ-6)
+    ("4710", "Foreign exchange gain – unrealised", "أرباح فروقات العملة غير المحققة", I, {}),  # PROPOSED (OQ-6)
     ("4900", "Non-compliant income (to purify)", "إيرادات غير متوافقة (للتطهير)", I, {"purify": True}),
     ("5000", "Expenses", "المصروفات", X, {"header": True}),
     ("5100", "Salaries and benefits", "الرواتب والمزايا", X, {}),
@@ -61,6 +70,9 @@ TEMPLATE = [
     ("5600", "Islamic financing cost", "تكلفة التمويل الإسلامي", X, {}),
     ("5610", "Conventional interest expense", "مصروف فوائد تقليدية", X, {"prohibited": True}),
     ("5700", "Bank charges", "رسوم بنكية", X, {}),
+    ("5750", "Foreign exchange loss – realised", "خسائر فروقات العملة المحققة", X, {}),  # PROPOSED (OQ-6)
+    ("5760", "Foreign exchange loss – unrealised", "خسائر فروقات العملة غير المحققة", X, {}),  # PROPOSED (OQ-6)
+    ("5770", "Currency rounding differences", "فروقات تقريب العملات", X, {}),  # PROPOSED (OQ-6); may carry credits
     ("5800", "Zakat", "الزكاة", X, {}),
     ("5900", "General and administrative", "مصروفات عمومية وإدارية", X, {}),
 ]
