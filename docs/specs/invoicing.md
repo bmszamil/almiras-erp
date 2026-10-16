@@ -1,6 +1,9 @@
 # Invoicing (Track A): accounts receivable and accounts payable, with VAT
 
-Django app: `invoicing`. Status: **draft spec. No business decisions recorded yet** (see section 2). Written 2026-10-16.
+**Compliance status: reviewed 2026-10-16 from search excerpts only; official documents not yet read; re-check required before go-live.** (Record: `docs/compliance/track-a-2026-10-16.md`.)
+
+Django app: `invoicing`. Status: **draft spec. No business decisions recorded yet** (see section 2). Written 2026-10-16; revised 2026-10-16 (compliance review applied).
+**[CC-verify]** = tax/ZATCA statement not yet checked against official text. **[CC-verify: search excerpt 2026-10-16]** = adopted from the 2026-10-16 review, which read only search excerpts (official ZATCA/SDAIA pages were unreachable); not verified.
 Companion spec: `docs/specs/zatca.md` (ZATCA Phase 2 e-invoicing), written in parallel. Hand-off points are in sections 4 (rules R40 to R46) and 6.
 
 ## 1. Purpose
@@ -45,8 +48,9 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | code | Char(20) | Y | | |
 | name_en / name_ar | Char(200) | Y / Y | Bi | Arabic name is required (ZATCA buyer name, D3) |
 | customer_kind | Choice: `business`, `individual`, `government` | Y | | Drives the standard vs simplified default (OQ-19) |
-| vat_number | Char(15) | N | | If set: 15 digits, starts and ends with `3` (ZATCA format) |
-| other_id_scheme | Choice: `CRN`, `MOM`, `MLS`, `700`, `SAG`, `NAT`, `GCC`, `IQA`, `PAS`, `OTH` | N | | Buyer ID when there is no VAT number (ZATCA) |
+| is_vat_registered | Bool | Y | | Default False. True → `vat_number` required (R16) |
+| vat_number | Char(15) | Y if `is_vat_registered` | | 15 digits, starts and ends with `3` (ZATCA format) |
+| other_id_scheme | Choice: `CRN`, `MOM`, `MLS`, `700`, `SAG`, `NAT`, `GCC`, `IQA`, `PAS`, `OTH` | N | | Buyer ID only for buyers **not** VAT-registered (ZATCA). Personal data for individuals (R49) |
 | other_id | Char(30) | N | | |
 | address: street, building_no, additional_no, district, city, postal_code, country (ISO-2, default `SA`) | Char | Y for standard invoices | Bi for street, district, city | ZATCA buyer address. `building_no` is 4 digits and `postal_code` 5 digits when country = SA |
 | group_entity | FK Entity, null | N | | Set when the customer is a group entity. Makes its invoices intercompany. Must not equal `entity`. |
@@ -97,9 +101,11 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | currency | Char(3) | Y | | Must equal entity base currency for now (OQ-6) |
 | payment_means_code | Char(3) (UNCL4461: 10, 30, 42, 48, 1) | N | | |
 | original_document | FK SalesDocument (invoice), null | Y for CN/DN | | ZATCA BillingReference |
-| reason_en / reason_ar | Char(300) | Y for CN/DN | Bi | ZATCA instruction note |
+| reason_ar / reason_en | Char(300) | `reason_ar` Y for CN/DN; `reason_en` N | Bi | ZATCA instruction note **[CC-verify]** |
+| retention_class / retention_until | Choice (`standard`, `capital_asset_real_estate`) / Date | Y at issue | | Same computation as zatca.md R-38; drives PDPL anonymisation (R52) |
 | document_discount | Money | N | | Document-level allowance |
-| total_net / total_vat / total_gross | Money | computed | | Stored at issue |
+| total_net / total_vat / total_gross | Money | computed | | Stored at issue. `total_vat` = sum of category VAT (R9) |
+| vat_breakdown | JSON: per (category, rate): taxable, vat | computed | | Document-level VAT per category (R9) |
 | amount_allocated | Money | computed | | Sum of allocations |
 | payment_state | Choice: `unpaid`, `partial`, `paid`, `credited` | computed | | |
 | requires_purification | Bool | computed | | True if any line hits an account with `requires_purification` |
@@ -127,7 +133,7 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | net_amount | Money | computed | | round(qty × unit_price − discount) |
 | vat_category | FK VatRate | Y | | Rate effective on `supply_date` (or `issue_date`) |
 | vat_exemption_reason | FK VatExemptionReason | Y if Z/E/O | | |
-| vat_amount | Money | computed | | Rounding policy undecided (OQ-11) |
+| vat_amount | Money | computed | | Display only; not summed into header VAT (R9) |
 | income_account | FK ledger.Account (same entity, type income, postable) | Y | | |
 
 ### 3.4 Purchase documents
@@ -151,7 +157,9 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | approved_by / approved_at | FK User / DateTime | | | |
 | journal_entry / reversal_entry | FK JournalEntry, null, PROTECT | | | |
 
-**PurchaseDocumentLine**: `description_en/_ar` (Bi, at least one), `quantity`, `unit_price`, `line_discount`, `net_amount`, `vat_category`, `vat_amount`, `vat_recoverable` (Bool, default True, OQ-9), `account` (FK Account, same entity; type expense or asset; postable).
+**PurchaseDocumentLine**: `description_en/_ar` (Bi, at least one), `quantity`, `unit_price`, `line_discount`, `net_amount`, `vat_category`, `vat_amount`, `vat_attribution` (Choice `taxable` / `exempt` / `mixed`, required, R29), `supply_kind` (Choice `goods` / `services`, required for non-resident vendors, R30), `vat_recoverable` (computed from R29/R30, not user-set), `account` (FK Account, same entity; type expense or asset; postable).
+
+**VatRecoveryRatio** (unique `(entity, year)`): `entity`, `year`, `ratio` Decimal(5,4), `kind` (`provisional` / `final`), `approved_by`, `approved_at`. Used only after OQ-9 sign-off; annual true-up compares provisional with final.
 
 ### 3.5 Money movements and allocation
 
@@ -162,6 +170,7 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | number | Char(40) | at posting | Gap-free |
 | date | Date | Y | |
 | amount | Money | Y | > 0 |
+| purpose | Choice: `settlement`, `advance`, `deposit` | Y (receipts) | Default `settlement`. `advance` / `deposit` blocked (R55) |
 | bank_charge | Money | N | Receipts only. Booked to 5700 |
 | currency | Char(3) | Y | = base currency for now |
 | bank_account | FK ledger.Account (same entity, asset) | Y | Default 1100 (OQ-20) |
