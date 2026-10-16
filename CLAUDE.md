@@ -10,7 +10,7 @@ No Odoo, SAP, Microsoft Dynamics or paid SaaS as dependencies; we may *connect* 
 4. Closed periods reject postings. Entities never post to another entity's accounts.
 5. Sharia is enforced per entity: Sharia-prohibited accounts are blocked; non-compliant income is flagged for purification.
 6. Intercompany lines always carry a counterparty entity.
-7. Money is `Decimal`, never float. Amounts stored with 2 decimals, currency explicit.
+7. Money is `Decimal`, never float, currency explicit. Functional-currency (SAR) amounts are stored with 2 decimals; foreign transaction-currency amounts with up to 3 decimals, checked against that currency's own decimals (project owner, 2026-10-16).
 
 ## Multi-entity rules
 - Every business record has an `entity` foreign key. Queries in views and APIs are always filtered by entity and user permission.
