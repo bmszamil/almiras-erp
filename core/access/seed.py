@@ -112,6 +112,17 @@ ROLE_SEED_V1 = {
     ),
 }
 
+# V2 (migration core.0009): managing_partner also holds the R32 entity-settings and user-activation rights (OQ-18).
+ROLE_SEED_V2 = {
+    **ROLE_SEED_V1,
+    "managing_partner": (
+        *ROLE_SEED_V1["managing_partner"][:5],
+        (*ROLE_SEED_V1["managing_partner"][5], "core.change_entity_settings", "core.manage_users"),
+    ),
+}
+# The current catalogue: what a fresh (or flushed test) database is seeded with.
+ROLE_SEED = ROLE_SEED_V2
+
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
     "billing": ("system.billing", "Billing system user", "مستخدم نظام الفوترة"),
@@ -120,7 +131,7 @@ SYSTEM_USERS_V1 = {
 }
 
 
-def apply_seed(Role, RolePermission, roles=ROLE_SEED_V1):
+def apply_seed(Role, RolePermission, roles=ROLE_SEED):
     """Create or update the seeded roles and their permission rows. Idempotent.
 
     Takes model classes so a migration can pass historical models.
@@ -138,16 +149,42 @@ def apply_seed(Role, RolePermission, roles=ROLE_SEED_V1):
             RolePermission.objects.get_or_create(role=role, codename=codename)
 
 
+class SeedConflict(RuntimeError):
+    """A system username is taken by a user that is not that system user (R20)."""
+
+
 def apply_system_users(User, UserProfile, users=SYSTEM_USERS_V1):
-    """Create one system user per system code, with an unusable password (R20). Idempotent."""
+    """Create one system user per system code (R20). Idempotent.
+
+    A username that already exists must belong to the matching system
+    profile; anything else (a human, an agent, another system code, a user
+    with no profile) fails loudly instead of being adopted. Every system user
+    is left with an unusable password and without superuser or staff flags,
+    whatever it had before.
+    """
     from django.contrib.auth.hashers import make_password
 
     for code, (username, en, ar) in users.items():
-        user, created = User.objects.get_or_create(
-            username=username,
-            defaults=dict(password=make_password(None), is_active=True, is_staff=False, is_superuser=False),
-        )
-        UserProfile.objects.get_or_create(
-            user=user,
-            defaults=dict(kind="system", system_code=code, display_name_en=en, display_name_ar=ar),
-        )
+        user = User.objects.filter(username=username).first()
+        if user is None:
+            user = User(username=username, password=make_password(None), is_active=True, is_staff=False, is_superuser=False)
+            # With the real User model the profile signal reads this (3.2); historical models ignore it.
+            user._access_profile = dict(kind="system", system_code=code, display_name_en=en, display_name_ar=ar)
+            user.save()
+            profile = UserProfile.objects.filter(user=user).first()
+            if profile is None:
+                UserProfile.objects.create(
+                    user=user, kind="system", system_code=code, display_name_en=en, display_name_ar=ar,
+                )
+            elif (profile.kind, profile.system_code) != ("system", code):
+                raise SeedConflict(f"New system user {username!r} got a {profile.kind} profile; expected system:{code}.")
+        else:
+            profile = UserProfile.objects.filter(user=user).first()
+            if profile is None or (profile.kind, profile.system_code) != ("system", code):
+                found = f"{profile.kind}:{profile.system_code or ''}" if profile else "no profile"
+                raise SeedConflict(
+                    f"Username {username!r} already exists and is not the {code} system user ({found}). "
+                    "Rename that user before migrating; system users are never adopted from existing accounts."
+                )
+        # update(), not save(): no signals with historical models, and the flags are forced, not compared.
+        User.objects.filter(pk=user.pk).update(password=make_password(None), is_staff=False, is_superuser=False)

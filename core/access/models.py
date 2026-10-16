@@ -172,7 +172,24 @@ def active_q(at, prefix=""):
     )
 
 
-class MembershipQuerySet(models.QuerySet):
+class AppendOnlyQuerySet(models.QuerySet):
+    """Bulk ``update()`` / ``delete()`` would skip the model guards, so they are refused (R9, R33)."""
+
+    append_only_message = "These records are append-only. / هذه السجلات للإضافة فقط."
+
+    def update(self, **kwargs):
+        raise AppendOnlyError(self.append_only_message)
+
+    def delete(self):
+        raise AppendOnlyError(self.append_only_message)
+
+
+class MembershipQuerySet(AppendOnlyQuerySet):
+    append_only_message = (
+        "Memberships are never edited or deleted in bulk; revoke through core.access.revoke_membership. / "
+        "لا تُعدَّل العضويات ولا تُحذف جماعيًا؛ استخدم خدمة إلغاء العضوية."
+    )
+
     def active(self, at=None):
         at = at or timezone.now()
         # A delegation ends when its source ends (R16); delegates cannot delegate, so one level is enough.
@@ -310,6 +327,17 @@ class Membership(models.Model):
         return f"{self.user} · {self.entity.code} · {self.role.code}"
 
 
+class DualControlRequestQuerySet(AppendOnlyQuerySet):
+    append_only_message = (
+        "Dual-control requests change only through core.access services. / "
+        "لا تتغير طلبات الرقابة المزدوجة إلا من خلال خدمات الصلاحيات."
+    )
+
+    def _transition(self, **kwargs):
+        """Conditional status change used only by core.access.services (R19)."""
+        return models.QuerySet.update(self, **kwargs)
+
+
 class DualControlRequest(models.Model):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
@@ -333,6 +361,8 @@ class DualControlRequest(models.Model):
     decision_note = models.CharField(max_length=500, blank=True)
     expires_at = models.DateTimeField()
 
+    objects = DualControlRequestQuerySet.as_manager()
+
     class Meta:
         ordering = ["-requested_at"]
         constraints = [
@@ -342,11 +372,23 @@ class DualControlRequest(models.Model):
             )
         ]
 
+    def save(self, *args, **kwargs):
+        if self.pk is not None and DualControlRequest.objects.filter(pk=self.pk).exists():
+            raise AppendOnlyError(  # R19: status changes go through request/decide/require_dual_control
+                "Dual-control requests change only through core.access services. / "
+                "لا تتغير طلبات الرقابة المزدوجة إلا من خلال خدمات الصلاحيات."
+            )
+        super().save(*args, **kwargs)
+
     def delete(self, *args, **kwargs):
         raise AppendOnlyError("Dual-control requests are never deleted. / لا تُحذف طلبات الرقابة المزدوجة.")
 
     def __str__(self):
         return f"{self.entity.code} {self.permission} #{self.target_id} ({self.status})"
+
+
+class AccessLogQuerySet(AppendOnlyQuerySet):
+    append_only_message = "The access log is append-only. / سجل الوصول للإضافة فقط."
 
 
 class AccessLog(models.Model):
@@ -367,6 +409,8 @@ class AccessLog(models.Model):
         AGENT_TOKEN_ISSUED = "agent_token_issued", "Agent token issued"
         AGENT_TOKEN_REVOKED = "agent_token_revoked", "Agent token revoked"
         BOOTSTRAP = "bootstrap", "Bootstrap"
+        ENTITY_SETTINGS_CHANGED = "entity_settings_changed", "Entity settings changed"
+        USER_ACTIVE_CHANGED = "user_active_changed", "User activated or deactivated"
 
     at = models.DateTimeField(default=timezone.now)
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
@@ -384,6 +428,8 @@ class AccessLog(models.Model):
     ip = models.CharField(max_length=45, blank=True)
     source = models.CharField(max_length=60, blank=True)
 
+    objects = AccessLogQuerySet.as_manager()
+
     class Meta:
         ordering = ["at", "id"]
 
@@ -397,3 +443,34 @@ class AccessLog(models.Model):
 
     def __str__(self):
         return f"{self.at:%Y-%m-%d %H:%M} {self.event} {self.permission}"
+
+
+class GrantUse(models.Model):
+    """The single use of a grant (R30): one row per ``permission_granted`` AccessLog row.
+
+    The one-to-one key makes a second use fail in the database, also when two
+    requests present the same grant at the same moment. Append-only.
+    """
+
+    log = models.OneToOneField(AccessLog, on_delete=models.PROTECT, related_name="grant_use")
+    used_at = models.DateTimeField(default=timezone.now)
+    used_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
+    target_type = models.CharField(max_length=100, blank=True, help_text="app_label.model the grant was used on")
+    target_id = models.PositiveBigIntegerField(null=True, blank=True)
+
+    objects = AppendOnlyQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["used_at", "id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None or kwargs.get("force_update"):
+            raise AppendOnlyError("A grant use is final. / استخدام التفويض نهائي.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise AppendOnlyError("A grant use is final. / استخدام التفويض نهائي.")
+
+    def __str__(self):
+        return f"grant {self.log_id} used {self.used_at:%Y-%m-%d %H:%M}"

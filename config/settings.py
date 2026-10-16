@@ -98,17 +98,32 @@ else:
 # database, so it is a test mirror of "default". A short lock timeout makes
 # the writer fall back to the main connection instead of waiting on it.
 ACCESS_LOG_DB = "access_log"
+
+
+def _access_log_options(default):
+    """The default connection's OPTIONS plus a 2 s lock timeout (access.md R27).
+
+    On PostgreSQL the timeout is appended to any libpq ``options`` already
+    configured (e.g. a search_path), never replacing them.
+    """
+    options = dict(default.get("OPTIONS", {}))
+    if default["ENGINE"].endswith("postgresql"):
+        options["options"] = " ".join(filter(None, [options.get("options", ""), "-c lock_timeout=2000"]))
+    else:
+        options["timeout"] = 2
+    return options
+
+
 DATABASES[ACCESS_LOG_DB] = {
     **DATABASES["default"],
     "ATOMIC_REQUESTS": False,
     "AUTOCOMMIT": True,
-    "OPTIONS": (
-        {**DATABASES["default"].get("OPTIONS", {}), "options": "-c lock_timeout=2000"}
-        if DATABASES["default"]["ENGINE"].endswith("postgresql")
-        else {**DATABASES["default"].get("OPTIONS", {}), "timeout": 2}
-    ),
+    "OPTIONS": _access_log_options(DATABASES["default"]),
     "TEST": {"MIRROR": "default"},
 }
+
+# How long a posting / approval grant may be used after it was issued (access.md R31).
+ACCESS_GRANT_MAX_AGE = int(os.environ.get("ACCESS_GRANT_MAX_AGE_SECONDS", 15 * 60))
 
 
 # Password validation

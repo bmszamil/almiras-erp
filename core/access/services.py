@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.conf import settings
-from django.db import DatabaseError, connections, router, transaction
+from django.db import DatabaseError, IntegrityError, connections, router, transaction
 from django.db.models import Q
 from django.http import Http404
 from django.utils import timezone
@@ -18,9 +18,13 @@ from django.utils import timezone
 from core.models import Entity
 
 from . import catalogue
-from .models import AccessLog, DualControlRequest, Kind, Membership, Role, UserProfile
+from .models import AccessLog, DualControlRequest, GrantUse, Kind, Membership, Role, UserProfile
 
 DUAL_CONTROL_TTL = timedelta(hours=72)  # OQ-11 default
+# How long a grant may be used after require() issued it (R31). Setting ACCESS_GRANT_MAX_AGE (timedelta or seconds).
+GRANT_MAX_AGE = timedelta(minutes=15)
+GRANT_EVENTS = ("permission_granted", "dual_control_used")
+DELEGATION_START_TOLERANCE = timedelta(minutes=1)
 
 # OQ-2 default: an access_admin grants every entity role except these.
 ACCESS_ADMIN_CANNOT_GRANT = frozenset({"access_admin", "approver", "zatca_admin"})
@@ -100,6 +104,30 @@ MESSAGES = {
         "يتطلب هذا الإجراء طلب رقابة مزدوجة معتمدًا وغير مستخدم لهذا التغيير بعينه.",
     ),
     "dual_control_expired": ("The four-eyes request has expired.", "انتهت صلاحية طلب الرقابة المزدوجة."),
+    "grant_forged": (
+        "This authorisation does not match the access log; ask for a new one.",
+        "هذا التفويض لا يطابق سجل الوصول؛ اطلب تفويضًا جديدًا.",
+    ),
+    "grant_expired": (
+        "This authorisation has expired; ask for a new one.",
+        "انتهت صلاحية هذا التفويض؛ اطلب تفويضًا جديدًا.",
+    ),
+    "grant_used": (
+        "This authorisation has already been used; each one is used once.",
+        "استُخدم هذا التفويض من قبل؛ يُستخدم كل تفويض مرة واحدة.",
+    ),
+    "grant_needs_document": (
+        "A posting authorisation is given for one document; this one names none or another.",
+        "يُمنح تفويض الترحيل لمستند واحد؛ وهذا التفويض لا يحدد مستندًا أو يحدد مستندًا آخر.",
+    ),
+    "posted_by_not_approver": (
+        "The person recorded as poster must be the approver recorded for this document.",
+        "يجب أن يكون المرحِّل المسجَّل هو المعتمد المسجَّل لهذا المستند.",
+    ),
+    "delegation_dates": (
+        "A delegation starts now or later, and not before the delegator's own membership.",
+        "يبدأ التفويض الآن أو لاحقًا، ولا يبدأ قبل عضوية المفوِّض نفسه.",
+    ),
 }
 
 
@@ -168,6 +196,9 @@ def _language(user):
 
 
 def _document_ref(document):
+    """``(app_label.model, pk)`` of a document, or the reference itself when a tuple is passed."""
+    if isinstance(document, (tuple, list)):
+        return (str(document[0]), document[1]) if len(document) == 2 and document[1] is not None else None
     if document is None or getattr(document, "pk", None) is None:
         return None
     return (document._meta.label_lower, document.pk)
@@ -180,8 +211,11 @@ def _user_id(value):
 
 
 def _document_people(document):
+    """Users who may not approve ``document``: its creator, submitter and last modifier (R14)."""
     people = set()
-    for attr in ("created_by", "submitted_by"):
+    if document is None or isinstance(document, (tuple, list)):
+        return people
+    for attr in ("created_by", "submitted_by", "modified_by"):
         uid = getattr(document, f"{attr}_id", None)
         if uid is None:
             uid = _user_id(getattr(document, attr, None))
@@ -190,7 +224,7 @@ def _document_people(document):
     return people
 
 
-def log(event, *, actor=None, entity=None, subject_user=None, membership=None, role=None, permission="", details=None, source=None, using=None):
+def log(event, *, actor=None, entity=None, subject_user=None, membership=None, role=None, permission="", details=None, source=None, using=None, at=None):
     """Write one AccessLog row (R27). Never pass passwords, tokens, keys or OTPs in ``details``.
 
     The row is written in the caller's transaction (``using`` picks another
@@ -198,7 +232,7 @@ def log(event, *, actor=None, entity=None, subject_user=None, membership=None, r
     """
     actor = actor if getattr(actor, "pk", None) else None
     return AccessLog.objects.using(using or router.db_for_write(AccessLog)).create(
-        at=now(),
+        at=at or now(),
         actor=actor,
         actor_kind=kind_of(actor),
         event=event,
@@ -350,6 +384,8 @@ def require(user, entity, permission, *, document=None, allow_self_approval=Fals
     perm = catalogue.get(permission)
     if perm.is_approval and document is None:
         raise AccessUsageError(f"{permission} is an approval permission; pass the document (R14).")
+    if perm.posts and _document_ref(document) is None:
+        raise AccessUsageError(f"{permission} authorises a posting for one document; pass the document (R30).")
     if perm.is_dual_control:
         raise AccessUsageError(f"{permission} needs dual control; use require_dual_control (R19).")
     at = now()
@@ -368,6 +404,7 @@ def require(user, entity, permission, *, document=None, allow_self_approval=Fals
             actor=user,
             entity=entity,
             permission=permission,
+            at=at,
             details={
                 "self_approval": self_approval,
                 "document": list(_document_ref(document)) if _document_ref(document) else None,
@@ -429,33 +466,104 @@ def get_scoped_or_404(queryset, user, permission, entity_field="entity", **looku
         raise Http404("Not found / غير موجود") from None
 
 
-def verify_grant(grant, entity, allowed_permissions, *, document=None, allow_self_approval=False):
-    """Check a Grant passed to a service: right type, same entity, and still valid now (R4, R23).
+def _grant_max_age():
+    value = getattr(settings, "ACCESS_GRANT_MAX_AGE", None)
+    if value is None:
+        return GRANT_MAX_AGE
+    return value if isinstance(value, timedelta) else timedelta(seconds=value)
 
-    With ``document``, the grant must have been issued for that document and
+
+def _grant_row_matches(grant, row):
+    """R31: the AccessLog row written when the grant was issued says exactly what the Grant says."""
+    if row is None or row.event not in GRANT_EVENTS:
+        return False
+    if (row.actor_id, row.entity_id, row.permission) != (_user_id(grant.user), getattr(grant.entity, "pk", None), grant.permission):
+        return False
+    if row.at != grant.checked_at:
+        return False
+    if row.event == AccessLog.Event.PERMISSION_GRANTED:
+        details = row.details or {}
+        expected = list(grant.document_ref) if grant.document_ref else None
+        if details.get("document") != expected or bool(details.get("self_approval")) != bool(grant.self_approval):
+            return False
+        if sorted(details.get("membership_ids") or []) != sorted(grant.membership_ids or ()):
+            return False
+    elif grant.document_ref is not None:
+        return False
+    return True
+
+
+def verify_grant(grant, entity, allowed_permissions, *, document=None, allow_self_approval=False, use=True, target=None):
+    """Check a Grant passed to a service before honouring it (R4, R23, R30, R31).
+
+    The Grant must match the ``permission_granted`` AccessLog row it was
+    issued with (user, entity, permission, document, time), be younger than
+    ``ACCESS_GRANT_MAX_AGE`` (default 15 minutes), not be used yet, and the
+    user must still hold the right now. With ``document`` (required for A and
+    P permissions), the grant must have been issued for that document and
     segregation (R14) is checked again; a self-approval grant is accepted only
     when the calling service passes ``allow_self_approval=True``.
+
+    With ``use=True`` (default) the grant is marked used here (single use,
+    R30); a service that wants the use to roll back with its own writes
+    passes ``use=False`` and calls :func:`use_grant` inside its transaction.
     Returns the user the grant belongs to. Refusals are logged and raise AccessDenied.
     """
     if not isinstance(grant, Grant):
         _deny(None, entity, "", "grant_missing")
     user = grant.user
-    if grant.entity.pk != entity.pk:
-        _deny(user, entity, grant.permission, "grant_other_entity")
+    actor = user if getattr(user, "pk", None) else None
+    if getattr(grant.entity, "pk", None) != entity.pk:
+        _deny(actor, entity, grant.permission, "grant_other_entity")
     if grant.permission not in allowed_permissions:
-        _deny(user, entity, grant.permission, "grant_wrong_permission")
+        _deny(actor, entity, grant.permission, "grant_wrong_permission")
     perm = catalogue.get(grant.permission)
+    if (perm.posts or perm.is_approval) and document is None:
+        raise AccessUsageError(f"{grant.permission}: pass the document the grant is used for (R30).")
+    row = AccessLog.objects.filter(pk=grant.log_id).first() if grant.log_id else None
+    if not _grant_row_matches(grant, row):
+        _deny(actor, entity, grant.permission, "grant_forged")
+    if now() - row.at > _grant_max_age():
+        _deny(actor, entity, grant.permission, "grant_expired")
+    if GrantUse.objects.filter(log_id=row.pk).exists():
+        _deny(actor, entity, grant.permission, "grant_used")
     _, reason = _evaluate(user, entity, grant.permission, now())
     if reason:
-        _deny(user, entity, grant.permission, reason)
+        _deny(actor, entity, grant.permission, reason)
     if document is not None:
-        if grant.document_ref != _document_ref(document):
-            _deny(user, entity, grant.permission, "grant_wrong_document")
+        if grant.document_ref is None or grant.document_ref != _document_ref(document):
+            _deny(actor, entity, grant.permission, "grant_wrong_document")
         if (perm.is_approval or perm.is_segregated) and user.pk in _document_people(document) and not (
             allow_self_approval and grant.self_approval and not perm.is_segregated
         ):
-            _deny(user, entity, grant.permission, "self_approval")
+            _deny(actor, entity, grant.permission, "self_approval")
+    if use:
+        use_grant(grant, target=target if target is not None else document)
     return user
+
+
+def use_grant(grant, *, target=None):
+    """Record the single use of ``grant`` (R30). A second use is refused, also under a race.
+
+    Call after :func:`verify_grant` (``use=False``), inside the transaction
+    that does the work, so the use rolls back with it.
+    """
+    ref = _document_ref(target)
+    try:
+        with transaction.atomic():
+            return GrantUse.objects.create(
+                log_id=grant.log_id, used_at=now(), used_by=grant.user, entity=grant.entity,
+                target_type=ref[0] if ref else "", target_id=ref[1] if ref else None,
+            )
+    except IntegrityError:
+        _deny(grant.user, grant.entity, grant.permission, "grant_used")
+
+
+def recorded_approvers(entity, permission, document):
+    """Users recorded in the access log as having been granted ``permission`` for ``document`` in ``entity``."""
+    expected = list(_document_ref(document) or ())
+    rows = AccessLog.objects.filter(event=AccessLog.Event.PERMISSION_GRANTED, entity=entity, permission=permission)
+    return {r.actor_id for r in rows.only("actor_id", "details") if expected and (r.details or {}).get("document") == expected}
 
 
 # --- memberships -------------------------------------------------------------
@@ -540,11 +648,14 @@ def delegate_approval(actor, delegate, entity, valid_from, valid_to, reason, sou
 
     The delegator delegates their own approver membership; a managing_partner
     may pass ``source`` (or rely on there being exactly one approver membership).
+    ``valid_from`` (None = now) is never in the past and never before the
+    source membership starts: a delegation cannot cover approvals already made.
     """
     if valid_to is None:
         raise ValidationError("A delegation needs an end date. / يجب تحديد تاريخ انتهاء التفويض.")
     grant = require(actor, entity, "core.delegate_approval")
     at = now()
+    valid_from = valid_from or at
     by_mp = not _grantor_is_restricted(grant)
     own = list(
         Membership.objects.active(at).filter(
@@ -569,6 +680,10 @@ def delegate_approval(actor, delegate, entity, valid_from, valid_to, reason, sou
         _deny(actor, entity, "core.delegate_approval", "delegate_cannot_delegate")
     if _user_id(delegate) in (actor.pk, source.user_id):
         _deny(actor, entity, "core.delegate_approval", "self_grant")
+    # A caller's "now" computed a moment earlier is accepted (one minute) and moved to now.
+    if valid_from < at - DELEGATION_START_TOLERANCE or valid_from < source.valid_from:
+        _deny(actor, entity, "core.delegate_approval", "delegation_dates")
+    valid_from = max(valid_from, at)
     with transaction.atomic():
         m = Membership(
             user=delegate, entity=entity, role=source.role, valid_from=valid_from, valid_to=valid_to,
@@ -599,8 +714,14 @@ def _require_dc_holder(user, entity, permission):
     return memberships
 
 
+def _check_target(target):
+    if target is None or getattr(target, "pk", None) is None:
+        raise AccessUsageError("A dual-control action names the object it changes (target) (R19).")
+
+
 def request_dual_control(user, entity, permission, target, payload):
     """Open a four-eyes request for a DC action on ``target`` with exactly ``payload`` (R19)."""
+    _check_target(target)
     _require_dc_holder(user, entity, permission)
     at = now()
     with transaction.atomic():
@@ -624,13 +745,13 @@ def decide_dual_control(user, request, approve, note=""):
         _deny(user, entity, permission, "self_approval")
     at = now()
     if request.expires_at <= at:
-        DualControlRequest.objects.filter(pk=request.pk, status=DualControlRequest.Status.PENDING).update(
+        DualControlRequest.objects.filter(pk=request.pk, status=DualControlRequest.Status.PENDING)._transition(
             status=DualControlRequest.Status.EXPIRED
         )
         _deny(user, entity, permission, "dual_control_expired")
     status = DualControlRequest.Status.APPROVED if approve else DualControlRequest.Status.REJECTED
     with transaction.atomic():
-        updated = DualControlRequest.objects.filter(pk=request.pk, status=DualControlRequest.Status.PENDING).update(
+        updated = DualControlRequest.objects.filter(pk=request.pk, status=DualControlRequest.Status.PENDING)._transition(
             status=status, decided_by=user, decided_at=at, decision_note=note
         )
         if not updated:
@@ -643,8 +764,12 @@ def decide_dual_control(user, request, approve, note=""):
     return request
 
 
-def require_dual_control(user, entity, permission, request, payload, target=None):
-    """Use an approved four-eyes request once (R19). Returns a Grant; the request becomes ``used``."""
+def require_dual_control(user, entity, permission, request, payload, target):
+    """Use an approved four-eyes request once, for the same ``target`` it was requested for (R19).
+
+    Returns a Grant; the request becomes ``used``.
+    """
+    _check_target(target)
     memberships = _require_dc_holder(user, entity, permission)
     request = DualControlRequest.objects.get(pk=request.pk)
     if (
@@ -652,25 +777,24 @@ def require_dual_control(user, entity, permission, request, payload, target=None
         or request.permission != permission
         or request.payload_hash != payload_hash(payload)
         or request.decided_by_id in (None, request.requested_by_id)
-        or (target is not None and (
-            request.target_type_id != ContentType.objects.get_for_model(target).pk or request.target_id != target.pk
-        ))
+        or request.target_type_id != ContentType.objects.get_for_model(target).pk
+        or request.target_id != target.pk
     ):
         _deny(user, entity, permission, "dual_control")
     at = now()
     if request.expires_at <= at:
-        DualControlRequest.objects.filter(pk=request.pk, status=DualControlRequest.Status.APPROVED).update(
+        DualControlRequest.objects.filter(pk=request.pk, status=DualControlRequest.Status.APPROVED)._transition(
             status=DualControlRequest.Status.EXPIRED
         )
         _deny(user, entity, permission, "dual_control_expired")
     with transaction.atomic():
-        used = DualControlRequest.objects.filter(pk=request.pk, status=DualControlRequest.Status.APPROVED).update(
+        used = DualControlRequest.objects.filter(pk=request.pk, status=DualControlRequest.Status.APPROVED)._transition(
             status=DualControlRequest.Status.USED
         )
         if not used:
             _deny(user, entity, permission, "dual_control")
         entry = log(
-            AccessLog.Event.DUAL_CONTROL_USED, actor=user, entity=entity, permission=permission,
+            AccessLog.Event.DUAL_CONTROL_USED, actor=user, entity=entity, permission=permission, at=at,
             details={"request": request.pk, "payload_hash": request.payload_hash},
         )
     return Grant(
@@ -689,8 +813,12 @@ def system_user(code):
 
 @transaction.atomic
 def bootstrap_managing_partner(user, entity, reason, os_user):
-    """Grant the first managing_partner membership (R26). Refused once any active one exists."""
-    role = Role.objects.get(code="managing_partner")
+    """Grant the first managing_partner membership (R26). Refused once any active one exists.
+
+    The role row is locked first, so two bootstraps at the same moment run one
+    after the other and the second sees the first's membership.
+    """
+    role = Role.objects.select_for_update().get(code="managing_partner")
     if Membership.objects.active(now()).filter(role=role).exists():
         raise ValidationError(
             "A managing partner membership already exists; use grant_membership. / "
@@ -704,3 +832,55 @@ def bootstrap_managing_partner(user, entity, reason, os_user):
         details={"os_user": os_user, **_membership_details(m)}, source="bootstrap",
     )
     return m
+
+
+# --- access log visibility and user activation ---------------------------------------
+
+def visible_access_log(user):
+    """AccessLog rows ``user`` may read (OQ-10 default): rows of entities where they hold ``core.view_access``,
+    plus rows without an entity (flag changes, user activation) when they hold it on a group parent entity."""
+    entities = entities_for(user, "core.view_access")
+    q = Q(entity__in=entities)
+    if entities.filter(consolidation=Entity.Consolidation.PARENT, parent__isnull=True).exists():
+        q |= Q(entity__isnull=True)
+    return AccessLog.objects.filter(q)
+
+
+def group_parent_of(entity):
+    """The top of ``entity``'s parent chain (the group parent entity, R6)."""
+    seen = {entity.pk}
+    current = entity
+    while current.parent_id and current.parent_id not in seen:
+        current = current.parent
+        seen.add(current.pk)
+    return current
+
+
+def set_user_active(actor, user, active, reason):
+    """Activate or deactivate a user account (R32 for users): ``core.manage_users`` on a group parent, logged.
+
+    Deactivating ends every right of the user at once (3.3). Nobody changes their own account.
+    """
+    if not reason:
+        raise ValidationError("A reason is required. / السبب مطلوب.")
+    parents = Entity.objects.filter(consolidation=Entity.Consolidation.PARENT, parent__isnull=True).order_by("pk")
+    parent = next((p for p in parents if has(actor, p, "core.manage_users")), None) or parents.first()
+    if parent is None:
+        raise ValidationError("No group parent entity exists. / لا يوجد كيان أم للمجموعة.")
+    require(actor, parent, "core.manage_users")
+    if _user_id(user) == _user_id(actor):
+        _deny(actor, parent, "core.manage_users", "self_grant")
+    User = type(user)
+    with transaction.atomic():
+        stored = User.objects.select_for_update().get(pk=user.pk)
+        before = stored.is_active
+        if before != bool(active):
+            stored.is_active = bool(active)
+            stored._access_actor = actor
+            stored.save(update_fields=["is_active"])
+            log(
+                AccessLog.Event.USER_ACTIVE_CHANGED, actor=actor, subject_user=stored, permission="core.manage_users",
+                details={"field": "is_active", "before": before, "after": bool(active), "reason": reason},
+            )
+    user.is_active = stored.is_active
+    return stored

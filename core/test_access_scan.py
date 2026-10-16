@@ -25,11 +25,33 @@ ALLOW = {
     "core/access/services.py:payload_hash": "helper",
     "core/access/services.py:system_user": "lookup used by system jobs (R20)",
     "core/access/services.py:bootstrap_managing_partner": "access_bootstrap command only (R26)",
+    "core/access/services.py:group_parent_of": "helper (walks parent links)",
+    "core/access/services.py:recorded_approvers": "reads the access log for a ledger check that already verified a grant",
+    "core/access/services.py:visible_access_log": "the scope mechanism for access-log rows (entities_for + group parent)",
+    "ledger/services.py:counterparty_choices": "choice list for admin; posting checks every line",
+    # Setup run by operators (setup_almiras, new-entity setup); no user action.
+    "ledger/services_setup.py:install_chart_of_accounts": "operator setup of a new entity (CLAUDE.md: entities are data)",
+    "ledger/services_setup.py:create_monthly_periods": "operator setup of a new entity",
+    # Pure arithmetic and validation on values the caller passes; no records read or written.
+    "ledger/fx.py:error": "pure helper",
+    "ledger/fx.py:to_decimal": "pure helper",
+    "ledger/fx.py:has_places": "pure helper",
+    "ledger/fx.py:check_txn_decimals": "pure helper",
+    "ledger/fx.py:check_functional_decimals": "pure helper",
+    "ledger/fx.py:check_rate": "pure helper",
+    "ledger/fx.py:round_functional": "pure helper",
+    "ledger/fx.py:convert": "pure helper",
+    "ledger/fx.py:inverse": "pure helper",
+    "ledger/fx.py:implied_rate": "pure helper",
 }
+
+# Modules with public functions that are not called services.py but act like them.
+EXTRA_MODULES = ("ledger/services_setup.py", "ledger/fx.py")
 
 
 def service_modules():
-    for path in sorted(REPO.glob("*/services.py")) + sorted(REPO.glob("*/*/services.py")):
+    extra = [REPO / name for name in EXTRA_MODULES]
+    for path in sorted(REPO.glob("*/services.py")) + sorted(REPO.glob("*/*/services.py")) + extra:
         if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.parts):
             continue
         yield path
@@ -78,7 +100,14 @@ def test_at26_every_public_service_checks_rights_or_is_allow_listed():
     assert not stale, f"Allow-list entries for functions that are gone or now check rights (remove them): {stale}"
 
 
+def test_scan_covers_setup_and_fx_modules():  # R1: helpers outside services.py are listed too
+    _, public = unchecked_functions()
+    assert "ledger/services_setup.py:install_chart_of_accounts" in public
+    assert "ledger/fx.py:convert" in public
+
+
 def test_ledger_posting_services_are_checked():
     unchecked, _ = unchecked_functions()
-    for name in ("post_entry", "reverse_entry", "create_entry", "close_period", "trial_balance", "intercompany_balances"):
+    for name in ("post_entry", "reverse_entry", "create_entry", "update_draft", "submit_entry", "close_period",
+                 "trial_balance", "intercompany_balances"):
         assert f"ledger/services.py:{name}" not in unchecked

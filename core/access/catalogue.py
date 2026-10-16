@@ -83,6 +83,9 @@ _PERMS = [
     _p("core.view_access", "View memberships and access log", "عرض العضويات وسجل الوصول"),
     _p("core.grant_membership", "Grant and revoke memberships", "منح العضويات وإلغاؤها", SEGREGATED),
     _p("core.delegate_approval", "Delegate approval", "تفويض صلاحية الاعتماد", SEGREGATED),
+    # R32, OQ-18 default: managing_partner only.
+    _p("core.change_entity_settings", "Change sensitive entity settings", "تغيير إعدادات الكيان الحساسة", GROUP_ONLY),
+    _p("core.manage_users", "Activate and deactivate user accounts", "تفعيل حسابات المستخدمين وإيقافها", GROUP_ONLY),
     # invoicing
     _p("invoicing.manage_customer", "Manage customers", "إدارة العملاء"),
     _p("invoicing.manage_vendor", "Manage vendors", "إدارة الموردين"),
@@ -155,9 +158,14 @@ SYSTEM_EXTRA = {
     "fx_import": frozenset(),
 }
 
-# Ledger postings (R23): which P grants each ledger service accepts.
+# Ledger postings (R23, R30): which P grants each ledger service accepts.
+# - post_entry (an existing draft): only ledger.post_entry, issued for that draft.
+# - create_entry(post=True, document=...): a sub-ledger P grant issued for that document.
+# - reverse_entry: ledger.reverse_entry for that entry, or invoicing.reverse_document for its document.
 REVERSE_PERMISSIONS = frozenset({"ledger.reverse_entry", "invoicing.reverse_document"})
-POST_PERMISSIONS = frozenset(c for c, p in CATALOGUE.items() if p.posts) - {"ledger.reverse_entry"}
+DRAFT_POST_PERMISSIONS = frozenset({"ledger.post_entry"})
+DOCUMENT_POST_PERMISSIONS = frozenset(c for c, p in CATALOGUE.items() if p.posts) - {"ledger.post_entry", "ledger.reverse_entry"}
+POST_PERMISSIONS = DRAFT_POST_PERMISSIONS | DOCUMENT_POST_PERMISSIONS
 
 
 def get(codename):

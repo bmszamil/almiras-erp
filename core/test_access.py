@@ -23,7 +23,7 @@ from core.access import catalogue, services
 from core.access.backends import EntityRoleBackend
 from core.access.checks import no_django_groups_or_user_permissions
 from core.access.models import AccessLog, AppendOnlyError, DualControlRequest, Kind, Membership, Role, RolePermission, UserProfile
-from core.access.seed import ROLE_SEED_V1, SYSTEM_USERS_V1
+from core.access.seed import ROLE_SEED, SYSTEM_USERS_V1
 from core.access.testing import make_agent, make_user, member
 from core.models import Entity
 from ledger.models import JournalEntry
@@ -88,7 +88,7 @@ def at(*args):
 # --- Seed and catalogue ------------------------------------------------------
 
 def test_seeded_roles_match_seed_and_catalogue():
-    for code, (en, ar, scope, kind, system_code, perms) in ROLE_SEED_V1.items():
+    for code, (en, ar, scope, kind, system_code, perms) in ROLE_SEED.items():
         role = Role.objects.get(code=code)
         assert (role.scope, role.kind, role.system_code, role.is_seeded) == (scope, kind, system_code, True)
         assert role.permission_codes == frozenset(perms)
@@ -130,7 +130,7 @@ def test_superuser_groups_and_user_permissions_give_nothing(w):
     for perm in ("ledger.view", "ledger.reverse_entry", "core.grant_membership"):
         assert not services.has(s, w.alm, perm)
         with pytest.raises(services.AccessDenied):
-            services.require(s, w.alm, perm)
+            services.require(s, w.alm, perm, document=bill(w.alm) if catalogue.get(perm).posts else None)
     assert not services.entities_for(s, "ledger.view").exists()
     assert services.scope(JournalEntry.objects.all(), s, "ledger.view").count() == 0
     assert denied_logged(s, "ledger.view", w.alm)
@@ -428,7 +428,7 @@ def test_r13_sys_permission_refused_for_humans_and_other_system_users(w):
     member(queue, w.alm, "system_zatca_queue")
     with pytest.raises(services.AccessDenied):
         services.require(queue, w.alm, "invoicing.create_from_billing")
-    assert services.require(queue, w.alm, "invoicing.post_on_clearance")
+    assert services.require(queue, w.alm, "invoicing.post_on_clearance", document=bill(w.alm))
 
 
 def test_at12_role_kind_must_match_user_kind(w):
@@ -723,13 +723,13 @@ def test_at19_dual_control_four_eyes_and_single_use(w, dc):
         services.decide_dual_control(dc.z1, dc.req, approve=True)
     assert exc.value.code == "self_approval"
     with pytest.raises(services.AccessDenied):  # not approved yet
-        services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, dc.payload)
+        services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, dc.payload, dc.target)
     services.decide_dual_control(dc.z2, dc.req, approve=True, note="Checked")
     grant = services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, dc.payload, target=dc.target)
     assert DualControlRequest.objects.get(pk=dc.req.pk).status == "used"
     assert AccessLog.objects.get(pk=grant.log_id).event == "dual_control_used"
     with pytest.raises(services.AccessDenied):
-        services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, dc.payload)
+        services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, dc.payload, dc.target)
     events = set(AccessLog.objects.filter(entity=w.alm).values_list("event", flat=True))
     assert {"dual_control_requested", "dual_control_decided", "dual_control_used"} <= events
 
@@ -749,18 +749,18 @@ def test_r19_decider_must_hold_permission(w, dc):
 def test_r19_rejected_request_cannot_be_used(w, dc):
     services.decide_dual_control(dc.z2, dc.req, approve=False, note="Not ready")
     with pytest.raises(services.AccessDenied):
-        services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, dc.payload)
+        services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, dc.payload, dc.target)
 
 
 def test_at20_other_payload_target_or_entity_refused(w, dc):
     services.decide_dual_control(dc.z2, dc.req, approve=True)
     with pytest.raises(services.AccessDenied):
-        services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, {**dc.payload, "egs": "EGS-2"})
+        services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, {**dc.payload, "egs": "EGS-2"}, dc.target)
     with pytest.raises(services.AccessDenied):
         services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, dc.payload, target=w.sub)
     member(dc.z1, w.sub, "zatca_admin")
     with pytest.raises(services.AccessDenied):
-        services.require_dual_control(dc.z1, w.sub, "zatca.switch_to_production", dc.req, dc.payload)
+        services.require_dual_control(dc.z1, w.sub, "zatca.switch_to_production", dc.req, dc.payload, dc.target)
     assert DualControlRequest.objects.get(pk=dc.req.pk).status == "approved"
 
 
@@ -768,7 +768,7 @@ def test_at20_expired_request_refused(w, dc, clock):
     services.decide_dual_control(dc.z2, dc.req, approve=True)
     clock.set(dc.req.requested_at + timedelta(hours=72, seconds=1))
     with pytest.raises(services.AccessDenied) as exc:
-        services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, dc.payload)
+        services.require_dual_control(dc.z1, w.alm, "zatca.switch_to_production", dc.req, dc.payload, dc.target)
     assert exc.value.code == "dual_control_expired"
     assert DualControlRequest.objects.get(pk=dc.req.pk).status == "expired"
 
@@ -782,7 +782,7 @@ def test_r19_decider_cannot_equal_requester_in_db(w, dc):
     from django.db import IntegrityError, transaction
 
     with pytest.raises(IntegrityError), transaction.atomic():
-        DualControlRequest.objects.filter(pk=dc.req.pk).update(decided_by=dc.z1)
+        DualControlRequest.objects.filter(pk=dc.req.pk)._transition(decided_by=dc.z1)  # the service-only path
 
 
 # --- AT-23, R26: bootstrap -----------------------------------------------------------

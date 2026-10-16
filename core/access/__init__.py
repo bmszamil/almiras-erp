@@ -9,6 +9,7 @@ _EXPORTS = {
     "AccessDenied", "AccessUsageError", "Grant", "require", "has", "entities_for", "scope",
     "get_scoped_or_404", "verify_grant", "deny", "require_dual_control", "request_dual_control",
     "decide_dual_control", "system_user", "grant_membership", "revoke_membership", "delegate_approval",
+    "use_grant", "recorded_approvers", "visible_access_log", "group_parent_of", "set_user_active",
 }
 
 
