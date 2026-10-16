@@ -132,6 +132,54 @@ def test_entity_settings_service_covers_equity_entities_and_checks_structure(w):
     assert Entity.objects.get(pk=w.sub.pk).parent_id == w.alm.pk
 
 
+def test_p5_top_level_group_parent_cannot_be_deactivated(w):
+    """P5 (reviewer probe): deactivating ALM locked everyone out of reactivating it (inactive_entity)."""
+    with pytest.raises(ValidationError, match="cannot be deactivated"):
+        core_services.change_entity_settings(w.alm, user=w.mp, reason="test", is_active=False)
+    assert Entity.objects.get(pk=w.alm.pk).is_active is True
+    other = entity("OTH", "parent")
+    with pytest.raises(ValidationError):  # nor by making a subsidiary top-level and inactive at once
+        core_services.change_entity_settings(w.sub, user=w.mp, reason="x", parent=None, consolidation="parent",
+                                             is_active=False)
+    assert other.is_active and Entity.objects.get(pk=w.sub.pk).is_active
+
+
+def test_inactive_group_parent_can_only_be_reactivated(w):
+    Entity.objects.filter(pk=w.alm.pk).update(is_active=False)  # e.g. data from before this rule
+    for changes in ({"sharia_enforced": False}, {"is_active": True, "sharia_enforced": False}):
+        with pytest.raises(services.AccessDenied) as exc:
+            core_services.change_entity_settings(w.alm, user=w.mp, reason="x", **changes)
+        assert exc.value.code == "inactive_entity_reactivate_only"
+    with pytest.raises(services.AccessDenied):  # nor other entities of the inactive group
+        core_services.change_entity_settings(w.sub, user=w.mp, reason="x", is_active=False)
+    with pytest.raises(services.AccessDenied) as exc:  # the I flag is only on core.change_entity_settings
+        services.require(w.mp, Entity.objects.get(pk=w.alm.pk), "core.grant_membership")
+    assert exc.value.code == "inactive_entity"
+    with pytest.raises(services.AccessDenied):
+        core_services.change_entity_settings(w.alm, user=w.acc, reason="x", is_active=True)
+    alm = core_services.change_entity_settings(w.alm, user=w.mp, reason="Reopened", is_active=True)
+    assert alm.is_active is True
+    row = AccessLog.objects.get(event="entity_settings_changed", entity=w.alm)
+    assert row.details["before"] == {"is_active": False} and row.details["after"] == {"is_active": True}
+
+
+def test_reactivate_entity_command_is_logged_and_only_for_inactive_entities(w):
+    from django.core.management import CommandError, call_command
+
+    Entity.objects.filter(pk=w.alm.pk).update(is_active=False)
+    with pytest.raises(CommandError):
+        call_command("reactivate_entity", entity="ALM", reason="")
+    call_command("reactivate_entity", entity="ALM", reason="Recovery after lock-out")
+    assert Entity.objects.get(pk=w.alm.pk).is_active is True
+    row = AccessLog.objects.get(event="entity_settings_changed", entity=w.alm)
+    assert row.actor is None and row.source == "command" and row.details["os_user"]
+    assert row.details["reason"] == "Recovery after lock-out"
+    with pytest.raises(CommandError, match="already active"):
+        call_command("reactivate_entity", entity="ALM", reason="again")
+    with pytest.raises(CommandError):
+        call_command("reactivate_entity", entity="NOPE", reason="x")
+
+
 def test_functional_currency_change_is_logged(w):
     from ledger import services as ledger
 

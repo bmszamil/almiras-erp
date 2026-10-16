@@ -7,6 +7,7 @@ Flags:
 - ``G``  group-level only (only group-scope roles may hold it)
 - ``Ag`` an agent role may hold it (R12)
 - ``P``  a grant for it authorises a ledger posting (R23)
+- ``I``  also checked on an inactive entity; the service then allows only reactivation (R32 recovery)
 ``system`` is set for "Sys:x" permissions: only system user ``x`` may hold them (R13).
 
 Arabic labels are marked for review [AR-review] like the role names in the spec.
@@ -19,8 +20,9 @@ DUAL_CONTROL = "DC"
 GROUP_ONLY = "G"
 AGENT_OK = "Ag"
 POSTS = "P"
+INACTIVE_OK = "I"
 
-FLAGS = frozenset({APPROVAL, SEGREGATED, DUAL_CONTROL, GROUP_ONLY, AGENT_OK, POSTS})
+FLAGS = frozenset({APPROVAL, SEGREGATED, DUAL_CONTROL, GROUP_ONLY, AGENT_OK, POSTS, INACTIVE_OK})
 # Flags an agent user can never use, whatever its role says (R12, A7).
 AGENT_FORBIDDEN_FLAGS = frozenset({APPROVAL, SEGREGATED, DUAL_CONTROL, GROUP_ONLY, POSTS})
 
@@ -64,6 +66,10 @@ class Perm:
         return POSTS in self.flags
 
     @property
+    def inactive_ok(self):
+        return INACTIVE_OK in self.flags
+
+    @property
     def is_view(self):
         """Read-only permissions; these still work on an inactive entity (OQ-8 default)."""
         return self.codename.split(".", 1)[1].startswith("view")
@@ -84,7 +90,9 @@ _PERMS = [
     _p("core.grant_membership", "Grant and revoke memberships", "منح العضويات وإلغاؤها", SEGREGATED),
     _p("core.delegate_approval", "Delegate approval", "تفويض صلاحية الاعتماد", SEGREGATED),
     # R32, OQ-18 default: managing_partner only.
-    _p("core.change_entity_settings", "Change sensitive entity settings", "تغيير إعدادات الكيان الحساسة", GROUP_ONLY),
+    # I: an inactive group parent can still be reactivated (core.services.change_entity_settings allows only that).
+    _p("core.change_entity_settings", "Change sensitive entity settings", "تغيير إعدادات الكيان الحساسة", GROUP_ONLY,
+       INACTIVE_OK),
     _p("core.manage_users", "Activate and deactivate user accounts", "تفعيل حسابات المستخدمين وإيقافها", GROUP_ONLY),
     # invoicing
     _p("invoicing.manage_customer", "Manage customers", "إدارة العملاء"),

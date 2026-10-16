@@ -191,16 +191,54 @@ def change_entity_settings(entity, *, user, reason, **changes):
     if not reason or not str(reason).strip():
         raise ValidationError("A reason is required. / السبب مطلوب.")
     entity = Entity.objects.get(pk=entity.pk)
-    access.require(user, access.group_parent_of(entity), ENTITY_SETTINGS_PERMISSION)
+    _require_settings_right(access, user, access.group_parent_of(entity), changes)
     new_parent = changes.get("parent", entity.parent)
+    if new_parent is None and changes.get("is_active", entity.is_active) is False:
+        # Nobody could reactivate it: every right is checked on the group parent (access.md R6, R32).
+        raise ValidationError(
+            "The top-level group parent entity cannot be deactivated. / لا يمكن إيقاف الكيان الأم الأعلى للمجموعة."
+        )
     if "parent" in changes and new_parent is not None:
         node = new_parent
         while node is not None:  # no cycles: the new parent is not the entity or below it
             if node.pk == entity.pk:
                 raise ValidationError("An entity cannot be placed under itself. / لا يمكن وضع الكيان تحت نفسه.")
             node = node.parent
-        access.require(user, access.group_parent_of(new_parent), ENTITY_SETTINGS_PERMISSION)
+        _require_settings_right(access, user, access.group_parent_of(new_parent), changes)
     return _change_entity_settings(entity, user, reason, changes)
+
+
+def _require_settings_right(access, user, group, changes):
+    """``core.change_entity_settings`` on ``group``; on an inactive group parent only reactivation (catalogue I)."""
+    grant = access.require(user, group, ENTITY_SETTINGS_PERMISSION)
+    if not group.is_active and changes != {"is_active": True}:
+        access.deny(user, group, ENTITY_SETTINGS_PERMISSION, "inactive_entity_reactivate_only")
+    return grant
+
+
+@transaction.atomic
+def reactivate_entity_by_operator(entity, reason, os_user):
+    """Recovery (R32): set ``is_active`` back on an inactive entity from the ``reactivate_entity`` command.
+
+    For when nobody holds ``core.change_entity_settings`` any more. Logged as
+    an ``entity_settings_changed`` row with the operator's OS user and no actor.
+    """
+    from core.access.models import AccessLog
+    from core.access.services import log
+
+    if not reason or not str(reason).strip():
+        raise ValidationError("A reason is required. / السبب مطلوب.")
+    entity = Entity.objects.select_for_update().get(pk=entity.pk)
+    if entity.is_active:
+        raise ValidationError(f"{entity.code} is already active. / الكيان {entity.code} نشط بالفعل.")
+    entity.is_active = True
+    entity.save(update_fields=["is_active"])
+    log(
+        AccessLog.Event.ENTITY_SETTINGS_CHANGED, entity=entity, permission=ENTITY_SETTINGS_PERMISSION, source="command",
+        details={"before": {"is_active": False}, "after": {"is_active": True}, "reason": reason, "os_user": os_user,
+                 "command": "reactivate_entity"},
+    )
+    return entity
 
 
 @transaction.atomic

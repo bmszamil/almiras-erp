@@ -63,6 +63,10 @@ MESSAGES = {
         "{entity} is inactive; only viewing is allowed.",
         "الكيان {entity} غير نشط؛ يُسمح بالعرض فقط.",
     ),
+    "inactive_entity_reactivate_only": (
+        "{entity} is inactive; the only change allowed is to reactivate it.",
+        "الكيان {entity} غير نشط؛ التغيير الوحيد المسموح هو إعادة تفعيله.",
+    ),
     "self_approval": (
         "You created or submitted this document, so you cannot approve it.",
         "لا يمكنك اعتماد مستند أنشأته أو قدمته بنفسك.",
@@ -386,7 +390,7 @@ def _evaluate(user, entity, permission, at):
     refusal = _kind_refusal(user, perm)
     if refusal:
         return [], refusal
-    if not entity.is_active and not perm.is_view:
+    if not entity.is_active and not (perm.is_view or perm.inactive_ok):
         return [], "inactive_entity"
     memberships = _memberships_for(user, entity, permission, at)
     if not memberships:

@@ -10,6 +10,7 @@ ALLOW = {
     "core/services.py:entity_ready_to_issue": "pure check on an entity the caller already holds",
     "core/services.py:load_setup_data": "reads a setup file; operator command only",
     "core/services.py:apply_entity_setup": "setup_almiras command only (operator, not a user action)",
+    "core/services.py:reactivate_entity_by_operator": "reactivate_entity recovery command only (operator, logged, R32)",
     "ledger/services.py:validate_entry": "pure validation, called inside post",
     "ledger/services.py:rates_visible_to": "the scope mechanism for rate rows (entities_for + global rows, ledger-fx R28)",
     "core/access/services.py:now": "clock",
