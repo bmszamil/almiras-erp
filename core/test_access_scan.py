@@ -11,6 +11,7 @@ ALLOW = {
     "core/services.py:load_setup_data": "reads a setup file; operator command only",
     "core/services.py:apply_entity_setup": "setup_almiras command only (operator, not a user action)",
     "ledger/services.py:validate_entry": "pure validation, called inside post",
+    "ledger/services.py:rates_visible_to": "the scope mechanism for rate rows (entities_for + global rows, ledger-fx R28)",
     "core/access/services.py:now": "clock",
     "core/access/services.py:profile_of": "helper",
     "core/access/services.py:kind_of": "helper",
