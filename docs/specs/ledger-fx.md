@@ -1,6 +1,6 @@
 # Spec: `ledger` multi-currency extension (ledger-fx)
 
-Status: draft for review · Written: 2026-10-16 · Author: spec-writer agent
+Status: draft for review · Written: 2026-10-16 · Revised: 2026-10-16 (project-owner decision D5 on decimals; CLAUDE.md rule 7 amended) · Author: spec-writer agent
 Extends: `ledger` (models, services, tests). Touches: `core.Entity`, `ledger/coa_template.py`, `ledger/services_setup.py`. Unblocks the ledger side of `docs/specs/invoicing.md` OQ-6 (that spec is not changed here).
 **[CC-verify]** = standards, Sharia or rate-source statement written from memory; the compliance-checker must check it against the official text before module-builder starts.
 
@@ -14,14 +14,15 @@ Lets **every entity** in the group (Almiras, subsidiaries, and any entity added 
 |---|---|---|---|
 | D1 | 2026-10-16 | Project owner | "Multi-currency is needed now." Group entities deal in many currencies: SAR, CNY (RMB), EGP, GBP, EUR, USD, AED, and others. |
 | D2 | 2026-10-16 | Project owner | The missing FX accounts may be added to the chart template (`ledger/coa_template.py`). |
-| D3 | in repo | CLAUDE.md | Posted entries immutable; corrections by `reverse_entry`; posting only through `post_entry`; entries balance with 2+ one-sided lines; closed periods reject postings; no posting to another entity's accounts; Sharia enforced per entity; intercompany lines carry a counterparty; money is `Decimal`, stored with 2 decimals, currency explicit; open source only; bilingual text; new entities are data. |
+| D3 | in repo | CLAUDE.md | Posted entries immutable; corrections by `reverse_entry`; posting only through `post_entry`; entries balance with 2+ one-sided lines; closed periods reject postings; no posting to another entity's accounts; Sharia enforced per entity; intercompany lines carry a counterparty; money is `Decimal`, stored with 2 decimals, currency explicit; open source only; bilingual text; new entities are data. *(Rule 7 amended 2026-10-16: see D5.)* |
 | D4 | 2026-10-16 | Caller (task brief, not a business decision) | Scope as listed in this spec. Debit/credit stay in functional currency. Existing entries migrate to functional currency at rate 1. Group consolidation currency SAR (to be confirmed, OQ-7). Rate table global by default (OQ-4). No paid rate feeds. Forwards and other deferred exchange are out of scope. |
+| D5 | 2026-10-16 | Project owner | Decimals (resolves OQ-1): functional-currency (SAR) amounts are stored with 2 decimals; foreign transaction-currency amounts are stored with up to 3 decimals and validated against that currency's own minor units. CLAUDE.md rule 7 amended accordingly. The rule "functional currency must be a 2-decimal currency" (R4) stays. |
 
 Nothing else is decided. Every other choice is in section 9; defaults used in the rules are marked "default (OQ-n)".
 
 ## 3. Data model
 
-Money conventions: functional amounts `DecimalField(max_digits=18, decimal_places=2)` (unchanged). Rates `DecimalField(max_digits=20, decimal_places=10)`, > 0, meaning **units of `to` currency per 1 unit of `from` currency**. Transaction amounts: see OQ-1 (recommended `max_digits=21, decimal_places=3`).
+Money conventions: functional amounts `DecimalField(max_digits=18, decimal_places=2)` (unchanged). Rates `DecimalField(max_digits=20, decimal_places=10)`, > 0, meaning **units of `to` currency per 1 unit of `from` currency**. Transaction amounts: `DecimalField(max_digits=21, decimal_places=3)`, with the decimals actually used limited to the currency's `minor_units` (D5, R8, R40).
 
 ### 3.1 `core.Currency` (new; global reference data, like `VatRate` in invoicing)
 
@@ -32,7 +33,7 @@ No `entity` FK: ISO 4217 is the same for every entity. Activation per entity is 
 | code | Char(3), primary key | Y | | ISO 4217 alpha, upper case (`CNY`, not `RMB`; `CNH` is not ISO and is not loaded, OQ-12) |
 | numeric_code | Char(3) | Y | | ISO 4217 numeric, e.g. `682` |
 | name_en / name_ar | Char(100) | Y / Y | Bi | e.g. Saudi riyal / ريال سعودي |
-| minor_units | PositiveSmallInt (0 to 4) | Y | | ISO exponent: SAR, USD, EUR, GBP, CNY, EGP, AED = 2; JPY = 0; KWD, BHD, OMR, JOD = 3 |
+| minor_units | PositiveSmallInt (0 to 4) | Y | | ISO exponent: SAR, USD, EUR, GBP, CNY, EGP, AED = 2; JPY = 0; KWD, BHD, OMR, JOD = 3. A currency with `minor_units` > 3 (e.g. ISO CLF, UYW) is not loaded and cannot be used (D5, R40) |
 | symbol | Char(8) | N | | Display only |
 | is_active | Bool | Y | | Inactive currencies cannot be used on new lines or rates |
 
@@ -76,7 +77,7 @@ A rate row referenced by any posted line is locked (cannot be edited or deleted)
 | Field | Type | Req | Notes |
 |---|---|---|---|
 | currency | FK Currency (`to_field="code"`), PROTECT | Y | Transaction currency. Migration default: entry entity's functional currency. |
-| txn_amount | Decimal (OQ-1) | Y | ≥ 0, same side as debit/credit. 0 only for `revaluation` lines. |
+| txn_amount | Decimal(21,3) (D5) | Y | ≥ 0, same side as debit/credit. 0 only for `revaluation` lines. Decimals used ≤ `currency.minor_units` (R8). |
 | fx_rate | Decimal(20,10), null | Y unless `revaluation` | Functional units per 1 transaction unit. Exactly 1 when `currency` = functional currency. |
 | rate_source | Choice: `functional`, `table`, `manual`, `carrying` | Y | `carrying` = clearing an earlier line at its original rate (settlement). |
 | exchange_rate | FK ExchangeRate, null, PROTECT | Y if `rate_source=table` | Provenance; locks the rate row (R11). |
@@ -106,11 +107,11 @@ Checks needing the entity (functional currency) live in `validate_entry` (R6 to 
 1. Every journal line has a transaction currency, a transaction amount and (except revaluation lines) a rate. `create_entry` called without currency fields produces `currency` = entity functional currency, `fx_rate` = 1, `rate_source=functional`, `txn_amount` = debit + credit. **[svc `create_entry` defaults; AT-1]**
 2. `debit`/`credit` are always functional-currency amounts. The existing check "debits = credits" in `validate_entry` is the balancing rule and is unchanged: **an entry must balance in functional currency**. **[svc `validate_entry`; AT-13]**
 3. An entry is **not** required to balance per transaction currency (cross-currency settlements and FX lines legitimately do not). The reversal of an entry nets to zero per account in both functional and transaction currency. **[svc; AT-6, AT-18]**
-4. An entity's functional currency must have `minor_units = 2` until OQ-1 is decided. **[`Entity.clean` + svc at entity setup; AT-20]**
+4. An entity's functional currency must have `minor_units = 2`. *(Amended 2026-10-16: kept by D5; previously "until OQ-1 is decided".)* **[`Entity.clean` + svc at entity setup; AT-20]**
 5. An entity's functional currency cannot change once the entity has a posted entry. A change of functional currency (IAS 21 / IFRS for SMEs s30, prospective **[CC-verify]**) needs a separate procedure (OQ-13). **[`Entity.clean` + svc; AT-23]**
 6. For a line whose currency equals the functional currency: `fx_rate` = 1 and `txn_amount` = debit + credit. **[svc `validate_entry`; AT-15]**
 7. For a foreign-currency `normal` line: functional amount = `round_half_up(txn_amount × fx_rate, 2)`. For a `settlement` line: either the same formula with the carrying rate, or exactly the remaining functional balance of `settles_line` (final clearing, R18). Any other value is rejected. **[svc `validate_entry`; AT-14]**
-8. `txn_amount` must have no more decimals than the currency's `minor_units` (JPY 1.5 rejected; KWD 1.234 accepted if OQ-1 follows the recommendation). Float input is rejected, not converted. **[svc input validation; AT-20]**
+8. `txn_amount` must have no more decimals than the currency's `minor_units`, and never more than 3 (D5): JPY 1.5 rejected; KWD 1.234 accepted; KWD 1.2345 rejected; USD 1.005 rejected. Functional `debit`/`credit` always have 2 decimals. Float input is rejected, not converted. *(Amended 2026-10-16 by D5.)* **[svc input validation; DB `decimal_places=3`; AT-20, AT-30]**
 9. A line on an account with `currency` set must be in that currency. Inactive currencies are rejected. **[svc `validate_entry`; AT-21, AT-22]**
 10. Revaluation lines (`txn_amount = 0`, functional amount ≠ 0) are allowed only in entries created by `revalue_period` or by its reversal. **[svc `validate_entry` checks entry origin; DB check on kind; AT-8]**
 
@@ -160,6 +161,11 @@ Checks needing the entity (functional currency) live in `validate_entry` (R6 to 
 ### Backward compatibility
 38. The schema migration adds the new fields; a data migration sets, for every existing line, `currency` = entry entity's `base_currency`, `fx_rate` = 1, `rate_source=functional`, `txn_amount` = debit + credit, `line_kind=normal`. It uses `QuerySet.update()` (the `JournalLine.save` lock is bypassed only here, because no amount, account or status changes). Functional amounts and trial balances are identical before and after. **[migration 0002; code-reviewer must approve the bypass; AT-2]**
 39. Every existing test in `ledger/tests.py` passes unchanged. **[test suite; AT-1]**
+
+### Decimals (added 2026-10-16, D5)
+40. A currency whose `minor_units` is greater than 3 cannot be loaded as active or used on a line or a rate (storage holds at most 3 decimals). **[`Currency.clean` + svc `validate_entry`; AT-30]**
+41. Conversion of a 3-decimal transaction amount to functional currency uses R7 unchanged: `round_half_up(txn_amount × fx_rate, 2)`. Revaluation (R21), settlement (R18) and rounding lines (R17) work on 2-decimal functional amounts only. **[svc; AT-30]**
+42. The R38 migration changes `txn_amount` to `Decimal(21,3)`; existing values (all functional, 2 decimals) are copied unchanged. **[migration 0002; AT-2]**
 
 ## 5. Accounting
 
@@ -288,7 +294,7 @@ Fixtures: ALM (parent, SAR, Sharia enforced), LZM (child, SAR), EGY (child, EGP 
 | AT-17 | F1 posted using a rate row | Edit or delete that row; add a corrected row; close 2027-01 then import rates for January | Edit/delete rejected. F1 lines unchanged. Import succeeds; posted lines unchanged. A new EUR entry dated in closed 2027-01: rejected "closed". |
 | AT-18 | F4 posted | `reverse_entry(F4, date=2027-02-25)` | Reversal copies currency, txn, rate, kind, settles_line; posts; per-account balances net to zero in SAR and in EUR. |
 | AT-19 | ALM Sharia enforced | EUR line on 5610; try to create an `ExchangeRate` with `rate_type="forward"`; `record_currency_exchange` with legs on two dates | All rejected. Same-date exchange posts as F8 with no FX line. |
-| AT-20 | Currency seed | KWD line 1.234; JPY line 1.5; float 0.1 input; entity created with KWD functional currency | KWD accepted (if OQ-1 recommendation adopted); JPY and float rejected; KWD functional rejected. |
+| AT-20 | Currency seed | KWD line 1.234; JPY line 1.5; float 0.1 input; entity created with KWD functional currency | KWD accepted (D5); JPY and float rejected; KWD functional rejected (R4 kept by D5). *(Amended 2026-10-16.)* |
 | AT-21 | Account 1100-USD with `currency=USD` | Post EUR line to it | Rejected. |
 | AT-22 | Currency XXX `is_active=False` | Use on a line or rate | Rejected. |
 | AT-23 | ALM has a posted entry | Change `base_currency` to USD | Rejected. A new entity with no postings: allowed. |
@@ -298,6 +304,7 @@ Fixtures: ALM (parent, SAR, Sharia enforced), LZM (child, SAR), EGY (child, EGP 
 | AT-27 | `ar` locale | Missing-rate error, currency names, new account names | Arabic text shown. |
 | AT-28 | ECB fixture file (EUR base, includes USD) and SAR/USD peg rate | `import_rates(source="ecb", file)` twice | Rows stored with `source=ecb`; EUR→SAR row stored with `source=derived` and reference; second import creates no duplicates. |
 | AT-29 | Agent service user | Create a rate; post an entry; run revaluation | All rejected; creating a draft with table rates allowed and logged. |
+| AT-30 | *Added 2026-10-16 (D5).* ALM (SAR); fixture KWD→SAR spot 12.2000; a test currency with `minor_units=4` | Post Dr 1200 KWD 1,234.567 / Cr 4100 KWD 1,234.567; then lines KWD 1.2345, USD 1.005, SAR txn 10.005; activate or use the 4-dp currency | First posts: txn stored as 1,234.567 (3 dp, read back unchanged), functional Dr/Cr 15,061.72 (= round_half_up(1,234.567 × 12.2000, 2)). KWD 1.2345, USD 1.005, SAR 10.005 rejected naming currency and allowed decimals (en/ar). 4-dp currency rejected (R8, R40, R41). |
 
 ## 9. Open questions
 
@@ -305,7 +312,7 @@ Fixtures: ALM (parent, SAR, Sharia enforced), LZM (child, SAR), EGY (child, EGP 
 
 | # | Question | Owner | Status |
 |---|---|---|---|
-| OQ-1 | **Transaction amount decimals.** CLAUDE.md rule 7 says amounts are stored with 2 decimals, but ISO 4217 has 0-dp (JPY) and 3-dp (KWD, BHD, OMR, JOD) currencies. **Recommendation:** keep functional `debit`/`credit` at 2 dp (all likely functional currencies SAR, EGP, CNY, AED, USD, EUR, GBP have 2); store `txn_amount` as `Decimal(21,3)` and validate against each currency's `minor_units`; block functional currencies without 2 dp (R4). This needs a human to amend CLAUDE.md rule 7 (agents do not edit it). Alternative: 2 dp everywhere and block 3-dp currencies. | Managing Partner / accountant + Dev | **BLOCKING** for the `JournalLine` schema. |
+| OQ-1 | **Transaction amount decimals.** CLAUDE.md rule 7 said amounts are stored with 2 decimals, but ISO 4217 has 0-dp (JPY) and 3-dp (KWD, BHD, OMR, JOD) currencies. | Managing Partner / accountant + Dev | **Resolved by D5** (recommendation adopted; CLAUDE.md rule 7 amended): `txn_amount` `Decimal(21,3)`, validated against `minor_units` (R8, R40); functional 2 dp (R4 kept). Effect on invoicing/billing document amounts: invoicing OQ-48, billing OQ-29. |
 | OQ-2 | Rate sources: which free source is primary per currency pair (SAMA, ECB, CBE, CBUAE, PBOC), whether machine-readable feeds exist and their licence terms **[CC-verify]**, import time of day, and source precedence. | Accountant | **BLOCKING** for `import_rates`. Manual entry and CSV upload are not blocked. |
 | OQ-3 | Fallback when no rate on the date (default: latest earlier rate within 5 calendar days); limit on manual line rate deviation from the table rate (default: none, flagged). | Accountant | Default |
 | OQ-4 | Are rates global or per entity? Default: one global table, optional entity override (e.g. EGY using CBE). Who maintains the global table. | Accountant + Managing Partner | Default |
@@ -323,14 +330,14 @@ Fixtures: ALM (parent, SAR, Sharia enforced), LZM (child, SAR), EGY (child, EGP 
 | OQ-16 | Migration of foreign open items from Daftra/SAP B1: original rate kept, or restated at cutover rate. | Accountant + migration-agent | Default: original currency, amount and rate; tie out per currency |
 | OQ-17 | Functional currency of each subsidiary (Egypt EGP?, China CNY?, UAE AED?) under IAS 21 indicators **[CC-verify]**. | Accountant / auditor | **BLOCKING** for setting up those entities, not for the build |
 
-**Blocking:** OQ-1 (schema), OQ-2 (automatic import), OQ-5 (translation), OQ-6 (FX postings), OQ-17 (subsidiary setup). **Sharia board sign-off:** OQ-14 and any forward contract.
+**Blocking:** OQ-2 (automatic import), OQ-5 (translation), OQ-6 (FX postings), OQ-17 (subsidiary setup). **Sharia board sign-off:** OQ-14 and any forward contract.
 
 ## Appendix: existing code that must change
 
 | File | Change |
 |---|---|
 | `core/models.py` | New `Currency`; `Entity.base_currency` → FK Currency (functional, 2-dp check, locked after first posting); `presentation_currency`. |
-| `ledger/models.py` | New `ExchangeRate`, `RevaluationRun`; `Account.is_monetary`, `Account.currency`; `JournalLine` fields and checks (3.5). |
+| `ledger/models.py` | New `ExchangeRate`, `RevaluationRun`; `Account.is_monetary`, `Account.currency`; `JournalLine` fields and checks (3.5), `txn_amount` `Decimal(21,3)` (D5). |
 | `ledger/services.py` | `create_entry`: currency/rate inputs, rate resolution, rounding line. `validate_entry`: R6 to R10, R15, account currency. `reverse_entry`: **must copy the new line fields** (today it copies only account, description, debit, credit, counterparty). `intercompany_balances`: per currency. `trial_balance`: optional per-currency columns (functional result unchanged). New: `get_rate`, `import_rates`, `fx_settlement_lines`, `record_currency_exchange`, `revalue_period`, `translate_trial_balance`. `post_entry` itself unchanged. |
 | `ledger/coa_template.py`, `ledger/services_setup.py` | Section 5.0 accounts and `monetary` flag; installer sets `is_monetary`/`currency`. |
 | `ledger/migrations/0002_*` | Schema + data migration (R38), plus data migration for new accounts and monetary flags on existing entities. |

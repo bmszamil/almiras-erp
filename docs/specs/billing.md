@@ -1,6 +1,6 @@
 # Billing: contract-based recurring and automatic invoicing
 
-Django app: `billing`. Status: **draft spec**. Written 2026-10-16 by the spec-writer agent.
+Django app: `billing`. Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (project-owner decisions D8 to D10: auto-issue, retroactive amendment/termination with correction notes, no mirror bill).
 Depends on: `core` (Entity), `docs/specs/invoicing.md` (sales documents, customers, VAT; being revised in parallel, so concepts are referenced, not copied), `docs/specs/zatca.md` (clearance and reporting), `docs/specs/ledger-fx.md` (currencies and rates; parallel spec, **not in the repo yet**), HR module (does not exist; interface defined in 3.6).
 **[CC-verify]** = tax, ZATCA or regulatory statement not checked against official text. The compliance-checker must verify it before module-builder starts.
 
@@ -18,7 +18,10 @@ The billing module holds customer contracts for **every entity** in the group (A
 | D4 | A contract may have an advance, a security deposit, both, or neither. | Project owner | 2026-10-16 |
 | D5 | Roles: accounting staff create; the CFO approves; posting is automatic on approval. Sales documents post only after ZATCA clearance or reporting. | Project owner | 2026-10-16 |
 | D6 | Until the HR module exists, accounting staff record the secondment end date. | Project owner (task brief) | 2026-10-16 |
-| D7 | Rules fixed by CLAUDE.md apply: `entity` FK on every record; queries filtered by entity and permission; new subsidiaries are data; en/ar text; `Decimal` money with explicit currency; posting only via `ledger.services`; open source only. | CLAUDE.md | in repo as of 2026-10-16 |
+| D7 | Rules fixed by CLAUDE.md apply: `entity` FK on every record; queries filtered by entity and permission; new subsidiaries are data; en/ar text; `Decimal` money with explicit currency; posting only via `ledger.services`; open source only. *(Rule 7 amended 2026-10-16: SAR 2 dp, foreign transaction amounts up to 3 dp; effect here: OQ-29.)* | CLAUDE.md | in repo as of 2026-10-16 |
+| D8 | Invoices auto-generated from a CFO-approved contract need **no per-invoice approval** (resolves OQ-1; invoicing OQ-36). | Project owner | 2026-10-16 |
+| D9 | A contract must stay modifiable and cancellable after approval, **including retroactively**, because staff may forget to tell the ERP that a contract or service was cancelled, cut short or modified. So: (a) contract amendments are versioned, CFO-approved, and the effective date may be in the past; (b) early termination or cancellation may have a past effective date; (c) for periods already billed, issued invoices are **never edited or deleted**: the system generates **draft** credit notes for over-billed amounts (debit notes for increases), a person reviews them and the CFO approves them; (d) posted-period rules still apply: corrections are dated in an open period. | Project owner | 2026-10-16 |
+| D10 | Intercompany: by default **no** automatic bill is created in the buyer entity; the buyer entity's staff enter it (resolves OQ-11; invoicing OQ-37). | Project owner | 2026-10-16 |
 
 ## 3. Data model
 
@@ -49,7 +52,9 @@ Conventions (same as invoicing.md): every model has `entity` FK → `core.Entity
 | deposit_terms | FK DepositTerm, null | N | | 3.4 |
 | status | Choice: `draft`, `approved`, `active`, `ended`, `terminated` | Y | | R6 |
 | approved_by / approved_at | FK User / DateTime | at approval | | CFO of this entity |
-| terminated_on / termination_reason | Date / Text | Y if `terminated` | Bi (reason) | |
+| terminated_on / termination_reason | Date / Text | Y if `terminated` | Bi (reason) | Last billable day (inclusive). Null for `cancellation`. Set only by an approved termination/cancellation version (R40) |
+| termination_kind | Choice: `early_termination`, `cancellation`, null | Y if `terminated` | | `cancellation` = nothing was ever billable (R40). Added 2026-10-16 (D9) |
+| current_version | FK ContractVersion | Y after approval | | Latest approved version (3.9). Added 2026-10-16 (D9) |
 | requires_purification | Bool | computed | | Any line on an account with `requires_purification` |
 
 ### 3.2 ContractLine
@@ -58,6 +63,8 @@ Conventions (same as invoicing.md): every model has `entity` FK → `core.Entity
 |---|---|---|---|---|
 | entity | FK Entity | Y | | Equals `contract.entity` |
 | contract | FK Contract | Y | | |
+| version | FK ContractVersion | Y | | Lines belong to one version; approved versions are immutable (R38). Added 2026-10-16 (D9) |
+| line_key | UUID | Y | | Same value for "the same line" across versions, so corrections compare like with like (R42). A line absent from a later version is billable 0 from its effective date |
 | line_no | PositiveInt | Y | | |
 | description | Char(300) | Y | Bi | Arabic required (invoicing default OQ-18). Period text is appended at generation |
 | amount | Money (contract currency) | Y | | Net amount per **full** billing period. > 0 |
@@ -97,7 +104,8 @@ Only explicit stepped amounts are supported until escalation types are decided (
 | hold_reason / failure_reason | Char(300) | N | Bi |
 | sales_document | FK invoicing.SalesDocument, null, PROTECT | N | Current document for this period |
 | superseded_documents | M2M invoicing.SalesDocument | N | ZATCA-rejected earlier attempts (R12) |
-| credit_document | FK invoicing.SalesDocument (credit note), null | N | After an early end (R21) |
+| credit_document | *Withdrawn — see D9* (corrections are `BillingAdjustment` rows, 3.10; a period may have several) | | |
+| billed_version | FK ContractVersion, null | Y when `generated` | Version in force when the invoice was generated. Never changed afterwards (R41). Added 2026-10-16 (D9) |
 
 ### 3.6 SecondmentAssignment (HR interface)
 
@@ -123,7 +131,43 @@ Interface the HR module must call (until then, the accounting-staff UI calls it)
 
 ### 3.8 ContractEvent (audit, append-only)
 
-entity, contract, action (`created`, `submitted_for_approval`, `approved`, `returned`, `activated`, `amended`, `secondment_ended`, `ended`, `terminated`, `period_released`), actor, at, detail JSON (never personal data beyond `employee_ref`).
+entity, contract, action (`created`, `submitted_for_approval`, `approved`, `returned`, `activated`, `amended`, `secondment_ended`, `ended`, `terminated`, `period_released`; added 2026-10-16 (D9): `version_submitted`, `version_approved`, `version_rejected`, `cancelled`, `corrections_computed`, `correction_drafted`, `correction_submitted`, `correction_discarded`, `correction_superseded`), actor, at, detail JSON (never personal data beyond `employee_ref`).
+
+### 3.9 ContractVersion (added 2026-10-16, D9; unique `(contract, version_no)`)
+
+| Field | Type | Req | Bi | Notes |
+|---|---|---|---|---|
+| entity | FK Entity | Y | | Equals `contract.entity` |
+| contract | FK Contract | Y | | |
+| version_no | PositiveInt | Y | | 1 = terms approved with the contract (R8). Gap-free per contract |
+| kind | Choice: `original`, `amendment`, `termination`, `cancellation` | Y | | |
+| effective_date | Date | Y | | First day the new terms apply. **May be in the past** (D9). ≥ `contract.start_date`. `original` and `cancellation`: = `start_date`. `termination`: = `terminated_on` + 1 day |
+| end_date, billing_frequency, billing_timing, period_anchor, due_days | as Contract 3.1 | Y | | The version's terms. Limits on retroactive change: R39 |
+| lines | ContractLine rows with `version` = this (with their ContractPriceStep rows) | Y unless termination/cancellation | | Full set, not a diff |
+| reason_en / reason_ar | Text | Y (ar) / N (en) | Bi | Arabic required: it becomes the reason on correction notes (invoicing R18/R19) |
+| status | Choice: `draft`, `submitted`, `approved`, `rejected`, `withdrawn` | Y | | Only `draft` is editable; `approved` is immutable (R38) |
+| created_by, submitted_by, approved_by, approved_at, rejected_reason (Bi) | | | | Approver = CFO of the entity, not creator or submitter (R39) |
+
+### 3.10 BillingAdjustment (added 2026-10-16, D9; one correction item)
+
+| Field | Type | Req | Bi | Notes |
+|---|---|---|---|---|
+| entity | FK Entity | Y | | Equals `contract.entity` |
+| contract / version | FK Contract / FK ContractVersion | Y | | `version` = the approved version (or secondment end, R49) that caused it |
+| billing_period | FK BillingPeriod (status `generated`) | Y | | |
+| original_document | FK invoicing.SalesDocument (invoice of that period) | Y | | Becomes the note's `original_document` (BT-25) |
+| kind | Choice: `credit`, `debit` | Y | | `credit` = over-billed (draft credit note); `debit` = under-billed (draft debit note) |
+| lines | JSON: per `line_key`: required net, billed net, delta (contract currency, `Decimal`) | Y | | Computed by R42; read-only |
+| supply_start / supply_end | Date | Y | | Part of the original period affected (≥ `effective_date`) |
+| document | FK invoicing.SalesDocument (credit/debit note), null, PROTECT | N | | Draft created via invoicing (R43) |
+| status | Choice: `waiting_original`, `drafted`, `submitted`, `issued`, `final`, `discarded`, `superseded`, `failed` | Y | | R44 to R48 |
+| reviewed_by / discard_reason (Bi) | FK User / Text | N | Bi | Human reviewer; discard needs a bilingual reason (R48) |
+
+Unique: one non-terminal (`waiting_original`, `drafted`, `submitted`) adjustment per (`billing_period`, `original_document`, `kind`).
+
+### 3.11 Billed position (computed, not stored)
+
+`billed_net(period, line_key)` = net of that line on the period's current invoice + Σ net on its debit notes − Σ net on its credit notes, counting notes with status `issued` or `final`, plus adjustments in `waiting_original`, `drafted` or `submitted` (so a pending correction is never computed twice, R46). Notes that ZATCA rejected do not count.
 
 ## 4. Rules
 
@@ -133,12 +177,12 @@ entity, contract, action (`created`, `submitted_for_approval`, `approved`, `retu
 1. A contract, its lines, steps, terms, schedule, assignments and runs all have the same `entity`. Customer and income accounts belong to that entity. **[svc `clean` on save; ledger `validate_entry` at posting; AT-14]**
 2. Views and APIs list billing records filtered by entity and by the user's entity permissions. A run for entity A never reads or writes B's records. **[Q; svc run loop scoped per entity; AT-14]**
 3. `counterparty_entity` comes only from `customer.group_entity`. It cannot be set by hand and never equals `entity`. **[svc; model `clean`; AT-11]**
-4. The system never creates records in the counterparty entity's books (no automatic mirror bill) until OQ-11 is decided. **[svc; AT-11]**
+4. The system never creates records in the counterparty entity's books: no automatic mirror bill; the buyer entity's staff enter the bill (D10). This also holds for correction notes (R50). *(Amended 2026-10-16: was "until OQ-11 is decided".)* **[svc; AT-11, AT-32]**
 5. A new entity bills with no code change once it has its chart, periods, customers and an approved contract. **[AT-15]**
 
 ### Contract lifecycle
 6. Status runs `draft → approved → active → ended`, or `active → terminated` (also `approved → terminated` before start). No other transitions exist. **[svc state machine; AT-1]**
-7. Only `draft` contracts can be edited or deleted. After approval, price, dates, lines, currency and VAT are changed only through an amendment approved by the CFO (OQ-7). Secondment end dates (R19) and termination (R21) are the exceptions. **[model `save` guard + svc; AT-1]**
+7. Only `draft` contracts can be edited or deleted. After approval, price, dates, lines and VAT are changed only through a CFO-approved `ContractVersion` (D9, R38 to R41); termination and cancellation are versions too (R40). Secondment end dates (R19, R49) are the only change without CFO approval (D6). *(Amended 2026-10-16 by D9.)* **[model `save` guard + svc; AT-1, AT-22]**
 8. Approval needs the CFO role on the contract's entity. The approver is not the creator (default, OQ-8). Approval assigns the contract number and builds the schedule in one transaction. **[svc; AT-1]**
 9. A contract becomes `active` on approval if `start_date ≤ today`, otherwise on the first run on or after `start_date`. It becomes `ended` when `end_date` has passed and every non-cancelled period is `generated`. **[svc run; AT-6]**
 
@@ -157,8 +201,8 @@ entity, contract, action (`created`, `submitted_for_approval`, `approved`, `retu
 
 ### Secondment, termination and end
 19. A secondment line is billed only for days from `assignment.start_date` to `assignment.end_date` inclusive. Recording an end date cancels `planned` periods that start after it and prorates the period that contains it. **[svc `end_secondment`; AT-7]**
-20. If the end date is earlier than periods already `generated`, the system creates a **draft** credit note for the days after the end date (factor = unused days / period days). An accountant issues it (invoicing permissions). It is not issued automatically (OQ-6). If the end date is moved later, cancelled periods within the new range go back to `planned`. **[svc; AT-8]**
-21. Termination sets `terminated_on`. It cancels later `planned` periods, prorates the period that contains `terminated_on`, and handles already-billed days as in R20. The termination is recorded by accounting staff and takes effect after CFO approval (default, OQ-7). **[svc; AT-9]**
+20. *Withdrawn — see D9 (replaced by R42 to R49; secondment case R49).*
+21. *Withdrawn — see D9 (replaced by R40 to R48).*
 22. A contract that has `ended` or been `terminated` produces no further invoices. **[svc; AT-6]**
 
 ### Closed periods and failures
@@ -184,7 +228,7 @@ entity, contract, action (`created`, `submitted_for_approval`, `approved`, `retu
 ### Runs, notifications, approval of generated invoices
 33. Each period is generated in its own transaction. One failure never stops the others or rolls them back. Every attempt writes a `BillingRunItem` with an en/ar message. **[svc; AT-17]**
 34. After each run, the entity's accounting staff get a summary (generated, held, failed) in the app, in their language. Failures still unresolved after 3 consecutive runs are also sent to the CFO (default, OQ-17). **[svc; AT-17]**
-35. Generated invoices are issued without per-invoice approval: the CFO's contract approval covers them (default, OQ-1). **[svc; AT-4]**
+35. Generated invoices are issued without per-invoice approval: the CFO's contract approval covers them (D8; was default OQ-1). This applies to invoices only, never to correction notes (R44). *(Amended 2026-10-16.)* **[svc; AT-4, AT-35]**
 36. Agents (gateway service users) may draft contracts if granted. They cannot approve, release, terminate, end secondments or start runs. The billing service user is a system user, not an agent, and it acts only on `active` contracts. **[Q + svc; AT-20]**
 37. All amounts are `Decimal` with 2 dp, and the currency is stored on every money field's parent record. **[svc + DB; AT-5]**
 
