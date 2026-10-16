@@ -470,7 +470,7 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
             access.require(user, entity, "ledger.create_entry")
     else:
         if grant is not None or posted_by is not None:
-            raise LedgerError("A grant or posted_by is only used with post=True.")
+            raise LedgerError("A grant or posted_by is only used with post=True. / يُستخدم التفويض أو المرحِّل مع الترحيل المباشر فقط.")
         # A draft is still a business record in ``entity``: ledger.create_entry there (access.md 3.6).
         access.require(user, entity, "ledger.create_entry")
     ref = access_services._document_ref(document)
@@ -528,7 +528,7 @@ def update_draft(entry, *, user, date=None, description=None, reference=None, li
 def _update_draft(entry, user, date, description, reference, lines):
     entry = JournalEntry.objects.select_for_update(of=("self",)).select_related("entity").get(pk=entry.pk)
     if entry.status != JournalEntry.Status.DRAFT:
-        raise LedgerError("Posted entries cannot be edited. Reverse the entry instead.")
+        raise LedgerError("Posted entries cannot be edited. Reverse the entry instead. / لا تُعدَّل القيود المرحّلة؛ اعكس القيد.")
     if _is_revaluation_entry(entry):
         raise error("A revaluation draft is changed by discarding and re-running it.", "تُعدَّل مسودة إعادة التقييم بإلغائها وإعادة تشغيلها.")
     for name, value in (("date", date), ("description", description), ("reference", reference)):
@@ -553,7 +553,7 @@ def submit_entry(entry, *, user):
     with transaction.atomic():
         entry = JournalEntry.objects.select_for_update(of=("self",)).get(pk=entry.pk)
         if entry.status != JournalEntry.Status.DRAFT:
-            raise LedgerError("Only draft entries can be submitted.")
+            raise LedgerError("Only draft entries can be submitted. / يمكن تقديم المسودات فقط.")
         entry.submitted_by = user
         entry.submitted_at = timezone.now()
         entry.save(update_fields=["submitted_by", "submitted_at"])
