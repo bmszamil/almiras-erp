@@ -20,6 +20,7 @@ All by Badr Alzamil, Managing Partner, 16 Oct 2026.
 | D8 | Subsidiaries join the same ERP later. When both entities are in the ERP, the receiving entity's bill is created automatically as a draft mirroring the invoice. When the counterparty is not on the ERP yet, only Almiras's side is booked. |
 | D9 | The rental assets module (leases, vehicles with fuel/mileage logs) is a later wave. Billing agreements must be able to take lines from rental leases later. |
 | D10 | Records created by future AI agents carry a `source` field (human / import / agent) and are drafts only. |
+| D12 | (16 Oct 2026, answers to Q5/Q14) **Cost-plus allocation basis is chosen per agreement:** fixed %, headcount or revenue. **Monthly invoices are dated the last day of the service month.** |
 | D11 | (16 Oct 2026, answer to Q1) **No late-payment penalties** on intercompany invoices. The penalty feature is not built. |
 
 ## 3. Data model

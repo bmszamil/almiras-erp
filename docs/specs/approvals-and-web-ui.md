@@ -23,6 +23,8 @@ All by Badr Alzamil, Managing Partner (MP), 16 Oct 2026.
 | D9 | Approvable documents: manual journal entries, supplier bills, payments, intercompany invoices, purchase requests, contracts — through one generic approval that any module plugs into. |
 | D10 | (16 Oct 2026, answers to OQ2/OQ4/OQ5) **MP self-approval allowed, logged:** when the MP creates a document and is the only eligible approver, he may approve it himself. The action is recorded as `self_approval_override` in the audit log and listed in a monthly self-approval report for the Chairman and auditor. No other user may self-approve. Replaces the "never self-approves" outcome in R9. |
 | D11 | **Approval posts automatically:** when the final approval is given, the owning module posts/executes the document in the same transaction (e.g. `ledger.services.post_entry`). If posting fails a ledger rule, the approval is rolled back and the approver sees the reason. |
+| D13 | (16 Oct 2026) **Go-live users at Almiras:** Managing Partner; Chairman; Accountant; Faisal (PA, prepares drafts and uploads documents); External auditor (read-only); Almiras CFO; Business Analyst (access to some modules only). Roles must allow module-level scoping (e.g. analyst sees investments and deals, not payroll). |
+| D14 | (16 Oct 2026) **Two-factor authentication for every user** (password + authenticator app). |
 | D12 | **Access is per entity:** a role at Almiras gives no access to subsidiaries; each entity is granted separately through `EntityAccess`. |
 
 ## 3. Data model
