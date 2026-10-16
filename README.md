@@ -13,15 +13,17 @@ In-house ERP for the Almiras group. Python / Django / PostgreSQL, all open sourc
   - Intercompany accounts require a counterparty entity (for elimination).
   - Gap-free numbering per entity and year: `ALM-JE-2027-000001`.
 - **Reports**: trial balance, intercompany positions by entity pair.
+- **Access** (`core/access/`, `docs/specs/access.md`): roles per entity (user × entity × role), time-bounded memberships, CFO delegation, four-eyes requests and an append-only access log. Services call `core.access.require(...)`; querysets use `core.access.scope(...)`. Posting and reversing need a grant for the entry's entity.
 
 ## Run it
 ```bash
 pip install -r requirements.txt
 python manage.py migrate
 python manage.py setup_almiras        # Almiras entity (registration + address from core/setup_data/almiras.json), 55 accounts, 2027 periods
-python manage.py createsuperuser
+python manage.py createsuperuser      # technical admin only: no business rights (access.md R24)
+python manage.py access_bootstrap --username <user> --entity ALM --reason "Initial setup"  # first managing partner
 python manage.py runserver            # admin at /admin
-python -m pytest -q                   # 52 tests
+python -m pytest -q                   # 148 tests
 ```
 Set `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST` to use PostgreSQL.
 
