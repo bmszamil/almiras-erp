@@ -1,6 +1,6 @@
 # Spec: `ledger` multi-currency extension (ledger-fx)
 
-Status: draft for review · Written: 2026-10-16 · Revised: 2026-10-16 (project-owner decision D5 on decimals; CLAUDE.md rule 7 amended) · Amended: 2026-10-16 (D6: build decisions, two-step revaluation, permission names) · Author: spec-writer agent
+Status: draft for review · Written: 2026-10-16 · Revised: 2026-10-16 (project-owner decision D5 on decimals; CLAUDE.md rule 7 amended) · Amended: 2026-10-16 (D6: build decisions, two-step revaluation, permission names) · Amended: 2026-10-16 (D7: R15, R18, R24, R28, R44, R45, R49, AT-34 to AT-38, OQ-18; code on branch `claude/funny-davinci-7yd88s`, commits aad0126..b690c12) · Author: spec-writer agent
 Extends: `ledger` (models, services, tests). Touches: `core.Entity`, `ledger/coa_template.py`, `ledger/services_setup.py`. Unblocks the ledger side of `docs/specs/invoicing.md` OQ-6 (that spec is not changed here).
 **[CC-verify]** = standards, Sharia or rate-source statement written from memory; the compliance-checker must check it against the official text before module-builder starts.
 
@@ -18,6 +18,7 @@ Lets **every entity** in the group (Almiras, subsidiaries, and any entity added 
 | D4 | 2026-10-16 | Caller (task brief, not a business decision) | Scope as listed in this spec. Debit/credit stay in functional currency. Existing entries migrate to functional currency at rate 1. Group consolidation currency SAR (to be confirmed, OQ-7). Rate table global by default (OQ-4). No paid rate feeds. Forwards and other deferred exchange are out of scope. |
 | D5 | 2026-10-16 | Project owner | Decimals (resolves OQ-1): functional-currency (SAR) amounts are stored with 2 decimals; foreign transaction-currency amounts are stored with up to 3 decimals and validated against that currency's own minor units. CLAUDE.md rule 7 amended accordingly. The rule "functional currency must be a 2-decimal currency" (R4) stays. |
 | D6 | 2026-10-16 | Build decisions (caller brief; follows access A1 / OQ-5 default) | (a) Revaluation is two-step: `revalue_period` prepares a draft, `post_revaluation` posts it with a `ledger.post_entry` grant, so the preparer cannot approve; `discard_revaluation` drops a draft run (R23, R43 to R45). (b) Account 3400 is non-postable (report-only) pending accountant confirmation (OQ-6). (c) Permission names follow access §3.6: `fx_rate_maintain` → `ledger.maintain_entity_rate`, `fx_manual_rate` → `ledger.use_manual_rate`, `fx_revalue` → `ledger.revalue`. (d) Rate age default 5 calendar days, setting `FX_MAX_RATE_AGE_DAYS` (R12, OQ-3). (e) Not built: translation (R30, OQ-5) and automatic rate feeds (OQ-2); rates come from manual entry and CSV upload only. |
+| D7 | 2026-10-16 | Build decisions (code-reviewer hardening, caller brief); human approval at merge | (a) `post_revaluation` recomputes the revaluation and refuses if anything changed since the draft (R44). (b) A discarded run is kept for audit; its never-posted draft entry is deleted and no link is kept; a discarded run does not count toward R24 (OQ-18 default adopted, R45). (c) Revaluation drafts are posted only by `post_revaluation`, never `post_entry`, and are not edited (R49). (d) Global rates are written only against the top-level group parent (R28). (e) `rerate_entry` refuses settlement drafts (R15). (f) Settlements of one item are serialised; the final one leaves no functional residue (R18). |
 
 Nothing else is decided. Every other choice is in section 9; defaults used in the rules are marked "default (OQ-n)".
 
@@ -94,14 +95,16 @@ Checks needing the entity (functional currency) live in `validate_entry` (R6 to 
 | Field | Type | Req | Notes |
 |---|---|---|---|
 | entity | FK Entity | Y | |
-| period | FK FiscalPeriod (same entity) | Y | Unique `(entity, period)` (amended 2026-10-16: see R24 and OQ-18 for discarded runs) |
+| period | FK FiscalPeriod (same entity) | Y | Unique `(entity, period)` (amended 2026-10-16: see R24 and OQ-18 for discarded runs). *Amended 2026-10-16 (D7):* DB partial unique `one_revaluation_per_period` among runs whose status is not `discarded` |
 | rate_date | Date | Y | = period end date |
 | status | Choice `draft`, `posted`, `discarded` | Y | *Added 2026-10-16 (D6).* `draft` after `revalue_period`; `posted` after `post_revaluation`; `discarded` after `discard_revaluation` |
-| entry | FK JournalEntry, null | N | Draft revaluation entry dated period end; null when no differences |
+| entry | FK JournalEntry, null | N | Draft revaluation entry dated period end; null when no differences. *Amended 2026-10-16 (D7):* set to null when the run is discarded (the draft is deleted, R45) |
 | reversal | FK JournalEntry, null | N | Auto-reversal dated day 1 of the next period; set by `post_revaluation` |
 | run_by, run_at | FK User, DateTime | Y | Preparer; human user only (R26) |
 | posted_by, posted_at | FK User, DateTime | N | *Added 2026-10-16.* User of the `ledger.post_entry` grant; never `run_by` (R44) |
 | discarded_by, discarded_at | FK User, DateTime | N | *Added 2026-10-16.* |
+
+*Amended 2026-10-16 (D7):* runs are never deleted; `status` and the fields above change only through `ledger.services`.
 
 ## 4. Rules
 
@@ -125,6 +128,7 @@ Checks needing the entity (functional currency) live in `validate_entry` (R6 to 
 13. Cross rates (e.g. EUR→SAR from ECB EUR→USD and the SAR/USD peg) are created only by the import job as rows with `source=derived` and `source_reference` naming the base rows. **[svc `import_rates`; AT-28]**
 14. `create_entry` resolves the rate for each foreign-currency line on the entry date. **No rate → no entry**: `create_entry` raises `LedgerError` naming currency pair and date (en/ar) and creates nothing. **[svc; AT-11]**
 15. `post_entry` (through `validate_entry`) rejects a foreign-currency line that has no rate, and a `table` line whose rate row is not the one `get_rate` would return for the entry's current date (the draft's date was changed after rating). The fix is to re-rate the draft. This check is skipped for reversal entries (`reversal_of` set), which copy the original rates. **[svc `validate_entry`; AT-11, AT-12]**
+    *Amended 2026-10-16 (D7):* `rerate_entry(entry, user)` refuses a draft that has `settlement` or `realised_fx` lines (re-rating the counter line alone would leave the realised FX line wrong); such a draft is discarded and its lines built again with `fx_settlement_lines` for the new date (en/ar message). **[svc `rerate_entry`; AT-36]**
 16. A `manual` rate on a line needs `manual_rate_reason` and the `ledger.use_manual_rate` permission (was `fx_manual_rate`; renamed 2026-10-16, D6). Allowed deviation from the table rate: OQ-3 (default: no limit, flagged on the FX exceptions report). **[svc + permission; AT-12]**
 
 ### Rounding
@@ -132,6 +136,7 @@ Checks needing the entity (functional currency) live in `validate_entry` (R6 to 
 
 ### Settlement and realised FX
 18. A settlement (payment, receipt, offset) clears the foreign-currency open item at its **carrying rate** (`rate_source=carrying`, `settles_line` set) and records the settling cash or counter item at the **settlement-date rate**. The functional difference goes to 4700 (gain) or 5750 (loss) as a `realised_fx` line in functional currency. Partial settlements clear `round(txn × carrying rate, 2)`; the settlement that brings the open transaction amount to zero clears exactly the remaining functional balance, so no residue is left. **[svc `fx_settlement_lines(...)` used by invoicing and manual journals; AT-4, AT-5, AT-7]**
+    *Amended 2026-10-16 (D7):* after the final settlement both the transaction and the functional balance of the settled item are exactly 0. Concurrent settlements of the same item are serialised: posting locks the entry's period, its own lines, the lines it settles (in pk order) and its rate rows (FOR SHARE on PostgreSQL), so two settlements together cannot clear more than is open. **[svc `_lock_for_posting`; AT-7, AT-37]**
 19. Because revaluations are reversed on the first day of the next period (R23), the carrying rate is always the original transaction rate. **[follows from R23; AT-8]**
 20. A currency exchange (e.g. SAR bank → USD bank) is one entry with both legs on the same date. The foreign leg's rate is the actual conversion rate (functional paid ÷ foreign received, `rate_source=manual`, reason "actual bank rate"); no FX gain/loss arises at the exchange itself. **[svc `record_currency_exchange(entity, date, from_account, from_amount, to_account, to_amount, user)`; AT-19]**
 
@@ -141,12 +146,14 @@ Checks needing the entity (functional currency) live in `validate_entry` (R6 to 
 23. The revaluation entry is dated the period end and posted with `post_entry`. In the same transaction it is reversed with `reverse_entry(entry, date=<next period start>, user, reason="Automatic reversal of FX revaluation")`. If the next period is missing or closed, the whole run fails. **[svc atomic; AT-8, AT-10]**
     *Amended 2026-10-16 (D6):* two steps. `revalue_period` creates the **draft** revaluation entry dated period end and a `RevaluationRun` in `draft`; it posts nothing. `post_revaluation(run, grant)` posts the draft with `post_entry` and, in the same transaction, posts its automatic reversal dated day 1 of the next period with `reverse_entry`. If the next period is missing or closed, nothing posts (neither entry nor reversal) and the run stays `draft`. Details in R43 to R45. **[svc atomic; AT-8, AT-10, AT-31]**
 24. One revaluation run per (entity, period). A second run is rejected. *(Amended 2026-10-16: a `discarded` run's effect on this rule is OQ-18.)* Re-running after a rate correction: OQ-9 (default: not possible; correct with a manual journal before closing). **[DB unique + svc; AT-9]**
+    *Amended 2026-10-16 (D7):* a `discarded` run does not count: the period may be revalued again after a draft is discarded (OQ-18 default). A posted run still blocks a second run (OQ-9). **[DB partial unique excluding `discarded`; AT-32, AT-35]**
 25. A revaluation into a closed period is rejected (existing `_find_open_period`). **[ledger; AT-10]**
 26. Only a human user with `ledger.revalue` permission (was `fx_revalue`; renamed 2026-10-16, D6) runs `revalue_period`; agents and system users cannot. **[svc permission; AT-29]**
 
 ### Entity separation
 27. Every line's account belongs to the entry's entity (unchanged). Entity-specific rates are used only by that entity; one entity's override never changes another entity's lookup. **[svc `validate_entry`, `get_rate`; AT-16]**
 28. Users maintain entity-specific rates only for entities they hold `ledger.maintain_entity_rate` on (was `fx_rate_maintain`; renamed 2026-10-16, D6); global rates need the group-level permission (OQ-4). Rate list views and APIs are filtered by entity permission (global rows are visible to all ledger users). **[svc + permission; AT-16]**
+    *Amended 2026-10-16 (D7):* global rates are used by every entity, so they are written only with `ledger.maintain_global_rate` (or `ledger.import_global_rate` for the import system user) on the **top-level** group parent (`consolidation=parent`, no `parent`). The right held on a lower parent entity is refused. **[svc `_authorise_rate_write`; AT-38]**
 29. Intercompany mirror checks compare positions in **transaction currency** per (entity, counterparty, currency); functional amounts of two entities with different functional currencies are not expected to mirror. **[svc `intercompany_balances(as_of, by_currency=True)`; AT-25]**
 
 ### Translation and consolidation
@@ -175,10 +182,17 @@ Checks needing the entity (functional currency) live in `validate_entry` (R6 to 
 ### Two-step revaluation and build decisions (added 2026-10-16, D6)
 43. `revalue_period(entity, period, user)` needs `require(user, entity, "ledger.revalue")` and a human user. It computes R21, creates the draft entry dated period end through `create_entry`, and creates the `RevaluationRun` (`draft`). R22 applies: a missing closing rate creates nothing. **[svc atomic; AT-8, AT-11, AT-29]**
 44. `post_revaluation(run, grant)` requires a `ledger.post_entry` grant (access R14, R23, R30) for that run's draft entry, in the run's entity. The preparer (`run_by`) cannot be the grant's user: segregation is the access **A** rule, with the draft's `created_by` = preparer. It posts the entry and its reversal (dated day 1 of the next period) in one transaction and sets `posted`, `posted_by`, `posted_at`, `reversal`. Missing or closed next period, closed revaluation period, or a run not in `draft`: nothing posts. **[svc atomic + access; AT-10, AT-31]**
+    *Amended 2026-10-16 (D7):* before posting, `post_revaluation` locks every period of the entity up to the next one and recomputes R21. If the computed lines (account, currency, counterparty, amounts, closing rate) differ from the draft (a backdated posting, a new closing rate), nothing posts, the grant stays unused and the error says "discard it and re-run the revaluation" (en/ar). **[svc; AT-34]**
 45. `discard_revaluation(run, user)` applies only to a `draft` run: it sets `discarded` and leaves the draft entry unposted (drafts are not journal postings; CLAUDE.md rule 1 is not affected). A `posted` run cannot be discarded; corrections follow OQ-9. Permission: `ledger.revalue` (default; OQ-18). **[svc; AT-32]**
+    *Amended 2026-10-16 (D7), replaces "leaves the draft entry unposted":* the run is kept with `status=discarded`, `discarded_by`, `discarded_at`; its draft entry, never posted, is **deleted** and `run.entry` is set to null (no link kept). CLAUDE.md rule 1 is not affected (only drafts are deleted). Discarding an already discarded run is refused. **[svc; AT-32, AT-35]**
 46. Account 3400 (translation reserve) is non-postable: `validate_entry` rejects any line on it in every entity. It is used by the translation report only. Pending accountant confirmation (OQ-6). **[svc `validate_entry` + account flag; AT-33]**
 47. `FX_MAX_RATE_AGE_DAYS` (Django setting, default 5) is the R12 fallback window. **[svc `get_rate`; AT-11]**
 48. Rates enter only by manual entry and CSV upload (`source=manual` / `file`). `import_rates` for SAMA, ECB, CBE, CBUAE, PBOC is not built (OQ-2); R13 and AT-28 are deferred. **[scope; code-reviewer]**
+
+### Build hardening (added 2026-10-16, D7)
+49. A revaluation draft is posted only by `post_revaluation` (with its reversal, after the R44 recheck): `post_entry` refuses it (`use_post_revaluation`). It is never edited: `update_draft` refuses it; the change is discard and re-run. **[svc `post_entry`, `_update_draft`; AT-34]**
+
+The other D7 changes are amendment notes on R15, R18, R24, R28, R44 and R45.
 
 ## 5. Accounting
 
@@ -326,6 +340,11 @@ Fixtures: ALM (parent, SAR, Sharia enforced), LZM (child, SAR), EGY (child, EGP 
 | AT-31 | *Added 2026-10-16 (D6).* Draft run for ALM 2027-01 prepared by accountant A; A also holds `approver` in ALM; approver P | A calls `post_revaluation` with A's own `ledger.post_entry` grant; P calls it with a grant for another entry; P with a grant for an LZM entry; P with a grant for this draft; P calls it again | A refused (preparer, access R14); other-entry and LZM grants refused (access R23, R30); P's grant posts F2 and F3 in one transaction, run `posted`, `posted_by` = P; second call refused (run not `draft`, grant used) |
 | AT-32 | *Added 2026-10-16 (D6).* Draft run for 2027-01; posted run for 2027-02 | `discard_revaluation` on each; `post_revaluation` on the discarded run | 2027-01 run `discarded`, draft entry not posted, TB unchanged; 2027-02 discard refused; posting a discarded run refused |
 | AT-33 | *Added 2026-10-16 (R46).* Account 3400 in ALM and EGY | Create and post an entry with a line on 3400, as accountant and as MP | Rejected in both entities, en/ar message |
+| AT-34 | *Added 2026-10-16 (D7; R44, R49).* Draft run for ALM 2027-01 prepared by A; approver P | P calls `post_entry` on the draft; A calls `update_draft` on it; a backdated EUR entry dated 2027-01-20 is posted, then P calls `post_revaluation`; a new closing-rate row is added instead, then P calls it | `post_entry` refused (`use_post_revaluation`); edit refused; both `post_revaluation` calls refused "discard it and re-run the revaluation" (en/ar), nothing posted, run `draft`, grant unused |
+| AT-35 | *Added 2026-10-16 (D7; R24, R45).* Draft run X for 2027-01 | A discards X; discards it again; runs `revalue_period(ALM, 2027-01)` again | X `discarded` with `discarded_by` = A and `discarded_at`; its draft entry no longer exists and `X.entry` is null; second discard refused; new run created (`draft`); X still exists |
+| AT-36 | *Added 2026-10-16 (D7; R15).* USD draft with `settlement` and `realised_fx` lines; plain USD draft | `rerate_entry` on each | First refused (en/ar, `rerate_settlement`), draft unchanged; second re-rated |
+| AT-37 | *Added 2026-10-16 (D7; R18), PostgreSQL.* F1 open EUR 10,000.00 | Two sessions each post a settlement of EUR 10,000.00 at the same time; then partial receipts per F10 | Postings are serialised on the settled line's lock; together they never clear more than is open (the second is refused); after F10 both EUR and SAR balances of the 1200 item are exactly 0.00 |
+| AT-38 | *Added 2026-10-16 (D7; R28).* ALM top-level parent; LZM child; T2 is `group_treasury` on ALM | T2 creates a global rate with `group=LZM`; with `group=ALM`; with no `group` when exactly one top-level parent exists | First refused ("not the top-level group parent entity", en/ar); second and third allowed |
 
 ## 9. Open questions
 
@@ -350,7 +369,7 @@ Fixtures: ALM (parent, SAR, Sharia enforced), LZM (child, SAR), EGY (child, EGP 
 | OQ-15 | `JournalEntry` has only an English `description`; add `description_ar` for system-generated entries (reversals, revaluations)? | Dev | Default: Arabic in reason text |
 | OQ-16 | Migration of foreign open items from Daftra/SAP B1: original rate kept, or restated at cutover rate. | Accountant + migration-agent | Default: original currency, amount and rate; tie out per currency |
 | OQ-17 | Functional currency of each subsidiary (Egypt EGP?, China CNY?, UAE AED?) under IAS 21 indicators **[CC-verify]**. | Accountant / auditor | **BLOCKING** for setting up those entities, not for the build |
-| OQ-18 | *Added 2026-10-16 (D6).* Does a `discarded` revaluation run free the period for a new run (R24)? Who may discard a draft run (preparer, approver, both)? | Accountant + Dev | Default: discarded run kept for audit and does not count toward R24; `ledger.revalue` holders may discard |
+| OQ-18 | *Added 2026-10-16 (D6).* Does a `discarded` revaluation run free the period for a new run (R24)? Who may discard a draft run (preparer, approver, both)? | Accountant + Dev | Default: discarded run kept for audit and does not count toward R24; `ledger.revalue` holders may discard. *Note 2026-10-16 (D7):* built with this default; the discarded run's draft entry is deleted (R45). Still for the accountant to confirm |
 
 **Blocking:** OQ-2 (automatic import; not built, CSV only, D6), OQ-5 (translation; not built, D6), OQ-6 (FX postings; 3400 non-postable meanwhile, R46), OQ-17 (subsidiary setup). **Sharia board sign-off:** OQ-14 and any forward contract.
 

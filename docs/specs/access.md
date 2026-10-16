@@ -1,6 +1,6 @@
 # Access: users, roles and permissions per entity (user × entity × role)
 
-Django app: `core` (package `core/access/`: `models.py`, `services.py`, `catalogue.py`, `backends.py`). Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (A11, A12: billing versions/corrections, unseal delegation). Amended 2026-10-16 (A13, R27, R30 to R33, AT-29 to AT-32: build decisions and reviewer hardening).
+Django app: `core` (package `core/access/`: `models.py`, `services.py`, `catalogue.py`, `backends.py`). Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (A11, A12: billing versions/corrections, unseal delegation). Amended 2026-10-16 (A13, R27, R30 to R33, AT-29 to AT-32: build decisions and reviewer hardening). Amended 2026-10-16 (A14, R23, R30, R32, R34 to R42, AT-33 to AT-40, OQ-19, OQ-20: ledger document registry, entity lifecycle, clearance approver; code on branch `claude/funny-davinci-7yd88s`, commits aad0126..b690c12).
 Depended on by: `docs/specs/invoicing.md` (OQ-25, OQ-42), `docs/specs/billing.md` §7, `docs/specs/zatca.md` §7, R-41, OQ-14, OQ-25, `docs/specs/ledger-fx.md` §7. Gateway design: `docs/ai-agent-gateway.md`.
 Role names and permission codenames in this spec replace the provisional names in those four specs (reconciliation table in §3.1).
 
@@ -25,6 +25,7 @@ The access module decides who may do what, in which entity. It holds the role ca
 | A11 | Contracts are amended, terminated or cancelled (also retroactively) through CFO-approved versions; correction credit/debit notes are drafted by the billing system user, reviewed and submitted by a person, and approved by the CFO. Auto-generated invoices from a CFO-approved contract need no per-invoice approval. | Project owner (billing D8, D9; invoicing D20, D21) | 2026-10-16 |
 | A12 | The ZATCA master key stays with the Managing Partner; no Shamir shares. The MP may delegate key access, including unsealing the secret store, to named custodians. | Project owner (zatca D-10) | 2026-10-16 |
 | A13 | *Added 2026-10-16.* Hardening adopted during the build from code-reviewer findings: (a) posting grants are tied to one document and are single-use; (b) a grant is verified against its `AccessLog` row before use; (c) sensitive entity settings (`sharia_enforced`, `consolidation`, `parent`, `base_currency`, `is_active`) change only through logged, permission-checked services, never Django admin; (d) `AccessLog` and `Membership` are append-only, also at database level on PostgreSQL; (e) `permission_denied` rows are written durably outside the caller's transaction (R27). | Build decision (code-reviewer, caller brief); human approval at merge | 2026-10-16 |
+| A14 | *Added 2026-10-16.* Further hardening adopted during the build: (a) sub-ledger postings go through a ledger **document registry**; a document books once (R34 to R36); (b) `invoicing.reverse_document` only reverses (R37); (c) entity lifecycle: catalogue flag **I**, the `reactivate_entity` recovery command, the top-level group parent cannot be deactivated, new entities only inside an existing group (R38 to R40); (d) revocation time is the current time, within 10 s (R41); (e) the `posted_by` of a posting on ZATCA clearance is a current, used approval (R42). | Build decision (code-reviewer, caller brief); human approval at merge | 2026-10-16 |
 
 Not decided (in §9): who approves when the CFO is absent or is the creator (OQ-1), who may grant memberships (OQ-2), which entities group-wide roles cover (OQ-3), and others.
 
@@ -130,19 +131,21 @@ Active at time *t* ⇔ `valid_from ≤ t < valid_to` (or `valid_to` null) and `r
 | details | JSON | Y | Before/after values; never passwords, tokens, keys or OTPs |
 | request_id / ip / source | Char | N | `source` = `human`, `system:<code>`, `agent:<name>` |
 
-`save` refuses updates, `delete` refuses always; the DB role of the app has no UPDATE/DELETE on this table (OQ-10). *Amended 2026-10-16 (A13):* append-only is also enforced at database level on PostgreSQL for `AccessLog` and `Membership` (R33). `permission_denied` rows are written through a separate `access_log` database connection (R27).
+`save` refuses updates, `delete` refuses always; the DB role of the app has no UPDATE/DELETE on this table (OQ-10). *Amended 2026-10-16 (A13):* append-only is also enforced at database level on PostgreSQL for `AccessLog` and `Membership` (R33). `permission_denied` rows are written through a separate `access_log` database connection (R27). *Amended 2026-10-16 (A14):* events also include `entity_settings_changed` (R32, R38 to R40; actor null only for the `reactivate_entity` command, which records the OS user) and the ledger's `post_on_clearance` row (R42).
 
 ### 3.6 Permission catalogue (`core/access/catalogue.py`, code, not data)
 
 Each codename is declared in its app's `Meta.permissions` (label in English, Arabic through Django translations) and listed in the catalogue with flags. Flags live in code so nobody can edit them in admin.
 
-Flags: **A** = approval (creator ≠ approver, R14); **S!** = segregation that cannot be switched off; **DC** = dual control (R19); **G** = group-level only; **Ag** = an agent role may hold it; **Sys:x** = only system user *x* may hold it; **P** = the grant authorises a ledger posting (R23).
+Flags: **A** = approval (creator ≠ approver, R14); **S!** = segregation that cannot be switched off; **DC** = dual control (R19); **G** = group-level only; **Ag** = an agent role may hold it; **Sys:x** = only system user *x* may hold it; **P** = the grant authorises a ledger posting (R23); **I** = still usable on an inactive entity, but only to reactivate it (R38; *added 2026-10-16, A14*).
 
 | Codename | Flags | Holders (seed) |
 |---|---|---|
 | `core.view_access` | | access_admin, managing_partner, viewer (own entity) |
 | `core.grant_membership` | S! | access_admin, managing_partner |
 | `core.delegate_approval` | S! | approver (own approver membership only), managing_partner |
+| `core.change_entity_settings` (R32, R38 to R40) | G, I | managing_partner (OQ-18 default). *Added 2026-10-16 (A14)* |
+| `core.manage_users` (activate / deactivate user accounts) | G | managing_partner. *Added 2026-10-16 (A14)* |
 | `invoicing.manage_customer` / `invoicing.manage_vendor` | | receivables_clerk / payables_clerk; accountant both |
 | `invoicing.create_sales_document` (draft create/edit) | Ag | receivables_clerk, accountant, agent (if granted) |
 | `invoicing.submit_sales_document` | | receivables_clerk, accountant |
@@ -152,7 +155,7 @@ Flags: **A** = approval (creator ≠ approver, R14); **S!** = segregation that c
 | `invoicing.create_bill` / `invoicing.create_vendor_payment` | Ag (bills only) | payables_clerk, accountant |
 | `invoicing.submit_bill` / `invoicing.submit_vendor_payment` | | payables_clerk, accountant |
 | `invoicing.approve_bill` / `invoicing.approve_vendor_payment` (R58, R59) | A, P | approver |
-| `invoicing.reverse_document` | P | accountant |
+| `invoicing.reverse_document` | P | accountant. *Amended 2026-10-16 (A14):* reverses a document's entry only; never books one (R37) |
 | `invoicing.post_receipt` (R33) | P | receivables_clerk, accountant |
 | `invoicing.allocate` | | receivables_clerk, payables_clerk, accountant |
 | `invoicing.enter_wht_data` / `invoicing.verify_wht_data` | | payables_clerk, accountant / accountant |
@@ -208,6 +211,8 @@ revoke_membership(actor, membership, reason) -> Membership
 delegate_approval(actor, delegate, entity, valid_from, valid_to, reason) -> Membership
 ```
 
+*Added 2026-10-16 (A14), entity services in `core/services.py`:* `change_entity_settings(entity, *, user, reason, **changes)`, `create_entity(entity, *, user, reason)`, `reactivate_entity_by_operator(entity, reason, os_user)` (called only by the `reactivate_entity` management command). Ledger side: `ledger.documents.register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at")`, called in the owning app's `AppConfig.ready()`.
+
 `Grant` is a frozen dataclass: `user, entity, permission, membership_ids, checked_at, log_id`. `AccessDenied` subclasses `django.core.exceptions.PermissionDenied` and carries `message_en` / `message_ar`. *Amended 2026-10-16 (A13):* a grant for a **P** permission also records the document it was issued for and can be used once only (R30, R31).
 
 ## 4. Rules
@@ -250,6 +255,7 @@ Enforcement: **S** = `core/access/services.py`; **M** = model `save`/`delete`/`c
 
 **Ledger posting**
 23. `ledger.services.post_entry` and `reverse_entry` require a `Grant` for a **P** permission in the entry's entity, or the user's own `ledger.post_entry` / `ledger.reverse_entry` right. A grant for another entity is refused. For deferred posting (sales posted on ZATCA clearance, zatca D-8), `system_zatca_queue` posts with `invoicing.post_on_clearance`; `posted_by` is the approver recorded on the document. **[S in ledger; test AT-21]**
+    *Amended 2026-10-16 (A14):* a sub-ledger document is booked by `create_entry(..., post=True, grant=..., document=...)`, where the grant is a sub-ledger **P** permission issued for that document and registered for its type (R34). `post_entry` takes only `ledger.post_entry` grants for manual drafts; a sub-ledger grant passed to it is refused. Which `posted_by` is accepted on clearance: R42.
 
 **Superusers and staff**
 24. `is_superuser` gives no business permission in `require` or `scope`. Superusers use Django admin for technical tasks; admin for business models subclasses `core.admin.EntityScopedAdmin`, which applies `scope` and blocks status changes. **[S + admin; test AT-22]**
@@ -264,9 +270,26 @@ Enforcement: **S** = `core/access/services.py`; **M** = model `save`/`delete`/`c
 
 **Hardening (added 2026-10-16, A13)**
 30. A grant for a **P** permission is tied to one document: `post_entry` / `reverse_entry` refuse it for any other document (or entry derived from another document). It is single-use: a second use is refused. **[S in core + ledger; test AT-30]**
+    *Amended 2026-10-16 (A14):* "the document" is the stored row of a registered document type (R34, R35); the entry records it (`document_type`, `document_id`), and its reversal carries the same reference.
 31. Before a grant is honoured, it is verified against its `AccessLog` row (`log_id`): the row must exist and match user, entity, permission and document. A forged or altered `Grant` is refused. **[S; test AT-30]**
 32. `Entity.sharia_enforced`, `consolidation`, `parent`, `base_currency` and `is_active` change only through services in `core` that call `require` and write an `AccessLog` row with before/after values. Django admin shows these fields read-only. Permission codename and holders: OQ-18. **[S + admin; test AT-31]**
+    *Amended 2026-10-16 (A14):* the codename is `core.change_entity_settings` (flags G, I), checked on the entity's group parent; moving an entity to another group needs it on that group too. `base_currency` changes only through `ledger.services.set_functional_currency` (ledger-fx R5). Lifecycle rules: R38 to R40.
 33. `AccessLog` and `Membership` are append-only: model guards (R9, 3.5) and, on PostgreSQL, a database-level guard that rejects UPDATE (except the single revocation write on `Membership`) and DELETE. **[M + DB; test AT-32 (PostgreSQL only)]**
+
+**Ledger document registry (added 2026-10-16, A14)**
+34. Each sub-ledger app registers, in its `AppConfig.ready()`, the document models that book journal entries and, per model, the **P** permissions that may post it and the permissions that may reverse it (`ledger.documents.register`). Registration is refused for non-concrete models, ledger models, models without an `entity` FK to `core.Entity`, an empty posting set, or permissions that are not sub-ledger posting / reversal permissions. The ledger registers nothing itself: until a module registers its types, every sub-ledger posting (`create_entry(post=True)` with a sub-ledger grant) is refused. **[S in ledger; test AT-33]**
+35. The document passed with a sub-ledger posting must be a saved model instance (never a tuple or stand-in) of a registered type whose posting set lists the grant's permission, must exist in the database, and must belong to the entity being posted. Otherwise refused (`grant_needs_document`, `document_not_registered`, `document_not_found`, `document_other_entity`), logged as `permission_denied`. Segregation is checked on the **stored** document, not the object the caller passed: the grant's user must not be its `created_by`, `submitted_by` or `modified_by` (`self_approval`). The ledger applies this to every sub-ledger posting, whatever the module's segregation switch (OQ-19). **[S in ledger; test AT-33, AT-35]**
+36. One booking per document: a document has at most one non-reversal entry (DB partial unique on `(entity, document_type, document_id)` where `reversal_of` is null, plus a service check, `document_booked`). A reversed document is not booked again; the correction is a **new document** with its own entry. **[S + DB; test AT-34]**
+37. `invoicing.reverse_document` (and any registered reversal permission) only reverses the entry of the document it was issued for; it never books a document's entry. **[S in ledger; test AT-36]**
+
+**Entity lifecycle (added 2026-10-16, A14)**
+38. On an inactive entity, rights are refused except view permissions (OQ-8 default) and permissions flagged **I**. An **I** permission on an inactive entity allows only reactivation (`change_entity_settings(..., is_active=True)` and nothing else); any other change is refused (`inactive_entity_reactivate_only`). **[S; test AT-37]**
+39. Recovery: when nobody can reactivate an entity, an operator runs `manage.py reactivate_entity` with a reason. It sets `is_active=True` only on an inactive entity and writes an `entity_settings_changed` row (no actor; `source="command"`, OS user, reason, before/after). The top-level group parent (no `parent`) cannot be deactivated, also not by making it top-level and inactive in one change, because every group right is checked on it. **[S + command; test AT-37]**
+40. `core.services.create_entity` creates an entity only under a parent in an existing group: the user needs `core.change_entity_settings` on that group's parent, which must be active. It never creates a new top-level group (an operator task). It writes one `entity_settings_changed` row with the new entity's sensitive settings and `base_currency`. **[S; test AT-38]**
+
+**Revocation time and clearance approver (added 2026-10-16, A14)**
+41. A membership revocation's `revoked_at` must be within 10 seconds of the current time when written (model `save`, and the PostgreSQL trigger of R33): no backdated or future-dated revocation. **[M + DB; test AT-39]**
+42. On a posting with `invoicing.post_on_clearance`, `posted_by` is required and must be a human who is not the document's creator, submitter or last modifier, and whose `invoicing.approve_sales_document` grant for this document was **used** and was issued **after the document's last change** (`modified_at`); earlier or unused approvals do not count. The approver need not still be active at clearance: the right was checked at approval (OQ-20). The posting writes an `AccessLog` row (`post_on_clearance`, document, entry, `posted_by`). **[S in ledger; test AT-40]**
 
 ## 5. Accounting
 
@@ -334,6 +357,14 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 | AT-30 | *Added 2026-10-16 (R30, R31).* Approver P holds a grant from approving bill X in ALM | Pass it to `post_entry` for X; again for X; for bill Y; pass a `Grant` with changed `log_id` or permission | First posts; second refused (used); Y refused (other document); altered grant refused (no matching `AccessLog` row) |
 | AT-31 | *Added 2026-10-16 (R32).* Superuser S; MP in ALM; accountant A | S edits `sharia_enforced` on ALM in admin; A calls the entity-settings service; MP calls it | Admin edit refused (field read-only); A refused with `permission_denied` row; MP change applied with an `AccessLog` row holding before/after |
 | AT-32 | *Added 2026-10-16 (R33), PostgreSQL only.* Existing `AccessLog` and `Membership` rows | Raw SQL UPDATE and DELETE on both tables; raw UPDATE of `Membership.revoked_at` on an unrevoked row | UPDATE/DELETE rejected by the database; the single revocation write allowed once |
+| AT-33 | *Added 2026-10-16 (R34, R35).* No module has registered `Receipt`; then it is registered with `post_permissions={"invoicing.post_receipt"}`; clerk K holds `invoicing.post_receipt` in ALM | K books receipt R (created by another user) before registration; after registration with R; with a tuple `("invoicing.receipt", 1)`; with an unsaved receipt; with a SUB receipt; with a manual draft entry as "document"; with a `post_receipt` grant on a bill type that does not list it; registering a ledger model, an abstract model or a model with `post_permissions={"invoicing.reverse_document"}` | Before registration refused (`document_not_registered`); after: R posts once with `document_type`/`document_id` set, `posted_by` = K; tuple, unsaved, other-entity, manual-draft and wrong-type postings refused with `permission_denied` rows; the three registrations raise `DocumentRegistryError` |
+| AT-34 | *Added 2026-10-16 (R36).* Receipt R booked | Book R again with a fresh grant; reverse R's entry; book R again | Second booking refused (`document_booked`); reversal posts with R's reference; re-booking R refused again; a new receipt R2 books |
+| AT-35 | *Added 2026-10-16 (R35).* Receipt R created by K; caller passes an in-memory copy of R with `created_by` changed to another user | K books R | Refused (`self_approval`): checked on the stored row; same when K is R's submitter or last modifier |
+| AT-36 | *Added 2026-10-16 (R37).* Accountant A holds `invoicing.reverse_document`; bills B7 (booked) and B8 (booked) | A books a new entry for B7 with the reversal grant; reverses B8's entry with a grant issued for B7; reverses B7's entry with the B7 grant; type registered without a reversal permission | Booking refused; B8 reversal refused; B7 reversal posts; reversal for the type without a registered reversal permission refused |
+| AT-37 | *Added 2026-10-16 (R38, R39).* SUB inactive; ALM is the top-level group parent; MP in ALM | MP changes SUB `sharia_enforced`; MP reactivates SUB; MP deactivates ALM; MP sets ALM `parent=None, is_active=False`; ALM made inactive in a fixture, MP changes its `consolidation`, then reactivates it; operator runs `reactivate_entity` on an active entity, then on an inactive one with a reason | SUB settings change refused while inactive; reactivation allowed and logged; ALM deactivation refused (both forms, en/ar); ALM consolidation refused (`inactive_entity_reactivate_only`), reactivation allowed; command refuses the active entity, reactivates the inactive one with an `entity_settings_changed` row (no actor, OS user, reason) |
+| AT-38 | *Added 2026-10-16 (R40).* MP in ALM; accountant A | MP creates NEW under SUB; MP creates an entity with no parent; A creates one under ALM; MP creates one under an inactive group parent | NEW created with one `entity_settings_changed` row holding its settings and `base_currency`; no-parent creation refused; A refused; inactive group refused |
+| AT-39 | *Added 2026-10-16 (R41).* Active membership M | Revoke via `revoke_membership`; write `revoked_at` = now − 1 h, now + 1 h through the model (and raw SQL on PostgreSQL) | Service revocation within 10 s of now accepted; backdated and future-dated revocations refused |
+| AT-40 | *Added 2026-10-16 (R42).* Sales document S (created by K); approver P approves (grant used); S then modified; approver Q approves again (used); P's membership later revoked | Queue posts S with `post_on_clearance` and `posted_by` = none; = P; = Q; = K; = an approver whose grant was issued but not used | None, P (approval before last change), K and the unused approver refused (`posted_by_not_approver`); Q accepted even after Q's membership is revoked; `post_on_clearance` row in `AccessLog` |
 
 ## 9. Open questions
 
@@ -348,7 +379,7 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 | OQ-5 | Manual journals: ledger-fx §7 lets the Accountant post directly; A1 says the CFO approves and posting follows. Which applies to manual and FX journals, revaluation and reversals? | Managing Partner / CFO | D | A1: `ledger.post_entry` = approver, not own; revaluation run by accountant creates drafts for approval |
 | OQ-6 | zatca's "Sales user" is mapped to `receivables_clerk`. Correct? | Managing Partner | D | Yes |
 | OQ-7 | Viewer/auditor: may they export the ZATCA archive (zatca §7 yes), even though B2C XML holds personal data that invoicing masks for viewers (R51)? Separate `external_auditor` role? | Managing Partner + legal (PDPL) | D | Export allowed only with `invoicing.view_personal_data`; one `viewer` role |
-| OQ-8 | Memberships on an inactive entity: read-only or nothing? | Accountant | D | View permissions still work; ledger already blocks posting |
+| OQ-8 | Memberships on an inactive entity: read-only or nothing? | Accountant | D | View permissions still work; ledger already blocks posting. *Amended 2026-10-16 (A14):* plus **I** permissions, for reactivation only (R38) |
 | OQ-9 | Keep `auth.User` + `UserProfile`, or swap to a custom user model before the first production migration? | Dev | D | Keep `auth.User` + profile |
 | OQ-10 | AccessLog retention, who may read it, DB-level UPDATE/DELETE revoke (PDPL: it holds personal data). | Managing Partner + legal | GL | Keep 10 years; readable by MP and `access_admin` (own entity); DB grants revoked by migration |
 | OQ-11 | Dual-control request expiry; does revoking a ZATCA certificate also need dual control (zatca OQ-14 left it open)? | Managing Partner | D | 72 h; revoke does not need dual control |
@@ -358,7 +389,9 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 | OQ-15 | Should `billing.approve_termination` be "not own"? billing §7 does not say so; invoicing does for all approvals. | Managing Partner | D | Yes, all **A** permissions are segregated. Billing R39/R40 (D9) now state CFO ≠ creator/submitter for every version, terminations included |
 | OQ-16 | Maximum delegation length (CFO and key custody; zatca OQ-25). | Managing Partner | D | No maximum; `valid_to` required for CFO delegates, optional for key custody (zatca default) |
 | OQ-17 | Should WHT entry and verification be separate people (enter ≠ verify)? | Accountant | D | No rule; same person may do both |
-| OQ-18 | *Added 2026-10-16.* Who may change sensitive entity settings (R32): `sharia_enforced`, `consolidation`, `parent`, `base_currency`, `is_active`? Should turning Sharia enforcement off need dual control? | Managing Partner | D | `managing_partner` only (`base_currency` also per ledger-fx R5); no dual control |
+| OQ-18 | *Added 2026-10-16.* Who may change sensitive entity settings (R32): `sharia_enforced`, `consolidation`, `parent`, `base_currency`, `is_active`? Should turning Sharia enforcement off need dual control? | Managing Partner | D | `managing_partner` only (`base_currency` also per ledger-fx R5); no dual control. *Note 2026-10-16:* built as `core.change_entity_settings` (G, I), R32, R38 to R40 |
+| OQ-19 | *Added 2026-10-16.* The ledger refuses every sub-ledger posting by the document's creator, submitter or last modifier (R35), also when the module's per-entity switch allows self-approval (R14, AT-7; invoicing `segregation_required = False`). Should the ledger honour the module switch, or is segregation on postings always on? Affects invoicing receipts (invoicing R33, OQ-49). | Managing Partner | D | Always on, as built; R14's switch then only affects approvals that do not post |
+| OQ-20 | *Added 2026-10-16.* A sales document posts on ZATCA clearance with `posted_by` = an approver whose membership may have ended since approval (R42). Acceptable, or should clearance require the approver to be still active? | Managing Partner | D | Acceptable, as built: the right is checked at approval |
 
 **Blocking:** OQ-13 blocks wiring zatca onboarding permissions (not the access module itself). **Go-live:** OQ-3, OQ-4, OQ-10. This spec also unblocks invoicing OQ-25 (views/APIs) once built.
 
