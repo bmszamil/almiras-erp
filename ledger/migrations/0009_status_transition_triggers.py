@@ -15,6 +15,14 @@ and stays unchanged):
   waits for a posting of the same entry in flight (which holds the entry FOR
   UPDATE) and then sees the posted status.
 
+This is a minimal check against writes that bypass the ORM, not proof that
+ledger.services made the change: raw SQL that sets ``status = 'posted'``
+together with ``number``, ``period_id``, ``posted_at`` and ``posted_by_id``
+on a draft with 2+ balancing lines is accepted (no Sharia, period-open,
+rate or segregation check runs in the database). The database role's
+privileges (access.md OQ-10) are the guard against such writes. 0012
+replaces this function and adds the reversal and document link checks.
+
 On SQLite this migration does nothing; the model and queryset guards apply.
 """
 from django.db import migrations
