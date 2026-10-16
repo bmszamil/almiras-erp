@@ -5,6 +5,7 @@ core/setup_data/ and are never loaded by tests.
 """
 import json
 from datetime import date
+from io import StringIO
 
 import pytest
 from django.core.exceptions import ValidationError
@@ -201,7 +202,51 @@ def test_setup_data_rejects_unknown_fields(setup_file):
     assert not Entity.objects.exists()
 
 
+def test_setup_command_rejects_invalid_date_bilingually(setup_file):
+    with pytest.raises(ValidationError) as exc:
+        call_command("setup_almiras", setup_data=setup_file(dict(FAKE_FIELDS, vat_effective_date="2025-13-01")))
+    message = exc.value.message_dict["vat_effective_date"][0]
+    assert "ISO date" in message and "تاريخ" in message
+    assert not Entity.objects.exists()
+
+
+def test_setup_command_reports_created_updated_unchanged(setup_file):
+    out = StringIO()
+    path = setup_file()
+    call_command("setup_almiras", setup_data=path, stdout=out)
+    assert out.getvalue().startswith("Created")
+    out = StringIO()
+    call_command("setup_almiras", setup_data=path, stdout=out)
+    assert out.getvalue().startswith("Unchanged ALM")
+    out = StringIO()
+    call_command("setup_almiras", setup_data=setup_file(dict(FAKE_FIELDS, street_en="New St")), stdout=out)
+    assert out.getvalue().startswith("Updated (street_en)")
+
+
+def test_setup_command_help_says_file_overwrites_admin_edits():
+    from ledger.management.commands.setup_almiras import Command
+
+    assert "source of truth" in Command.help and "overwrites" in Command.help
+
+
 # --- Entity separation ----------------------------------------------------
+
+@pytest.mark.parametrize("code", ["LZM", "alm", ""])
+def test_setup_file_for_another_entity_is_rejected_and_changes_nothing(setup_file, code):
+    alm = make_entity("ALM", name_en="Almiras", name_ar="المراس")
+    other = make_entity("LZM", name_en="Other", name_ar="أخرى", consolidation="full", parent=alm)
+    before = {e["code"]: e for e in Entity.objects.values()}
+    with pytest.raises(ValidationError):
+        call_command("setup_almiras", setup_data=setup_file(code=code))
+    assert {e["code"]: e for e in Entity.objects.values()} == before
+    assert not Account.objects.filter(entity__in=[alm, other]).exists()
+
+
+def test_setup_file_for_unknown_entity_creates_nothing(setup_file):
+    with pytest.raises(ValidationError, match="only sets up 'ALM'"):
+        call_command("setup_almiras", setup_data=setup_file(code="NEW"))
+    assert not Entity.objects.exists()
+
 
 def test_setup_touches_only_its_entity(setup_file):
     other = make_entity("LZM", name_en="Other", name_ar="أخرى", consolidation="full", parent=make_entity("ALM"))

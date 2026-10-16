@@ -10,6 +10,8 @@ from .models import Entity, validate_vat_number
 
 SETUP_DATA_DIR = Path(__file__).resolve().parent / "setup_data"
 ALMIRAS_SETUP_DATA = SETUP_DATA_DIR / "almiras.json"
+# The only entity setup_almiras may create or change. The file never chooses it.
+ALMIRAS_CODE = "ALM"
 
 # Seller fields that must be filled before any document can be issued (R69).
 ISSUE_REQUIRED_FIELDS = (
@@ -57,31 +59,64 @@ def entity_ready_to_issue(entity, standard_rated=False):
     return missing
 
 
-def load_setup_data(path):
-    """Read an entity setup-data file (JSON) and return its dict."""
+def load_setup_data(path, expected_code=ALMIRAS_CODE):
+    """Read an entity setup-data file (JSON) and return its dict.
+
+    The file's ``code`` must equal ``expected_code``: the command decides which
+    entity is changed, the file only confirms it. A file written for another
+    entity is rejected before anything is read from the database.
+    """
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
     if not data.get("code") or not isinstance(data.get("fields"), dict):
-        raise ValidationError("Setup data needs 'code' and a 'fields' object.")
+        raise ValidationError(
+            "Setup data needs 'code' and a 'fields' object. / يجب أن تحتوي بيانات الإعداد على 'code' وكائن 'fields'."
+        )
+    if data["code"] != expected_code:
+        raise ValidationError(
+            f"Setup data is for entity {data['code']!r}; this command only sets up {expected_code!r}. / "
+            f"بيانات الإعداد للكيان {data['code']!r}؛ هذا الأمر يُعِدّ الكيان {expected_code!r} فقط.",
+            code="wrong_entity",
+        )
     unknown = set(data["fields"]) - SETUP_FIELDS
     if unknown:
-        raise ValidationError(f"Setup data has unknown entity fields: {', '.join(sorted(unknown))}")
+        raise ValidationError(
+            f"Setup data has unknown entity fields: {', '.join(sorted(unknown))} / "
+            "تحتوي بيانات الإعداد على حقول غير معروفة."
+        )
     return data
+
+
+def _parse_date(name, value):
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise ValidationError(
+            {name: f"{value!r} is not a valid ISO date (YYYY-MM-DD). / {value!r} ليس تاريخًا صالحًا بصيغة YYYY-MM-DD."},
+            code="invalid_date",
+        ) from None
 
 
 @transaction.atomic
 def apply_entity_setup(entity, fields):
     """Set registration and address fields on ``entity``, validate and save.
 
+    Returns the names of the fields whose value changed (empty: nothing saved).
     Idempotent: applying the same fields twice leaves the entity unchanged.
     Only ``entity`` is touched; no other entity is read or written.
     """
+    changed = []
     for name, value in fields.items():
         if name not in SETUP_FIELDS:
-            raise ValidationError(f"Field {name!r} cannot be set from setup data.")
+            raise ValidationError(
+                f"Field {name!r} cannot be set from setup data. / لا يمكن تعيين الحقل {name!r} من بيانات الإعداد."
+            )
         if name == "vat_effective_date" and isinstance(value, str):
-            value = date.fromisoformat(value)
+            value = _parse_date(name, value)
+        if getattr(entity, name) != value:
+            changed.append(name)
         setattr(entity, name, value)
     entity.full_clean()
-    entity.save()
-    return entity
+    if changed or entity.pk is None:
+        entity.save()
+    return changed
