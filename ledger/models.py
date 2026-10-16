@@ -6,6 +6,8 @@ Rules enforced here and in ledger.services:
 - Postings into a closed period, a closed entity or another entity's account are rejected.
 - Accounts flagged as Sharia-prohibited (e.g. conventional interest) cannot be posted
   to in an entity that enforces Sharia rules.
+- Manual entries (requires_approval=True) go draft -> pending_approval -> approved -> posted
+  through the approvals engine; while pending or approved they are locked like posted entries.
 """
 from decimal import Decimal
 
@@ -87,8 +89,14 @@ class FiscalPeriod(models.Model):
 class JournalEntry(models.Model):
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"
+        PENDING_APPROVAL = "pending_approval", "Pending approval"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
         POSTED = "posted", "Posted"
         REVERSED = "reversed", "Reversed"
+
+    # Fields post_entry writes; the only change allowed on an approved entry.
+    POSTING_FIELDS = {"period", "number", "status", "posted_by", "posted_at"}
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="journal_entries")
     number = models.CharField(max_length=40, blank=True, help_text="Assigned on posting, never reused")
@@ -96,7 +104,15 @@ class JournalEntry(models.Model):
     period = models.ForeignKey(FiscalPeriod, null=True, blank=True, on_delete=models.PROTECT, related_name="entries")
     description = models.CharField(max_length=500)
     reference = models.CharField(max_length=100, blank=True, help_text="Source document code")
-    status = models.CharField(max_length=8, choices=Status.choices, default=Status.DRAFT)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
+    source = models.CharField(
+        max_length=60, default="human", help_text="human / import / agent:<name> (who or what created the entry)"
+    )
+    requires_approval = models.BooleanField(
+        default=True,
+        help_text="Manual entries need approval before posting. System entries made by module services "
+        "through create_entry (and reversals) are exempt until OQ3 is answered.",
+    )
     reversal_of = models.OneToOneField(
         "self", null=True, blank=True, on_delete=models.PROTECT, related_name="reversed_by"
     )
@@ -125,13 +141,35 @@ class JournalEntry(models.Model):
 
     def save(self, *args, **kwargs):
         stored = self._stored_status()
+        update_fields = kwargs.get("update_fields")
         # A posted entry may only change to "reversed"; a reversed entry never changes.
         if stored == self.Status.REVERSED:
             raise LedgerError("Reversed entries are locked.")
+        if stored == self.Status.REJECTED:
+            raise LedgerError("Rejected entries are locked. Create a new entry. / القيد المرفوض مقفل.")
         if stored == self.Status.POSTED and not (
-            self.status == self.Status.REVERSED and kwargs.get("update_fields") == ["status"]
+            self.status == self.Status.REVERSED and update_fields == ["status"]
         ):
             raise LedgerError("Posted entries cannot be edited. Reverse the entry instead.")
+        # Pending or approved entries are locked (R11); only the approval workflow moves their status.
+        if stored == self.Status.PENDING_APPROVAL and not (
+            update_fields == ["status"] and getattr(self, "_workflow", False) is True
+            and self.status in {self.Status.DRAFT, self.Status.APPROVED, self.Status.REJECTED}
+        ):
+            raise LedgerError(
+                "Entries pending approval cannot be edited. / لا يمكن تعديل قيد بانتظار الاعتماد."
+            )
+        if stored == self.Status.APPROVED and not (
+            self.status == self.Status.POSTED and getattr(self, "_posting", False) is True
+            and update_fields is not None and set(update_fields) <= self.POSTING_FIELDS
+        ):
+            raise LedgerError("Approved entries are locked until posted. / القيد المعتمد مقفل حتى يُرحّل.")
+        if stored in {None, self.Status.DRAFT} and self.status != self.Status.DRAFT and not (
+            (self.status == self.Status.POSTED and getattr(self, "_posting", False) is True)
+            or (self.status == self.Status.PENDING_APPROVAL and getattr(self, "_workflow", False) is True)
+        ):
+            # Status jumps only through ledger.services.post_entry / the approval workflow.
+            raise LedgerError("Status can only change through ledger.services. / لا تتغير الحالة إلا عبر خدمات الدفتر.")
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):

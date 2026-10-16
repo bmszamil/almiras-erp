@@ -30,12 +30,12 @@ class JournalLineInline(admin.TabularInline):
 
 @admin.register(JournalEntry)
 class JournalEntryAdmin(admin.ModelAdmin):
-    list_display = ["number", "entity", "date", "description", "status", "total_debit"]
-    list_filter = ["entity", "status"]
+    list_display = ["number", "entity", "date", "description", "status", "source", "total_debit"]
+    list_filter = ["entity", "status", "source"]
     search_fields = ["number", "description", "reference"]
     inlines = [JournalLineInline]
-    actions = ["post_selected", "reverse_selected"]
-    readonly_fields = ["number", "status", "period", "posted_by", "posted_at", "reversal_of"]
+    actions = ["submit_selected", "post_selected", "reverse_selected"]
+    readonly_fields = ["number", "status", "source", "requires_approval", "period", "posted_by", "posted_at", "reversal_of"]
 
     def has_change_permission(self, request, obj=None):
         return obj is None or obj.status == JournalEntry.Status.DRAFT
@@ -46,7 +46,21 @@ class JournalEntryAdmin(admin.ModelAdmin):
     def save_model(self, request, obj, form, change):
         if not change:
             obj.created_by = request.user
+            obj.source = request.user.source
+            obj.requires_approval = True  # manual entries are posted by approval (D11)
         super().save_model(request, obj, form, change)
+
+    @admin.action(description="Submit selected drafts for approval")
+    def submit_selected(self, request, queryset):
+        from access.services import Context
+        from approvals.services import submit
+
+        for entry in queryset:
+            try:
+                r = submit(entry, request.user, ctx=Context.from_request(request, channel="web"))
+                self.message_user(request, f"Entry {entry.pk} submitted (request {r.pk}).")
+            except Exception as exc:
+                self.message_user(request, f"Entry {entry.pk}: {exc}", messages.ERROR)
 
     @admin.action(description="Post selected draft entries")
     def post_selected(self, request, queryset):

@@ -13,6 +13,10 @@ from .models import Account, EntrySequence, FiscalPeriod, JournalEntry, JournalL
 ZERO = Decimal("0")
 
 
+def _is_service_agent(user):
+    return getattr(user, "user_type", None) == "service_agent"
+
+
 def _find_open_period(entity, date):
     period = FiscalPeriod.objects.filter(entity=entity, start_date__lte=date, end_date__gte=date).first()
     if period is None:
@@ -60,8 +64,16 @@ def validate_entry(entry):
 
 @transaction.atomic
 def post_entry(entry, user=None):
+    """Post an entry. Entries that require approval must be approved first (approvals engine, D11)."""
+    if _is_service_agent(user):
+        raise LedgerError("AI agents cannot post entries. / لا يمكن لوكلاء الذكاء الاصطناعي ترحيل القيود.")
     entry = JournalEntry.objects.select_for_update().get(pk=entry.pk)
-    if entry.status != JournalEntry.Status.DRAFT:
+    if entry.requires_approval:
+        if entry.status in (JournalEntry.Status.DRAFT, JournalEntry.Status.PENDING_APPROVAL):
+            raise LedgerError("This entry needs approval before posting. / يحتاج هذا القيد إلى اعتماد قبل الترحيل.")
+        if entry.status != JournalEntry.Status.APPROVED:
+            raise LedgerError("Only approved entries can be posted.")
+    elif entry.status != JournalEntry.Status.DRAFT:
         raise LedgerError("Only draft entries can be posted.")
     problems = validate_entry(entry)
     if problems:
@@ -71,7 +83,8 @@ def post_entry(entry, user=None):
     entry.status = JournalEntry.Status.POSTED
     entry.posted_by = user
     entry.posted_at = timezone.now()
-    entry.save()  # stored status is still draft, so the lock allows this one transition
+    entry._posting = True  # the one allowed transition into "posted"
+    entry.save(update_fields=sorted(JournalEntry.POSTING_FIELDS))
     return entry
 
 
@@ -88,6 +101,8 @@ def reverse_entry(entry, date=None, user=None, reason=""):
         reference=entry.number,
         reversal_of=entry,
         created_by=user,
+        source=getattr(user, "source", "human") if user is not None else "human",
+        requires_approval=False,  # correction of an already approved/posted entry (see Build notes)
     )
     for line in entry.lines.all():
         JournalLine.objects.create(
@@ -106,10 +121,22 @@ def reverse_entry(entry, date=None, user=None, reason=""):
 
 
 @transaction.atomic
-def create_entry(entity, date, description, lines, user=None, reference="", post=False):
-    """lines: iterable of dicts with account (code or Account), debit, credit, description, counterparty."""
+def create_entry(entity, date, description, lines, user=None, reference="", post=False, manual=False, source=None):
+    """lines: iterable of dicts with account (code or Account), debit, credit, description, counterparty.
+
+    manual=False: system entry made by a module service (e.g. from an approved bill); may post directly.
+    manual=True: a person's or agent's manual entry; it is a draft that must go through approvals
+    (approvals.services.submit) and cannot be posted here.
+    """
+    if _is_service_agent(user):
+        manual = True  # agents create drafts only (D8, R18)
+    if manual and post:
+        raise LedgerError("Manual entries are posted by approval, not directly. / تُرحّل القيود اليدوية بالاعتماد.")
+    if source is None:
+        source = getattr(user, "source", "human") if user is not None else "human"
     entry = JournalEntry.objects.create(
-        entity=entity, date=date, description=description, reference=reference, created_by=user
+        entity=entity, date=date, description=description, reference=reference, created_by=user,
+        source=source, requires_approval=manual,
     )
     for spec in lines:
         account = spec["account"]
@@ -134,6 +161,12 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
 def close_period(period):
     if JournalEntry.objects.filter(period=period, status=JournalEntry.Status.DRAFT).exists():
         raise LedgerError("Draft entries exist in this period.")
+    in_approval = JournalEntry.objects.filter(
+        entity=period.entity, date__gte=period.start_date, date__lte=period.end_date,
+        status__in=[JournalEntry.Status.PENDING_APPROVAL, JournalEntry.Status.APPROVED],
+    )
+    if in_approval.exists():
+        raise LedgerError("Entries in this period are still in approval.")
     period.status = FiscalPeriod.Status.CLOSED
     period.save(update_fields=["status"])
     return period
