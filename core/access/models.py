@@ -2,6 +2,8 @@
 
 Loaded by ``core.models`` so they belong to the ``core`` app.
 """
+from datetime import timedelta
+
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
@@ -172,6 +174,10 @@ def active_q(at, prefix=""):
     )
 
 
+# How far a revocation's revoked_at may be from the clock when it is written (also the PostgreSQL trigger).
+REVOCATION_CLOCK_TOLERANCE = timedelta(seconds=10)
+
+
 class AppendOnlyQuerySet(models.QuerySet):
     """Bulk ``update()`` / ``delete()`` would skip the model guards, so they are refused (R9, R33)."""
 
@@ -309,6 +315,11 @@ class Membership(models.Model):
                     raise AppendOnlyError("A revoked membership is final. / إلغاء العضوية نهائي.")
                 if self.revoked_at is None or self.revoked_by_id is None or not self.revoke_reason:
                     raise AppendOnlyError("A revocation needs a time, a person and a reason. / الإلغاء يتطلب وقتًا وشخصًا وسببًا.")
+                if abs(self.revoked_at - timezone.now()) > REVOCATION_CLOCK_TOLERANCE:
+                    raise AppendOnlyError(  # R9: a revocation is recorded when it happens, never back- or forward-dated
+                        "A revocation takes effect now; it cannot be dated in the past or the future. / "
+                        "يسري الإلغاء الآن؛ لا يجوز تأريخه في الماضي أو المستقبل."
+                    )
         else:
             self.full_clean()
             if self.granted_by_id is None and not getattr(self, "_bootstrap", False):
