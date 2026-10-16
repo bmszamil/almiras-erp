@@ -1,4 +1,5 @@
 """Repository-wide test guards."""
+import os
 from pathlib import Path
 
 import pytest
@@ -45,3 +46,39 @@ def _access_log_connection_only_when_declared(request):
     declared = marker.kwargs.get("databases") if marker else None
     if alias and not (declared == "__all__" or (declared and alias in declared)):
         request.getfixturevalue("settings").ACCESS_LOG_DB = None
+
+
+# --- CI: the PostgreSQL job must run the PostgreSQL-only tests (REQUIRE_POSTGRES=1) ---------------
+# The trigger and locking tests skip on SQLite. In the PostgreSQL job a wrong database setting would
+# silently skip them and still pass, so there the run fails unless the database is PostgreSQL and no
+# test was skipped.
+
+REQUIRE_POSTGRES = os.environ.get("REQUIRE_POSTGRES") == "1"
+_skipped = []
+
+
+def pytest_sessionstart(session):
+    if REQUIRE_POSTGRES:
+        from django.db import connection
+
+        if connection.vendor != "postgresql":
+            raise pytest.UsageError(f"REQUIRE_POSTGRES=1 but the test database is {connection.vendor}.")
+
+
+def pytest_runtest_logreport(report):
+    if REQUIRE_POSTGRES and report.skipped and not hasattr(report, "wasxfail"):
+        _skipped.append(report.nodeid)
+
+
+def pytest_terminal_summary(terminalreporter):
+    if REQUIRE_POSTGRES and _skipped:
+        terminalreporter.write_line(
+            f"REQUIRE_POSTGRES=1: {len(_skipped)} test(s) skipped; none may skip on PostgreSQL:", red=True
+        )
+        for nodeid in _skipped:
+            terminalreporter.write_line(f"  {nodeid}", red=True)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if REQUIRE_POSTGRES and _skipped and session.exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED

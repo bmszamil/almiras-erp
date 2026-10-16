@@ -1,6 +1,6 @@
 # Checks and tests on every push and pull request (CLAUDE.md: python -m pytest -q must pass before any merge).
 # Two jobs: PostgreSQL 16 (the real database; runs the PostgreSQL-only trigger and locking tests) and SQLite.
-# Throwaway databases only: no real data or credentials.
+# Throwaway databases only: no real data or credentials. Actions are pinned by commit SHA (tag in the comment).
 name: tests
 
 on:
@@ -33,9 +33,11 @@ jobs:
       POSTGRES_PASSWORD: erp-ci-only
       POSTGRES_HOST: localhost
       POSTGRES_PORT: "5432"
+      # conftest.py: fail unless the tests run on PostgreSQL and none is skipped.
+      REQUIRE_POSTGRES: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4 (v4.4.0)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5 (v5.6.0)
         with:
           python-version: "3.13"
           cache: pip
@@ -43,13 +45,13 @@ jobs:
       - run: python manage.py makemigrations --check --dry-run
       - run: DJANGO_SETTINGS_MODULE=config.settings_test python manage.py makemigrations --check --dry-run
       - run: python manage.py check
-      - run: python -m pytest -q
+      - run: python -m pytest -q -rs
 
   sqlite:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4 (v4.4.0)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5 (v5.6.0)
         with:
           python-version: "3.13"
           cache: pip
@@ -57,4 +59,4 @@ jobs:
       - run: python manage.py makemigrations --check --dry-run
       - run: DJANGO_SETTINGS_MODULE=config.settings_test python manage.py makemigrations --check --dry-run
       - run: python manage.py check
-      - run: python -m pytest -q
+      - run: python -m pytest -q -rs
