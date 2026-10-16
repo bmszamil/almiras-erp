@@ -1,10 +1,10 @@
 # Invoicing (Track A): accounts receivable and accounts payable, with VAT
 
-**Compliance status: reviewed 2026-10-16 from search excerpts only; official documents not yet read; re-check required before go-live.** (Record: `docs/compliance/track-a-2026-10-16.md`.)
+**Compliance status: Technical rules checked 2026-10-16 against official ZATCA documents (see docs/compliance/zatca-verification-2026-10-16.md); SDK-confirm and expert items remain.** (Earlier record: `docs/compliance/track-a-2026-10-16.md`.)
 
-Django app: `invoicing`. Status: **draft spec.** Written 2026-10-16; revised 2026-10-16 (compliance review applied); revised 2026-10-16 (project-owner decisions D10 to D19 recorded).
+Django app: `invoicing`. Status: **draft spec.** Written 2026-10-16; revised 2026-10-16 (compliance review applied); revised 2026-10-16 (project-owner decisions D10 to D19 recorded); revised 2026-10-16 (ZATCA verification report I1–I20 applied).
 Depends on (written in parallel): `docs/specs/ledger-fx.md` (document currency, rates, FX differences; D13), `docs/specs/billing.md` (contracts and billing schedules; D15, D17).
-**[CC-verify]** = tax/ZATCA statement not yet checked against official text. **[CC-verify: search excerpt 2026-10-16]** = adopted from the 2026-10-16 review, which read only search excerpts (official ZATCA/SDAIA pages were unreachable); not verified.
+**Tags.** A citation in parentheses, e.g. "(XML v1.2 BR-KSA-44, p.56)", points to an official ZATCA document checked on 2026-10-16 (abbreviations as in the Sources table of `docs/compliance/zatca-verification-2026-10-16.md`). **[SDK-confirm]** = technical point to settle against the ZATCA SDK/sandbox. **[Needs expert sign-off: tax|legal|security|Sharia]** = adviser decision needed; the default stands until then. Items whose sources were not downloaded (Input Tax Deduction guideline, RCM circular, PDPL) or not covered by the verification carry an expert tag. No [CC-verify] tags remain.
 Companion spec: `docs/specs/zatca.md` (ZATCA Phase 2 e-invoicing), written in parallel. Hand-off points are in sections 4 (rules R40 to R46) and 6.
 
 ## 1. Purpose
@@ -30,7 +30,7 @@ D1 to D9 are fixed by CLAUDE.md, the README and existing code. D10 to D19 were g
 | D11 | All group entities issue invoices and invoice each other often. No entity is in a VAT group: each entity is a separate VAT taxpayer. **Confirmed:** each subsidiary is its own company with its own VAT number and its own EGS unit(s); the holding owns it fully or holds a share. Partly-owned and minority-stake entities are also separate taxpayers issuing their own invoices. Intercompany invoices (with any of them) are normal VAT invoices carrying the counterparty entity (CLAUDE.md rule 6). | Project owner | 2026-10-16 |
 | D12 | ZATCA is built in-house with open-source libraries (zatca.md). A rejected invoice is corrected and re-issued under a new number; the rejected number stays used. All hosting (DB, backups, logs, secret store) is in KSA. | Project owner | 2026-10-16 |
 | D13 | Multi-currency is needed now (CNY, EGP, GBP, EUR, USD, AED, etc.). Functional/reporting currency per entity is SAR unless set otherwise (`Entity.base_currency`). The ledger is extended by `docs/specs/ledger-fx.md`: documents carry currency and rate; VAT for ZATCA is also expressed in SAR. | Project owner | 2026-10-16 |
-| D14 | Withholding tax is in scope: Almiras pays non-resident suppliers and service providers. WHT per vendor/line category, WHT payable account, treaty certificates, gross-up option, monthly WHT return data. Rates and categories: **[CC-verify]** + tax adviser sign-off. | Project owner | 2026-10-16 |
+| D14 | Withholding tax is in scope: Almiras pays non-resident suppliers and service providers. WHT per vendor/line category, WHT payable account, treaty certificates, gross-up option, monthly WHT return data. Rates and categories: reference list in OQ-8 (WHT §3 p.28) + tax adviser sign-off. *(Tag updated 2026-10-16 only; decision unchanged.)* | Project owner | 2026-10-16 |
 | D15 | Advances and security deposits both occur, varying by arrangement; some contracts have neither. The contract states which applies. Advance receipt → prepayment invoice (386) and deferred income. Security deposit → liability; VAT treatment **needs tax adviser sign-off**. | Project owner | 2026-10-16 |
 | D16 | Income types: commercial rent, residential rent (VAT-exempt), dividends (out of scope for invoicing), management fees, service charges, service fees, and others. They feed Art. 51 apportionment (OQ-9); the ratio method keeps tax-adviser sign-off. | Project owner | 2026-10-16 |
 | D17 | Accounting staff create documents; the CFO approves; posting is automatic on approval (for sales, after ZATCA clearance/reporting). Roles are assigned per entity. Recurring invoicing (annual car-rental contracts, rent, seconded staff billed until HR ends the secondment) is specified in `docs/specs/billing.md`; invoicing exposes a service to create a document from a billing schedule (`source="system"`) under the same approval/posting rules (approval of auto-generated invoices: OQ-36). | Project owner | 2026-10-16 |
@@ -63,7 +63,7 @@ D1 to D9 are fixed by CLAUDE.md, the README and existing code. D10 to D19 were g
 | OQ-30 | Purification E14/E15 by accountant only, human user, no automation. Sharia board sign-off still open. |
 | OQ-7 | Superseded by D17: credit and debit notes are approved by the CFO like invoices; no threshold. |
 
-The 2026-10-16 compliance review is technical input, not a business decision. Rules it changed are tagged in section 4; choices it raised are in section 9.
+The 2026-10-16 compliance review and the 2026-10-16 verification against official ZATCA documents are technical input, not business decisions; no D-n was changed. Rules they changed are tagged in section 4; choices they raised are in section 9. Where the verification affects the scope of a rule built on a decision (R48 under D19/OQ-19; OQ-18 under D19), the rule/OQ says so.
 
 ### Ledger API this module must use (actual signatures)
 
@@ -86,17 +86,17 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | legal_form | Choice: `llc`, `jsc`, `sole`, `branch_foreign`, `other` | Y | | Display text en/ar via translations |
 | unified_number | Char(10) | N | | Unified national number ("700" number) |
 | cr_number | Char(20) (exists) | Y to issue | | CR of the issuing branch (one branch per entity for now, OQ-35) |
-| vat_number | Char(15) (exists) | Y for S lines (R11) | | 15 digits, starts and ends with `3` |
+| vat_number | Char(15) (exists) | Y for S lines (R11) | | 15 digits, first and last digit `3` (XML v1.2 BR-KSA-40, p.56) |
 | vat_effective_date | Date, null | Y if `vat_number` | | OQ-32 |
 | vat_return_period | Choice: `monthly`, `quarterly` | Y if `vat_number` | | Also drives zatca.md R-38 retention dates |
-| building_no | Char(4) | Y to issue | | 4 digits |
-| street_en / street_ar | Char(200) | Y to issue | Bi | |
+| building_no | Char(4) | Y to issue | | 4 digits (seller: BR-KSA-37, p.56) |
+| street_en / street_ar | Char(200) | Y to issue | Bi | Seller address set: BR-KSA-09 (p.49) |
 | district_en / district_ar | Char(100) | Y to issue | Bi | |
-| additional_no | Char(4) | Y to issue | | Secondary number (الرقم الإضافي) |
-| postal_code | Char(5) | Y to issue | | 5 digits |
+| additional_no | Char(4) | N | | Secondary number (الرقم الإضافي). Optional in ZATCA XML (DD KSA-23 "O"; zatca.md §3.1); emitted when present. *Changed 2026-10-16 from "Y to issue" (verification Z3).* |
+| postal_code | Char(5) | Y to issue | | 5 digits (BR-KSA-66, p.58) |
 | city_en / city_ar | Char(100) | Y to issue | Bi | |
 | country | Char(2) ISO | Y | | Default `SA` |
-| short_address | Char(8) | N | | e.g. 4 letters + 4 digits |
+| short_address | Char(8) | N | | e.g. 4 letters + 4 digits. Default CSR location (zatca.md §3.2) |
 | base_currency | Char(3) (exists) | Y | | Functional/reporting currency, default SAR (D13) |
 
 **Almiras setup data (D10).** Loaded by a setup command from `core/setup_data/almiras.*`, never by tests or fixtures (AT-49).
@@ -126,10 +126,10 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | name_en / name_ar | Char(200) | Y / Y | Bi | Arabic name is required (ZATCA buyer name, D3) |
 | customer_kind | Choice: `business`, `individual`, `government` | Y | | Drives the standard vs simplified default (OQ-19) |
 | is_vat_registered | Bool | Y | | Default False. True → `vat_number` required (R16) |
-| vat_number | Char(15) | Y if `is_vat_registered` | | 15 digits, starts and ends with `3` (ZATCA format) |
-| other_id_scheme | Choice: `CRN`, `MOM`, `MLS`, `700`, `SAG`, `NAT`, `GCC`, `IQA`, `PAS`, `OTH` | N | | Buyer ID only for buyers **not** VAT-registered (ZATCA). Personal data for individuals (R49) |
-| other_id | Char(30) | N | | |
-| address: street, building_no, additional_no, district, city, postal_code, country (ISO-2, default `SA`) | Char | Y for standard invoices | Bi for street, district, city | ZATCA buyer address. `building_no` is 4 digits and `postal_code` 5 digits when country = SA |
+| vat_number | Char(15) | Y if `is_vat_registered` | | 15 digits, first and last digit `3` (XML v1.2 BR-KSA-44, p.56). Not emitted on an export invoice: the buyer VAT number must not exist there (BR-KSA-46, p.57) |
+| other_id_scheme | Choice, in priority order: `TIN`, `CRN`, `MOM`, `MLS`, `700`, `SAG`, `NAT`, `GCC`, `IQA`, `PAS`, `OTH` | N | | Buyer ID, required only if the buyer is not VAT-registered (XML v1.2 BR-KSA-14, p.50–51; DD BT-46; DTG p.79). If the buyer holds several IDs, the first in that order is used. `TIN` added 2026-10-16 (verification I2). Personal data for individuals (R49) |
+| other_id | Char(30) | N | | Alphanumeric |
+| address: street, building_no, additional_no, district, city, postal_code, country (ISO-2, default `SA`) | Char | Y for standard invoices (see notes) | Bi for street, district, city | ZATCA buyer address (not required on simplified). All countries: street, city, country (BR-KSA-10, p.50). Country = SA: also building_no, postal_code and district (BR-KSA-63, p.57); postal_code 5 digits (BR-KSA-67, p.58). `building_no` 4 digits for SA buyers is a **house rule**, not ZATCA (BR-KSA-37 applies to the seller only; OQ-45). `additional_no` optional |
 | group_entity | FK Entity, null | N | | Set when the customer is a group entity (subsidiary, associate or minority holding, D11). Makes its invoices intercompany. Must not equal `entity`. Buyer snapshot is taken from that entity's §3.0 fields. |
 | payment_terms_days | PositiveInt, null | N | | D19 (OQ-3): none by default |
 | currency | Char(3) | Y | | Default currency for new documents; default `entity.base_currency` (D13) |
@@ -158,11 +158,13 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 
 **VatExemptionReason**: `code` (ZATCA `VATEX-SA-…`), `name_en`, `name_ar`. Required on lines with category Z, E or O.
 
-**DocumentSequence** (unique `(entity, doc_type, year)`): `entity`, `doc_type` (`INV`, `CN`, `DN`, `PRE`, `BILL`, `VCN`, `RCPT`, `PAY`), `year`, `last_number`. Locked with `select_for_update`, the same pattern as `EntrySequence`. `PRE` = prepayment invoice 386 (R65); whether it shares the `INV` sequence: OQ-4 note **[CC-verify]**.
+**DocumentSequence** (unique `(entity, doc_type, year)`): `entity`, `doc_type` (`INV`, `CN`, `DN`, `PRE`, `BILL`, `VCN`, `RCPT`, `PAY`), `year`, `last_number`. Locked with `select_for_update`, the same pattern as `EntrySequence`. `PRE` = prepayment invoice 386 (R65); whether it shares the `INV` sequence: OQ-4 note **[Needs expert sign-off: tax]** (not covered by the 2026-10-16 verification).
 
-**IncomeType** (global reference, D16): `code` (`rent_commercial`, `rent_residential`, `management_fee`, `service_charge`, `service_fee`, `secondment`, `car_rental`, `ip_licence`, `other`), `name_en/_ar` (Bi), `default_vat_category` (FK VatRate category; residential rent `E`, others `S` **[CC-verify]**), `default_exemption_reason` (null), `art51_class` (`taxable` / `exempt`), `default_account_code` (§5 proposals). Dividends are not an income type here (out of scope, D16). Sales lines carry `income_type` (required); it prefills account and VAT category and feeds the Art. 51 ratio (OQ-9).
+**NoteReason** (global reference, added 2026-10-16, verification I5): `code`, `name_en`, `name_ar` (Bi). Loaded with the five statutory credit/debit note reasons (VAT Implementing Regulations Art. 40(1) / 54(3)) in English and Arabic exactly as listed in DD v1.2 KSA-10. Used as a pick list that prefills `reason_ar` / `reason_en` (R18, R19).
 
-**WhtCategory** (global statutory table, D14; values **[CC-verify]** + tax adviser sign-off): `code`, `name_en/_ar` (Bi), `rate` Decimal(5,2), `valid_from` / `valid_to`, `return_line_code`. Rates are data with effective dates, never constants.
+**IncomeType** (global reference, D16): `code` (`rent_commercial`, `rent_residential`, `management_fee`, `service_charge`, `service_fee`, `secondment`, `car_rental`, `ip_licence`, `other`), `name_en/_ar` (Bi), `default_vat_category` (FK VatRate category; residential rent `E`, others `S` **[Needs expert sign-off: tax]**, OQ-39), `default_exemption_reason` (null), `art51_class` (`taxable` / `exempt`), `default_account_code` (§5 proposals). Dividends are not an income type here (out of scope, D16). Sales lines carry `income_type` (required); it prefills account and VAT category and feeds the Art. 51 ratio (OQ-9).
+
+**WhtCategory** (global statutory table, D14; reference values in OQ-8 from WHT §3 p.28 + **[Needs expert sign-off: tax]**): `code`, `name_en/_ar` (Bi), `rate` Decimal(5,2), `valid_from` / `valid_to`, `return_line_code`. Rates are data with effective dates, never constants.
 
 **TreatyCertificate** (per entity and vendor): `entity`, `vendor` (same entity, non-resident), `country`, `treaty_rate` Decimal(5,2) (0.00 = exempt), `wht_category` (null = all), `valid_from` / `valid_to`, `document` (File), `received_on`, `verified_by` / `verified_at`. Never edited after verification; a new certificate replaces it.
 
@@ -174,7 +176,7 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | entity | FK Entity | Y | | Seller |
 | doc_type | Choice (+ `prepayment_invoice`, D15) | Y | | Maps to ZATCA type code 388 / 381 / 383 / 386 |
 | zatca_profile | Choice: `standard` (B2B/B2G, clearance) or `simplified` (B2C, reporting) | Y | | |
-| zatca_flags | JSON / bool set: third_party, nominal, export, summary, self_billed | N | | ZATCA invoice transaction code positions 3 to 7 |
+| zatca_flags | JSON / bool set: third_party, nominal, export, summary, self_billed | N | | ZATCA invoice transaction code positions 3 to 7 (P N E S B) (XML v1.2 BR-KSA-06, p.48). No self_billed with export (BR-KSA-07); simplified allows only third_party, nominal, summary (BR-KSA-31, p.55). Checked at submit (svc) and again by zatca.md R-46 |
 | number | Char(40), blank until issue | | | Gap-free; format undecided (OQ-4) |
 | uuid | UUID | Y | | Generated at creation, never changed (ZATCA) |
 | status | Choice: `draft`, `submitted`, `issued`, `final`, `rejected` | Y | | See R57 (`submitted` added by D17) |
@@ -189,12 +191,14 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | due_date | Date | Y | | Default rule undecided (OQ-3) |
 | currency | Char(3) ISO 4217 | Y | | Document currency, any active currency (D13, R56) |
 | fx_rate / fx_rate_date / fx_rate_source | per ledger-fx.md | Y if currency ≠ base | | Rate to `entity.base_currency`, fixed at issue |
-| total_vat_sar | Money (SAR) | computed | | VAT in SAR for ZATCA (R56) **[CC-verify]** |
+| total_vat_sar | Money (SAR) | computed | | VAT in SAR for ZATCA (R56): tax must be stated in SAR (TIR §4.2.2 p.17; XML v1.2 BR-KSA-68, BR-KSA-EN16931-02). For SAR documents = `total_vat` |
 | prepayment_deductions | through `PrepaymentDeduction` (prepayment doc, net, vat) | N | | On a 388 settling 386 documents (R65) |
-| payment_means_code | Char(3) (UNCL4461: 10, 30, 42, 48, 1) | N | | |
-| original_document | FK SalesDocument (invoice), null | Y for CN/DN | | ZATCA BillingReference |
-| reason_ar / reason_en | Char(300) | `reason_ar` Y for CN/DN; `reason_en` N | Bi | ZATCA instruction note **[CC-verify]** |
-| retention_class / retention_until | Choice (`standard`, `capital_asset_real_estate`) / Date | Y at issue | | Same computation as zatca.md R-38; drives PDPL anonymisation (R52) |
+| payment_means_code | Char(3) (UNCL4461: 10, 30, 42, 48, 1) | Y for CN/DN; N otherwise | | BT-81. Required on CN/DN because the note reason KSA-10 sits in `cac:PaymentMeans` and BR-49 requires a code there (XML v1.2 p.38, 52). *Changed 2026-10-16 (verification I5).* |
+| original_document | FK SalesDocument (invoice), null | Y for CN/DN | | ZATCA BillingReference BT-25, emitted as the original's `number` (IRN), not its UUID (DD BT-25). One original per note (default; multiple: OQ-43) |
+| reason_code | FK NoteReason, null | N | | Pick list of the five statutory reasons; prefills `reason_ar` / `reason_en`, which stay editable |
+| reason_ar / reason_en | Char(300) | `reason_ar` Y for CN/DN; `reason_en` N | Bi | ZATCA KSA-10 `cac:PaymentMeans/cbc:InstructionNote`, mandatory on 381/383 (BR-KSA-17, p.52), 1–1,000 chars, visible on output, so Arabic required (DTG p.79; DG p.59, 62) |
+| adjustment_event_date | Date, null | N | | CN/DN only: date of the event that triggered the adjustment; drives the R71 deadline warning (OQ-47) |
+| retention_class / retention_until | Choice (`standard`, `capital_asset_real_estate`, `movable_capital_asset`) / Date | Y at issue | | Same computation as zatca.md R-38; `movable_capital_asset` set only by explicit flag (OQ-46); drives PDPL anonymisation (R52) |
 | document_discount | Money | N | | Document-level allowance |
 | total_net / total_vat / total_gross | Money | computed | | Stored at issue. `total_vat` = sum of category VAT (R9) |
 | vat_breakdown | JSON: per (category, rate): taxable, vat, vat_sar | computed | | Document-level VAT per category (R9, R56) |
@@ -203,7 +207,7 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 | requires_purification | Bool | computed | | True if any line hits an account with `requires_purification` |
 | is_intercompany | Bool | computed | | `customer.group_entity` is set |
 | journal_entry | FK ledger.JournalEntry, null, PROTECT | | | Draft at issue, posted at final (R41) |
-| notes_en / notes_ar | Text | N | Bi | |
+| notes_en / notes_ar | Text | N; `notes_ar` Y if `notes_en` is set | Bi | Notes are visible fields and must be in Arabic (DG p.62; OQ-18) |
 | **ZATCA fields (written only by `zatca.services`, read-only here)** | | | | Ownership to be agreed with zatca.md (OQ-2, still open) |
 | zatca_icv | PositiveInt, null | | | Invoice counter value |
 | zatca_previous_hash | Char, null | | | PIH link |
@@ -217,16 +221,16 @@ Conventions: every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`,
 |---|---|---|---|---|
 | document | FK SalesDocument | Y | | `entity` is the same as the document's (denormalised and checked) |
 | line_no | PositiveInt | Y | | |
-| description_en / description_ar | Char(300) | at least one; Arabic required on sales documents (default, OQ-18) | Bi | |
+| description_en / description_ar | Char(300) | at least one; Arabic required on sales documents, B2B included (OQ-18, confirmed: DTG p.79; TIR §4.2.1) | Bi | Latin script allowed for proper names |
 | quantity | Decimal(12,3) | Y | | > 0 |
 | unit_code | Char(3) (UN/ECE rec 20, e.g. `C62`, `MON`, `HUR`) | Y | | |
-| unit_price | Decimal(18,2) | Y | | ≥ 0. Precision undecided (OQ-12) |
+| unit_price | Decimal(18,2) | Y | | ≥ 0. 2 dp per D19 (OQ-12); ZATCA sets no limit on unit-price decimals, only line net is 2 dp (XML v1.2 p.12, 17; DTG p.70) |
 | line_discount | Money | N | | |
 | net_amount | Money | computed | | round(qty × unit_price − discount) |
 | income_type | FK IncomeType | Y | | D16; prefills `income_account`, `vat_category` |
 | vat_category | FK VatRate | Y | | Rate effective on `supply_date` (or `issue_date`) |
 | vat_exemption_reason | FK VatExemptionReason | Y if Z/E/O | | |
-| vat_amount | Money | computed | | Display only; not summed into header VAT (R9) |
+| vat_amount | Money | computed | | Display only; not summed into header VAT (R9). Still emitted as line VAT KSA-11 (with line total KSA-12) on standard documents (BR-KSA-52/53) |
 | income_account | FK ledger.Account (same entity, type income, postable) | Y | | |
 
 ### 3.4 Purchase documents
@@ -304,7 +308,7 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 
 ### Money and VAT
 8. *Withdrawn — see Decision D13 (replaced by R56).*
-9. Line `net_amount` = `quantity × unit_price − line_discount`, rounded to 2 dp. Header VAT is computed **per VAT category and rate at document level**: category VAT = round(sum of line net amounts in that category (after document discount) × rate, 2). `total_vat` = sum of category VAT. It is **not** the sum of rounded line VAT. Line `vat_amount` = round(net × rate, 2) is for display only. The allowed line-vs-document difference follows ZATCA BR-KSA rules **[CC-verify]**; doc-level method **[CC-verify: search excerpt 2026-10-16]**. Rounding mode ROUND_HALF_UP (OQ-11). The 2200 / 1310 JE line equals `total_vat`. **[svc; test AT-1, AT-35]**
+9. Line `net_amount` = `quantity × unit_price − line_discount`, rounded to 2 dp. Header VAT is computed **per VAT category and rate at document level**: category VAT = round(sum of line net amounts in that category (after document discount) × rate, 2). `total_vat` = sum of category VAT. It is **not** the sum of rounded line VAT ("rounded on document level and not as a summation of rounded Invoice line VAT amounts", XML v1.2 §10 p.29; BR-CO-17 / BR-S-09). Line `vat_amount` = round(net × rate, 2) is not used for the header, but is still emitted as KSA-11/KSA-12 on standard documents (BR-KSA-52/53). ZATCA publishes no line-vs-document tolerance, so none is checked (zatca.md R-31). Rounding mode ROUND_HALF_UP (OQ-11; XML v1.2 §10 p.29; VAT rounded to the nearest halala, TIR §4.2.4 p.21). *Amended 2026-10-16 (verification I7).* The 2200 / 1310 JE line equals `total_vat`. **[svc; test AT-1, AT-35]**
 10. The VAT rate is taken from `VatRate` effective on the supply date (or the issue date if no supply date). Lines with category Z, E or O need an exemption reason. **[svc; test AT-15]**
 11. An entity with an empty `vat_number` cannot issue sales documents with category S lines. **[svc; D19 (OQ-17); test AT-16]**
 
@@ -313,10 +317,10 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 13. Only drafts can be edited or deleted. Issued, final and rejected documents are immutable except for fields written by `zatca.services` and the computed payment fields. **[model `save` guard like `JournalEntry.save`; svc; test AT-5]**
 14. On issue, the system assigns the number from `DocumentSequence(entity, doc_type, year of issue_date)`. The number is gap-free and never reused. Assigning the number and changing the status happen in one transaction. A failure rolls back both. **[svc `select_for_update`; DB unique `(entity, doc_type, number)`; test AT-6]**
 15. On issue, the buyer and seller snapshots are frozen. Later edits to the Customer or Entity do not change issued documents. **[svc; test AT-7]**
-16. A standard (B2B) document needs a buyer name in Arabic and a full buyer address. If the customer is VAT-registered, the buyer VAT number is mandatory; `other_id` is accepted only for buyers not VAT-registered **[CC-verify: search excerpt 2026-10-16]**. **[svc validation at issue; test AT-8, AT-36]**
+16. A standard (B2B) document needs a buyer name in Arabic and the buyer address of §3.1: street, city, country (BR-KSA-10); for SA buyers also building number, postal code (5 digits) and district (BR-KSA-63, BR-KSA-67); buyer building number 4 digits as a house rule (OQ-45). If the customer is VAT-registered, the buyer VAT number is mandatory; otherwise an `other_id` is mandatory, chosen by the §3.1 priority order (BR-KSA-81, XML v1.2 p.61; BR-KSA-14; DTG p.79). Export invoices carry no buyer VAT number (BR-KSA-46). *Amended 2026-10-16 (verification I1, I2, I3, I9).* **[svc validation at issue; test AT-8, AT-36, AT-61, AT-65]**
 17. Issued invoices are never cancelled or deleted. A final invoice is corrected only by a credit note or debit note that references it. **[svc: no cancel path; ZATCA requirement; test AT-9]**
-18. A credit note must reference a `final` invoice of the same entity and customer, and it needs a reason in Arabic (`reason_ar` required; English optional) **[CC-verify]**. Its gross amount cannot exceed the invoice gross amount minus credit notes already issued against that invoice. **[svc; test AT-10]**
-19. A debit note must reference a `final` invoice of the same entity and customer, and it needs a reason in Arabic (`reason_ar` required; English optional) **[CC-verify]**. **[svc; test AT-11]**
+18. A credit note must reference a `final` invoice of the same entity and customer (one original per note, default, OQ-43), and it needs a reason in Arabic (`reason_ar` required; English optional; KSA-10 mandatory on 381, BR-KSA-17, XML v1.2 p.52; visible fields in Arabic, DTG p.79) and a `payment_means_code` (BR-49, p.38). The `reason_code` pick list offers the five statutory reasons in en/ar (DD KSA-10). Its gross amount cannot exceed the invoice gross amount minus credit notes already issued against that invoice. **[svc; test AT-10, AT-11, AT-63]**
+19. A debit note must reference a `final` invoice of the same entity and customer (one original, OQ-43), and it needs a reason in Arabic (`reason_ar` required; English optional; KSA-10 mandatory on 383, BR-KSA-17) and a `payment_means_code` (BR-49). Same pick list as R18. **[svc; test AT-11, AT-63]**
 20. A rejected document keeps its number (the number stays used) and has no posted GL effect. The correction is a new document under a new number (confirmed by D12). **[svc; test AT-19]**
 
 ### Purchase document lifecycle
@@ -330,8 +334,8 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 ### Posting (all documents)
 27. Every journal entry is created with `ledger.services.create_entry(..., reference=document.number)` and posted only with `post_entry`. Invoicing never sets `JournalEntry.status`. **[svc; code-reviewer; test AT-1]**
 28. The JE date is `issue_date` for sales documents, `accounting_date` for purchase documents and `date` for receipts and payments. Posting fails when no open period covers that date. The document stays in its previous status and no number is consumed. **[ledger `_find_open_period`; svc single transaction; test AT-17]**
-29. Input VAT recovery follows VAT Implementing Regulations Art. 51 **[CC-verify: search excerpt 2026-10-16]**. Each bill line has `vat_attribution`: `taxable` (used for taxable supplies), `exempt` (used for exempt supplies) or `mixed`. For a resident vendor, VAT goes to 1310 only when attribution is `taxable` **and** the vendor document has a vendor VAT number. `exempt` VAT is added to the line's expense or asset account. `mixed`: once OQ-9 is signed off, the recoverable share uses the entity's `VatRecoveryRatio` for the year, with an annual true-up; **until then, mixed VAT is posted fully to the line account (cost)**. This is the conservative default: it never claims more than allowed, and posting is not blocked. **Needs expert sign-off** (tax adviser). **[svc; test AT-25, AT-39]**
-30. Reverse charge applies only to **standard-rated services imported** from a non-resident vendor (`supply_kind=services`). It does not apply to goods (import VAT on goods is paid at customs, outside this module; OQ-29) **[CC-verify: search excerpt 2026-10-16]**. RC lines post Dr 1310 and Cr 2200 for the same amount, and AP holds net only. R30 takes precedence over R29's vendor-VAT-number requirement (a non-resident has none), but R29 attribution still applies to the 1310 side: `exempt` → cost, `mixed` → cost by default. VAT-return box mapping: OQ-29. **[svc; KSA VAT reverse-charge; test AT-26, AT-40]**
+29. Input VAT recovery follows VAT Implementing Regulations Art. 51 **[Needs expert sign-off: tax]** (the Input Tax Deduction guideline was not downloaded on 2026-10-16; unverified). Each bill line has `vat_attribution`: `taxable` (used for taxable supplies), `exempt` (used for exempt supplies) or `mixed`. For a resident vendor, VAT goes to 1310 only when attribution is `taxable` **and** the vendor document has a vendor VAT number. `exempt` VAT is added to the line's expense or asset account. `mixed`: once OQ-9 is signed off, the recoverable share uses the entity's `VatRecoveryRatio` for the year, with an annual true-up; **until then, mixed VAT is posted fully to the line account (cost)**. This is the conservative default: it never claims more than allowed, and posting is not blocked. **[Needs expert sign-off: tax]**. **[svc; test AT-25, AT-39]**
+30. Reverse charge applies only to **standard-rated services imported** from a non-resident vendor (`supply_kind=services`). It does not apply to goods (import VAT on goods is paid at customs, outside this module; OQ-29) **[Needs expert sign-off: tax]** (the RCM circular was not downloaded on 2026-10-16; TIR p.13 only notes that no tax invoice is issued for VAT due under reverse charge). RC lines post Dr 1310 and Cr 2200 for the same amount, and AP holds net only. R30 takes precedence over R29's vendor-VAT-number requirement (a non-resident has none), but R29 attribution still applies to the 1310 side: `exempt` → cost, `mixed` → cost by default. VAT-return box mapping: OQ-29. **[svc; KSA VAT reverse-charge; test AT-26, AT-40]**
 31. *Withdrawn — see Decision D14 (replaced by R61 to R64).*
 32. Reversals use `reverse_entry(entry, date=..., user=..., reason=...)`. If the original period is closed, the service passes a date in the current open period. It never relies on the default `date=None`. **[svc; test AT-24]**
 
@@ -354,15 +358,15 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 46. A purchase document is never sent to ZATCA. **[svc]**
 
 ### Added 2026-10-16 (compliance review)
-47. The printed and PDF title is "Tax Invoice" / "فاتورة ضريبية" for standard documents and "Simplified Tax Invoice" / "فاتورة ضريبية مبسطة" for simplified ones; credit and debit notes use their bilingual titles **[CC-verify: search excerpt 2026-10-16]**. **[svc rendering; test AT-37]**
-48. A document to a VAT-registered business buyer (`customer_kind=business`, `is_vat_registered=True`) with gross of SAR 1,000.00 or more cannot be `simplified` **[CC-verify]**. **[svc at issue; test AT-38]**
+47. The printed and PDF title is "Tax Invoice" / "فاتورة ضريبية" for standard documents and "Simplified Tax Invoice" / "فاتورة ضريبية مبسطة" for simplified ones; credit and debit notes use their bilingual titles "Credit Note" / "Debit Note" (TIR §4.2.3 p.17, §7 p.37, annex). **[svc rendering; test AT-37]**
+48. *Amended 2026-10-16 (verification I11; scope widened, D19/OQ-19 default unchanged).* A simplified tax invoice may be issued only for a supply of less than SAR 1,000, or to a natural person not subject to VAT regardless of value (TIR §4.1.1 p.12–13, §4.3.1 p.23; DG §2.3 p.8, §4.2.1 p.17). So a document to any customer whose `customer_kind` is not `individual` (every business, VAT-registered or not, and every `government` customer) with a value of SAR 1,000.00 or more cannot be `simplified`; 1,000.00 itself must be standard ("less than"). Documents to `individual` customers may be simplified at any value. The value tested is the gross amount in SAR (default) until it is settled whether the threshold is gross or net of VAT **[Needs expert sign-off: tax]** (OQ-44). **[svc at issue; test AT-38, AT-62]**
 
 ### Personal data (PDPL)
-49. Buyer snapshots and parties of `customer_kind=individual` are personal data. The lawful basis recorded for them is legal obligation (tax invoicing and record-keeping) **[CC-verify: search excerpt 2026-10-16]**. **[data register; svc]**
+49. Buyer snapshots and parties of `customer_kind=individual` are personal data. The lawful basis recorded for them is legal obligation (tax invoicing and record-keeping) **[Needs expert sign-off: legal]** (PDPL sources not downloaded on 2026-10-16). **[data register; svc]**
 50. Simplified documents do not collect or store a buyer ID (`other_id`) unless a rule requires it. **[svc: fields cleared/blocked at issue; test AT-42]**
 51. Access to individuals' personal data (customer record, buyer snapshot, `other_id`, IBAN) is limited to roles that need it, and each view/export is logged with user, entity and time. **[permission + access log; test AT-44]**
-52. After `retention_until`, personal data of individuals on documents and parties is anonymised (names, IDs, address replaced by a fixed token); amounts, VAT, numbers and ZATCA hashes are kept. No job runs before the retention rules are confirmed (zatca.md OQ-8). **[svc job; test AT-43]**
-53. Any processor outside KSA (hosting, backup, e-mail, OCR, AI) needs a transfer assessment before it receives personal data. **Needs legal sign-off** (OQ-31). **[process; code-reviewer]**
+52. After `retention_until`, personal data of individuals on documents and parties is anonymised (names, IDs, address replaced by a fixed token); amounts, VAT, numbers and ZATCA hashes are kept. `retention_until` follows zatca.md R-38 per class: `standard` 6 years from the end of the tax period; `capital_asset_real_estate` 15 years; `movable_capital_asset` Art. 52 adjustment period + 5 years from acquisition (TIR §8.3.3 p.42; OQ-46). WHT payment records are kept at least 10 years after payment (WHT p.31; OQ-8). No job runs before the retention rules are confirmed (zatca.md OQ-8, OQ-31). **[svc job; test AT-43]**
+53. Any processor outside KSA (hosting, backup, e-mail, OCR, AI) needs a transfer assessment before it receives personal data. **[Needs expert sign-off: legal]** (OQ-31). Independently of PDPL, VAT already requires invoice records of KSA-resident taxpayers to be kept on servers in the Kingdom (TIR §8.3.1 p.41; zatca.md OQ-20). **[process; code-reviewer]**
 
 ### Purification and advances
 54. Purification moves the flagged amount from 4900 to 2600 Charity payable, and the payout clears 2600 against a bank account (E14, E15). Both go through `create_entry` + `post_entry`, carry `reference`, and need a human user; never an agent. Amount and approval: OQ-30. **[svc; ledger; test AT-45]**
@@ -371,7 +375,7 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 ### Added 2026-10-16 (project-owner decisions D10 to D18)
 
 **Currency (D13)**
-56. Every amount is `Decimal` with 2 dp; a float input is rejected, not converted. Every document, receipt and payment stores its currency (any active ISO 4217 code) and, when it differs from `entity.base_currency`, the rate, rate date and source defined in `ledger-fx.md`. The JE is created per ledger-fx.md (document and functional amounts). For ZATCA, document VAT is also expressed in SAR: `total_vat_sar` and `vat_breakdown.vat_sar` = round(category VAT × rate to SAR, 2) **[CC-verify]** (ZATCA rule for tax amount in SAR when the invoice currency differs). Non-SAR documents cannot be issued or posted until ledger-fx.md is approved and built. **[svc; DB decimal fields; test AT-46, AT-47]**
+56. Every amount is `Decimal` with 2 dp; a float input is rejected, not converted. Every document, receipt and payment stores its currency (any active ISO 4217 code) and, when it differs from `entity.base_currency`, the rate, rate date and source defined in `ledger-fx.md`. The JE is created per ledger-fx.md (document and functional amounts). For ZATCA, document VAT is also expressed in SAR: `total_vat_sar` and `vat_breakdown.vat_sar` = round(category VAT × rate to SAR, 2), using the SAMA daily exchange rate on the date the tax becomes due (TIR §4.2.2 p.17; XML v1.2 BR-KSA-68, BR-KSA-EN16931-02/09). zatca.md R-40 emits the SAR tax total on every document, SAR ones included. Non-SAR documents cannot be issued or posted until ledger-fx.md is approved and built. **[svc; DB decimal fields; test AT-46, AT-47]**
 
 **Approval and posting (D17)**
 57. Sales documents run `draft → submitted → issued → final`, or `issued → rejected`; `submitted → draft` returns it for edits. Accounting staff create and submit. CFO approval of a `submitted` document issues it (number, snapshots, ZATCA hand-off R40) in one transaction; posting then follows automatically on ZATCA `cleared` / `reported` / `*_with_warnings` (R41). The approver must differ from the creator when `InvoicingSettings.segregation_required` (D19/OQ-5). No other transitions. **[svc state machine; test AT-2, AT-51]**
@@ -379,14 +383,14 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 59. Vendor payments run `draft → submitted → posted` with CFO approval posting at once, as R58. Customer receipts keep R33 (OQ-41). **[svc; test AT-52]**
 60. `invoicing.services.create_from_billing(billing_item, user)` creates a sales document with `source="system"` and `billing_item` set, using the same validation, numbering, ZATCA and posting rules. If the item's contract is CFO-approved and `InvoicingSettings.auto_issue_from_approved_contract` is True, the document is issued without per-invoice approval (`approved_by` = the contract approver); otherwise it waits as `submitted` for the CFO (OQ-36). Only the billing system user may call it; agent-gateway users cannot (D8). One document per billing item (idempotent). **[svc; DB unique `billing_item`; test AT-53]**
 
-**Withholding tax (D14; rates and categories [CC-verify] + tax adviser sign-off)**
+**Withholding tax (D14; reference rates in OQ-8 (WHT §3 p.28) + [Needs expert sign-off: tax])**
 61. Every bill line from a non-resident vendor carries a `wht_category`. A payment allocated to a non-resident bill with a line lacking a category is rejected. **[svc; test AT-57]**
-62. On a payment to a non-resident vendor, WHT = round(allocated base × rate, 2) per category, where rate = `WhtCategory.rate` effective on the payment date, or the `treaty_rate` of a verified `TreatyCertificate` valid on the payment date for that vendor and category. One `WhtDeduction` row per category. Without gross-up, cash paid = settled amount − WHT; the AP settled is the full amount. WHT is recognised at payment **[CC-verify]**. **[svc; test AT-54, AT-56]**
-63. With `wht_gross_up` (vendor or contract, OQ-8), the vendor receives the full amount and WHT = round(amount × rate / (1 − rate), 2) **[CC-verify]**, booked as an expense of the entity (E21). **[svc; test AT-55]**
+62. On a payment to a non-resident vendor, WHT = round(allocated base × rate, 2) per category, where rate = `WhtCategory.rate` effective on the payment date, or the `treaty_rate` of a verified `TreatyCertificate` valid on the payment date for that vendor and category. One `WhtDeduction` row per category. Without gross-up, cash paid = settled amount − WHT; the AP settled is the full amount. WHT is recognised at payment **[Needs expert sign-off: tax]** (not stated in the verified excerpts). **[svc; test AT-54, AT-56]**
+63. With `wht_gross_up` (vendor or contract, OQ-8), the vendor receives the full amount and WHT = round(amount × rate / (1 − rate), 2) **[Needs expert sign-off: tax]** (gross-up not covered by the WHT guideline read), booked as an expense of the entity (E21). **[svc; test AT-55]**
 64. `wht_return_data(entity, month)` returns, per category and vendor, base, rate, WHT (SAR), treaty reference and country, from `WhtDeduction`; it ties to the 2220 movements for the month. Remittance (E22) is a CFO-approved payment. **[svc report; test AT-58]**
 
 **Advances and security deposits (D15)**
-65. An advance is invoiced with a prepayment invoice (`doc_type=prepayment_invoice`, ZATCA 386, zatca.md R-39) referencing a contract that states an advance applies; VAT is due on the advance **[CC-verify]**. The 386 posts to 2310 Deferred income (E16). The final 388 lists its `prepayment_deductions` (same entity, customer and contract) and cannot deduct more than the 386 net and VAT not yet deducted (E17). **[svc; test AT-59]**
+65. An advance is invoiced with a prepayment invoice (`doc_type=prepayment_invoice`, ZATCA 386, zatca.md R-39) referencing a contract that states an advance applies. VAT is due on the advance: the supply occurs on receipt, to the extent of the amount paid, and the tax invoice is due within fifteen days from the end of the month of receipt (TIR §4.5.1 p.26; PSG §6.1 p.26; DG §8 p.40). The 386 posts to 2310 Deferred income (E16). The final 388 lists its `prepayment_deductions` (same entity, customer and contract) and cannot deduct more than the 386 net and VAT not yet deducted (E17); its XML reference to the 386 (KSA-26/28/29/30, KSA-31 to KSA-34, BT-113) is built by zatca.md R-39. **[svc; test AT-59]**
 66. A receipt with `purpose=deposit` needs a contract stating a deposit applies and posts to 2320 Security deposits received (E18). Deposit receipts are blocked while `InvoicingSettings.deposit_vat_treatment` is null; it is set only after tax-adviser sign-off (OQ-16). Application or forfeiture of a deposit is not built (OQ-16). **[svc; test AT-60]**
 67. A receipt with `purpose=advance` or `deposit` without a qualifying contract is rejected. **[svc; test AT-60]**
 
@@ -394,6 +398,9 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 68. An invoice to a customer with `group_entity` (subsidiary, associate or minority holding) is a normal standard VAT invoice: VAT per R9 to R11, ZATCA clearance, buyer snapshot from the buyer entity's §3.0 fields, counterparty on 1210 (R4). The buyer entity books its own bill in its own books; invoicing never creates or posts records in another entity (CLAUDE.md rule 4; mirror drafts: OQ-37). **[svc; test AT-50]**
 69. Issuing needs the seller's §3.0 fields complete (legal names en/ar, CR, VAT if S lines, full national address). **[svc at issue; test AT-48]**
 70. Real Almiras identifiers (D10) exist only in setup data, never in test fixtures or sample data. **[test AT-49 scans fixtures]**
+
+### Added 2026-10-16 (ZATCA verification)
+71. A credit or debit note should be issued no later than 15 days of the month following the event that triggered the adjustment (TIR §7.2 p.39). When `adjustment_event_date` is set and the issue date is later than the 15th of the following month, the CFO sees a bilingual warning at approval; issue is not blocked (OQ-47). **[svc warning; test AT-64]**
 
 ## 5. Accounting
 
@@ -475,7 +482,7 @@ Both accounts exist in `ledger/coa_template.py` (4900 with `purify`, 2600). If a
 
 **E16. Prepayment invoice 386, final** (advance net 10,000.00, VAT 1,500.00; R65): Dr 1200 11,500.00 / Cr 2310 10,000.00 / Cr 2200 1,500.00. The receipt is E5, allocated to the 386.
 
-**E17. Final invoice 388 deducting that prepayment** (total net 40,000.00, VAT 6,000.00) **[CC-verify]** presentation
+**E17. Final invoice 388 deducting that prepayment** (total net 40,000.00, VAT 6,000.00; XML presentation per zatca.md R-39: BT-113 = 11,500.00, payable = 46,000.00 − 11,500.00 = 34,500.00, XML v1.2 §9.5; DG §8)
 | Account | Dr | Cr |
 |---|---|---|
 | 1200 Trade receivables (balance due) | 34,500.00 | |
@@ -485,14 +492,14 @@ Both accounts exist in `ledger/coa_template.py` (4900 with `purify`, 2600). If a
 
 **E18. Security deposit received** (R66, only once `deposit_vat_treatment` is set; VAT lines per that sign-off): Dr 1100 5,000.00 / Cr 2320 5,000.00. **E19. Deposit refund**: Dr 2320 / Cr 1100.
 
-**E20. Vendor payment with WHT, vendor bears it** (bill 10,000.00, example rate 5% **[CC-verify]**; R62)
+**E20. Vendor payment with WHT, vendor bears it** (bill 10,000.00, example rate 5%, e.g. technical and consulting services (WHT §3 p.28); R62)
 | Account | Dr | Cr |
 |---|---|---|
 | 2100 Trade payables | 10,000.00 | |
 | 1100 Cash and bank | | 9,500.00 |
 | 2220 Withholding tax payable | | 500.00 |
 
-**E21. Vendor payment with WHT gross-up** (R63; 10,000 × 5/95 = 526.32 **[CC-verify]**)
+**E21. Vendor payment with WHT gross-up** (R63; 10,000 × 5/95 = 526.32; gross-up method **[Needs expert sign-off: tax]**)
 | Account | Dr | Cr |
 |---|---|---|
 | 2100 Trade payables | 10,000.00 | |
@@ -603,7 +610,7 @@ Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, 
 | AT-35 | ALM invoice, 3 lines × net 10.03 at S 15% | Issue, stub `cleared` | Line VAT shown 1.50 each (sum 4.50). Category VAT = round(30.09 × 15%) = round(4.5135) = 4.51. Totals net 30.09, VAT 4.51, gross 34.60. JE Dr 1200 34.60 / Cr 4100 30.09 / Cr 2200 4.51 (R9). |
 | AT-36 | Customer `is_vat_registered=True`, no VAT number, `other_id` CRN | Issue a standard invoice (or save the customer) | Rejected: VAT number required. Same customer with `is_vat_registered=False` and CRN: accepted (R16). |
 | AT-37 | Standard and simplified final invoices; a credit note | Render PDF in `ar` and `en` | Titles "Tax Invoice"/"فاتورة ضريبية", "Simplified Tax Invoice"/"فاتورة ضريبية مبسطة", and the note's bilingual title (R47). |
-| AT-38 | VAT-registered business customer | Issue as `simplified` with gross 1,000.00; then 999.99 | First rejected; second allowed (R48, threshold pending verification). |
+| AT-38 | VAT-registered business customer | Issue as `simplified` with gross 1,000.00; then 999.99 | First rejected; second allowed (R48; gross vs net pending OQ-44). |
 | AT-39 | Resident vendor with VAT number; bill lines each net 1,000 + VAT 150: `taxable`, `exempt`, `mixed`; no ratio approved | Post | Dr expense 1,000 + Dr 1310 150; Dr expense 1,150; Dr expense 1,150; Cr 2100 3,450.00 (R29). |
 | AT-40 | Non-resident vendor, no VAT number: line A services S 10,000 `taxable`; line B goods 5,000 | Post | Line A as E9 (Dr 1310 1,500 / Cr 2200 1,500) despite no VAT number. Line B: Dr expense 5,000, no RC lines. AP 15,000.00 (R30). |
 | AT-41 | *Withdrawn — see Decision D15 (now AT-59, AT-60).* | | |
@@ -626,6 +633,11 @@ Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, 
 | AT-58 | Payments in 2027-03 with WHT in two categories | `wht_return_data(ALM, 2027-03)` | Rows per category/vendor; total equals 2220 credits for March; SUB data excluded (R64). |
 | AT-59 | Contract with advance terms; 386 for net 10,000.00 S 15% cleared; final 388 net 40,000.00 deducting it | Issue both; try a second 388 deducting the same 386 | E16, then E17 (AR 34,500.00). Second deduction rejected (R65). |
 | AT-60 | Contract with deposit terms; `deposit_vat_treatment` null; receipt `purpose=advance` with no contract | Post deposit receipt; set treatment, post again; post the advance receipt | First rejected (en/ar "pending tax adviser sign-off"); second E18; third rejected (R66, R67). |
+| AT-61 | Customer not VAT-registered with `other_id_scheme` `TIN`; second customer holding both a TIN and a CRN | Issue a standard invoice to each | First accepted with scheme `TIN`. Second: snapshot uses `TIN` (first in priority order) (R16, §3.1). |
+| AT-62 | Customers: business not VAT-registered; `government`; `individual` | Issue `simplified` with gross 1,000.00 to the first two; 5,000.00 to the individual; 999.99 to the business | First two rejected; individual accepted; 999.99 accepted (R48). |
+| AT-63 | Credit note on a final invoice, `reason_code` picked, `payment_means_code` blank; then with code `30` | Issue | First rejected ("payment means code required", en/ar). Second accepted; `reason_ar`/`reason_en` prefilled from `NoteReason`; ZATCA hand-off carries the original's `number` as the billing reference (R18). |
+| AT-64 | Credit note with `adjustment_event_date` 2027-03-02 | CFO approves on 2027-04-15, then another on 2027-04-16 | First: no warning. Second: bilingual warning shown, issue proceeds (R71). |
+| AT-65 | Standard invoice: SA buyer with blank district; non-SA buyer (country `AE`) with street, city, country only | Issue | First rejected listing district. Second accepted (R16). |
 
 ## 9. Open questions
 
@@ -636,21 +648,21 @@ Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, 
 | OQ-1 | Where do seller addresses (street, building no., additional no., district, city, postal code) live: new fields on `core.Entity` or a zatca config? `Entity` has none today. | Dev + zatca.md | **Resolved by D10**: fields on `core.Entity` (§3.0). |
 | OQ-2 | Exact zatca service names, the callback contract, and which model owns ICV/PIH/hash/QR (invoice fields vs `zatca.Submission`). | zatca.md author | **BLOCKING** for R40 to R45. Build against a stub interface. |
 | OQ-3 | Payment terms: standard terms per customer/vendor, due-date rules, early-payment discounts. | Accountant | Resolved by D19. |
-| OQ-4 | Document number format and prefixes (INV, CN, DN, BILL, VCN, RCPT, PAY), and whether CN/DN share the invoice sequence. ZATCA requires uniqueness. | Accountant | Resolved by D19. Still open: whether 386 (`PRE`) may have its own sequence **[CC-verify]**; default separate. |
+| OQ-4 | Document number format and prefixes (INV, CN, DN, BILL, VCN, RCPT, PAY), and whether CN/DN share the invoice sequence. ZATCA requires uniqueness. | Accountant | Resolved by D19. Still open: whether 386 (`PRE`) may have its own sequence **[Needs expert sign-off: tax]** (not covered by the 2026-10-16 verification); default separate. |
 | OQ-5 | Approval thresholds for bills, payments and invoices (amounts, who approves, the Managing Partner's limit). Is segregation of duties mandatory for small entities? | Managing Partner | Resolved by D19 and D17 (approver = CFO). Amount thresholds: none. |
-| OQ-6 | Multi-currency: foreign-currency invoices and bills, FX rate source, realised/unrealised FX. `JournalLine` has no currency field and the template has no FX account. | Accountant + Dev | **Resolved by D13** (in scope). Rates, FX accounts and JE currency are owned by `ledger-fx.md`; non-SAR issue/posting **BLOCKED until ledger-fx.md is approved and built** (R56). |
+| OQ-6 | Multi-currency: foreign-currency invoices and bills, FX rate source, realised/unrealised FX. `JournalLine` has no currency field and the template has no FX account. | Accountant + Dev | **Resolved by D13** (in scope). Rates, FX accounts and JE currency are owned by `ledger-fx.md`; non-SAR issue/posting **BLOCKED until ledger-fx.md is approved and built** (R56). For when it is unblocked (verification I14): tax must be stated in SAR, converted at the SAMA daily rate on the date tax becomes due (TIR §4.2.2 p.17); the XML shape is zatca.md R-40. |
 | OQ-7 | Do credit notes (and debit notes) need approval, and above what amount? | Managing Partner | Resolved by D17: CFO approval, no threshold. |
-| OQ-8 | Withholding tax on payments to non-resident vendors. **In scope by D14** (R61 to R64, E20 to E22, 2220/5920 proposed). Still open: category list and rates **[CC-verify]**; recognition at payment vs at bill **[CC-verify]**; gross-up per vendor or per contract; treaty certificate evidence required; return due date **[CC-verify]**. **Needs expert sign-off** (tax adviser). | Accountant / tax adviser | Buildable now with `WhtCategory` as data. **BLOCKING for go-live** of non-resident payments until rates/categories are signed off. |
-| OQ-9 | Input VAT recovery per Art. 51 **[CC-verify: search excerpt 2026-10-16]**: which entities make exempt supplies (e.g. residential rent), how `mixed` lines are apportioned (`VatRecoveryRatio` per entity per year, provisional vs final), and the annual true-up method and account. **Needs expert sign-off** (tax adviser). | Accountant / tax adviser | Default resolved by D19 (R29). Exempt supplies now known (D16: residential rent, via `IncomeType.art51_class`). Ratio method and true-up account still need tax adviser sign-off. |
+| OQ-8 | Withholding tax on payments to non-resident vendors. **In scope by D14** (R61 to R64, E20 to E22, 2220/5920 proposed). Reference rate list for `WhtCategory` (non-residents; WHT §3 p.28, p.31, verification I18): management fees 20%; royalties 15%; dividends 5%; rent 5%; loan charges 5%; insurance/reinsurance 5%; technical and consulting services 5%; air tickets / air or sea freight 5%; international telecom 5%; land transport within KSA 15%; any other payments 15%. Payment due by the 10th of the following month; late payment 1% per 30 days; annual beneficiary list required. WHT payment records kept at least 10 years after payment (WHT p.31; R52). Sharia note: "loan charges" must never arise in a Sharia-enforcing entity (R5, R7). Still open: recognition at payment vs at bill; gross-up per vendor or per contract and its method; treaty relief and certificate evidence; related-party variants **[Needs expert sign-off: tax]**. | Accountant / tax adviser | Buildable now with `WhtCategory` as data (load the list above as fixture-independent reference data). **BLOCKING for go-live** of non-resident payments until rates/categories are signed off. |
+| OQ-9 | Input VAT recovery per Art. 51 (source not downloaded on 2026-10-16; unverified): which entities make exempt supplies (e.g. residential rent), how `mixed` lines are apportioned (`VatRecoveryRatio` per entity per year, provisional vs final), and the annual true-up method and account. **[Needs expert sign-off: tax]**. | Accountant / tax adviser | Default resolved by D19 (R29). Exempt supplies now known (D16: residential rent, via `IncomeType.art51_class`). Ratio method and true-up account still need tax adviser sign-off. |
 | OQ-10 | Duplicate-bill rule and whether a vendor credit note must reference an original bill. | Accountant | Resolved by D19. |
-| OQ-11 | Rounding policy (per line vs per document, half-up vs half-even) and how to absorb a 0.01 difference against vendor totals. There is no rounding account. | Accountant | Sales: decided by compliance input, not open (R9: document-level VAT per category, ROUND_HALF_UP; tolerance per BR-KSA **[CC-verify]**). Resolved by D19 (half-up; bills match exactly; 5910 proposed if a tolerance is ever allowed). |
-| OQ-12 | Unit price precision beyond 2 dp (e.g. hourly rates). | Accountant | Resolved by D19. |
+| OQ-11 | Rounding policy (per line vs per document, half-up vs half-even) and how to absorb a 0.01 difference against vendor totals. There is no rounding account. | Accountant | Sales: decided by compliance input, not open (R9: document-level VAT per category, ROUND_HALF_UP, confirmed by XML v1.2 §10 p.29 and TIR §4.2.4 p.21). No line-vs-header tolerance is published by ZATCA, so none is applied; line VAT is still emitted (KSA-11/12). Resolved by D19 (half-up; bills match exactly; 5910 proposed if a tolerance is ever allowed). |
+| OQ-12 | Unit price precision beyond 2 dp (e.g. hourly rates). | Accountant | Resolved by D19 (2 dp). Note (verification I8): ZATCA sets no limit on unit-price decimals (only line net is 2 dp), so a later change to more dp has no ZATCA blocker. |
 | OQ-13 | Are any group entities in a KSA VAT group (no VAT on intra-group supplies)? | Accountant / tax adviser | **Resolved by D11**: no VAT group; VAT charged on intercompany invoices (R68). |
 | OQ-14 | Shared party master across entities (one customer for ALM and SUB) or per entity. | Managing Partner | Resolved by D19. |
-| OQ-15 | Late payment: are any late charges contracted, and what is their VAT treatment? Sharia allows no penalty income. If built later: Dr 1200 / Cr 2600, never income. **Needs Sharia board sign-off.** | Managing Partner + Sharia board | Default resolved by D19; Sharia board sign-off still open if a feature is ever requested. |
-| OQ-16 | Customer advances and deposits. **In scope by D15** (R65 to R67, E16 to E19). Still open: deposit VAT treatment at receipt, on application to unpaid amounts and on forfeiture **Needs expert sign-off** (tax adviser); 386 VAT timing and 388 deduction presentation **[CC-verify]**. | Accountant / tax adviser | Advances buildable now. Deposits: build; posting blocked per entity until `deposit_vat_treatment` is set after sign-off (R66). Application/forfeiture not built. |
+| OQ-15 | Late payment: are any late charges contracted, and what is their VAT treatment? Sharia allows no penalty income. If built later: Dr 1200 / Cr 2600, never income. **[Needs expert sign-off: Sharia]** (no ZATCA document addresses it). | Managing Partner + Sharia board | Default resolved by D19; Sharia board sign-off still open if a feature is ever requested. |
+| OQ-16 | Customer advances and deposits. **In scope by D15** (R65 to R67, E16 to E19). 386 VAT timing confirmed (VAT due on receipt, tax invoice within 15 days from the end of the month; TIR §4.5.1 p.26; R65) and 388 deduction presentation per zatca.md R-39. Still open: deposit VAT treatment at receipt, on application to unpaid amounts and on forfeiture **[Needs expert sign-off: tax]**. | Accountant / tax adviser | Advances buildable now. Deposits: build; posting blocked per entity until `deposit_vat_treatment` is set after sign-off (R66). Application/forfeiture not built. |
 | OQ-17 | Can a non-VAT-registered group entity issue invoices, and in what form? | Accountant | Resolved by D19. |
-| OQ-18 | Must every sales line description be in Arabic (ZATCA/VAT regulations), or is English-only acceptable on B2B? | compliance-checker | Resolved by D19. |
+| OQ-18 | Must every sales line description be in Arabic (ZATCA/VAT regulations), or is English-only acceptable on B2B? | compliance-checker | Resolved by D19. **Closed 2026-10-16** (verification I15): every visible field, line descriptions and notes included, must be in Arabic on all documents, B2B included; bilingual allowed; Latin script allowed for proper names (DTG p.79; DG p.62; TIR §4.2.1). D19's default stands; `notes_ar` now required when `notes_en` is set. |
 | OQ-19 | Which entities issue simplified (B2C) invoices, e.g. rentals to individuals? | Managing Partner | Resolved by D19. |
 | OQ-20 | Bank accounts: one sub-account per bank or IBAN under 1100? | Accountant | Resolved by D19. |
 | OQ-21 | Bank payment file format and bank (SARIE, bulk upload, H2H). | Accountant | Resolved by D19: not in scope. |
@@ -661,19 +673,24 @@ Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, 
 | OQ-26 | Retention on contracts (percentage held, release terms). | Managing Partner | Resolved by D19: not built. |
 | OQ-27 | Bad-debt write-off and ECL policy. | Accountant | Resolved by D19: not built. |
 | OQ-28 | Ledger protection: should `ledger.services.reverse_entry` refuse entries owned by a sub-ledger (needs a `source_module` field on `JournalEntry`), so a final invoice can't be reversed outside invoicing? | Dev + code-reviewer | Resolved by D19. |
-| OQ-29 | VAT-return box mapping per line type **[CC-verify]**; how customs import VAT on goods is recorded. | Accountant / tax adviser | Resolved by D19: no VAT-return report for now. |
-| OQ-30 | Purification: who decides the amount and timing, approval before payout, recipient charities. | Managing Partner + Sharia board | Default resolved by D19; amount/charity choice and Sharia board sign-off still open. |
-| OQ-31 | PDPL: offshore processors (hosting, backup, e-mail, OCR, AI models) and the transfer assessment for each; privacy notice text en/ar; data-subject request handling. **Needs legal sign-off.** | Managing Partner + legal | Hosting in KSA decided (D12). Default "no offshore processor receives personal data" stands. **BLOCKING** for go-live with real personal data until legal sign-off. |
-| OQ-32 | Can an entity issue S-rated lines dated before `vat_effective_date` **[CC-verify]**? | Accountant | Default: rejected, as R11. |
-| OQ-33 | Which seller ID goes on the invoice: branch CR (`CRN`) or unified national number (`700`) **[CC-verify]**? | compliance-checker | Default: `CRN` = `Entity.cr_number`. |
+| OQ-29 | VAT-return box mapping per line type **[Needs expert sign-off: tax]** (not in the downloaded docs); how customs import VAT on goods is recorded. | Accountant / tax adviser | Resolved by D19: no VAT-return report for now. |
+| OQ-30 | Purification: who decides the amount and timing, approval before payout, recipient charities. | Managing Partner + Sharia board | Default resolved by D19; amount/charity choice still open **[Needs expert sign-off: Sharia]**. |
+| OQ-31 | PDPL: offshore processors (hosting, backup, e-mail, OCR, AI models) and the transfer assessment for each; privacy notice text en/ar; data-subject request handling. **[Needs expert sign-off: legal]**. | Managing Partner + legal | Hosting in KSA decided (D12); for invoice records this is also a VAT requirement (TIR §8.3.1 p.41; zatca.md OQ-20). Default "no offshore processor receives personal data" stands. PDPL sources were not downloaded on 2026-10-16 **[Needs expert sign-off: legal]**. **BLOCKING** for go-live with real personal data until legal sign-off. |
+| OQ-32 | Can an entity issue S-rated lines dated before `vat_effective_date` **[Needs expert sign-off: tax]** (not covered by the 2026-10-16 verification)? | Accountant | Default: rejected, as R11. |
+| OQ-33 | Which seller ID goes on the invoice: branch CR (`CRN`) or unified national number (`700`)? | compliance-checker | **Answered 2026-10-16** (verification Z2): BR-KSA-08 emits one ID in the order CRN, MOM, MLS, 700, SAG, OTH (XML v1.2 p.48–49), so `CRN` = `Entity.cr_number` whenever present (zatca.md OQ-24). |
 | OQ-34 | *Withdrawn — see Decision D11* (each subsidiary has its own VAT number and EGS unit(s): confirmed by the project owner). | | Resolved by D11. |
 | OQ-35 | Entities with more than one branch (CR per branch, EGS per branch): is a `Branch` model needed? | Managing Partner | Default: one branch per entity, CR on `Entity`. |
 | OQ-36 | Do auto-generated invoices from an approved contract need per-invoice CFO approval? | Managing Partner / CFO | Default (flagged): no, the CFO approved the contract (R60); per-entity switch `auto_issue_from_approved_contract`. |
 | OQ-37 | Should an intercompany sales invoice create a mirror draft bill in the buyer entity? | Accountant | Default: no; buyer enters the bill; `intercompany_balances` reconciles. |
 | OQ-38 | Consolidation treatment of intercompany balances with associates/minority holdings (not fully eliminated). | Accountant | Out of invoicing scope; consolidation spec. Default here: same 1210/2110 + counterparty. |
-| OQ-39 | Exemption reason code for residential rent and VAT category per `IncomeType` **[CC-verify]**. | compliance-checker | Default: residential rent `E`, others `S`. |
+| OQ-39 | Exemption reason code for residential rent and VAT category per `IncomeType` **[Needs expert sign-off: tax]** (not covered by the 2026-10-16 verification). | compliance-checker | Default: residential rent `E`, others `S`. |
 | OQ-40 | Vendor-side advances and deposits paid by group entities: in scope? | Accountant | Default: not built; 1330 proposed. |
 | OQ-41 | Do customer receipts need CFO approval? | CFO | Default: R33, posted at once by accounting staff. |
 | OQ-42 | Who approves when the CFO is the creator or absent (delegate per entity)? | Managing Partner | Default: a named delegate approver per entity; Managing Partner otherwise. |
+| OQ-43 | *Added 2026-10-16 (verification I6).* May one credit/debit note adjust several invoices of the same customer? VAT allows it ("one single credit or debit note reflecting adjustments to multiple tax invoices issued to the same customer", TIR §7.2 p.39; BT-25 is 1..n and may be a range, DG p.19, 62). Business decision; shared with zatca.md OQ-27. | Accountant / CFO | Default: one original invoice per note (single `original_document` FK, R18, R19). |
+| OQ-44 | *Added 2026-10-16 (verification I11).* R48 threshold: is SAR 1,000 measured gross or net of VAT, and is the boundary "less than 1,000" (TIR) or "exceeding 1,000" (one passage of the guidance)? **[Needs expert sign-off: tax]** | Tax adviser | Default: gross in SAR; 1,000.00 and above must be standard. |
+| OQ-45 | *Added 2026-10-16 (verification I3).* Keep the 4-digit `building_no` check for SA buyers as a house rule, or relax it (ZATCA requires 4 digits for the seller only)? | Accountant | Default: keep the house rule. |
+| OQ-46 | *Added 2026-10-16 (verification I16).* Movable capital assets: which sales documents get `retention_class=movable_capital_asset`, the Art. 52 adjustment period, and where the acquisition date comes from. **[Needs expert sign-off: tax]** Shared with zatca.md OQ-31. | Accountant / tax adviser | Default: set only by an explicit flag on the document (no automatic trigger); no anonymisation or purge job runs (R52). |
+| OQ-47 | *Added 2026-10-16 (verification I6).* 15-day note deadline (R71): is a warning enough or should late notes be blocked; should `adjustment_event_date` be mandatory on CN/DN? | Accountant / CFO | Default: optional field, warning only. |
 
-**Blocking (build):** OQ-2 (zatca hand-off contract), OQ-25 (core role model, views/APIs only), non-SAR documents until `ledger-fx.md` is approved (OQ-6), `billing.md` contract/billing-item models for R60 and R65 to R67. **Blocking (go-live):** OQ-8 WHT rates/categories sign-off (non-resident payments), OQ-16 deposit VAT sign-off (deposit posting), OQ-31 legal. **Review before merge:** D18 proposed accounts (accountant). **Expert sign-off:** tax adviser OQ-8, OQ-9, OQ-16, R48 threshold; legal OQ-31 / R53; Sharia board OQ-15, OQ-30. Every **[CC-verify]** item is re-checked against official documents before go-live.
+**Blocking (build):** OQ-2 (zatca hand-off contract), OQ-25 (core role model, views/APIs only), non-SAR documents until `ledger-fx.md` is approved (OQ-6), `billing.md` contract/billing-item models for R60 and R65 to R67. **Blocking (go-live):** OQ-8 WHT rates/categories sign-off (non-resident payments), OQ-16 deposit VAT sign-off (deposit posting), OQ-31 legal. **Review before merge:** D18 proposed accounts (accountant). **Expert sign-off:** tax adviser OQ-4 (386 sequence), OQ-8, OQ-9 / R29, OQ-16, OQ-29 / R30, OQ-32, OQ-39, OQ-44 (R48 threshold), OQ-46, R62/R63 (WHT recognition and gross-up); legal OQ-31 / R49 / R53; Sharia board OQ-15, OQ-30. Technical [SDK-confirm] items live in zatca.md; none remain in this spec.
