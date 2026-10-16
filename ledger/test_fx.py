@@ -453,3 +453,393 @@ def test_r16_at12_manual_rate_needs_reason_and_permission_and_is_flagged(w):
     assert flagged[0]["deviation_pct"] == D("0.5333") and flagged[0]["reason"].startswith("Rate agreed")
     with pytest.raises(access.AccessDenied):  # the approver does not draft, let alone with a manual rate
         draft(w, w.alm, date(2027, 3, 10), lines, user=w.cfo)
+
+
+# --- R17 / AT-13: rounding --------------------------------------------------------
+
+def test_r17_at13_f9_rounding_line_added_within_tolerance(w):
+    rate("EUR", "SAR", date(2027, 1, 20), "4.1235")
+    e = book(w, w.alm, date(2027, 1, 20), [
+        {"account": "5300", "currency": "EUR", "txn_debit": "33.33"},
+        {"account": "5300", "currency": "EUR", "txn_debit": "33.33"},
+        {"account": "5300", "currency": "EUR", "txn_debit": "33.34"},
+        {"account": "2100", "currency": "EUR", "txn_credit": "100.00"},
+    ])
+    assert sorted(l.debit for l in e.lines.filter(account__code="5300")) == [D("137.44"), D("137.44"), D("137.48")]
+    assert line_on(e, "2100").credit == D("412.35")
+    rounding = line_on(e, "5770")
+    assert (rounding.credit, rounding.currency_id, rounding.line_kind) == (D("0.01"), "SAR", "rounding")
+
+
+def test_r17_at13_difference_above_tolerance_is_not_fixed(w):
+    rate("EUR", "SAR", date(2027, 1, 20), "4.1000")
+    entry = draft(w, w.alm, date(2027, 1, 20), [
+        {"account": "5300", "currency": "EUR", "txn_debit": "50.00"},
+        {"account": "5300", "currency": "EUR", "txn_debit": "50.00", "rate": "4.1010", "rate_reason": "bank"},
+        {"account": "2100", "currency": "EUR", "txn_credit": "100.00"},
+    ])  # 205.00 + 205.05 vs 410.00: 0.05 on 3 foreign lines (tolerance 0.03)
+    assert not entry.lines.filter(line_kind="rounding").exists()
+    with pytest.raises(LedgerError, match="does not balance"):
+        post(w, entry)
+
+
+# --- R18 / AT-4, AT-5, AT-7: settlement and realised FX ------------------------------------
+
+def test_r18_at4_f4_receipt_realised_gain(w):
+    inv = f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 2, 20), "4.1250")
+    r = receipt(w, inv, date(2027, 2, 20), "10000.00")
+    cash, ar, gain = line_on(r, "1100"), line_on(r, "1200"), line_on(r, "4700")
+    assert (cash.currency_id, cash.debit, cash.fx_rate, cash.rate_source) == ("EUR", D("41250.00"), D("4.125"), "table")
+    assert (ar.credit, ar.fx_rate, ar.rate_source, ar.line_kind, ar.settles_line_id) == (
+        D("41000.00"), D("4.1"), "carrying", "settlement", line_on(inv, "1200").pk)
+    assert (gain.credit, gain.currency_id, gain.line_kind) == (D("250.00"), "SAR", "realised_fx")
+    assert balance(w.alm, "1200", currency="EUR") == (D("0"), D("0"))
+
+
+def test_r18_at5_f5_payment_realised_loss(w):
+    rate("GBP", "SAR", date(2027, 1, 10), "4.7000")
+    rate("GBP", "SAR", date(2027, 2, 10), "4.7600")
+    bill = book(w, w.alm, date(2027, 1, 10), [
+        {"account": "5300", "currency": "GBP", "txn_debit": "2000.00"},
+        {"account": "2100", "currency": "GBP", "txn_credit": "2000.00"},
+    ])
+    pay = book(w, w.alm, date(2027, 2, 10), services.fx_settlement_lines(
+        w.alm, date(2027, 2, 10), line_on(bill, "2100"), "2000.00", "1100", user=w.clerk))
+    assert line_on(pay, "2100").debit == D("9400.00")
+    assert line_on(pay, "1100").credit == D("9520.00")
+    assert line_on(pay, "5750").debit == D("120.00")
+    assert not pay.lines.filter(account__code="4700").exists()
+
+
+def test_r18_at7_f10_partial_settlements_leave_no_residue(w):
+    inv = f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 2, 5), "4.1100")
+    rate("EUR", "SAR", date(2027, 2, 25), "4.0900")
+    first = receipt(w, inv, date(2027, 2, 5), "3333.33")
+    assert line_on(first, "1200").credit == D("13666.65")  # round(3,333.33 x 4.1000)
+    second = receipt(w, inv, date(2027, 2, 25), "6666.67")
+    assert line_on(second, "1200").credit == D("27333.35")  # exactly what is left
+    assert balance(w.alm, "1200") == (D("0"), D("0"))
+    # realised FX per receipt against its own settlement rate
+    assert line_on(first, "4700").credit == D("33.34")  # 13,699.99 - 13,666.65
+    assert line_on(second, "5750").debit == D("66.67")  # 27,333.35 - 27,266.68 (6,666.67 x 4.0900)
+
+
+def test_r18_over_settlement_and_wrong_settlements_rejected(w):
+    inv = f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 2, 20), "4.1250")
+    item = line_on(inv, "1200")
+    with pytest.raises(LedgerError, match="open"):
+        services.fx_settlement_lines(w.alm, date(2027, 2, 20), item, "10000.01", "1100", user=w.clerk)
+    # a hand-built settlement for more than is open is refused at posting
+    entry = draft(w, w.alm, date(2027, 2, 20), [
+        {"account": "1100", "currency": "EUR", "txn_debit": "10001.00"},
+        {"account": "1200", "currency": "EUR", "txn_credit": "10001.00", "settles_line": item, "credit": "41004.10"},
+        {"account": "4700", "credit": "250.03", "line_kind": "realised_fx"},
+    ])
+    with pytest.raises(LedgerError, match="only 10000.000 is open"):
+        post(w, entry)
+    # a settlement amount that is neither carrying rate nor remaining balance
+    entry = draft(w, w.alm, date(2027, 2, 20), [
+        {"account": "1100", "currency": "EUR", "txn_debit": "100.00"},
+        {"account": "1200", "currency": "EUR", "txn_credit": "100.00", "settles_line": item, "credit": "412.50"},
+    ])
+    with pytest.raises(LedgerError, match="neither the carrying rate"):
+        post(w, entry)
+    # settling another entity's line
+    with pytest.raises(LedgerError, match="another entity"):
+        services.fx_settlement_lines(w.lzm, date(2027, 2, 20), item, "1.00", "1100", user=w.clerk)
+
+
+def test_f11_at18_reversal_copies_currency_fields_and_nets_to_zero(w):
+    inv = f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 2, 20), "4.1250")
+    rate("EUR", "SAR", date(2027, 2, 25), "4.2000")  # a later rate does not affect the reversal (R15 skipped)
+    r = receipt(w, inv, date(2027, 2, 20), "10000.00")
+    rev = reverse(w, r, date=date(2027, 2, 25))
+    assert rev.status == "posted" and JournalEntry.objects.get(pk=r.pk).status == "reversed"
+    for orig in lines_of(r):
+        copy = rev.lines.get(account=orig.account)
+        assert (copy.debit, copy.credit) == (orig.credit, orig.debit)
+        for f in ("currency_id", "txn_amount", "fx_rate", "rate_source", "exchange_rate_id", "settles_line_id",
+                  "line_kind", "counterparty_entity_id", "manual_rate_reason"):
+            assert getattr(copy, f) == getattr(orig, f), f
+    for code in ("1100", "4700"):
+        assert balance(w.alm, code, as_of=date(2027, 2, 28)) == (D("0"), D("0"))
+    assert balance(w.alm, "1200", as_of=date(2027, 2, 28)) == (D("41000.00"), D("10000.000"))  # invoice open again
+    again = receipt(w, inv, date(2027, 2, 25), "10000.00")  # and can be settled again
+    assert line_on(again, "4700").credit == D("1000.00")
+
+
+# --- R19, R21 to R26 / AT-8 to AT-11: revaluation -------------------------------------
+
+def revalue_and_post(w, entity, period_name, runner=None, approver=None):
+    period = entity.periods.get(name=period_name)
+    run = services.revalue_period(entity, period, user=runner or w.clerk)
+    if run.entry is not None:
+        grant = access.require(approver or w.cfo, entity, "ledger.post_entry", document=run.entry)
+        run = services.post_revaluation(run, grant)
+    return run
+
+
+def test_r21_r23_at8_f2_f3_revaluation_posts_and_reverses_next_day(w):
+    inv = f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")
+    run = revalue_and_post(w, w.alm, "2027-01")
+    entry, rev = JournalEntry.objects.get(pk=run.entry_id), JournalEntry.objects.get(pk=run.reversal_id)
+    assert (entry.date, entry.status, entry.created_by, entry.posted_by) == (date(2027, 1, 31), "reversed", w.clerk, w.cfo)
+    assert (rev.date, rev.status, rev.reversal_of_id) == (date(2027, 2, 1), "posted", entry.pk)
+    assert "Automatic reversal of FX revaluation" in rev.description
+    loss, ar = line_on(entry, "5760"), line_on(entry, "1200")
+    assert (loss.debit, loss.currency_id, loss.line_kind) == (D("200.00"), "SAR", "normal")
+    assert (ar.credit, ar.currency_id, ar.txn_amount, ar.fx_rate, ar.line_kind) == (D("200.00"), "EUR", D("0"), None, "revaluation")
+    assert line_on(rev, "1200").debit == D("200.00") and line_on(rev, "5760").credit == D("200.00")
+    assert tb(w, w.alm, date(2027, 1, 31))["5760"] == D("200.00")
+    assert tb(w, w.alm, date(2027, 1, 31))["1200"] == D("40800.00")
+    # R19: after the reversal the carrying rate is the original rate again
+    rate("EUR", "SAR", date(2027, 2, 20), "4.1250")
+    receipt(w, inv, date(2027, 2, 20), "10000.00")
+    feb = tb(w, w.alm, date(2027, 2, 28))
+    assert "5760" not in feb and feb["4700"] == D("-250.00")
+    assert balance(w.alm, "1200", as_of=date(2027, 2, 28)) == (D("0"), D("0"))
+
+
+def test_f7_revaluation_of_a_liability_and_gains(w):
+    rate("GBP", "SAR", date(2027, 1, 10), "4.7000")
+    rate("USD", "SAR", date(2027, 1, 10), "3.7500")
+    book(w, w.alm, date(2027, 1, 10), [
+        {"account": "5300", "currency": "GBP", "txn_debit": "2000.00"},
+        {"account": "2100", "currency": "GBP", "txn_credit": "2000.00"},
+    ])
+    book(w, w.alm, date(2027, 1, 10), [
+        {"account": "1100", "currency": "USD", "txn_debit": "1000.00"},
+        {"account": "3100", "credit": "3750.00"},
+    ])
+    rate("GBP", "SAR", date(2027, 1, 31), "4.7500")
+    rate("USD", "SAR", date(2027, 1, 31), "3.7600")
+    run = revalue_and_post(w, w.alm, "2027-01")
+    entry = JournalEntry.objects.get(pk=run.entry_id)
+    assert line_on(entry, "2100").credit == D("100.00") and line_on(entry, "2100").currency_id == "GBP"
+    assert line_on(entry, "1100").debit == D("10.00")
+    assert line_on(entry, "5760").debit == D("100.00") and line_on(entry, "4710").credit == D("10.00")
+    assert not entry.lines.filter(account__code="5300").exists()  # expenses are not monetary
+
+
+def test_r24_at9_second_run_rejected(w):
+    f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")
+    revalue_and_post(w, w.alm, "2027-01")
+    with pytest.raises(LedgerError, match="already revalued"):
+        services.revalue_period(w.alm, w.alm.periods.get(name="2027-01"), user=w.clerk)
+
+
+def test_r22_r23_r25_at10_closed_or_missing_periods_fail_atomically(w):
+    f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")
+    rate("EUR", "SAR", date(2027, 12, 31), "4.0800")
+    jan, feb = w.alm.periods.get(name="2027-01"), w.alm.periods.get(name="2027-02")
+    feb.status = "closed"
+    feb.save()
+    with pytest.raises(LedgerError, match="2027-02 is closed"):
+        services.revalue_period(w.alm, jan, user=w.clerk)
+    with pytest.raises(LedgerError, match="No fiscal period covers 2028-01-01"):
+        services.revalue_period(w.alm, w.alm.periods.get(name="2027-12"), user=w.clerk)
+    feb.status = "open"
+    feb.save()
+    services.close_period(jan, user=w.cfo)
+    with pytest.raises(LedgerError, match="2027-01 is closed"):
+        services.revalue_period(w.alm, jan, user=w.clerk)
+    assert not RevaluationRun.objects.exists()
+    assert JournalEntry.objects.filter(entity=w.alm).count() == 1  # only F1
+
+
+def test_r23_next_period_closed_after_run_fails_posting_atomically(w):
+    f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")
+    run = services.revalue_period(w.alm, w.alm.periods.get(name="2027-01"), user=w.clerk)
+    feb = w.alm.periods.get(name="2027-02")
+    feb.status = "closed"
+    feb.save()
+    with pytest.raises(LedgerError, match="closed"):
+        services.post_revaluation(run, access.require(w.cfo, w.alm, "ledger.post_entry", document=run.entry))
+    assert JournalEntry.objects.get(pk=run.entry_id).status == "draft"
+    assert RevaluationRun.objects.get(pk=run.pk).reversal_id is None
+
+
+def test_r22_at11_missing_closing_rate_fails_whole_run(w):
+    f1_invoice(w)
+    rate("USD", "SAR", date(2027, 1, 10), "3.7500")
+    book(w, w.alm, date(2027, 1, 10), [{"account": "1100", "currency": "USD", "txn_debit": "10.00"}, {"account": "3100", "credit": "37.50"}])
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")  # EUR closing exists, USD does not (Jan 10 is too old)
+    with pytest.raises(LedgerError) as exc:
+        services.revalue_period(w.alm, w.alm.periods.get(name="2027-01"), user=w.clerk)
+    assert "USD->SAR" in problems_text(exc) and "2027-01-31" in problems_text(exc)
+    assert not RevaluationRun.objects.exists() and JournalEntry.objects.count() == 2
+
+
+def test_r24_run_without_differences_records_run_and_posts_nothing(w):
+    book(w, w.alm, date(2027, 1, 10), [{"account": "1100", "debit": 5}, {"account": "3100", "credit": 5}])
+    run = services.revalue_period(w.alm, w.alm.periods.get(name="2027-01"), user=w.clerk)
+    assert run.entry_id is None and JournalEntry.objects.count() == 1
+    with pytest.raises(LedgerError, match="nothing to post"):
+        services.post_revaluation(run, access.require(w.cfo, w.alm, "ledger.post_entry", document=JournalEntry.objects.first()))
+
+
+def test_r26_at29_only_humans_with_revalue_right_run_it_and_runner_cannot_approve(w):
+    f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")
+    jan = w.alm.periods.get(name="2027-01")
+    agent = drafting_agent(w.alm)
+    for user in (w.cfo, agent, access.system_user("fx_import"), make_user("outsider")):
+        with pytest.raises(access.AccessDenied):
+            services.revalue_period(w.alm, jan, user=user)
+    run = services.revalue_period(w.alm, jan, user=w.clerk)
+    member(w.clerk, w.alm, "approver")
+    with pytest.raises(access.AccessDenied):  # the runner created the entry (access R14)
+        access.require(w.clerk, w.alm, "ledger.post_entry", document=run.entry)
+    other_grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=run.entry)
+    with pytest.raises(access.AccessDenied) as exc:  # only a manual-journal posting right posts a revaluation
+        services.post_revaluation(run, other_grant)
+    assert exc.value.code == "grant_wrong_permission"
+    assert JournalEntry.objects.get(pk=run.entry_id).status == "draft"
+
+
+def test_oq9_discard_draft_run_then_run_again(w):
+    f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")
+    jan = w.alm.periods.get(name="2027-01")
+    run = services.revalue_period(w.alm, jan, user=w.clerk)
+    with pytest.raises(access.AccessDenied):
+        services.discard_revaluation(run, user=w.cfo)
+    services.discard_revaluation(run, user=w.clerk)
+    assert not RevaluationRun.objects.exists() and JournalEntry.objects.count() == 1
+    posted = revalue_and_post(w, w.alm, "2027-01")
+    with pytest.raises(LedgerError, match="cannot be discarded"):
+        services.discard_revaluation(posted, user=w.clerk)
+
+
+def test_revaluation_entry_lines_cannot_be_changed_after_posting(w):
+    f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")
+    run = revalue_and_post(w, w.alm, "2027-01")
+    line = line_on(JournalEntry.objects.get(pk=run.entry_id), "1200")
+    line.credit = D("1.00")
+    with pytest.raises(LedgerError):
+        line.save()
+
+
+# --- R27, R28 / AT-16: entity separation of rates ------------------------------------
+
+def test_r27_at16_entity_override_used_only_by_that_entity(w):
+    services.create_rate(user=w.treasury, from_currency="EUR", to_currency="SAR", on=date(2027, 3, 1), rate="4.1000")
+    services.create_rate(user=w.clerk, entity=w.lzm, from_currency="EUR", to_currency="SAR", on=date(2027, 3, 1), rate="4.1100")
+    eur = [{"account": "1200", "currency": "EUR", "txn_debit": "100.00"}, {"account": "4100", "currency": "EUR", "txn_credit": "100.00"}]
+    alm_e, lzm_e = book(w, w.alm, date(2027, 3, 1), eur), book(w, w.lzm, date(2027, 3, 1), eur)
+    assert line_on(alm_e, "1200").debit == D("410.00") and line_on(alm_e, "1200").exchange_rate.entity_id is None
+    assert line_on(lzm_e, "1200").debit == D("411.00") and line_on(lzm_e, "1200").exchange_rate.entity_id == w.lzm.pk
+
+
+def test_r27_line_using_another_entitys_rate_row_rejected(w):
+    lzm_rate = rate("EUR", "SAR", date(2027, 3, 1), "4.1100", entity=w.lzm)
+    rate("EUR", "SAR", date(2027, 3, 1), "4.1000")
+    entry = draft(w, w.alm, date(2027, 3, 1), [
+        {"account": "1200", "currency": "EUR", "txn_debit": "100.00"}, {"account": "4100", "currency": "EUR", "txn_credit": "100.00"},
+    ])
+    JournalLine.objects.filter(entry=entry, account__code="1200").update(exchange_rate=lzm_rate, fx_rate=D("4.11"), debit=D("411.00"))
+    JournalLine.objects.filter(entry=entry, account__code="4100").update(exchange_rate=lzm_rate, fx_rate=D("4.11"), credit=D("411.00"))
+    with pytest.raises(LedgerError, match="another entity"):
+        post(w, entry)
+
+
+def test_r28_at16_who_may_maintain_rates(w):
+    alm_only = make_user("alm.accountant")
+    member(alm_only, w.alm, "accountant")
+    kw = dict(from_currency="EUR", to_currency="SAR", on=date(2027, 3, 1), rate="4.1")
+    with pytest.raises(access.AccessDenied):
+        services.create_rate(user=alm_only, entity=w.lzm, **kw)
+    with pytest.raises(access.AccessDenied):  # an accountant is not group treasury
+        services.create_rate(user=alm_only, **kw)
+    with pytest.raises(access.AccessDenied):
+        services.create_rate(user=drafting_agent(w.alm), entity=w.alm, **kw)
+    assert not ExchangeRate.objects.exists()
+    assert services.create_rate(user=alm_only, entity=w.alm, **kw).entity == w.alm
+    assert services.create_rate(user=w.treasury, entity=w.lzm, **kw).entity == w.lzm  # treasury: entity rates too
+    fx_import = access.system_user("fx_import")
+    member(fx_import, w.alm, "system_fx_import")
+    assert services.create_rate(user=fx_import, source="file", **kw).entity is None
+    with pytest.raises(LedgerError, match="not a group parent"):
+        services.create_rate(user=w.treasury, group=w.lzm, **kw)
+
+
+def test_r28_rate_lists_are_filtered_by_entity(w):
+    rate("EUR", "SAR", date(2027, 3, 1), "4.1000")
+    rate("EUR", "SAR", date(2027, 3, 1), "4.1100", entity=w.lzm)
+    rate("EUR", "SAR", date(2027, 3, 1), "4.1200", entity=w.alm)
+    lzm_viewer, nobody = make_user("lzm.viewer"), make_user("nobody")
+    member(lzm_viewer, w.lzm, "viewer")
+    rows = services.rates_visible_to(lzm_viewer)
+    assert sorted((r.entity_id or 0) for r in rows) == [0, w.lzm.pk]
+    assert not services.rates_visible_to(nobody).exists()
+
+
+# --- R32 to R36 / AT-19: Sharia and spot exchange ------------------------------------------
+
+def test_r32_at19_sharia_block_applies_to_foreign_lines(w):
+    rate("EUR", "SAR", date(2027, 1, 15), "4.1000")
+    entry = draft(w, w.alm, date(2027, 1, 15), [
+        {"account": "5610", "currency": "EUR", "txn_debit": "10.00"}, {"account": "1100", "currency": "EUR", "txn_credit": "10.00"},
+    ])
+    with pytest.raises(LedgerError, match="Sharia-prohibited"):
+        post(w, entry)
+
+
+def test_r36_at19_no_forward_rate_type(w):
+    with pytest.raises(LedgerError, match="only spot and average"):
+        services.create_rate(user=w.treasury, from_currency="USD", to_currency="SAR", on=date(2027, 1, 15), rate="3.75",
+                             rate_type="forward")
+    row = ExchangeRate(from_currency_id="USD", to_currency_id="SAR", date=date(2027, 1, 15), rate=D("3.75"),
+                       rate_type="forward", source="manual", created_by=w.treasury)
+    with pytest.raises(ValidationError):
+        row.full_clean()
+    with pytest.raises(IntegrityError), transaction.atomic():
+        row.save()
+    assert "forward" not in ExchangeRate.RateType.values
+
+
+def test_r20_r35_at19_f8_spot_currency_exchange(w):
+    with pytest.raises(LedgerError, match="same date"):
+        services.record_currency_exchange(
+            w.alm, date(2027, 1, 20), "1100", "37510.00", "1110", "10000.00", user=w.clerk, to_currency="USD",
+            to_date=date(2027, 1, 22),
+        )
+    assert not JournalEntry.objects.exists()
+    entry = services.record_currency_exchange(
+        w.alm, date(2027, 1, 20), "1100", "37510.00", "1110", "10000.00", user=w.clerk, to_currency="USD",
+    )
+    posted = post(w, entry)
+    usd, sar = line_on(posted, "1110"), line_on(posted, "1100")
+    assert (usd.currency_id, usd.txn_amount, usd.fx_rate, usd.rate_source, usd.debit) == ("USD", D("10000.000"), D("3.751"), "manual", D("37510.00"))
+    assert "Actual bank rate" in usd.manual_rate_reason
+    assert (sar.currency_id, sar.credit, sar.fx_rate) == ("SAR", D("37510.00"), D("1"))
+    assert posted.lines.count() == 2  # no FX gain or loss at the exchange itself
+
+
+def test_r20_exchange_between_two_foreign_currencies_uses_table_rate_for_sold_leg(w):
+    rate("USD", "SAR", date(2027, 1, 20), "3.7500")
+    entry = services.record_currency_exchange(
+        w.alm, date(2027, 1, 20), "1100", "1000.00", "1110", "920.00", user=w.clerk, from_currency="USD", to_currency="EUR",
+    )
+    posted = post(w, entry)
+    assert line_on(posted, "1100").credit == line_on(posted, "1110").debit == D("3750.00")
+    assert line_on(posted, "1110").rate_source == "manual" and line_on(posted, "1100").rate_source == "table"
+
+
+def test_r33_fx_accounts_are_ordinary_and_template_accounts_are_bilingual(w):
+    for code in ("3400", "4700", "4710", "5750", "5760", "5770"):
+        acc = Account.objects.get(entity=w.alm, code=code)
+        assert acc.name_en and acc.name_ar and not acc.sharia_prohibited and not acc.requires_purification
+    assert not Account.objects.get(entity=w.alm, code="3400").is_postable  # report / consolidation use only
+    monetary = set(Account.objects.filter(entity=w.alm, is_monetary=True).values_list("code", flat=True))
+    assert monetary == {"1100", "1110", "1200", "1210", "1220", "1300", "1310", "2100", "2110", "2200", "2210",
+                        "2300", "2400", "2500", "2600"}
