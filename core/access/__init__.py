@@ -7,7 +7,7 @@ imported while Django apps are still loading.
 
 _EXPORTS = {
     "AccessDenied", "AccessUsageError", "Grant", "require", "has", "entities_for", "scope",
-    "get_scoped_or_404", "verify_grant", "require_dual_control", "request_dual_control",
+    "get_scoped_or_404", "verify_grant", "deny", "require_dual_control", "request_dual_control",
     "decide_dual_control", "system_user", "grant_membership", "revoke_membership", "delegate_approval",
 }
 

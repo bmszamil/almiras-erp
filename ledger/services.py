@@ -6,11 +6,14 @@ from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 
+from core import access
+from core.access import catalogue
 from core.models import Entity
 
 from .models import Account, EntrySequence, FiscalPeriod, JournalEntry, JournalLine, LedgerError
 
 ZERO = Decimal("0")
+CLEARANCE_PERMISSION = "invoicing.post_on_clearance"
 
 
 def _find_open_period(entity, date):
@@ -58,8 +61,31 @@ def validate_entry(entry):
     return problems
 
 
+def _authorise_post(entity, grant, posted_by, document=None):
+    """R23: a Grant for a P permission in the entry's own entity, checked again now.
+
+    A ``ledger.post_entry`` grant must have been issued for this very draft and
+    never covers the entry's creator (A permission, R14; the ledger has no
+    self-approval switch). Only ``invoicing.post_on_clearance`` may record a
+    different ``posted_by`` (the approver on the document, zatca D-8).
+    """
+    if getattr(grant, "permission", None) == "ledger.post_entry":
+        if document is None:  # create_entry(post=True): there is no draft yet to approve
+            access.deny(grant.user, entity, grant.permission, "grant_needs_draft")
+        user = access.verify_grant(grant, entity, catalogue.POST_PERMISSIONS, document=document)
+    else:
+        user = access.verify_grant(grant, entity, catalogue.POST_PERMISSIONS)
+    if grant.permission == CLEARANCE_PERMISSION:
+        if posted_by is None:
+            raise LedgerError("Posting on clearance needs the approver recorded on the document (posted_by).")
+        return posted_by
+    if posted_by is not None and posted_by != user:
+        raise LedgerError("posted_by is set from the grant; only posting on clearance records another approver.")
+    return user
+
+
 @transaction.atomic
-def post_entry(entry, user=None):
+def _post(entry, posted_by):
     entry = JournalEntry.objects.select_for_update().get(pk=entry.pk)
     if entry.status != JournalEntry.Status.DRAFT:
         raise LedgerError("Only draft entries can be posted.")
@@ -69,14 +95,32 @@ def post_entry(entry, user=None):
     entry.period = _find_open_period(entry.entity, entry.date)
     entry.number = _next_number(entry.entity, entry.date.year)
     entry.status = JournalEntry.Status.POSTED
-    entry.posted_by = user
+    entry.posted_by = posted_by
     entry.posted_at = timezone.now()
     entry.save()  # stored status is still draft, so the lock allows this one transition
     return entry
 
 
+def post_entry(entry, grant=None, *, posted_by=None):
+    """Post a draft. ``grant`` comes from ``core.access.require`` for the entry's entity (R23).
+
+    The grant is checked before any write, so a refusal changes nothing.
+    Sharia, period, balance and entity rules apply whatever the grant (R7).
+    """
+    entry = JournalEntry.objects.select_related("entity").get(pk=entry.pk)
+    user = _authorise_post(entry.entity, grant, posted_by, document=entry)
+    return _post(entry, user)
+
+
+def reverse_entry(entry, grant=None, date=None, reason=""):
+    """Reverse a posted entry with a ``ledger.reverse_entry`` or ``invoicing.reverse_document`` grant (R23)."""
+    entry = JournalEntry.objects.select_related("entity").get(pk=entry.pk)
+    user = access.verify_grant(grant, entry.entity, catalogue.REVERSE_PERMISSIONS)
+    return _reverse(entry, user, date, reason)
+
+
 @transaction.atomic
-def reverse_entry(entry, date=None, user=None, reason=""):
+def _reverse(entry, user, date, reason):
     entry = JournalEntry.objects.select_for_update().get(pk=entry.pk)
     if entry.status != JournalEntry.Status.POSTED:
         raise LedgerError("Only posted entries can be reversed.")
@@ -98,16 +142,28 @@ def reverse_entry(entry, date=None, user=None, reason=""):
             credit=line.debit,
             counterparty_entity=line.counterparty_entity,
         )
-    post_entry(reversal, user=user)
+    _post(reversal, user)  # authorised by the reversal grant checked in reverse_entry
     entry.status = JournalEntry.Status.REVERSED
     entry.save(update_fields=["status"])
     reversal.refresh_from_db()
     return reversal
 
 
+def create_entry(entity, date, description, lines, user=None, reference="", post=False, grant=None, posted_by=None):
+    """lines: iterable of dicts with account (code or Account), debit, credit, description, counterparty.
+
+    With ``post=True`` a P grant for ``entity`` is required and checked before
+    anything is written (R23). A ``ledger.post_entry`` grant cannot be used
+    here: manual journals are drafted first and posted by an approver who is
+    not the creator, through ``post_entry``.
+    """
+    if post:
+        posted_by = _authorise_post(entity, grant, posted_by)
+    return _create(entity, date, description, lines, user, reference, post, posted_by)
+
+
 @transaction.atomic
-def create_entry(entity, date, description, lines, user=None, reference="", post=False):
-    """lines: iterable of dicts with account (code or Account), debit, credit, description, counterparty."""
+def _create(entity, date, description, lines, user, reference, post, posted_by):
     entry = JournalEntry.objects.create(
         entity=entity, date=date, description=description, reference=reference, created_by=user
     )
@@ -127,7 +183,7 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
             counterparty_entity=counterparty,
         )
     if post:
-        entry = post_entry(entry, user=user)
+        entry = _post(entry, posted_by)
     return entry
 
 

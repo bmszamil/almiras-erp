@@ -90,6 +90,10 @@ MESSAGES = {
         "This authorisation was given for another document.",
         "هذا التفويض صادر لمستند آخر.",
     ),
+    "grant_needs_draft": (
+        "A manual journal is posted with post_entry after it is drafted, by someone other than its creator.",
+        "يُرحَّل القيد اليدوي بعد إنشائه كمسودة، ومن شخص غير منشئه.",
+    ),
     "dual_control": (
         "This action needs an approved, unused four-eyes request for exactly this change.",
         "يتطلب هذا الإجراء طلب رقابة مزدوجة معتمدًا وغير مستخدم لهذا التغيير بعينه.",
@@ -216,6 +220,11 @@ def _deny(user, entity, permission, code, **fmt):
     en, ar = MESSAGES[code]
     log(AccessLog.Event.PERMISSION_DENIED, actor=user, entity=entity, permission=permission, details={"reason": code})
     raise AccessDenied(code, en.format(**values), ar.format(**values), _language(user))
+
+
+def deny(user, entity, permission, code, **fmt):
+    """Log a ``permission_denied`` row and raise AccessDenied with a catalogue message (R27, R28)."""
+    _deny(user, entity, permission, code, **fmt)
 
 
 def _kind_refusal(user, perm):
@@ -391,9 +400,12 @@ def get_scoped_or_404(queryset, user, permission, entity_field="entity", **looku
         raise Http404("Not found / غير موجود") from None
 
 
-def verify_grant(grant, entity, allowed_permissions, *, document=None):
+def verify_grant(grant, entity, allowed_permissions, *, document=None, allow_self_approval=False):
     """Check a Grant passed to a service: right type, same entity, and still valid now (R4, R23).
 
+    With ``document``, the grant must have been issued for that document and
+    segregation (R14) is checked again; a self-approval grant is accepted only
+    when the calling service passes ``allow_self_approval=True``.
     Returns the user the grant belongs to. Refusals are logged and raise AccessDenied.
     """
     if not isinstance(grant, Grant):
@@ -411,7 +423,7 @@ def verify_grant(grant, entity, allowed_permissions, *, document=None):
         if grant.document_ref != _document_ref(document):
             _deny(user, entity, grant.permission, "grant_wrong_document")
         if (perm.is_approval or perm.is_segregated) and user.pk in _document_people(document) and not (
-            grant.self_approval and not perm.is_segregated
+            allow_self_approval and grant.self_approval and not perm.is_segregated
         ):
             _deny(user, entity, grant.permission, "self_approval")
     return user
