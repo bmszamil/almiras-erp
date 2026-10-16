@@ -843,3 +843,173 @@ def test_r33_fx_accounts_are_ordinary_and_template_accounts_are_bilingual(w):
     monetary = set(Account.objects.filter(entity=w.alm, is_monetary=True).values_list("code", flat=True))
     assert monetary == {"1100", "1110", "1200", "1210", "1220", "1300", "1310", "2100", "2110", "2200", "2210",
                         "2300", "2400", "2500", "2600"}
+
+
+# --- AT-24, AT-25, AT-26: other functional currencies, intercompany, translation ------------
+
+def test_at24_entity_with_egp_functional_works_as_data(w):
+    rate("SAR", "EGP", date(2027, 1, 10), "13.0000")
+    rate("SAR", "EGP", date(2027, 2, 10), "13.2000")
+    bill = book(w, w.egy, date(2027, 1, 10), [
+        {"account": "5300", "currency": "SAR", "txn_debit": "1000.00"},
+        {"account": "2100", "currency": "SAR", "txn_credit": "1000.00"},
+    ])
+    assert bill.number.startswith("EGY-JE-2027-")
+    assert line_on(bill, "2100").credit == D("13000.00")
+    pay = book(w, w.egy, date(2027, 2, 10), services.fx_settlement_lines(
+        w.egy, date(2027, 2, 10), line_on(bill, "2100"), "1000.00", "1100", user=w.clerk, counter_currency="EGP"))
+    cash, loss = line_on(pay, "1100"), line_on(pay, "5750")
+    assert (cash.currency_id, cash.credit) == ("EGP", D("13200.00"))
+    assert (loss.currency_id, loss.debit) == ("EGP", D("200.00"))
+    assert pay.number.startswith("EGY-JE-2027-")
+
+
+def test_r29_at25_intercompany_positions_mirror_in_transaction_currency(w):
+    rate("USD", "SAR", date(2027, 1, 10), "3.7500")
+    rate("USD", "SAR", date(2027, 1, 12), "3.7600")
+    book(w, w.alm, date(2027, 1, 10), [
+        {"account": "1220", "currency": "USD", "txn_debit": "10000.00", "counterparty": w.lzm},
+        {"account": "1100", "currency": "USD", "txn_credit": "10000.00"},
+    ])
+    book(w, w.lzm, date(2027, 1, 12), [
+        {"account": "1100", "currency": "USD", "txn_debit": "10000.00"},
+        {"account": "2110", "currency": "USD", "txn_credit": "10000.00", "counterparty": w.alm},
+    ])
+    viewer = make_user("group.viewer")
+    member(viewer, w.alm, "group_viewer")
+    ic = services.intercompany_balances(date(2027, 1, 31), user=viewer, group=w.alm, by_currency=True)
+    assert ic[("ALM", "LZM", "USD")] == -ic[("LZM", "ALM", "USD")] == D("10000.000")
+    functional = services.intercompany_balances(date(2027, 1, 31), user=viewer, group=w.alm)
+    assert functional[("ALM", "LZM")] == D("37500.00") and functional[("LZM", "ALM")] == D("-37600.00")
+
+
+def test_r30_r31_at26_translation_is_report_only(w):
+    book(w, w.alm, date(2027, 1, 10), [{"account": "1100", "debit": 5}, {"account": "3100", "credit": 5}])
+    before = JournalEntry.objects.count()
+    viewer = make_user("auditor")
+    member(viewer, w.alm, "group_viewer")
+    same = services.translate_trial_balance(w.alm, date(2027, 1, 31), date(2027, 1, 1), "SAR", user=viewer)
+    assert same == services.trial_balance(w.alm, date(2027, 1, 31), user=viewer)
+    with pytest.raises(NotImplementedError, match="OQ-5"):
+        services.translate_trial_balance(w.egy, date(2027, 1, 31), date(2027, 1, 1), "SAR", user=viewer)
+    with pytest.raises(access.AccessDenied):
+        services.translate_trial_balance(w.alm, date(2027, 1, 31), date(2027, 1, 1), "SAR", user=make_user("x"))
+    assert JournalEntry.objects.count() == before
+
+
+def test_trial_balance_functional_result_unchanged_with_per_currency_columns(w):
+    f1_invoice(w)
+    plain = services.trial_balance(w.alm, date(2027, 1, 31), user=w.clerk)
+    detailed = services.trial_balance(w.alm, date(2027, 1, 31), user=w.clerk, by_currency=True)
+    assert [{k: v for k, v in r.items() if k != "by_currency"} for r in detailed] == plain
+    assert {r["code"]: r["by_currency"] for r in detailed} == {"1200": {"EUR": D("10000.000")}, "4100": {"EUR": D("-10000.000")}}
+
+
+# --- R37 / AT-27: bilingual ---------------------------------------------------------
+
+def _has_arabic(text):
+    return any("؀" <= ch <= "ۿ" for ch in str(text))
+
+
+def test_r37_at27_arabic_text_for_errors_currencies_accounts_and_labels(w):
+    with pytest.raises(LedgerError) as exc:
+        draft(w, w.alm, date(2027, 3, 10), [{"account": "1200", "currency": "USD", "txn_debit": "1"}, {"account": "4100", "credit": 1}])
+    assert _has_arabic(problems_text(exc)) and "USD->SAR" in problems_text(exc)
+    assert all(c.name_en and _has_arabic(c.name_ar) for c in Currency.objects.all())
+    assert Currency.objects.filter(code__in=["SAR", "USD", "EUR", "GBP", "CNY", "EGP", "AED", "KWD", "BHD", "OMR",
+                                             "QAR", "JOD", "JPY", "CHF", "INR", "PKR", "TRY"]).count() == 17
+    for code in ("3400", "4700", "4710", "5750", "5760", "5770"):
+        assert _has_arabic(Account.objects.get(entity=w.alm, code=code).name_ar)
+    for choices in (JournalLine.LineKind, JournalLine.RateSource, ExchangeRate.RateType, ExchangeRate.Source):
+        assert all(_has_arabic(label) for label in choices.labels)
+    for model, names in ((JournalLine, ["currency", "txn_amount", "fx_rate", "line_kind"]),
+                         (ExchangeRate, ["rate", "date", "source"]), (Account, ["is_monetary", "currency"])):
+        for name in names:
+            assert _has_arabic(model._meta.get_field(name).verbose_name)
+
+
+def test_r37_revaluation_texts_are_bilingual(w):
+    f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")
+    run = revalue_and_post(w, w.alm, "2027-01")
+    assert _has_arabic(JournalEntry.objects.get(pk=run.entry_id).description)
+    assert _has_arabic(JournalEntry.objects.get(pk=run.reversal_id).description)
+
+
+# --- R11 to R13 / AT-28: CSV import ------------------------------------------------------
+
+CSV = (
+    "date,from_currency,to_currency,rate,rate_type,period_start,period_end\n"
+    "2027-01-15,EUR,SAR,4.1000,,,\n"
+    "2027-01-15,USD,SAR,3.7500,,,\n"
+    "2027-01-31,EUR,SAR,4.0950,average,2027-01-01,2027-01-31\n"
+)
+
+
+def test_at28_csv_import_is_idempotent_and_atomic(w, tmp_path):
+    from io import StringIO
+
+    path = tmp_path / "rates-2027-01.csv"
+    path.write_text(CSV, encoding="utf-8")
+    first = services.import_rates(path, user=w.treasury)
+    assert first["created"] == 3 and first["batch"]
+    rows = ExchangeRate.objects.filter(import_batch=first["batch"])
+    assert rows.count() == 3 and all(r.source == "file" and r.source_reference == "rates-2027-01.csv" and r.entity is None for r in rows)
+    assert rows.get(rate_type="average").period_start == date(2027, 1, 1)
+    second = services.import_rates(path, user=w.treasury)
+    assert (second["created"], second["unchanged"]) == (0, 3) and ExchangeRate.objects.count() == 3
+    conflict = CSV.replace("4.1000", "4.2000") + "2027-02-01,GBP,SAR,4.7000,,,\n"
+    with pytest.raises(LedgerError, match="already exists"):
+        services.import_rates(StringIO(conflict), user=w.treasury)
+    assert ExchangeRate.objects.count() == 3  # nothing from the failed file
+    for bad, message in (("date,from_currency,rate\n", "Missing columns"),
+                         ("date,from_currency,to_currency,rate\n15/01/2027,EUR,SAR,4.1\n", "not a date"),
+                         ("date,from_currency,to_currency,rate\n2027-01-16,EUR,SAR,-1\n", "above zero"),
+                         ("date,from_currency,to_currency,rate\n2027-01-16,EUR,EUR,1\n", "differ")):
+        with pytest.raises(LedgerError, match=message):
+            services.import_rates(StringIO(bad), user=w.treasury)
+
+
+def test_oq2_automatic_sources_not_enabled_and_import_needs_rights(w):
+    from io import StringIO
+
+    with pytest.raises(LedgerError, match="not enabled"):
+        services.import_rates(StringIO(CSV), user=w.treasury, source="ecb")
+    with pytest.raises(access.AccessDenied):
+        services.import_rates(StringIO(CSV), user=w.clerk)  # global rates: group-level right only
+    result = services.import_rates(StringIO(CSV), user=w.clerk, entity=w.alm)  # own entity's overrides
+    assert result["created"] == 3 and set(ExchangeRate.objects.values_list("entity", flat=True)) == {w.alm.pk}
+
+
+# --- AT-29: agents ------------------------------------------------------------------------
+
+def test_at29_agent_drafts_with_table_rates_only_and_is_logged(w):
+    rate("EUR", "SAR", date(2027, 1, 15), "4.1000")
+    agent = drafting_agent(w.alm)
+    with pytest.raises(access.AccessDenied):
+        services.create_rate(user=agent, from_currency="EUR", to_currency="SAR", on=date(2027, 1, 16), rate="4.1")
+    entry = draft(w, w.alm, date(2027, 1, 15), [
+        {"account": "1200", "currency": "EUR", "txn_debit": "10.00"}, {"account": "4100", "currency": "EUR", "txn_credit": "10.00"},
+    ], user=agent)
+    assert entry.status == "draft" and entry.created_by == agent
+    assert AccessLog.objects.filter(actor=agent, event="permission_granted", permission="ledger.create_entry",
+                                    details__document=["ledger.journalentry", entry.pk]).exists()
+    with pytest.raises(access.AccessDenied):
+        access.require(agent, w.alm, "ledger.post_entry", document=entry)
+    with pytest.raises(access.AccessDenied):
+        services.revalue_period(w.alm, w.alm.periods.get(name="2027-01"), user=agent)
+    assert post(w, entry).status == "posted"  # a person approves the agent's draft
+
+
+def test_rerate_needs_draft_rights_in_that_entity(w):
+    rate("USD", "SAR", date(2027, 3, 10), "3.7500")
+    entry = draft(w, w.alm, date(2027, 3, 10), [
+        {"account": "1200", "currency": "USD", "txn_debit": "1.00"}, {"account": "4100", "currency": "USD", "txn_credit": "1.00"},
+    ])
+    outsider = make_user("lzm.only")
+    member(outsider, w.lzm, "accountant")
+    with pytest.raises(access.AccessDenied):
+        services.rerate_entry(entry, user=outsider)
+    post(w, entry)
+    with pytest.raises(LedgerError, match="Only draft"):
+        services.rerate_entry(entry, user=w.clerk)
