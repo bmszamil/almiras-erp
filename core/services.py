@@ -25,12 +25,14 @@ ISSUE_REQUIRED_FIELDS = (
     "street_ar",
     "district_en",
     "district_ar",
-    "additional_no",
     "postal_code",
     "city_en",
     "city_ar",
     "country",
 )
+# Optional to issue, but checked when filled because they are copied to documents.
+# additional_no: optional since 2026-10-16 (§3.0, verification Z3). unified_number: R72.
+OPTIONAL_CHECKED_FIELDS = ("additional_no", "unified_number")
 # Required once the entity has a VAT number ("Y if vat_number", §3.0).
 VAT_REQUIRED_FIELDS = ("vat_effective_date", "vat_return_period")
 
@@ -38,7 +40,8 @@ VAT_REQUIRED_FIELDS = ("vat_effective_date", "vat_return_period")
 SETUP_FIELDS = frozenset(
     ISSUE_REQUIRED_FIELDS
     + VAT_REQUIRED_FIELDS
-    + ("unified_number", "vat_number", "short_address")
+    + OPTIONAL_CHECKED_FIELDS
+    + ("vat_number", "short_address")
 )
 
 
@@ -70,6 +73,7 @@ def entity_ready_to_issue(entity, standard_rated=False):
     so a bad value written without ``full_clean`` is reported, not issued.
     """
     missing = [f for f in ISSUE_REQUIRED_FIELDS if _field_problem(entity, f)]
+    missing += [f for f in OPTIONAL_CHECKED_FIELDS if getattr(entity, f) and _field_problem(entity, f)]
     # Any stored VAT number, even whitespace, is checked: it would be copied to documents.
     if entity.vat_number or standard_rated:
         if _field_problem(entity, "vat_number"):

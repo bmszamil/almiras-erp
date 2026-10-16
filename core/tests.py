@@ -233,6 +233,13 @@ def test_invalid_stored_field_is_listed(field, bad):
     assert services.entity_ready_to_issue(e) == [field]
 
 
+def test_secondary_number_is_optional_but_checked_when_filled():
+    # §3.0: additional_no "N" since 2026-10-16 (verification Z3); unified_number optional (R72).
+    assert "additional_no" not in services.ISSUE_REQUIRED_FIELDS
+    assert services.entity_ready_to_issue(complete_entity("AAA", additional_no="", unified_number="")) == []
+    assert services.entity_ready_to_issue(complete_entity("BBB", unified_number="6000000001")) == ["unified_number"]
+
+
 @pytest.mark.parametrize("field", ["street_ar", "legal_name_en", "city_en", "cr_number"])
 def test_whitespace_only_field_is_missing(field):
     e = complete_entity(**{field: "   "})
