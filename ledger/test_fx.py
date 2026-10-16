@@ -716,10 +716,126 @@ def test_oq9_discard_draft_run_then_run_again(w):
     with pytest.raises(access.AccessDenied):
         services.discard_revaluation(run, user=w.cfo)
     services.discard_revaluation(run, user=w.clerk)
-    assert not RevaluationRun.objects.exists() and JournalEntry.objects.count() == 1
-    posted = revalue_and_post(w, w.alm, "2027-01")
+    kept = RevaluationRun.objects.get(pk=run.pk)  # kept for audit (OQ-18 default)
+    assert (kept.status, kept.entry_id, kept.discarded_by) == ("discarded", None, w.clerk) and kept.discarded_at
+    assert JournalEntry.objects.count() == 1  # the draft entry is gone; F1 stays
+    posted = revalue_and_post(w, w.alm, "2027-01")  # a discarded run does not count toward R24
+    assert posted.status == "posted"
     with pytest.raises(LedgerError, match="cannot be discarded"):
         services.discard_revaluation(posted, user=w.clerk)
+
+
+def _jan_run(w):
+    f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")
+    return services.revalue_period(w.alm, w.alm.periods.get(name="2027-01"), user=w.clerk)
+
+
+def test_at31_post_revaluation_grants(w):
+    """AT-31: preparer refused; grants for another entry or entity refused; P posts once; second call refused."""
+    run = _jan_run(w)
+    member(w.clerk, w.alm, "approver")  # the preparer also holds approver
+    with pytest.raises(access.AccessDenied) as exc:
+        access.require(w.clerk, w.alm, "ledger.post_entry", document=run.entry)
+    assert exc.value.code == "self_approval"
+    own = access.require(w.clerk, w.alm, "ledger.post_entry", document=run.entry, allow_self_approval=True)
+    with pytest.raises(access.AccessDenied) as exc:  # the ledger has no self-approval switch
+        services.post_revaluation(run, own)
+    assert exc.value.code == "self_approval"
+    other = draft(w, w.alm, date(2027, 1, 20), [{"account": "1100", "debit": 1}, {"account": "3100", "credit": 1}])
+    with pytest.raises(access.AccessDenied) as exc:
+        services.post_revaluation(run, access.require(w.cfo, w.alm, "ledger.post_entry", document=other))
+    assert exc.value.code == "grant_wrong_document"
+    lzm_entry = draft(w, w.lzm, date(2027, 1, 20), [{"account": "1100", "debit": 1}, {"account": "3100", "credit": 1}])
+    with pytest.raises(access.AccessDenied) as exc:
+        services.post_revaluation(run, access.require(w.cfo, w.lzm, "ledger.post_entry", document=lzm_entry))
+    assert exc.value.code == "grant_other_entity"
+    assert RevaluationRun.objects.get(pk=run.pk).status == "draft" and JournalEntry.objects.get(pk=run.entry_id).status == "draft"
+    grant = access.require(w.cfo, w.alm, "ledger.post_entry", document=run.entry)
+    posted = services.post_revaluation(run, grant)
+    assert (posted.status, posted.posted_by) == ("posted", w.cfo) and posted.posted_at and posted.reversal_id
+    assert JournalEntry.objects.get(pk=run.entry_id).status == "reversed"
+    assert JournalEntry.objects.get(pk=posted.reversal_id).status == "posted"
+    for again in (grant, access.require(w.mp, w.alm, "ledger.post_entry", document=run.entry)):
+        with pytest.raises(LedgerError, match="only a draft run"):
+            services.post_revaluation(run, again)
+
+
+def test_revaluation_draft_is_not_posted_through_post_entry(w):
+    run = _jan_run(w)
+    with pytest.raises(LedgerError, match="post_revaluation"):
+        services.post_entry(run.entry, access.require(w.cfo, w.alm, "ledger.post_entry", document=run.entry))
+    assert JournalEntry.objects.get(pk=run.entry_id).status == "draft"
+
+
+def test_at32_discard_draft_and_posted_runs(w):
+    """AT-32: discard the 2027-01 draft; discarding a posted 2027-02 run and posting a discarded run are refused."""
+    run = _jan_run(w)
+    before = tb(w, w.alm, date(2027, 12, 31))
+    rate("EUR", "SAR", date(2027, 2, 28), "4.0500")
+    feb = revalue_and_post(w, w.alm, "2027-02")
+    assert feb.status == "posted"
+    after_feb = tb(w, w.alm, date(2027, 12, 31))
+    draft_entry = run.entry
+    discarded = services.discard_revaluation(run, user=w.clerk)
+    assert discarded.status == "discarded" and not JournalEntry.objects.filter(pk=draft_entry.pk).exists()
+    assert tb(w, w.alm, date(2027, 12, 31)) == after_feb and after_feb == before  # F2/F3 of Feb net to zero by year end
+    with pytest.raises(LedgerError, match="cannot be discarded"):
+        services.discard_revaluation(feb, user=w.clerk)
+    with pytest.raises(LedgerError):  # a discarded run is never posted
+        services.post_revaluation(discarded, access.require(w.cfo, w.alm, "ledger.post_entry", document=feb.entry))
+    with pytest.raises(LedgerError, match="already discarded"):
+        services.discard_revaluation(discarded, user=w.clerk)
+    assert RevaluationRun.objects.get(pk=feb.pk).status == "posted"
+
+
+def test_revaluation_runs_are_kept_and_change_only_through_services(w):
+    run = _jan_run(w)
+    for attempt in (run.delete, RevaluationRun.objects.all().delete,
+                    lambda: RevaluationRun.objects.filter(pk=run.pk).update(status="posted")):
+        with pytest.raises(LedgerError):
+            attempt()
+    services.discard_revaluation(run, user=w.clerk)
+    run = RevaluationRun.objects.get(pk=run.pk)
+    run.status = "draft"
+    with pytest.raises(LedgerError):  # a discarded run is final
+        run.save()
+    with pytest.raises(IntegrityError), transaction.atomic():  # two live runs for a period: refused by the database
+        jan = w.alm.periods.get(name="2027-01")
+        for _ in range(2):
+            RevaluationRun.objects.create(entity=w.alm, period=jan, rate_date=jan.end_date, run_by=w.clerk)
+
+
+def test_p6_post_revaluation_recomputes_and_refuses_a_stale_draft(w):
+    """P6 (reviewer probe): a backdated posting after the run made the posted revaluation wrong (200 vs 400)."""
+    run = _jan_run(w)
+    book(w, w.alm, date(2027, 1, 20), [
+        {"account": "1200", "currency": "EUR", "txn_debit": "10000.00"},
+        {"account": "4100", "currency": "EUR", "txn_credit": "10000.00"},
+    ])
+    grant = access.require(w.cfo, w.alm, "ledger.post_entry", document=run.entry)
+    with pytest.raises(LedgerError, match="re-run the revaluation"):
+        services.post_revaluation(run, grant)
+    assert RevaluationRun.objects.get(pk=run.pk).status == "draft"
+    assert JournalEntry.objects.get(pk=run.entry_id).status == "draft"
+    services.discard_revaluation(run, user=w.clerk)
+    rerun = revalue_and_post(w, w.alm, "2027-01")
+    assert tb(w, w.alm, date(2027, 1, 31))["5760"] == D("400.00")
+    assert rerun.status == "posted"
+
+
+def test_post_revaluation_refuses_when_the_closing_rate_changed(w):
+    run = _jan_run(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0700", source="file")  # a second closing row; manual still wins
+    grant = access.require(w.cfo, w.alm, "ledger.post_entry", document=run.entry)
+    services.post_revaluation(run, grant)  # same rate row chosen: posts
+    run2 = RevaluationRun.objects.get(pk=run.pk)
+    assert run2.status == "posted"
+    rate("EUR", "SAR", date(2027, 2, 28), "4.0500")
+    feb = services.revalue_period(w.alm, w.alm.periods.get(name="2027-02"), user=w.clerk)
+    rate("EUR", "SAR", date(2027, 2, 28), "4.0400", entity=w.alm)  # an entity override now takes precedence (R12)
+    with pytest.raises(LedgerError, match="re-run the revaluation"):
+        services.post_revaluation(feb, access.require(w.cfo, w.alm, "ledger.post_entry", document=feb.entry))
 
 
 def test_revaluation_entry_lines_cannot_be_changed_after_posting(w):

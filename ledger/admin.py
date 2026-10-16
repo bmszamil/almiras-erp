@@ -220,8 +220,10 @@ class ExchangeRateAdmin(admin.ModelAdmin):
 
 @admin.register(RevaluationRun)
 class RevaluationRunAdmin(EntityScopedAdmin):
-    """Read-only: runs are made by ledger.services.revalue_period and posted by post_revaluation."""
+    """Read-only: runs are made by ledger.services.revalue_period, posted by post_revaluation and
+    discarded by discard_revaluation (kept for audit)."""
 
-    list_display = ["entity", "period", "rate_date", "entry", "reversal", "run_by", "run_at"]
-    list_filter = ["entity"]
+    list_display = ["entity", "period", "rate_date", "status", "entry", "reversal", "run_by", "run_at", "posted_by",
+                    "discarded_by"]
+    list_filter = ["entity", "status"]
     access_view_permission = "ledger.view"

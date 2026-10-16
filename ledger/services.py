@@ -445,6 +445,9 @@ def post_entry(entry, grant=None, *, posted_by=None):
     whatever the grant (R7).
     """
     entry = JournalEntry.objects.select_related("entity").get(pk=entry.pk)
+    if _is_revaluation_entry(entry):  # posted with its automatic reversal, after a fresh check (R23, R44)
+        raise error("A revaluation draft is posted with post_revaluation.", "تُرحَّل مسودة إعادة التقييم من خلال ترحيل إعادة التقييم.",
+                    code="use_post_revaluation")
     user = _authorise_draft_post(entry, grant, posted_by)
     with transaction.atomic():
         access.use_grant(grant, target=entry)
@@ -1410,13 +1413,40 @@ def _revalue(entity, period, user):
     period = FiscalPeriod.objects.select_for_update().get(pk=period.pk)
     if period.entity_id != entity.pk:
         raise error("The period belongs to another entity.", "الفترة تخص كيانًا آخر.")
-    if RevaluationRun.objects.filter(entity=entity, period=period).exists():
+    if RevaluationRun.objects.filter(entity=entity, period=period).exclude(status=RevaluationRun.Status.DISCARDED).exists():
         raise error(
             f"{entity.code} {period.name} is already revalued.", f"تمت إعادة تقييم {period.name} للكيان {entity.code} مسبقًا.",
             code="already_revalued",
         )
     _find_open_period(entity, period.end_date)
     _find_open_period(entity, period.end_date + timedelta(days=1))
+    lines = _revaluation_lines(entity, period)
+    run = RevaluationRun(entity=entity, period=period, rate_date=period.end_date, run_by=user)
+    if not lines:
+        run.save()
+        return run
+    entry = JournalEntry.objects.create(
+        entity=entity, date=period.end_date, created_by=user, reference=f"FXREV-{period.name}",
+        description=f"FX revaluation {period.name} / إعادة تقييم العملات {period.name}",
+    )
+    for line in lines:
+        line.entry = entry
+        line.save()
+    run.entry = entry
+    run.save()
+    problems = validate_entry(entry)
+    if problems:
+        raise LedgerError(problems)
+    return run
+
+
+def _revaluation_lines(entity, period):
+    """R21: unsaved revaluation lines for ``period`` from the booked balances and closing rates now.
+
+    One ``revaluation`` line per (account, currency, counterparty) with a
+    difference, plus the 4710 gain / 5760 loss lines. A missing closing rate
+    raises (R22).
+    """
     functional = entity.base_currency_id
     balances = (
         JournalLine.objects.filter(
@@ -1452,10 +1482,8 @@ def _revalue(entity, period, user):
             gains += diff
         else:
             losses -= diff
-    run = RevaluationRun(entity=entity, period=period, rate_date=period.end_date, run_by=user)
     if not lines:
-        run.save()
-        return run
+        return lines
     for code, side, amount in ((FX_GAIN_UNREALISED, "credit", gains), (FX_LOSS_UNREALISED, "debit", losses)):
         if amount:
             line = JournalLine(
@@ -1465,30 +1493,31 @@ def _revalue(entity, period, user):
             )
             _set_side(line, side, amount)
             lines.append(line)
-    entry = JournalEntry.objects.create(
-        entity=entity, date=period.end_date, created_by=user, reference=f"FXREV-{period.name}",
-        description=f"FX revaluation {period.name} / إعادة تقييم العملات {period.name}",
+    return lines
+
+
+def _revaluation_key(line):
+    return (
+        line.account_id, line.currency_id, line.counterparty_entity_id, line.debit, line.credit,
+        line.exchange_rate_id, line.line_kind,
     )
-    for line in lines:
-        line.entry = entry
-        line.save()
-    run.entry = entry
-    run.save()
-    problems = validate_entry(entry)
-    if problems:
-        raise LedgerError(problems)
-    return run
 
 
 def post_revaluation(run, grant):
-    """Post a revaluation draft and, in the same transaction, its automatic reversal (R23).
+    """Post a revaluation draft and, in the same transaction, its automatic reversal (R23, R44).
 
     ``grant`` is ``require(approver, entity, "ledger.post_entry", document=run.entry)``;
     the person who ran the revaluation cannot approve it (access.md R14).
+    Only a ``draft`` run posts. The differences and closing rates are
+    computed again; if they no longer match the draft (a backdated posting,
+    a new closing rate), nothing posts and the revaluation is re-run.
     """
     run = RevaluationRun.objects.select_related("entity", "period", "entry").get(pk=run.pk)
     if getattr(grant, "permission", None) != "ledger.post_entry":
         access.deny(getattr(grant, "user", None), run.entity, getattr(grant, "permission", ""), "grant_wrong_permission")
+    if run.status != RevaluationRun.Status.DRAFT:
+        raise error(f"This revaluation is {run.status}; only a draft run is posted.",
+                    f"حالة إعادة التقييم هذه {run.get_status_display()}؛ تُرحَّل المسودة فقط.", code="run_not_draft")
     if run.entry is None:
         raise error("This revaluation found no differences; nothing to post.", "لم تظهر فروقات في إعادة التقييم؛ لا شيء للترحيل.")
     user = _authorise_draft_post(run.entry, grant, None)
@@ -1500,36 +1529,59 @@ def post_revaluation(run, grant):
 @transaction.atomic
 def _post_revaluation(run, user):
     run = RevaluationRun.objects.select_for_update(of=("self",)).select_related("entity", "period").get(pk=run.pk)
-    if run.reversal_id is not None:
-        raise error("This revaluation is already posted.", "إعادة التقييم هذه مرحّلة مسبقًا.")
+    if run.status != RevaluationRun.Status.DRAFT or run.reversal_id is not None:
+        raise error("This revaluation is already posted or discarded.", "إعادة التقييم هذه مرحّلة أو ملغاة مسبقًا.",
+                    code="run_not_draft")
     next_start = run.period.end_date + timedelta(days=1)
+    # Every period up to the next one: no posting can change the revalued balances until this commits.
+    list(FiscalPeriod.objects.select_for_update(of=("self",)).filter(
+        entity=run.entity, start_date__lte=next_start).order_by("start_date"))
     _find_open_period(run.entity, next_start, lock=True)
+    expected = sorted(map(_revaluation_key, _revaluation_lines(run.entity, run.period)), key=repr)
+    drafted = sorted(map(_revaluation_key, JournalLine.objects.filter(entry_id=run.entry_id)), key=repr)
+    if expected != drafted:
+        raise error(
+            "Balances or closing rates changed since this revaluation was prepared; discard it and re-run the revaluation.",
+            "تغيرت الأرصدة أو أسعار الإقفال منذ إعداد إعادة التقييم هذه؛ ألغها وأعد تشغيل إعادة التقييم.",
+            code="revaluation_stale",
+        )
     entry = _post(run.entry, user)
     reversal = _reverse(
         entry, user, next_start, "Automatic reversal of FX revaluation / عكس تلقائي لإعادة تقييم العملات",
     )
     run.reversal = reversal
-    run.save(update_fields=["reversal"])
+    run.status = RevaluationRun.Status.POSTED
+    run.posted_by, run.posted_at = user, timezone.now()
+    run.save(update_fields=["reversal", "status", "posted_by", "posted_at"])
     return run
 
 
 @transaction.atomic
 def discard_revaluation(run, *, user):
-    """Remove a revaluation run whose entry is still a draft (or that found nothing), so it can be run again.
+    """Discard a draft revaluation run so the period can be revalued again (R45, OQ-18 default).
 
-    A posted revaluation cannot be re-run (R24, OQ-9 default): correct it with a manual journal before closing.
+    The run is kept (``discarded``, with who and when) for audit; its draft
+    entry is deleted, which rule 1 allows because it was never posted. A
+    posted revaluation cannot be discarded (R24, OQ-9 default): correct it
+    with a manual journal before closing.
     """
     run = RevaluationRun.objects.select_for_update(of=("self",)).select_related("entity", "entry").get(pk=run.pk)
     access.require(user, run.entity, "ledger.revalue")
-    if run.entry is not None and run.entry.status != JournalEntry.Status.DRAFT:
+    if run.status == RevaluationRun.Status.POSTED or (run.entry is not None and run.entry.status != JournalEntry.Status.DRAFT):
         raise error(
             "A posted revaluation cannot be discarded; correct it with a manual journal (OQ-9).",
             "لا يمكن إلغاء إعادة تقييم مرحّلة؛ صحّحها بقيد يدوي (OQ-9).",
         )
+    if run.status == RevaluationRun.Status.DISCARDED:
+        raise error("This revaluation is already discarded.", "إعادة التقييم هذه ملغاة مسبقًا.", code="run_not_draft")
     entry = run.entry
-    run.delete()
+    run.entry = None
+    run.status = RevaluationRun.Status.DISCARDED
+    run.discarded_by, run.discarded_at = user, timezone.now()
+    run.save(update_fields=["entry", "status", "discarded_by", "discarded_at"])
     if entry is not None:
         entry.delete()
+    return run
 
 
 # --- translation and functional currency (R4, R5, R30, R31) ------------------------

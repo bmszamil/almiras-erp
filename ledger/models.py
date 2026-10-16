@@ -518,12 +518,39 @@ class ExchangeRate(models.Model):
         return f"{self.date} {self.from_currency_id}->{self.to_currency_id} {self.rate} ({self.rate_type}, {self.source}, {scope})"
 
 
+class RevaluationRunQuerySet(models.QuerySet):
+    """Runs are kept for audit (R44, R45): never deleted, status changes only through ledger.services."""
+
+    def update(self, **kwargs):
+        raise LedgerError(REVALUATION_RUN_LOCK)
+
+    def delete(self):
+        raise LedgerError(REVALUATION_RUN_LOCK)
+
+
+REVALUATION_RUN_LOCK = (
+    "Revaluation runs change only through ledger.services and are never deleted. / "
+    "تتغير تشغيلات إعادة التقييم من خلال خدمات الدفتر فقط ولا تُحذف."
+)
+
+
 class RevaluationRun(models.Model):
-    """One period-end FX revaluation per entity and period (ledger-fx.md 3.6, R21 to R26)."""
+    """One period-end FX revaluation per entity and period (ledger-fx.md 3.6, R21 to R26, R43 to R45).
+
+    ``draft`` after revalue_period, ``posted`` after post_revaluation,
+    ``discarded`` after discard_revaluation. A discarded run is kept for
+    audit and does not count toward one run per period (OQ-18 default).
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", bi("Draft", "مسودة")
+        POSTED = "posted", bi("Posted", "مرحّل")
+        DISCARDED = "discarded", bi("Discarded", "ملغى")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="revaluation_runs")
     period = models.ForeignKey(FiscalPeriod, on_delete=models.PROTECT, related_name="revaluation_runs")
     rate_date = models.DateField(bi("Rate date", "تاريخ السعر"))
+    status = models.CharField(bi("Status", "الحالة"), max_length=9, choices=Status.choices, default=Status.DRAFT)
     entry = models.OneToOneField(
         JournalEntry, null=True, blank=True, on_delete=models.PROTECT, related_name="revaluation_run",
         verbose_name=bi("Revaluation entry", "قيد إعادة التقييم"),
@@ -534,16 +561,42 @@ class RevaluationRun(models.Model):
     )
     run_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
     run_at = models.DateTimeField(auto_now_add=True)
+    posted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Posted by", "رحّله"),
+    )
+    posted_at = models.DateTimeField(bi("Posted at", "تاريخ الترحيل"), null=True, blank=True)
+    discarded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Discarded by", "ألغاه"),
+    )
+    discarded_at = models.DateTimeField(bi("Discarded at", "تاريخ الإلغاء"), null=True, blank=True)
+
+    objects = RevaluationRunQuerySet.as_manager()
 
     class Meta:
         verbose_name = bi("FX revaluation run", "تشغيل إعادة تقييم العملات")
         verbose_name_plural = bi("FX revaluation runs", "تشغيلات إعادة تقييم العملات")
-        constraints = [models.UniqueConstraint(fields=["entity", "period"], name="one_revaluation_per_period")]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["entity", "period"], condition=~models.Q(status="discarded"), name="one_revaluation_per_period"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(status__in=["draft", "posted", "discarded"]), name="revaluation_status_known"
+            ),
+        ]
 
     def save(self, *args, **kwargs):
         if self.period.entity_id != self.entity_id:
             raise LedgerError("The period belongs to another entity. / الفترة تخص كيانًا آخر.")
+        if self.pk is not None:
+            stored = RevaluationRun.objects.filter(pk=self.pk).values_list("status", flat=True).first()
+            if stored is not None and stored != self.Status.DRAFT:
+                raise LedgerError(REVALUATION_RUN_LOCK)
         super().save(*args, **kwargs)
 
+    def delete(self, *args, **kwargs):
+        raise LedgerError(REVALUATION_RUN_LOCK)
+
     def __str__(self):
-        return f"{self.entity.code} {self.period.name} revaluation"
+        return f"{self.entity.code} {self.period.name} revaluation ({self.status})"
