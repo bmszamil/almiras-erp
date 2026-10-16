@@ -271,6 +271,8 @@ def _authorise_draft_post(entry, grant, posted_by):
     if not isinstance(grant, access.Grant):
         _deny_grant(grant, entry.entity, "grant_missing")
     user = access.verify_grant(grant, entry.entity, catalogue.DRAFT_POST_PERMISSIONS, document=entry, use=False)
+    if entry.modified_at is not None and entry.modified_at > grant.checked_at:  # approved before the last change
+        access.deny(user, entry.entity, grant.permission, "grant_document_changed")
     if posted_by is not None and posted_by != user:
         raise LedgerError("posted_by is set from the grant; only posting on clearance records another approver.")
     return user
@@ -309,16 +311,19 @@ def _authorise_document_post(entity, grant, posted_by, document, created_by):
 
 
 def _purification_flags(entry, lines):
-    """CLAUDE.md rule 5: lines on purification accounts, or Sharia-prohibited income, are flagged at posting.
+    """CLAUDE.md rule 5, invoicing R6: income lines to purify are flagged at posting.
 
-    Per entity: an entity that does not enforce Sharia flags nothing.
+    A credit on an account flagged ``requires_purification`` (4900), or on a
+    Sharia-prohibited income account (which can only post in an entity that
+    does not enforce Sharia), is non-compliant income. Debits on those
+    accounts (the purification transfer E14, reversals) are not flagged.
     """
-    if not entry.entity.sharia_enforced:
-        return []
     return [
         line.pk for line in lines
-        if line.account.requires_purification
-        or (line.account.sharia_prohibited and line.account.type == Account.Type.INCOME)
+        if line.credit > ZERO and line.line_kind == Kind_.NORMAL and (
+            line.account.requires_purification
+            or (line.account.sharia_prohibited and line.account.type == Account.Type.INCOME)
+        )
     ]
 
 
@@ -423,15 +428,13 @@ def _reverse(entry, user, date, reason):
 def _source_for(user, requested=None):
     """JournalEntry.source from the user's kind (gateway rule 4); a person may mark an entry as an import."""
     kind = kind_of(user) if getattr(user, "pk", None) else Kind.HUMAN
-    if kind == Kind.AGENT:
-        return JournalEntry.Source.AGENT
-    if kind == Kind.SYSTEM:
-        return JournalEntry.Source.SYSTEM
-    if requested == JournalEntry.Source.IMPORT:
+    by_kind = {Kind.AGENT: JournalEntry.Source.AGENT, Kind.SYSTEM: JournalEntry.Source.SYSTEM}.get(kind, JournalEntry.Source.HUMAN)
+    if requested in (None, by_kind):
+        return by_kind
+    if requested == JournalEntry.Source.IMPORT and by_kind == JournalEntry.Source.HUMAN:
         return JournalEntry.Source.IMPORT
-    if requested not in (None, JournalEntry.Source.HUMAN):
-        raise error(f"Source {requested!r} is set from the user, not chosen.", f"المصدر {requested!r} يُحدَّد من المستخدم.")
-    return JournalEntry.Source.HUMAN
+    raise error(f"Source {requested!r} does not match the user; it is set from the user.",
+                f"المصدر {requested!r} لا يطابق المستخدم؛ يُحدَّد من المستخدم.", code="source_mismatch")
 
 
 def create_entry(entity, date, description, lines, user=None, reference="", post=False, grant=None, posted_by=None,

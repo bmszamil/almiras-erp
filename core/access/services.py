@@ -120,6 +120,10 @@ MESSAGES = {
         "A posting authorisation is given for one document; this one names none or another.",
         "يُمنح تفويض الترحيل لمستند واحد؛ وهذا التفويض لا يحدد مستندًا أو يحدد مستندًا آخر.",
     ),
+    "grant_document_changed": (
+        "The document changed after this authorisation was given; it must be approved again.",
+        "تغيّر المستند بعد صدور هذا التفويض؛ يجب اعتماده من جديد.",
+    ),
     "posted_by_not_approver": (
         "The person recorded as poster must be the approver recorded for this document.",
         "يجب أن يكون المرحِّل المسجَّل هو المعتمد المسجَّل لهذا المستند.",
