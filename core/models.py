@@ -138,3 +138,7 @@ class Entity(models.Model):
 
     def __str__(self):
         return f"{self.code} — {self.name_en}"
+
+
+# Access models (access.md §3) live in core/access/models.py and belong to this app.
+from core.access import models as _access_models  # noqa: E402,F401

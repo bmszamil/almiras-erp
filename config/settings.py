@@ -95,6 +95,13 @@ else:
 # Password validation
 # https://docs.djangoproject.com/en/6.1/ref/settings/#auth-password-validators
 
+# Access control (docs/specs/access.md): password login for human users only; business
+# rights come from memberships through core.access, never from Django permissions.
+AUTHENTICATION_BACKENDS = [
+    "core.access.backends.HumanModelBackend",
+    "core.access.backends.EntityRoleBackend",
+]
+
 AUTH_PASSWORD_VALIDATORS = [
     {
         "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",

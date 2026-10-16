@@ -1,0 +1,399 @@
+"""Access models (access.md §3): roles, profiles, memberships, dual control, access log.
+
+Loaded by ``core.models`` so they belong to the ``core`` app.
+"""
+from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
+from django.db import models
+from django.db.models import Q
+from django.utils import timezone
+
+from core.models import Entity
+
+from . import catalogue
+
+
+class Kind(models.TextChoices):
+    HUMAN = "human", "Human"
+    SYSTEM = "system", "System"
+    AGENT = "agent", "Agent"
+
+
+class SystemCode(models.TextChoices):
+    BILLING = "billing", "Billing"
+    ZATCA_QUEUE = "zatca_queue", "ZATCA queue"
+    FX_IMPORT = "fx_import", "FX import"
+
+
+class AppendOnlyError(ValidationError):
+    """Raised when an append-only access record would be edited or deleted."""
+
+
+class Role(models.Model):
+    class Scope(models.TextChoices):
+        ENTITY = "entity", "Entity"
+        GROUP = "group", "Group"
+
+    code = models.SlugField(max_length=40, unique=True)
+    name_en = models.CharField(max_length=120)
+    name_ar = models.CharField(max_length=120)
+    description_en = models.TextField(blank=True)
+    description_ar = models.TextField(blank=True)
+    scope = models.CharField(max_length=6, choices=Scope.choices)
+    kind = models.CharField(max_length=6, choices=Kind.choices)
+    system_code = models.CharField(
+        max_length=20, choices=SystemCode.choices, null=True, blank=True,
+        help_text="For system roles: the system user this role belongs to (R11, R13)",
+    )
+    is_seeded = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["code"]
+
+    def clean(self):
+        if self.kind == Kind.SYSTEM and not self.system_code:
+            raise ValidationError("A system role needs a system code. / يجب تحديد رمز النظام لدور النظام.")
+        if self.kind != Kind.SYSTEM and self.system_code:
+            raise ValidationError("Only system roles have a system code. / رمز النظام لأدوار النظام فقط.")
+
+    @property
+    def permission_codes(self):
+        return frozenset(self.permission_rows.values_list("codename", flat=True))
+
+    def __str__(self):
+        return f"{self.code} — {self.name_en} / {self.name_ar}"
+
+
+class RolePermission(models.Model):
+    """One catalogue permission held by a role (3.1 ``permissions``).
+
+    Stored as a catalogue codename rather than an ``auth.Permission`` row, because
+    the invoicing, billing and zatca apps that would own those rows do not exist yet.
+    """
+
+    role = models.ForeignKey(Role, on_delete=models.CASCADE, related_name="permission_rows")
+    codename = models.CharField(max_length=100)
+
+    class Meta:
+        unique_together = [("role", "codename")]
+        ordering = ["role", "codename"]
+
+    def clean(self):
+        if self.codename not in catalogue.CATALOGUE:
+            raise ValidationError(f"{self.codename} is not in the permission catalogue. / الصلاحية غير موجودة في الدليل.")
+        reason = catalogue.role_may_hold(self.role.kind, self.role.scope, self.role.system_code, catalogue.get(self.codename))
+        if reason:
+            raise ValidationError(
+                f"Role {self.role.code} may not hold {self.codename} ({reason}). / "
+                f"لا يجوز أن يحمل الدور {self.role.code} الصلاحية {self.codename}.",
+                code=reason,
+            )
+
+    def save(self, *args, **kwargs):
+        self.full_clean()  # R12, R13: refused at save time
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.role.code}: {self.codename}"
+
+
+class UserProfile(models.Model):
+    class Language(models.TextChoices):
+        EN = "en", "English"
+        AR = "ar", "العربية"
+
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="access_profile")
+    kind = models.CharField(max_length=6, choices=Kind.choices, default=Kind.HUMAN)
+    display_name_en = models.CharField(max_length=200, blank=True)
+    display_name_ar = models.CharField(max_length=200, blank=True)
+    preferred_language = models.CharField(max_length=2, choices=Language.choices, default=Language.EN)
+    system_code = models.CharField(max_length=20, choices=SystemCode.choices, null=True, blank=True, unique=True)
+    agent_name = models.SlugField(max_length=40, null=True, blank=True, unique=True)
+    agent_model = models.CharField(max_length=100, blank=True)
+    agent_version = models.CharField(max_length=100, blank=True)
+    allow_external_ai = models.BooleanField(default=False)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        help_text="Null for profiles created by migration, createsuperuser or the signal",
+    )
+
+    LOCKED_FIELDS = ("kind", "system_code", "agent_name", "user_id")
+
+    def clean(self):
+        if self.kind == Kind.SYSTEM and not self.system_code:
+            raise ValidationError("A system user needs a system code. / يجب تحديد رمز النظام لمستخدم النظام.")
+        if self.kind == Kind.AGENT and not self.agent_name:
+            raise ValidationError("An agent user needs an agent name. / يجب تحديد اسم الوكيل.")
+        if self.kind != Kind.SYSTEM and self.system_code:
+            raise ValidationError("Only system users have a system code.")
+        if self.kind != Kind.AGENT and self.agent_name:
+            raise ValidationError("Only agent users have an agent name.")
+        if self.kind != Kind.AGENT and self.allow_external_ai:
+            raise ValidationError("Only agent users have the external AI setting.")
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = UserProfile.objects.filter(pk=self.pk).values(*self.LOCKED_FIELDS).first()
+            if stored and any(stored[f] != getattr(self, f) for f in self.LOCKED_FIELDS):
+                raise ValidationError(  # R10
+                    "A user's kind, system code and agent name never change. / "
+                    "لا يمكن تغيير نوع المستخدم أو رمز النظام أو اسم الوكيل."
+                )
+        self.clean()
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise AppendOnlyError("User profiles are never deleted. / لا تُحذف ملفات المستخدمين.")
+
+    @property
+    def source(self):
+        """Value for ``source`` on records this user creates (gateway rule 4, R21)."""
+        if self.kind == Kind.SYSTEM:
+            return f"system:{self.system_code}"
+        if self.kind == Kind.AGENT:
+            return f"agent:{self.agent_name}"
+        return "human"
+
+    def __str__(self):
+        return f"{self.user} ({self.kind})"
+
+
+def active_q(at, prefix=""):
+    """Q for memberships active at ``at`` (3.3), excluding the delegation-source check."""
+    p = prefix
+    return (
+        Q(**{f"{p}valid_from__lte": at})
+        & (Q(**{f"{p}valid_to__isnull": True}) | Q(**{f"{p}valid_to__gt": at}))
+        & (Q(**{f"{p}revoked_at__isnull": True}) | Q(**{f"{p}revoked_at__gt": at}))
+        & Q(**{f"{p}role__is_active": True})
+        & Q(**{f"{p}user__is_active": True})
+    )
+
+
+class MembershipQuerySet(models.QuerySet):
+    def active(self, at=None):
+        at = at or timezone.now()
+        # A delegation ends when its source ends (R16); delegates cannot delegate, so one level is enough.
+        return self.filter(active_q(at)).filter(Q(delegated_from__isnull=True) | active_q(at, "delegated_from__"))
+
+
+class Membership(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="memberships")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="memberships")
+    role = models.ForeignKey(Role, on_delete=models.PROTECT, related_name="memberships")
+    valid_from = models.DateTimeField()
+    valid_to = models.DateTimeField(null=True, blank=True)
+    granted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        help_text="Null only for the bootstrap managing_partner membership (R26)",
+    )
+    granted_at = models.DateTimeField(default=timezone.now)
+    reason = models.CharField(max_length=500)
+    delegated_from = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.PROTECT, related_name="delegations"
+    )
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    revoked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+"
+    )
+    revoke_reason = models.CharField(max_length=500, blank=True)
+
+    objects = MembershipQuerySet.as_manager()
+
+    REVOCATION_FIELDS = ("revoked_at", "revoked_by_id", "revoke_reason")
+    FROZEN_FIELDS = (
+        "user_id", "entity_id", "role_id", "valid_from", "valid_to", "granted_by_id", "granted_at",
+        "reason", "delegated_from_id",
+    )
+
+    class Meta:
+        ordering = ["entity", "user", "role", "valid_from"]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(valid_to__isnull=True) | Q(valid_to__gt=models.F("valid_from")),
+                name="membership_valid_to_after_from",
+            ),
+            models.CheckConstraint(
+                condition=Q(delegated_from__isnull=True) | Q(valid_to__isnull=False),
+                name="membership_delegation_needs_valid_to",
+            ),
+        ]
+
+    @property
+    def effective_end(self):
+        ends = [d for d in (self.valid_to, self.revoked_at) if d is not None]
+        return min(ends) if ends else None
+
+    def is_active_at(self, at=None):
+        return Membership.objects.active(at).filter(pk=self.pk).exists()
+
+    def clean(self):
+        errors = []
+        if not self.reason:
+            errors.append("A reason is required. / السبب مطلوب.")
+        if self.valid_to is not None and self.valid_to <= self.valid_from:
+            errors.append("valid_to must be after valid_from. / يجب أن يكون تاريخ الانتهاء بعد تاريخ البدء.")
+        if self.granted_by_id is not None and self.granted_by_id == self.user_id:
+            errors.append("Nobody grants a membership to themselves. / لا يجوز منح العضوية للنفس.")  # R8
+        if not (self.role_id and self.entity_id and self.user_id):
+            if errors:
+                raise ValidationError(errors)
+            return
+        role = self.role
+        if role.scope == Role.Scope.GROUP and self.entity.consolidation != Entity.Consolidation.PARENT:
+            errors.append(  # R6
+                "A group role can only be granted on the group parent entity. / "
+                "لا يُمنح دور المجموعة إلا على الكيان الأم."
+            )
+        profile = UserProfile.objects.filter(user_id=self.user_id).first()
+        kind = profile.kind if profile else Kind.HUMAN
+        if role.kind != kind:
+            errors.append(  # R11
+                f"A {role.kind} role cannot be given to a {kind} user. / لا يتوافق نوع الدور مع نوع المستخدم."
+            )
+        elif kind == Kind.SYSTEM and role.system_code != profile.system_code:
+            errors.append("This system role belongs to another system user. / دور النظام هذا لمستخدم نظام آخر.")
+        if self.delegated_from_id:
+            src = self.delegated_from
+            if self.valid_to is None:
+                errors.append("A delegation needs an end date. / يجب تحديد تاريخ انتهاء التفويض.")  # R16
+            if src.delegated_from_id:
+                errors.append("A delegate cannot delegate further. / لا يجوز للمفوَّض التفويض مرة أخرى.")
+            if src.entity_id != self.entity_id or src.role.code != "approver" or role.code != "approver":
+                errors.append("A delegation covers an approver membership in the same entity. / التفويض لعضوية معتمد في الكيان نفسه.")
+            if src.valid_to is not None and self.valid_to is not None and self.valid_to > src.valid_to:
+                errors.append("A delegation cannot outlast the delegator. / لا يجوز أن يتجاوز التفويض مدة عضوية المفوِّض.")
+            if src.user_id == self.user_id:
+                errors.append("Nobody delegates to themselves. / لا يجوز التفويض للنفس.")
+        if errors:
+            raise ValidationError(errors)
+
+    def overlapping(self):
+        """Other unrevoked memberships of the same (user, entity, role) whose dates overlap (R9)."""
+        qs = Membership.objects.filter(user_id=self.user_id, entity_id=self.entity_id, role_id=self.role_id).exclude(pk=self.pk)
+        qs = qs.filter(Q(revoked_at__isnull=True) | Q(revoked_at__gt=self.valid_from))
+        qs = qs.filter(Q(valid_to__isnull=True) | Q(valid_to__gt=self.valid_from))
+        if self.valid_to is not None:
+            qs = qs.filter(valid_from__lt=self.valid_to)
+        return qs
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = Membership.objects.filter(pk=self.pk).values(*self.FROZEN_FIELDS, *self.REVOCATION_FIELDS).first()
+            if stored:
+                if any(stored[f] != getattr(self, f) for f in self.FROZEN_FIELDS):
+                    raise AppendOnlyError(  # R9
+                        "Memberships are never edited; revoke and grant a new one. / "
+                        "لا تُعدَّل العضويات؛ ألغِ العضوية وامنح عضوية جديدة."
+                    )
+                if stored["revoked_at"] is not None:
+                    raise AppendOnlyError("A revoked membership is final. / إلغاء العضوية نهائي.")
+                if self.revoked_at is None or self.revoked_by_id is None or not self.revoke_reason:
+                    raise AppendOnlyError("A revocation needs a time, a person and a reason. / الإلغاء يتطلب وقتًا وشخصًا وسببًا.")
+        else:
+            self.full_clean()
+            if self.granted_by_id is None and not getattr(self, "_bootstrap", False):
+                raise ValidationError("A membership needs the person who granted it. / يجب تحديد مانح العضوية.")
+            if self.overlapping().exists():
+                raise ValidationError(  # R9
+                    "An overlapping membership for this user, entity and role already exists. / "
+                    "توجد عضوية متداخلة لهذا المستخدم والكيان والدور."
+                )
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise AppendOnlyError("Memberships are never deleted. / لا تُحذف العضويات.")
+
+    def __str__(self):
+        return f"{self.user} · {self.entity.code} · {self.role.code}"
+
+
+class DualControlRequest(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+        EXPIRED = "expired", "Expired"
+        USED = "used", "Used"
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="dual_control_requests")
+    permission = models.CharField(max_length=100)
+    target_type = models.ForeignKey(ContentType, on_delete=models.PROTECT, related_name="+")
+    target_id = models.PositiveBigIntegerField()
+    payload_hash = models.CharField(max_length=64)
+    requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
+    requested_at = models.DateTimeField(default=timezone.now)
+    status = models.CharField(max_length=8, choices=Status.choices, default=Status.PENDING)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+"
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_note = models.CharField(max_length=500, blank=True)
+    expires_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ["-requested_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(decided_by__isnull=True) | ~Q(decided_by=models.F("requested_by")),
+                name="dual_control_decider_not_requester",
+            )
+        ]
+
+    def delete(self, *args, **kwargs):
+        raise AppendOnlyError("Dual-control requests are never deleted. / لا تُحذف طلبات الرقابة المزدوجة.")
+
+    def __str__(self):
+        return f"{self.entity.code} {self.permission} #{self.target_id} ({self.status})"
+
+
+class AccessLog(models.Model):
+    class Event(models.TextChoices):
+        MEMBERSHIP_GRANTED = "membership_granted", "Membership granted"
+        MEMBERSHIP_REVOKED = "membership_revoked", "Membership revoked"
+        DELEGATION_GRANTED = "delegation_granted", "Delegation granted"
+        DELEGATION_REVOKED = "delegation_revoked", "Delegation revoked"
+        ROLE_CHANGED = "role_changed", "Role changed"
+        PROFILE_CHANGED = "profile_changed", "Profile changed"
+        DUAL_CONTROL_REQUESTED = "dual_control_requested", "Dual control requested"
+        DUAL_CONTROL_DECIDED = "dual_control_decided", "Dual control decided"
+        DUAL_CONTROL_USED = "dual_control_used", "Dual control used"
+        PERMISSION_GRANTED = "permission_granted", "Approval or posting right used"
+        PERMISSION_DENIED = "permission_denied", "Permission denied"
+        SUPERUSER_FLAG_CHANGED = "superuser_flag_changed", "Superuser flag changed"
+        STAFF_FLAG_CHANGED = "staff_flag_changed", "Staff flag changed"
+        AGENT_TOKEN_ISSUED = "agent_token_issued", "Agent token issued"
+        AGENT_TOKEN_REVOKED = "agent_token_revoked", "Agent token revoked"
+        BOOTSTRAP = "bootstrap", "Bootstrap"
+
+    at = models.DateTimeField(default=timezone.now)
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    actor_kind = models.CharField(max_length=6, choices=Kind.choices, default=Kind.HUMAN)
+    event = models.CharField(max_length=30, choices=Event.choices)
+    entity = models.ForeignKey(Entity, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    subject_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+"
+    )
+    membership = models.ForeignKey(Membership, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    role = models.ForeignKey(Role, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    permission = models.CharField(max_length=100, blank=True)
+    details = models.JSONField(default=dict)
+    request_id = models.CharField(max_length=64, blank=True)
+    ip = models.CharField(max_length=45, blank=True)
+    source = models.CharField(max_length=60, blank=True)
+
+    class Meta:
+        ordering = ["at", "id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None or kwargs.get("force_update"):
+            raise AppendOnlyError("The access log is append-only. / سجل الوصول للإضافة فقط.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise AppendOnlyError("The access log is append-only. / سجل الوصول للإضافة فقط.")
+
+    def __str__(self):
+        return f"{self.at:%Y-%m-%d %H:%M} {self.event} {self.permission}"
