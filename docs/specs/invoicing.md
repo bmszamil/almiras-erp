@@ -26,6 +26,8 @@ The invoicing module keeps the customer and vendor sub-ledgers for **every entit
 | D8 | Agents create drafts only, act as named service users, and every action is logged. Business records carry a `source` field (human / import / agent). | `docs/ai-agent-gateway.md` | same |
 | D9 | Business logic lives in `services.py`. Every rule gets a test. | CLAUDE.md | same |
 
+The 2026-10-16 compliance review is technical input, not a business decision. Rules it changed are tagged in section 4; choices it raised are in section 9.
+
 ### Ledger API this module must use (actual signatures)
 
 | Function | Signature | Notes for invoicing |
@@ -206,7 +208,7 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 
 ### Money and VAT
 8. Every amount is `Decimal` with 2 decimal places. A float input is rejected with an error, not converted. Currency is stored on every document and must equal `entity.base_currency` until OQ-6 is decided. **[svc input validation; DB decimal fields; test AT-14]**
-9. Line `net_amount` = `quantity × unit_price − line_discount`, rounded to 2 dp. `vat_amount` = `net_amount × rate`, rounded to 2 dp, per line. Document totals are sums of line values. Rounding mode is ROUND_HALF_UP by default (OQ-11). **[svc; test AT-1]**
+9. Line `net_amount` = `quantity × unit_price − line_discount`, rounded to 2 dp. Header VAT is computed **per VAT category and rate at document level**: category VAT = round(sum of line net amounts in that category (after document discount) × rate, 2). `total_vat` = sum of category VAT. It is **not** the sum of rounded line VAT. Line `vat_amount` = round(net × rate, 2) is for display only. The allowed line-vs-document difference follows ZATCA BR-KSA rules **[CC-verify]**; doc-level method **[CC-verify: search excerpt 2026-10-16]**. Rounding mode ROUND_HALF_UP (OQ-11). The 2200 / 1310 JE line equals `total_vat`. **[svc; test AT-1, AT-35]**
 10. The VAT rate is taken from `VatRate` effective on the supply date (or the issue date if no supply date). Lines with category Z, E or O need an exemption reason. **[svc; test AT-15]**
 11. An entity with an empty `vat_number` cannot issue sales documents with category S lines. **[svc; default pending OQ-17; test AT-16]**
 
@@ -215,10 +217,10 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 13. Only drafts can be edited or deleted. Issued, final and rejected documents are immutable except for fields written by `zatca.services` and the computed payment fields. **[model `save` guard like `JournalEntry.save`; svc; test AT-5]**
 14. On issue, the system assigns the number from `DocumentSequence(entity, doc_type, year of issue_date)`. The number is gap-free and never reused. Assigning the number and changing the status happen in one transaction. A failure rolls back both. **[svc `select_for_update`; DB unique `(entity, doc_type, number)`; test AT-6]**
 15. On issue, the buyer and seller snapshots are frozen. Later edits to the Customer or Entity do not change issued documents. **[svc; test AT-7]**
-16. A standard (B2B) document needs a buyer name in Arabic, a full buyer address, and either a buyer VAT number or an `other_id`. **[svc validation at issue; test AT-8]**
+16. A standard (B2B) document needs a buyer name in Arabic and a full buyer address. If the customer is VAT-registered, the buyer VAT number is mandatory; `other_id` is accepted only for buyers not VAT-registered **[CC-verify: search excerpt 2026-10-16]**. **[svc validation at issue; test AT-8, AT-36]**
 17. Issued invoices are never cancelled or deleted. A final invoice is corrected only by a credit note or debit note that references it. **[svc: no cancel path; ZATCA requirement; test AT-9]**
-18. A credit note must reference a `final` invoice of the same entity and customer, and it needs a reason (EN or AR). Its gross amount cannot exceed the invoice gross amount minus credit notes already issued against that invoice. **[svc; test AT-10]**
-19. A debit note must reference a `final` invoice of the same entity and customer, and it needs a reason. **[svc]**
+18. A credit note must reference a `final` invoice of the same entity and customer, and it needs a reason in Arabic (`reason_ar` required; English optional) **[CC-verify]**. Its gross amount cannot exceed the invoice gross amount minus credit notes already issued against that invoice. **[svc; test AT-10]**
+19. A debit note must reference a `final` invoice of the same entity and customer, and it needs a reason in Arabic (`reason_ar` required; English optional) **[CC-verify]**. **[svc; test AT-11]**
 20. A rejected document keeps its number and has no posted GL effect. The correction is a new document. **[svc; test AT-19]**
 
 ### Purchase document lifecycle
@@ -232,8 +234,8 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 ### Posting (all documents)
 27. Every journal entry is created with `ledger.services.create_entry(..., reference=document.number)` and posted only with `post_entry`. Invoicing never sets `JournalEntry.status`. **[svc; code-reviewer; test AT-1]**
 28. The JE date is `issue_date` for sales documents, `accounting_date` for purchase documents and `date` for receipts and payments. Posting fails when no open period covers that date. The document stays in its previous status and no number is consumed. **[ledger `_find_open_period`; svc single transaction; test AT-17]**
-29. Input VAT on a bill line goes to 1310 only when the line is `vat_recoverable` and the vendor document has a vendor VAT number. Otherwise the VAT is added to the line's expense or asset account (default, OQ-9). **[svc; test AT-25]**
-30. A bill from a non-resident vendor with S-category services is posted with reverse-charge VAT: Dr 1310 and Cr 2200 for the same amount, and AP holds net only. **[svc; KSA VAT reverse-charge; test AT-26]**
+29. Input VAT recovery follows VAT Implementing Regulations Art. 51 **[CC-verify: search excerpt 2026-10-16]**. Each bill line has `vat_attribution`: `taxable` (used for taxable supplies), `exempt` (used for exempt supplies) or `mixed`. For a resident vendor, VAT goes to 1310 only when attribution is `taxable` **and** the vendor document has a vendor VAT number. `exempt` VAT is added to the line's expense or asset account. `mixed`: once OQ-9 is signed off, the recoverable share uses the entity's `VatRecoveryRatio` for the year, with an annual true-up; **until then, mixed VAT is posted fully to the line account (cost)**. This is the conservative default: it never claims more than allowed, and posting is not blocked. **Needs expert sign-off** (tax adviser). **[svc; test AT-25, AT-39]**
+30. Reverse charge applies only to **standard-rated services imported** from a non-resident vendor (`supply_kind=services`). It does not apply to goods (import VAT on goods is paid at customs, outside this module; OQ-29) **[CC-verify: search excerpt 2026-10-16]**. RC lines post Dr 1310 and Cr 2200 for the same amount, and AP holds net only. R30 takes precedence over R29's vendor-VAT-number requirement (a non-resident has none), but R29 attribution still applies to the 1310 side: `exempt` → cost, `mixed` → cost by default. VAT-return box mapping: OQ-29. **[svc; KSA VAT reverse-charge; test AT-26, AT-40]**
 31. Payment posting to a non-resident vendor is blocked until OQ-8 (withholding tax) is decided. **[svc; test AT-27]**
 32. Reversals use `reverse_entry(entry, date=..., user=..., reason=...)`. If the original period is closed, the service passes a date in the current open period. It never relies on the default `date=None`. **[svc; test AT-24]**
 
@@ -243,7 +245,7 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 35. Allocation has no GL effect (both sides sit on the same control account). It changes `payment_state` only. **[svc]**
 36. Allocations are never edited or deleted. An un-allocation is a new row with negative amount and `reverses` set. **[model `save/delete` guard; test AT-30]**
 37. On reaching `final`, a credit note is automatically allocated to its original invoice up to the invoice's open amount. Any remainder stays as customer credit. **[svc; test AT-10]**
-38. Unallocated receipts are allowed. They stay as a credit balance on the customer and appear on the unallocated-cash report. VAT treatment of advances is open (OQ-16). **[svc + report]**
+38. Unallocated receipts with `purpose=settlement` (overpayments, unidentified cash awaiting allocation) are allowed. They stay as a credit balance on the customer and appear on the unallocated-cash report. Advances and deposits: R55. **[svc + report]**
 39. The open amounts in the sub-ledger tie out to the GL: the sum of open customer balances per entity equals the trial balance of 1200, plus 1210 per counterparty for intercompany customers. The same holds for AP against 2100 and 2110. **[svc `reconcile_subledger(entity, as_of)`; test AT-31]**
 
 ### ZATCA hand-off (details in `docs/specs/zatca.md`; service names provisional, OQ-2)
@@ -254,6 +256,21 @@ Each rule ends with **[enforcement]**. "svc" = `invoicing.services`; "DB" = DB c
 44. A document is not final, cannot be allocated, and cannot be credited until it is cleared or reported. A standard invoice is not shared with the buyer before clearance. **[svc; test AT-18]**
 45. Fields `zatca_*` are written only by `zatca.services`. Invoicing never computes the hash, ICV, PIH or QR. **[model guard / code-reviewer]**
 46. A purchase document is never sent to ZATCA. **[svc]**
+
+### Added 2026-10-16 (compliance review)
+47. The printed and PDF title is "Tax Invoice" / "فاتورة ضريبية" for standard documents and "Simplified Tax Invoice" / "فاتورة ضريبية مبسطة" for simplified ones; credit and debit notes use their bilingual titles **[CC-verify: search excerpt 2026-10-16]**. **[svc rendering; test AT-37]**
+48. A document to a VAT-registered business buyer (`customer_kind=business`, `is_vat_registered=True`) with gross of SAR 1,000.00 or more cannot be `simplified` **[CC-verify]**. **[svc at issue; test AT-38]**
+
+### Personal data (PDPL)
+49. Buyer snapshots and parties of `customer_kind=individual` are personal data. The lawful basis recorded for them is legal obligation (tax invoicing and record-keeping) **[CC-verify: search excerpt 2026-10-16]**. **[data register; svc]**
+50. Simplified documents do not collect or store a buyer ID (`other_id`) unless a rule requires it. **[svc: fields cleared/blocked at issue; test AT-42]**
+51. Access to individuals' personal data (customer record, buyer snapshot, `other_id`, IBAN) is limited to roles that need it, and each view/export is logged with user, entity and time. **[permission + access log; test AT-44]**
+52. After `retention_until`, personal data of individuals on documents and parties is anonymised (names, IDs, address replaced by a fixed token); amounts, VAT, numbers and ZATCA hashes are kept. No job runs before the retention rules are confirmed (zatca.md OQ-8). **[svc job; test AT-43]**
+53. Any processor outside KSA (hosting, backup, e-mail, OCR, AI) needs a transfer assessment before it receives personal data. **Needs legal sign-off** (OQ-31). **[process; code-reviewer]**
+
+### Purification and advances
+54. Purification moves the flagged amount from 4900 to 2600 Charity payable, and the payout clears 2600 against a bank account (E14, E15). Both go through `create_entry` + `post_entry`, carry `reference`, and need a human user; never an agent. Amount and approval: OQ-30. **[svc; ledger; test AT-45]**
+55. Customer receipts with `purpose=advance` or `deposit`, and advance invoices, are blocked until the prepayment invoice (type 386) flow is built with zatca.md R-39 (OQ-16). **[svc; test AT-41]**
 
 ## 5. Accounting
 
@@ -300,9 +317,9 @@ VAT on bank charges: OQ-23.
 | 1310 VAT input | 1,500.00 | | |
 | 2100 Trade payables (or 2110) | | 11,500.00 | (SUB) |
 
-**E8. Vendor bill, non-recoverable VAT** (default, OQ-9): Dr expense 11,500.00 / Cr 2100 11,500.00.
+**E8. Vendor bill, non-recoverable VAT** (no vendor VAT number, or attribution `exempt`, or `mixed` by default; R29, OQ-9): Dr expense or asset 11,500.00 / Cr 2100 11,500.00.
 
-**E9. Vendor bill, non-resident, reverse charge**
+**E9. Vendor bill, non-resident, standard-rated services, reverse charge, attribution `taxable`** (for `exempt`/`mixed` the 1310 debit goes to the expense line instead; goods: no RC lines, R30)
 | Account | Dr | Cr |
 |---|---|---|
 | 5xxx expense (per line) | 10,000.00 | |
@@ -319,7 +336,21 @@ Withholding tax is not booked: there is no WHT payable account (OQ-8).
 
 **E13. Allocation**: no journal entry.
 
-**Accounts missing from the template** (not invented here, see OQ-22): retention receivable and payable, withholding tax payable, customer advances and deferred income, vendor advances, FX gain/loss, rounding difference, ECL allowance and bad-debt expense, separate reverse-charge VAT accounts, intercompany IP income. The template also has no "control account" flag that would stop manual journals hitting 1200, 2100, 1210 and 2110.
+**E14. Purification transfer** (R54; amount and approval per OQ-30; example 1,200.00)
+| Account | Dr | Cr |
+|---|---|---|
+| 4900 Non-compliant income (to purify) | 1,200.00 | |
+| 2600 Charity payable (purification) | | 1,200.00 |
+
+**E15. Purification payout**
+| Account | Dr | Cr |
+|---|---|---|
+| 2600 Charity payable (purification) | 1,200.00 | |
+| 1100 Cash and bank | | 1,200.00 |
+
+Both accounts exist in `ledger/coa_template.py` (4900 with `purify`, 2600). If a late-payment charge is ever built (OQ-15), it is Dr 1200 / Cr 2600, never income.
+
+**Accounts missing from the template** (not invented here, see OQ-22): retention receivable and payable, withholding tax payable, customer advances and deferred income (unearned revenue for 386 prepayments), vendor advances, FX gain/loss, rounding difference, ECL allowance and bad-debt expense, separate reverse-charge VAT accounts, intercompany IP income. The template also has no "control account" flag that would stop manual journals hitting 1200, 2100, 1210 and 2110.
 
 ## 6. Integrations
 
@@ -331,7 +362,8 @@ Withholding tax is not booked: there is no WHT payable account (OQ-8).
 | Banks | In | Statement lines matched to receipts and payments | README step 4 (bank module), not built here |
 | GOSI / Mudad | none | Payroll is out of scope | n/a |
 | SAP B1 / Daftra | In (one-off) | Open AR/AP items at cutover as `source=import` documents. No ZATCA resubmission. They must tie to the opening balances in 1200/2100 | migration-agent. Method in OQ-24 |
-| Agent gateway | In | Draft bills from the "invoice reader" agent (`source=agent:invoice-reader`) | Drafts only (R22) |
+| Agent gateway | In | Draft bills from the "invoice reader" agent (`source=agent:invoice-reader`) | Drafts only (R22). If the agent's model runs outside KSA, bill attachments with personal data need the R53 transfer assessment |
+| ZATCA VAT return | Out (report only) | Box totals per entity and period | Box mapping undecided (OQ-29) |
 
 ## 7. Permissions
 
@@ -349,6 +381,8 @@ No entity-scoped role model exists in `core` yet (OQ-25). The proposed roles bel
 | Post receipt or payment | Y (receipt) | | Y | Y (payment) | | No |
 | Allocate / un-allocate | Y | Y | Y | | | No |
 | View documents and reports | Y | Y | Y | Y | Y | Scoped |
+| View/export individuals' personal data (R51) | Y (logged) | Y (vendor, logged) | Y (logged) | | Masked unless granted | No |
+| Post purification transfer / payout (R54) | | | Y | Y (payout) | | No |
 
 Segregation of duties (creator ≠ approver) is on by default and configurable per entity (OQ-5).
 
@@ -358,17 +392,17 @@ Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, 
 
 | # | Given | When | Then |
 |---|---|---|---|
-| AT-1 | ALM draft invoice, 2 lines: 3 × 1,000.00 at S 15%, and 1 × 333.33 at S 15% | Issue, then ZATCA stub returns `cleared` | Line VAT 450.00 and 50.00 (49.9995 rounds half-up). Totals net 3,333.33, VAT 500.00, gross 3,833.33. JE posted: Dr 1200 3,833.33 / Cr 4100 3,333.33 / Cr 2200 500.00. Reference = invoice number. Status `final`. |
+| AT-1 | ALM draft invoice, 2 lines: 3 × 1,000.00 at S 15%, and 1 × 333.33 at S 15% | Issue, then ZATCA stub returns `cleared` | Category S taxable 3,333.33; category VAT = round(3,333.33 × 15%) = round(499.9995) = 500.00 (document level, half-up). Line VAT shown 450.00 and 50.00 (display only). Totals net 3,333.33, VAT 500.00, gross 3,833.33. JE posted: Dr 1200 3,833.33 / Cr 4100 3,333.33 / Cr 2200 500.00. Reference = invoice number. Status `final`. |
 | AT-2 | Final invoice | Try to set status to `draft` or `issued` | Error. Status unchanged. |
 | AT-3 | ALM invoice line uses SUB's account 4100 | Save line / issue | Rejected with "belongs to another entity". No number consumed. |
 | AT-4 | User with rights on ALM only | List invoices, or create an invoice for a SUB customer | Sees only ALM documents. Create rejected. |
 | AT-5 | Issued invoice | Edit a line's quantity, or delete the document | Rejected. |
 | AT-6 | Two ALM invoices issued concurrently in 2027 | Both issue | Consecutive numbers, no gap or duplicate. A third issue that fails validation consumes no number. |
 | AT-7 | Final invoice; the customer's address is then changed | Read the invoice | The invoice still shows the old address snapshot. |
-| AT-8 | Standard draft invoice, customer with no Arabic name / no address / no VAT number and no other ID | Issue | Rejected, listing each missing field. |
+| AT-8 | Standard draft invoice, customer (not VAT-registered) with no Arabic name / no address / no VAT number and no other ID | Issue | Rejected, listing each missing field. |
 | AT-9 | Final invoice | Call cancel or delete; call `reverse_entry` through invoicing services | No cancel path exists. The invoicing service refuses. The only correction is a credit note. |
 | AT-10 | Final invoice gross 11,500.00, open 11,500.00 | Credit note 4,600.00 (incl. VAT) cleared, then a second credit note of 7,000.00 | First: JE as E4 for 4,000/600, auto-allocated, invoice open 6,900.00, `partial`. Second rejected (exceeds 6,900.00 creditable). |
-| AT-11 | Credit note without reason, or referencing another customer's invoice | Issue | Rejected. |
+| AT-11 | Credit or debit note without reason, with an English-only reason, or referencing another customer's invoice | Issue | Rejected. With `reason_ar` only: accepted. |
 | AT-12 | ALM (Sharia enforced) bill line on 5610 conventional interest | Save line / post | Rejected "Sharia-prohibited". Same bill in an entity with `sharia_enforced=False`: posts. |
 | AT-13 | Invoice line on 4900 non-compliant income | Final | Posts. Document `requires_purification=True`. Appears on the purification report. |
 | AT-14 | Line `unit_price` given as float `0.1`, or currency `USD` on an ALM (SAR) document | Save | Rejected. |
@@ -392,6 +426,17 @@ Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, 
 | AT-32 | Issued invoice in 2027-03 awaiting ZATCA | `close_period(2027-03)` | Rejected "Draft entries exist". |
 | AT-33 | Any document, customer, vendor or VAT category | Render the label in the `ar` locale | Arabic text shown. Missing Arabic on a required Bi field is rejected at save. |
 | AT-34 | New entity NEW added as data (chart + periods) | Run AT-1 for NEW | Passes with no code change. Numbers use the `NEW` prefix. |
+| AT-35 | ALM invoice, 3 lines × net 10.03 at S 15% | Issue, stub `cleared` | Line VAT shown 1.50 each (sum 4.50). Category VAT = round(30.09 × 15%) = round(4.5135) = 4.51. Totals net 30.09, VAT 4.51, gross 34.60. JE Dr 1200 34.60 / Cr 4100 30.09 / Cr 2200 4.51 (R9). |
+| AT-36 | Customer `is_vat_registered=True`, no VAT number, `other_id` CRN | Issue a standard invoice (or save the customer) | Rejected: VAT number required. Same customer with `is_vat_registered=False` and CRN: accepted (R16). |
+| AT-37 | Standard and simplified final invoices; a credit note | Render PDF in `ar` and `en` | Titles "Tax Invoice"/"فاتورة ضريبية", "Simplified Tax Invoice"/"فاتورة ضريبية مبسطة", and the note's bilingual title (R47). |
+| AT-38 | VAT-registered business customer | Issue as `simplified` with gross 1,000.00; then 999.99 | First rejected; second allowed (R48, threshold pending verification). |
+| AT-39 | Resident vendor with VAT number; bill lines each net 1,000 + VAT 150: `taxable`, `exempt`, `mixed`; no ratio approved | Post | Dr expense 1,000 + Dr 1310 150; Dr expense 1,150; Dr expense 1,150; Cr 2100 3,450.00 (R29). |
+| AT-40 | Non-resident vendor, no VAT number: line A services S 10,000 `taxable`; line B goods 5,000 | Post | Line A as E9 (Dr 1310 1,500 / Cr 2200 1,500) despite no VAT number. Line B: Dr expense 5,000, no RC lines. AP 15,000.00 (R30). |
+| AT-41 | ALM customer | Post receipt with `purpose=advance`, then `deposit`, then `settlement` with no allocation | First two rejected "blocked until prepayment invoice flow" (en/ar). Third posts and shows as unallocated (R38, R55). |
+| AT-42 | Simplified invoice to an individual; user enters `other_id` | Issue | Snapshot has no `other_id`; the field is not stored (R50). |
+| AT-43 | Test setting with anonymisation job enabled; final simplified invoice to an individual with `retention_until` yesterday; another with it tomorrow | Run job | First: names, address, ID replaced by token; number, amounts, VAT, ZATCA hash unchanged; JE untouched. Second unchanged. Default settings: job disabled (R52). |
+| AT-44 | Individual customer in ALM | Viewer opens it; accountant opens and exports it | Viewer sees masked data. Accountant sees it; one access-log row per view/export with user, entity, time (R51). |
+| AT-45 | ALM final invoice with 1,200.00 on 4900 | Post purification transfer, then payout; agent user tries the same | E14 then E15 posted with references; 4900 and 2600 net to zero for that amount. Agent rejected (R54). |
 
 ## 9. Open questions
 
@@ -406,24 +451,29 @@ Fixtures: entities ALM (Sharia enforced, VAT number set) and SUB (child of ALM, 
 | OQ-5 | Approval thresholds for bills, payments and invoices (amounts, who approves, the Managing Partner's limit). Is segregation of duties mandatory for small entities? | Managing Partner | Default: one approval on every bill and payment, creator ≠ approver, configurable per entity. |
 | OQ-6 | Multi-currency: foreign-currency invoices and bills, FX rate source, realised/unrealised FX. `JournalLine` has no currency field and the template has no FX account. | Accountant + Dev | **BLOCKING** for non-SAR documents. Default: base currency only, others rejected. |
 | OQ-7 | Do credit notes (and debit notes) need approval, and above what amount? | Managing Partner | Default: accountant or approver role only, no threshold. |
-| OQ-8 | Withholding tax on payments to non-resident vendors (rates by service type, WHT payable account, monthly return). | Accountant | **BLOCKING** for non-resident payments (R31). Bills can be posted. |
-| OQ-9 | Input VAT recovery: is any entity partly exempt (e.g. residential rentals exempt, dividends out of scope), and is apportionment needed? How is non-recoverable VAT booked? | Accountant / tax adviser | Default: recoverable if vendor VAT number present, else capitalised to the line account (E8). |
+| OQ-8 | Withholding tax on payments to non-resident vendors. Needed before unblocking: WHT category per vendor and per bill line (service type → rate); a WHT payable account (OQ-22); treaty-relief certificates per vendor with validity dates; gross-up rule (who bears the tax); monthly WHT return data. **Needs expert sign-off** (tax adviser). | Accountant / tax adviser | **BLOCKING** for non-resident payments (R31). Bills can be posted. |
+| OQ-9 | Input VAT recovery per Art. 51 **[CC-verify: search excerpt 2026-10-16]**: which entities make exempt supplies (e.g. residential rent), how `mixed` lines are apportioned (`VatRecoveryRatio` per entity per year, provisional vs final), and the annual true-up method and account. **Needs expert sign-off** (tax adviser). | Accountant / tax adviser | Default (R29): `taxable` + vendor VAT number → 1310; `exempt` → cost; `mixed` → fully to cost (conservative, no over-claim). |
 | OQ-10 | Duplicate-bill rule and whether a vendor credit note must reference an original bill. | Accountant | Default: unique vendor + number. Reference required. |
-| OQ-11 | Rounding policy (per line vs per document, half-up vs half-even) and how to absorb a 0.01 difference against vendor totals. There is no rounding account. | Accountant | Default: per line, ROUND_HALF_UP. Bill totals must match the vendor document exactly. |
+| OQ-11 | Rounding policy (per line vs per document, half-up vs half-even) and how to absorb a 0.01 difference against vendor totals. There is no rounding account. | Accountant | Sales: decided by compliance input, not open (R9: document-level VAT per category, ROUND_HALF_UP; tolerance per BR-KSA **[CC-verify]**). Still open: half-up vs half-even confirmation and vendor-total differences. Default for bills: totals must match the vendor document exactly. |
 | OQ-12 | Unit price precision beyond 2 dp (e.g. hourly rates). | Accountant | Default: 2 dp. |
 | OQ-13 | Are any group entities in a KSA VAT group (no VAT on intra-group supplies)? | Accountant / tax adviser | Default: no VAT group. VAT is charged on intercompany invoices. |
 | OQ-14 | Shared party master across entities (one customer for ALM and SUB) or per entity. | Managing Partner | Default: per entity. |
-| OQ-15 | Late payment: are any late charges contracted? If so, are they donated (Cr 2600 Charity payable), and what is their VAT treatment? Sharia allows no penalty income. | Managing Partner + Sharia adviser | Default: no late-charge feature. |
-| OQ-16 | Customer advances and deposits (e.g. rent in advance, security deposits): VAT on advance receipt, prepayment invoices, deferred income account. | Accountant | **BLOCKING** for advance invoices and deposits. Default: unallocated receipts allowed and reported (R38), no VAT on them. compliance-checker to confirm. |
+| OQ-15 | Late payment: are any late charges contracted, and what is their VAT treatment? Sharia allows no penalty income. If built later: Dr 1200 / Cr 2600, never income. **Needs Sharia board sign-off.** | Managing Partner + Sharia board | Default: no late-charge feature. |
+| OQ-16 | Customer advances and deposits (e.g. rent in advance): build the prepayment invoice (386) flow with zatca.md R-39 (VAT at receipt of the advance **[CC-verify]**, deduction on the final invoice, deferred income account in OQ-22). Security deposits (refundable, VAT treatment): **Needs expert sign-off** (tax adviser). | Accountant / tax adviser | **BLOCKING** for advances and deposits. Default: receipts with `purpose=advance`/`deposit` and advance invoices blocked until the 386 flow is built (R55). |
 | OQ-17 | Can a non-VAT-registered group entity issue invoices, and in what form? | Accountant | Default: S lines blocked (R11). Z/E/O allowed. |
 | OQ-18 | Must every sales line description be in Arabic (ZATCA/VAT regulations), or is English-only acceptable on B2B? | compliance-checker | Default: Arabic required on sales documents, English optional. |
-| OQ-19 | Which entities issue simplified (B2C) invoices, e.g. rentals to individuals? | Managing Partner | Default: standard unless customer_kind = individual. |
+| OQ-19 | Which entities issue simplified (B2C) invoices, e.g. rentals to individuals? | Managing Partner | Default: standard unless customer_kind = individual; R48 guard applies. |
 | OQ-20 | Bank accounts: one sub-account per bank or IBAN under 1100? | Accountant | Default: 1100, selectable asset account. |
 | OQ-21 | Bank payment file format and bank (SARIE, bulk upload, H2H). | Accountant | Not in scope for this module. |
-| OQ-22 | Missing accounts: retention receivable/payable, WHT payable, customer advances/deferred income, vendor advances, FX gain/loss, rounding, ECL allowance/bad debt, reverse-charge VAT split, intercompany IP income. Also add an `is_control` flag on 1200/2100/1210/2110 to block manual journals. | Accountant | **BLOCKING** for the related features (retention, write-off, FX, advances). Core AR/AP is not blocked. |
+| OQ-22 | Missing accounts: retention receivable/payable, WHT payable, customer advances, deferred income (unearned revenue for 386 prepayments), VAT true-up (if not 1310), vendor advances, FX gain/loss, rounding, ECL allowance/bad debt, reverse-charge VAT split, intercompany IP income. Also add an `is_control` flag on 1200/2100/1210/2110 to block manual journals. | Accountant | **BLOCKING** for the related features (retention, write-off, FX, advances). Core AR/AP is not blocked. |
 | OQ-23 | VAT on bank charges deducted from receipts. | Accountant | Default: booked gross to 5700, no VAT split. |
 | OQ-24 | Migration: how open Daftra/SAP B1 AR/AP items are loaded (per-document vs per-party balance), and whether their ZATCA data (hash chain) carries over. | Accountant + migration-agent | Default: per-document `source=import`, status `final`, no ZATCA call, tie-out to opening TB. |
 | OQ-25 | Entity-scoped role/permission model (user × entity × role) is missing from `core`. Role names and who holds them. | Managing Partner + Dev | **BLOCKING** for views/APIs. Services can be built and tested now. |
 | OQ-26 | Retention on contracts (percentage held, release terms). | Managing Partner | Default: not built. |
 | OQ-27 | Bad-debt write-off and ECL policy. | Accountant | Default: not built. Use credit notes only. |
 | OQ-28 | Ledger protection: should `ledger.services.reverse_entry` refuse entries owned by a sub-ledger (needs a `source_module` field on `JournalEntry`), so a final invoice can't be reversed outside invoicing? | Dev + code-reviewer | Default: invoicing services refuse it. The code-reviewer checks there is no direct call. |
+| OQ-29 | VAT-return box mapping per line type (standard, zero, exempt, RC imported services, imports of goods via customs, adjustments, Art. 51 true-up) **[CC-verify]**; how customs import VAT on goods is recorded. | Accountant / tax adviser | Default: no VAT-return report; customs VAT entered as a manual JE outside this module. |
+| OQ-30 | Purification: who decides the amount and timing, approval before payout, recipient charities. | Managing Partner + Sharia board | Default: E14/E15 by accountant only, human user, no automation. |
+| OQ-31 | PDPL: offshore processors (hosting, backup, e-mail, OCR, AI models) and the transfer assessment for each; privacy notice text en/ar; data-subject request handling. **Needs legal sign-off.** See zatca.md OQ-20 (residency). | Managing Partner + legal | **BLOCKING** for go-live with real personal data. Default: no offshore processor receives personal data. |
+
+**Blocking:** OQ-1, OQ-2, OQ-6 (non-SAR), OQ-8 (non-resident payments), OQ-16 (advances/deposits), OQ-22 (related features), OQ-25 (views/APIs), OQ-31 (go-live). **Expert sign-off:** tax adviser OQ-8, OQ-9, OQ-16 (deposits), R48 threshold; legal OQ-31 / R53; Sharia board OQ-15, OQ-30. Every **[CC-verify]** item is re-checked against official documents before go-live.
