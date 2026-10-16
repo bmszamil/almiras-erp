@@ -230,7 +230,23 @@ Unique: one non-terminal (`waiting_original`, `drafted`, `submitted`) adjustment
 34. After each run, the entity's accounting staff get a summary (generated, held, failed) in the app, in their language. Failures still unresolved after 3 consecutive runs are also sent to the CFO (default, OQ-17). **[svc; AT-17]**
 35. Generated invoices are issued without per-invoice approval: the CFO's contract approval covers them (D8; was default OQ-1). This applies to invoices only, never to correction notes (R44). *(Amended 2026-10-16.)* **[svc; AT-4, AT-35]**
 36. Agents (gateway service users) may draft contracts if granted. They cannot approve, release, terminate, end secondments or start runs. The billing service user is a system user, not an agent, and it acts only on `active` contracts. **[Q + svc; AT-20]**
-37. All amounts are `Decimal` with 2 dp, and the currency is stored on every money field's parent record. **[svc + DB; AT-5]**
+37. All amounts are `Decimal` with 2 dp, and the currency is stored on every money field's parent record. Contracts in a currency whose `minor_units` ≠ 2 are rejected at save until OQ-29 is decided (default). *(Amended 2026-10-16 after CLAUDE.md rule 7 change.)* **[svc + DB; AT-5]**
+
+### Amendments, termination, cancellation and corrections (added 2026-10-16, D9)
+38. Every approved contract has versions 1..n. The terms that apply to a day are those of the approved version with the latest `effective_date` ≤ that day (equal dates: higher `version_no`). Approved versions, their lines and price steps are never edited or deleted. **[model `save/delete` guard + svc `terms_on(contract, day)`; AT-22]**
+39. An amendment is drafted and submitted by accounting staff and takes effect only when the entity's CFO approves it; the approver is neither its creator nor its submitter. `reason_ar` is required. The effective date may be in the past (no lower limit other than `start_date`) or in the future. Default limits until OQ-23 is decided: entity, customer, currency and contract type cannot be amended (a new contract is needed); `billing_frequency`, `billing_timing` and `period_anchor` may change only with an effective date after the end of the last `generated` period. Each version is checked like a new contract: R1, R24, R25, R27, R29, R30. **[svc state machine + `core.access.require` (A); AT-22, AT-34, AT-36]**
+40. Early termination is a version of kind `termination`: `terminated_on` = `effective_date` − 1 day = last billable day. Cancellation is a version of kind `cancellation` with `effective_date` = `start_date`: nothing is billable. Both may have a past effective date, need CFO approval like R39, and on approval set `status=terminated` and `termination_kind`. **[svc; AT-9, AT-23, AT-24]**
+41. Approval of a version runs in one transaction under the entity's billing advisory lock (the same lock as runs, R11), so no run generates a period while terms change. It (a) sets `current_version`; (b) rebuilds only `planned`, `held` and `failed` periods for the new terms (cancel those outside the new range, add missing ones); (c) never changes, regenerates or re-bills a `generated` period or its documents; (d) runs the correction pass (R42). **[svc + advisory lock; AT-26, AT-27]**
+42. Correction pass: for every `generated` period that ends on or after the earliest effective date affected, and per `line_key`: `required_net` = Σ over the parts of the period governed by each version: `round(amount × part_days / period_days, 2)` (amount per R18 within that version; actual days, R16; ROUND_HALF_UP; a part after `terminated_on`, or under a cancellation, is 0). `delta` = `required_net` − `billed_net` (3.11). Per period and original invoice, negative deltas form one `credit` adjustment and positive deltas one `debit` adjustment. Delta 0 → nothing. Mid-period effect by actual days is the default for amendments (OQ-24); scheduled price steps keep the OQ-4 default. **[svc `compute_corrections(contract, user)`; AT-23 to AT-26]**
+43. For each adjustment, billing calls `invoicing.services.create_adjustment_from_billing(adjustment, user=<billing system user>)` (invoicing R73), which creates a **draft** credit note (`credit`) or debit note (`debit`), `source="system"`, in the contract currency, referencing the period's invoice (`original_document`), supply period = `supply_start`..`supply_end`, lines from the adjustment, `reason_ar`/`reason_en` from the version, `adjustment_event_date` = the version's `effective_date` (OQ-25). Billing never writes `SalesDocument` or journal rows itself (R13). **[svc → inv; AT-23]**
+44. Correction notes are **never issued automatically**, whatever `InvoicingSettings.auto_issue_from_approved_contract` says. A human reviewer (accounting staff) checks the draft, completes the fields invoicing requires (e.g. `payment_means_code`, invoicing R18) and submits it; the CFO approves (= issues) it under invoicing R57, not being the reviewer. The computed amounts are read-only for the reviewer (OQ-26). Agents and the billing system user cannot submit or approve. **[inv R57 + `core.access` R14; AT-23, AT-35]**
+45. Issued invoices and notes are never edited, cancelled or deleted (invoicing R13, R17). Notes are dated on their actual issue date in an open fiscal period; the supply period they refer to may lie in a closed period. If no open period covers the issue date, CFO approval fails and the note stays `submitted` (invoicing R28). Billing never reopens or backdates a period (R15, R23). **[inv + ledger `_find_open_period`; AT-28]**
+46. No double billing: (a) a `generated` period is never billed again (R11, R41c); (b) `billed_net` includes pending adjustments, so re-running the pass with no new version creates nothing; (c) when a later version is approved, every adjustment of the contract still `waiting_original`, `drafted` or `submitted` becomes `superseded` and its draft note is deleted (drafts only) before the pass recomputes; `issued`/`final` notes are kept and counted; (d) after all notes are final, for every generated period and line, invoice + debit notes − credit notes = `required_net`. Credit-note caps of invoicing R18 still apply. **[svc + DB unique 3.10; AT-26]**
+47. If the period's invoice is not yet `final` (awaiting ZATCA), the adjustment is created as `waiting_original` and its draft note is created when the invoice becomes `final` (credit/debit notes need a final original, invoicing R18/R19). If ZATCA rejects a correction note, the adjustment becomes `failed` and drops out of `billed_net`; the next pass (on the next version or on a human "recompute") creates a new one. **[svc callback; AT-29]**
+48. The reviewer may discard a draft (for example when the contract's terms forbid a refund) with a reason in Arabic (English optional). A discarded adjustment stays on the bilingual "unresolved billing differences" report for the entity and is not re-created by later passes for the same version; a later version or a human "recompute" may create a new one. **[svc + report; AT-30]**
+49. Secondment end (R19, `end_secondment`) needs no CFO approval (D6) and is a correction trigger like a version: an end date before already-billed days produces draft credit notes via R42 to R48; an end date moved later puts cancelled periods back to `planned` and produces draft debit notes for re-added days that had been credited. The notes themselves need review and CFO approval (R44). **[svc; AT-31]**
+50. Corrections stay inside the contract's entity; intercompany notes post to 1210 with `counterparty = counterparty_entity` (invoicing R4); nothing is created in the counterparty (R4, D10). Sharia checks of R29 run on every version line at save and approval; notes carry `requires_purification` from their lines. All version, adjustment and report texts are en/ar. **[svc + inv + ledger; AT-32, AT-36]**
+51. After a version is approved, the entity's accounting staff get an in-app summary (en/ar) of the adjustments created, waiting and superseded. **[svc; AT-23]**
 
 ## 5. Accounting
 
@@ -256,9 +272,25 @@ Billing posts nothing. Each generated invoice is posted by invoicing (`create_en
 
 **B5. Foreign-currency contract** (USD 1,000.00 net, S 15%, fixture rate 3.75 SAR/USD from ledger-fx): Dr 1200 4,312.50 / Cr 4100 3,750.00 / Cr 2200 562.50. How the currency amount and rate are stored on the JE is defined by ledger-fx.md (`JournalLine` has no currency field today).
 
-**B6. Credit note after early end** (R20/R21; mirror of the invoice for the unused days): Dr 4100/4110/4200/4210, Dr 2200 (if S), Cr 1200 or 1210 (+ counterparty). Issued and posted by invoicing (invoicing E4).
+**B6. Credit note after early end** (R40, R42 to R49; mirror of the invoice for the unused days): Dr 4100/4110/4200/4210, Dr 2200 (if S), Cr 1200 or 1210 (+ counterparty). Issued and posted by invoicing (invoicing E4) after CFO approval and ZATCA clearance.
 
-**No entry** for: contract approval, schedule creation, runs, held or failed periods, advance terms, deposit terms.
+**B7. Retroactive cancellation, credit note per billed month** (added 2026-10-16, D9; AT-23: commercial lease 10,000.00 S 15%, January invoice credited in full; note issued 2027-03-20, posted on that date in open 2027-03 even if 2027-01 is closed)
+| Account | Dr | Cr | Counterparty |
+|---|---|---|---|
+| 4100 Rental income | 10,000.00 | | |
+| 2200 VAT output | 1,500.00 | | |
+| 1200 Trade receivables | | 11,500.00 | |
+Same for February and March: three notes, one per original invoice.
+
+**B8. Backdated price increase, debit note** (added 2026-10-16, D9; AT-25: March delta net 1,032.26, VAT 154.84 at document level, invoicing R9)
+| Account | Dr | Cr | Counterparty |
+|---|---|---|---|
+| 1200 Trade receivables | 1,187.10 | | |
+| 4100 Rental income | | 1,032.26 | |
+| 2200 VAT output | | 154.84 | |
+A backdated decrease gives the B7 shape for the delta. Intercompany: 1210 + counterparty, 4110/4210 (R50).
+
+**No entry** for: contract approval, schedule creation, runs, held or failed periods, advance terms, deposit terms, contract versions, the correction pass, draft or discarded adjustments. Notes post only through invoicing (`post_entry` after ZATCA, invoicing R41).
 
 **Accounts missing** (not invented here; see invoicing OQ-22): deferred income for multi-month in-advance billing (OQ-2), customer advances, security deposits held, intercompany IP income, FX gain/loss.
 
@@ -299,7 +331,14 @@ Granted **per entity**. The role model is missing from `core` (invoicing OQ-25).
 | Start a manual run | Y | Y | Y | Y (scheduled) | | No |
 | Release `held` / `failed` period | Y | Y | Y | | | No |
 | Generate and issue invoices from active contracts | | | | Y (only) | | No |
-| Issue credit note drafts from R20/R21 | | Y | Y | | | No |
+| Issue credit note drafts from R20/R21 | *Withdrawn — see D9 (rows below)* | | | | | |
+| Draft / submit amendment, termination or cancellation version (R39, R40) | Y | Y | Y | | | No (default, OQ-28) |
+| Approve version (R39, R40) | | Y (not creator/submitter) | | | | No |
+| Create draft correction notes (R43) | | | | Y (only) | | No |
+| Review, complete and submit, or discard, a correction draft (R44, R48) | Y | | Y | | | No |
+| Approve (= issue) correction note (R44; invoicing R57) | | Y (not reviewer) | | | | No |
+| Request "recompute corrections" (R47, R48) | Y | Y | Y | | | No |
+| View versions, adjustments, unresolved-differences report | Y | Y | Y | | Y | Scoped, if granted |
 | View contracts, schedules, runs | Y | Y | Y | | Y | Scoped, if granted |
 | View `employee_ref` on secondments | Y | Y | Y | | Masked | No |
 
@@ -316,8 +355,8 @@ Fixtures: entities ALM (parent, SAR, Sharia enforced, VAT number) and SUB (child
 | AT-5 | Lease 10,000.00/month, `calendar` anchor, start 2027-01-15; amount given as float | Approve; run 2027-01-15; save float | January factor 17/31; net 5,483.87; February 10,000.00. Float rejected (R16, R37). |
 | AT-6 | Contract end 2027-06-20, monthly in arrears | Runs through 2027-07-01, then run 2027-08-01 | June factor 20/30, net = round(amount × 20/30, 2). Status `ended` after the June invoice. August run: nothing generated (R9, R22). |
 | AT-7 | ALM → SUB secondment, 31,000.00/month, arrears, S; S records end date 2027-03-10 | Run 2027-04-01 | March invoice net 10,000.00, VAT 1,500.00, JE as B3 with counterparty SUB. April onward `cancelled`. No later invoices (R19). |
-| AT-8 | Secondment billed in advance; April invoice `final`; end date recorded as 2027-04-10 | `end_secondment` | Draft credit note for 20/30 of April. Not issued until an accountant issues it. Recording the same date again: no-op (R20, 3.6). |
-| AT-9 | Annual vehicle rental, monthly in arrears; termination on 2027-05-15 recorded by S | Before and after C approves | Before: billing unchanged. After: May prorated 15/31; June onward `cancelled`; status `terminated` (R21). |
+| AT-8 | *Withdrawn — see D9 (now AT-31).* | | |
+| AT-9 | Annual vehicle rental, monthly in arrears; termination version with `terminated_on` 2027-05-15 drafted by S | Before and after C approves | Before: billing unchanged. After: May prorated 15/31; June onward `cancelled`; status `terminated`, `termination_kind=early_termination` (R40; was R21). |
 | AT-10 | Fiscal period 2027-03 closed; March period due | Run 2027-03-02. Separately: run on 2027-04-01 with a catch-up period whose supply period is wholly in closed 2027-02 | First: item `failed` "period closed" (en/ar), no document or number consumed, retried next run. Second: period `held`, no invoice until released (R23). |
 | AT-11 | ALM customer with `group_entity=SUB`; IC rental contract 5,000.00 S | Approve and run | Contract `counterparty_entity=SUB` (not editable). Invoice is a standard VAT invoice; JE Dr 1210 5,750.00 (counterparty SUB) / Cr 4110 5,000.00 / Cr 2200 750.00. No record created in SUB. An IC IP line → rejected (R3, R4, R26, R27). |
 | AT-12 | Residential lease line with category S; then E with exemption reason; commercial lease line with E | Save / approve | First and third rejected. Second accepted; invoice has no VAT; JE as B2 (R24). |
@@ -331,13 +370,33 @@ Fixtures: entities ALM (parent, SAR, Sharia enforced, VAT number) and SUB (child
 | AT-20 | Agent service user | Creates a draft contract; tries to approve, release, end a secondment, start a run | Draft allowed (`source=agent:<name>`). The rest rejected (R36). |
 | AT-21 | Any contract, line, status, run message | Render in `ar` and `en` | Arabic and English shown. Missing Arabic description rejected at save. |
 
+Added 2026-10-16 (D8 to D10). Common fixture for AT-23 to AT-30: ALM commercial lease L1, 10,000.00/month net, S 15%, monthly in advance, `calendar` anchor, start 2027-01-01, end 2027-12-31, version 1 approved by C; invoices for the months named are `final` unless stated. Notes are submitted by S and approved by C unless stated.
+
+| # | Given | When | Then |
+|---|---|---|---|
+| AT-22 | L1 approved (version 1) | S drafts version 2 (amount 11,000.00, effective 2027-02-01, `reason_ar` set) and submits; S approves; C approves; anyone edits version 1 or 2 afterwards | S approval rejected (not CFO / own). C: version 2 `approved`, `current_version` = 2, `version_approved` event. Edits of approved versions rejected. Version 2 without `reason_ar`: rejected at submit (R38, R39). |
+| AT-23 | L1, January to March invoiced; on 2027-03-20 S records that the lease never started | S drafts a `cancellation` version; C approves it | Three `credit` adjustments, one per original invoice, each net 10,000.00, VAT 1,500.00; three **draft** credit notes with `source=system`, `original_document` = the month's invoice, supply period = the month; none issued. Status `terminated`, `termination_kind=cancellation`; April to December periods `cancelled`; the 2027-04-01 run generates nothing. Staff summary sent (en/ar). After S submits (with `payment_means_code`) and C approves each, then ZATCA stub `cleared`: JEs as B7 dated 2027-03-20. The three issued invoices are unchanged (R40 to R45, R51). |
+| AT-24 | L1, January to March invoiced; on 2027-03-20 S records a termination with `terminated_on` 2027-01-15 | C approves | January: `credit` net 5,161.29 (= 10,000.00 − round(10,000.00 × 15/31, 2) = 10,000.00 − 4,838.71), VAT 774.19. February and March: `credit` net 10,000.00 each. April onward `cancelled` (R40, R42). |
+| AT-25 | L1, March to May invoiced at 10,000.00; on 2027-05-10 S records a price change to 12,000.00 effective **2027-03-16** | C approves version 2 | March: `debit` net 1,032.26 (= round(10,000.00 × 15/31, 2) 4,838.71 + round(12,000.00 × 16/31, 2) 6,193.55 − 10,000.00), VAT 154.84, gross 1,187.10 (B8). April and May: `debit` net 2,000.00 each. Three draft debit notes. The June run invoices 12,000.00. A decrease to 9,000.00 instead: same shape with `credit` adjustments (R42, R43). |
+| AT-26 | AT-25 done; drafts not yet issued | (a) "recompute" with no new version; (b) re-run billing for March to May; (c) S/C issue only the April debit note, then C approves version 3 (back to 10,000.00 effective 2027-04-01) | (a) nothing created. (b) every item `skipped_already_billed`, no document, no number consumed. (c) March and May drafts `superseded` and deleted (drafts only); April debit note kept. New pass: March `debit` 1,032.26 (version 2 still governs 16 to 31 March); April `credit` 2,000.00; May nothing. After all notes final, per period invoice + DN − CN = required: March 11,032.26, April 10,000.00, May 10,000.00. No period has two invoices (R41, R46). |
+| AT-27 | A billing run for ALM holds the advisory lock | C approves a version for an ALM contract at the same moment | Approval waits for the lock (or fails with a bilingual "billing run in progress, retry" message); no period is both generated with old terms after approval and left uncorrected (R41). |
+| AT-28 | AT-24 setup; fiscal 2027-01 and 2027-02 closed; 2027-03 open; then 2027-03 closed and 2027-04 open | C approves the January credit note on 2027-03-22; separately approves a note on a date whose period is closed | First: JE dated 2027-03-22 in 2027-03; note's supply period 2027-01-16 to 2027-01-31. Second: approval rejected "period closed" (en/ar), note stays `submitted`, no number consumed. No period reopened (R45). |
+| AT-29 | March invoice issued, ZATCA stub `pending` | C approves a version effective 2027-03-01; then stub returns `cleared` for March; later ZATCA rejects the March correction note | March adjustment `waiting_original`, no draft note; after clearance, draft note created. After rejection: adjustment `failed`; the next "recompute" creates a new adjustment and draft; the rejected note keeps its number (R47). |
+| AT-30 | AT-25 drafts exist | S discards the April draft without a reason; then with `discard_reason_ar` | First rejected. Second: adjustment `discarded`, shown on the unresolved-differences report (en/ar) for ALM only; a "recompute" for the same version does not re-create it; a new version does (R48). |
+| AT-31 | ALM → SUB secondment, 30,000.00/month, advance, S; April invoice `final`; S records end date 2027-04-10 | `end_secondment`; then the same date again; then, after the April credit note is final, end date moved to 2027-04-20 | Draft credit note net 20,000.00 (= 30,000.00 − round(30,000.00 × 10/30, 2)), not issued until S submits and C approves; May onward `cancelled`. Same date again: no-op. Moved later: May stays cancelled, draft debit note net 10,000.00 for 11 to 20 April (R19, R49). |
+| AT-32 | ALM IC rental contract with SUB, 5,000.00 S, January invoiced | On 2027-02-10 C approves a retroactive cancellation | Draft credit note on 1210 with counterparty SUB (Dr 4110 5,000.00, Dr 2200 750.00, Cr 1210 5,750.00 on final). No document or bill created in SUB (R4, R50, D10). |
+| AT-33 | Agent service user with draft-contract rights | Drafts a version; submits or discards a correction; approves a version or a note | All rejected (R44, OQ-28 default). |
+| AT-34 | L1 with March invoiced | Versions: effective 2026-12-01 (before start); currency USD; customer changed; frequency `quarterly` effective 2027-02-01 | All rejected at submit with bilingual messages. Frequency change effective 2027-04-01 (after the last generated period): accepted (R39). |
+| AT-35 | ALM `auto_issue_from_approved_contract=True` | Run generates April invoice; a version creates a correction | Invoice issued with no per-invoice approval, `approved_by` = contract approver (D8). Correction note stays `draft`; the billing system user's submit or approve call is rejected (R35, R44). |
+| AT-36 | ALM Sharia enforced | Version adds a line on a `sharia_prohibited` account; a version line on 4900; render version, adjustment and report in `ar` | First rejected at save and approval. Second accepted; resulting notes `requires_purification=True`. Arabic text shown everywhere (R39, R50). |
+
 ## 9. Open questions
 
 **BLOCKING** = the builder cannot build that part without an answer. **Default** = safe default used in the rules, easy to change.
 
 | # | Question | Owner | Status |
 |---|---|---|---|
-| OQ-1 | Do auto-generated invoices from a CFO-approved contract need per-invoice approval, e.g. above an amount, or for intercompany? | Project owner / CFO | Default: no; contract approval suffices (R35). **Flagged for confirmation.** |
+| OQ-1 | Do auto-generated invoices from a CFO-approved contract need per-invoice approval, e.g. above an amount, or for intercompany? | Project owner / CFO | **Resolved by D8**: no per-invoice approval (R35). Correction notes are not covered and always need CFO approval (D9, R44). |
 | OQ-2 | Revenue recognition for multi-month in-advance billing (quarterly/annual): invoicing credits income in full at issue, and there is no deferred income account (invoicing OQ-22). | Accountant | **BLOCKING** for `advance` timing with non-monthly frequency. Default: such contracts cannot be approved until the account and deferral method exist. |
 | OQ-3 | Proration method (actual days vs 30/360 vs whole months) and period anchor (calendar vs contract start). | Accountant | Default: actual days; `calendar` anchor (R16, R17). |
 | OQ-4 | Escalation types: fixed %, fixed amount, compounding, index-linked (index-linked needs a Sharia check), mid-period effect. | Accountant + Sharia board | Default: explicit stepped amounts only, from the next period. |
