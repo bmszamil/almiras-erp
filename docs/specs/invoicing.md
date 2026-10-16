@@ -2,7 +2,8 @@
 
 **Compliance status: reviewed 2026-10-16 from search excerpts only; official documents not yet read; re-check required before go-live.** (Record: `docs/compliance/track-a-2026-10-16.md`.)
 
-Django app: `invoicing`. Status: **draft spec. No business decisions recorded yet** (see section 2). Written 2026-10-16; revised 2026-10-16 (compliance review applied).
+Django app: `invoicing`. Status: **draft spec.** Written 2026-10-16; revised 2026-10-16 (compliance review applied); revised 2026-10-16 (project-owner decisions D10 to D19 recorded).
+Depends on (written in parallel): `docs/specs/ledger-fx.md` (document currency, rates, FX differences; D13), `docs/specs/billing.md` (contracts and billing schedules; D15, D17).
 **[CC-verify]** = tax/ZATCA statement not yet checked against official text. **[CC-verify: search excerpt 2026-10-16]** = adopted from the 2026-10-16 review, which read only search excerpts (official ZATCA/SDAIA pages were unreachable); not verified.
 Companion spec: `docs/specs/zatca.md` (ZATCA Phase 2 e-invoicing), written in parallel. Hand-off points are in sections 4 (rules R40 to R46) and 6.
 
@@ -12,7 +13,7 @@ The invoicing module keeps the customer and vendor sub-ledgers for **every entit
 
 ## 2. Decisions
 
-**The Managing Partner and the accountant have not recorded any business decisions for this module yet.** The table lists only what CLAUDE.md, the README and the existing code already fix. Every other business choice is in section 9.
+D1 to D9 are fixed by CLAUDE.md, the README and existing code. D10 to D19 were given by the project owner in the build session on 2026-10-16. Every other business choice is in section 9.
 
 | # | Decision | Source | Date |
 |---|---|---|---|
