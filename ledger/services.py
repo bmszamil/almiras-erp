@@ -53,6 +53,7 @@ FX_GAIN_UNREALISED = "4710"
 FX_LOSS_REALISED = "5750"
 FX_LOSS_UNREALISED = "5760"
 FX_ROUNDING = "5770"
+TRANSLATION_RESERVE = "3400"
 ACTUAL_BANK_RATE = "Actual bank rate / سعر البنك الفعلي"
 
 
@@ -102,8 +103,15 @@ def validate_entry(entry):
             problems.append(f"Account {acc.code} belongs to another entity.")
         if not acc.is_postable or not acc.is_active:
             problems.append(f"Account {acc.code} is not open for posting.")
-        if acc.sharia_prohibited and entry.entity.sharia_enforced:
+        # A reversal only undoes what was booked (e.g. before the entity enforced Sharia): never blocked here.
+        if acc.sharia_prohibited and entry.entity.sharia_enforced and entry.reversal_of_id is None:
             problems.append(f"Account {acc.code} ({acc.name_en}) is Sharia-prohibited.")
+        if acc.code == TRANSLATION_RESERVE:  # R46, OQ-6: report-only, in every entity
+            problems.append(
+                f"Account {TRANSLATION_RESERVE} (translation reserve) is used by the translation report only; "
+                "nothing posts to it. / "
+                f"الحساب {TRANSLATION_RESERVE} (احتياطي ترجمة العملات) للتقرير فقط؛ لا يُرحَّل إليه شيء."
+            )
         if acc.is_intercompany and line.counterparty_entity_id is None:
             problems.append(f"Intercompany account {acc.code} needs a counterparty entity.")
         if line.counterparty_entity_id == entry.entity_id:
@@ -1270,8 +1278,15 @@ def rerate_entry(entry, *, user):
     access.require(user, entry.entity, "ledger.create_entry")
     if entry.status != JournalEntry.Status.DRAFT:
         raise error("Only draft entries can be re-rated.", "يمكن إعادة تسعير المسودات فقط.")
-    functional = entry.entity.base_currency_id
     lines = list(entry.lines.all())
+    if any(l.line_kind in (Kind_.SETTLEMENT, Kind_.REALISED_FX) for l in lines):
+        # Re-rating the counter line alone would leave the realised FX line wrong; build it again instead.
+        raise error(
+            "A settlement draft is not re-rated: discard it and build its lines again with fx_settlement_lines for the new date.",
+            "لا يُعاد تسعير مسودة تسوية: احذفها وأعد بناء بنودها بخدمة بنود التسوية للتاريخ الجديد.",
+            code="rerate_settlement",
+        )
+    functional = entry.entity.base_currency_id
     for line in lines:
         if line.line_kind == Kind_.ROUNDING:
             line.delete()

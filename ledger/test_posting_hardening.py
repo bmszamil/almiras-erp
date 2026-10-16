@@ -878,3 +878,22 @@ def test_concurrent_settlements_cannot_over_settle():
     assert "is open" in result["outcome"], result
     assert JournalEntry.objects.get(pk=mar.pk).status == "draft"
     assert services._open_item(item) == (D("0.000"), D("0.00"))
+
+
+# --- item 16: reversals are never blocked by the Sharia check ---------------------------------------
+
+def test_reversal_of_an_entry_booked_before_sharia_enforcement_is_allowed(w):
+    from core import services as core_services
+
+    conv = setup_entity("CONV", "full", w.alm, sharia_enforced=False)
+    member(w.clerk, conv, "accountant")
+    member(w.cfo, conv, "approver")
+    Account.objects.create(entity=conv, code="4950", name_en="Interest income", name_ar="إيرادات فوائد", type="income",
+                           sharia_prohibited=True)
+    interest = post(w, draft(w, [{"account": "1100", "debit": 50}, {"account": "4950", "credit": 50}], entity=conv))
+    core_services.change_entity_settings(conv, user=w.mp, reason="Now Sharia-compliant", sharia_enforced=True)
+    new = draft(w, [{"account": "1100", "debit": 5}, {"account": "4950", "credit": 5}], entity=conv)
+    with pytest.raises(LedgerError, match="Sharia-prohibited"):  # new postings are blocked (rule 5)
+        post(w, new)
+    rev = services.reverse_entry(interest, access.require(w.clerk, conv, "ledger.reverse_entry", document=interest))
+    assert rev.status == "posted" and status(interest) == "reversed"  # undoing the old income is allowed

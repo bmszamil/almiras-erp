@@ -1237,3 +1237,39 @@ def test_settlement_locks_the_item_it_settles(w):
     assert any(str(item.pk) in sql for sql in locks)  # the settled item is read in the lock step
     if connection.features.has_select_for_update:
         assert all("FOR UPDATE" in sql for sql in locks)
+
+
+# --- item 15: settlement drafts are rebuilt, not re-rated -------------------------------------------
+
+def test_rerate_refuses_settlement_drafts(w):
+    inv = f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 2, 20), "4.1250")
+    lines = services.fx_settlement_lines(w.alm, date(2027, 2, 20), line_on(inv, "1200"), "10000.00", "1100", user=w.clerk)
+    entry = draft(w, w.alm, date(2027, 2, 20), lines)
+    assert entry.lines.filter(line_kind="realised_fx").exists()
+    with pytest.raises(LedgerError, match="fx_settlement_lines"):
+        services.rerate_entry(entry, user=w.clerk)
+    assert JournalEntry.objects.get(pk=entry.pk).modified_by is None  # nothing changed
+
+
+# --- R46 / AT-33: 3400 is report-only in every entity ---------------------------------------------
+
+@pytest.mark.parametrize("entity_name", ["alm", "egy"])
+def test_at33_no_posting_to_translation_reserve(w, entity_name):
+    entity = getattr(w, entity_name)
+    lines = [{"account": "1100", "debit": "10.00"}, {"account": "3400", "credit": "10.00"}]
+    entry = draft(w, entity, date(2027, 1, 10), lines)  # drafted by the accountant
+    for approver in (w.cfo, w.mp):  # the CFO and the Managing Partner alike
+        with pytest.raises(LedgerError) as exc:
+            post(w, entry, approver=approver)
+        text = problems_text(exc)
+        assert "3400" in text and "translation report only" in text and "للتقرير فقط" in text
+    assert JournalEntry.objects.get(pk=entry.pk).status == "draft"
+    from testdocs.models import Bill
+
+    bill = Bill.objects.create(entity=entity, created_by=w.clerk)
+    before = JournalEntry.objects.count()
+    with pytest.raises(LedgerError, match="3400"):  # nor through a sub-ledger document's posting
+        services.create_entry(entity, date(2027, 1, 10), "Bill", lines, user=w.clerk, post=True, document=bill,
+                              grant=access.require(w.mp, entity, "invoicing.approve_bill", document=bill))
+    assert JournalEntry.objects.count() == before
