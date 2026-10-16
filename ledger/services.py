@@ -373,13 +373,25 @@ def _clearance_approver(entity, user, grant, posted_by, document, doc_type, crea
 
 
 def _purification_flags(entry, lines):
-    """CLAUDE.md rule 5, invoicing R6: income lines to purify are flagged at posting.
+    """CLAUDE.md rule 5, invoicing R6: the lines of ``entry`` that carry non-compliant income, set at posting.
 
-    A credit on an account flagged ``requires_purification`` (4900), or on a
-    Sharia-prohibited income account (which can only post in an entity that
-    does not enforce Sharia), is non-compliant income. Debits on those
-    accounts (the purification transfer E14, reversals) are not flagged.
+    In an ordinary entry, a credit on an account flagged
+    ``requires_purification`` (4900), or on a Sharia-prohibited income
+    account (which can only post in an entity that does not enforce
+    Sharia), is non-compliant income. Debits on those accounts (the
+    purification transfer E14) are not flagged.
+
+    A reversal flags exactly the lines that mirror flagged lines of the
+    original, so the flags carry their sign: a reversed income line is a
+    flagged debit and nets the original to zero, and reversing a
+    purification transfer (an unflagged debit) creates no new income.
     """
+    if entry.reversal_of_id:
+        original = list(JournalLine.objects.filter(entry_id=entry.reversal_of_id).order_by("pk"))
+        mine = sorted(lines, key=lambda l: l.pk)
+        if len(original) != len(mine):
+            raise error("A reversal mirrors every line of its entry.", "العكس يقابل كل بنود القيد.")
+        return [rev.pk for rev, orig in zip(mine, original) if orig.requires_purification]
     return [
         line.pk for line in lines
         if line.credit > ZERO and line.line_kind == Kind_.NORMAL and (
@@ -387,6 +399,31 @@ def _purification_flags(entry, lines):
             or (line.account.sharia_prohibited and line.account.type == Account.Type.INCOME)
         )
     ]
+
+
+def signed_purification(lines):
+    """Net non-compliant income of ``lines``: flagged credits minus flagged debits (rule 5).
+
+    Pure helper over lines the caller has read; reversals net their original to zero.
+    """
+    return sum(((l.credit - l.debit) for l in lines if l.requires_purification), ZERO)
+
+
+def purification_amount(entity, *, user, as_of=None, date_from=None):
+    """Non-compliant income of ``entity`` still to purify from booked entries, signed (rule 5, invoicing R6).
+
+    Flagged credits minus flagged debits on posted and reversed entries
+    (a reversal cancels its original). The purification transfers
+    themselves (Dr 4900 / Cr 2600) are not flagged and do not reduce it;
+    what was transferred is on 2600. ``user`` needs ``ledger.view``.
+    """
+    access.require(user, entity, "ledger.view")
+    qs = JournalLine.objects.filter(entry__entity=entity, entry__status__in=BOOKED, requires_purification=True)
+    if as_of is not None:
+        qs = qs.filter(entry__date__lte=as_of)
+    if date_from is not None:
+        qs = qs.filter(entry__date__gte=date_from)
+    return signed_purification(qs.only("debit", "credit", "requires_purification"))
 
 
 def _lock_for_posting(entry):
@@ -424,9 +461,12 @@ def _post(entry, posted_by):
     if problems:
         raise LedgerError(problems)
     entry.period = period
-    flagged = _purification_flags(entry, list(entry.lines.select_related("account")))
-    if flagged:  # still a draft here, so the line lock allows it
-        JournalLine.objects.filter(pk__in=flagged).update(requires_purification=True)
+    lines = list(entry.lines.select_related("account"))
+    flagged = set(_purification_flags(entry, lines))
+    wrong = [l.pk for l in lines if l.requires_purification != (l.pk in flagged)]
+    if wrong:  # still a draft here, so the line lock allows it; flags are set only here
+        for pk in wrong:
+            JournalLine.objects.filter(pk=pk).update(requires_purification=pk in flagged)
     entry.number = _next_number(entry.entity, entry.date.year)
     entry.status = JournalEntry.Status.POSTED
     entry.posted_by = posted_by

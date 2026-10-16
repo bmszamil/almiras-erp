@@ -701,10 +701,39 @@ def test_purification_flag_set_at_posting(w):
     # The purification transfer itself (Dr 4900 / Cr 2600, invoicing E14) is not income to purify.
     transfer = post(w, draft(w, [{"account": "4900", "debit": 1000}, {"account": "2600", "credit": 1000}]))
     assert not JournalLine.objects.filter(entry=transfer, requires_purification=True).exists()
-    # A reversal's lines are debits on 4900: not flagged; the original keeps its flag.
+    assert services.purification_amount(w.alm, user=w.clerk) == D("1000")
+    # A reversal flags the mirror of the flagged line, a debit, so the income nets to zero; the original keeps its flag.
     rev = services.reverse_entry(posted, access.require(w.clerk, w.alm, "ledger.reverse_entry", document=posted))
-    assert not JournalLine.objects.filter(entry=rev, requires_purification=True).exists()
+    mirrored = JournalLine.objects.get(entry=rev, requires_purification=True)
+    assert (mirrored.account.code, mirrored.debit) == ("4900", D("1000.00"))
     assert JournalLine.objects.filter(entry=posted, requires_purification=True).count() == 1
+    assert services.purification_amount(w.alm, user=w.clerk) == D("0")
+
+
+def test_p7_reversing_a_purification_transfer_creates_no_new_income(w):
+    """P7 (reviewer probe): the reversal of Dr 4900 / Cr 2600 was a Cr 4900 line flagged as new income."""
+    post(w, draft(w, [{"account": "1100", "debit": 100}, {"account": "4900", "credit": 100}]))
+    transfer = post(w, draft(w, [{"account": "4900", "debit": 100}, {"account": "2600", "credit": 100}]))
+    rev = services.reverse_entry(transfer, access.require(w.clerk, w.alm, "ledger.reverse_entry", document=transfer))
+    assert not JournalLine.objects.filter(entry=rev, requires_purification=True).exists()
+    assert services.purification_amount(w.alm, user=w.clerk) == D("100")
+    assert services.purification_amount(w.alm, user=w.clerk, as_of=date(2026, 12, 31)) == D("0")
+    viewer = make_user("outsider")
+    member(viewer, w.sub, "viewer")
+    with pytest.raises(access.AccessDenied):
+        services.purification_amount(w.alm, user=viewer)
+
+
+def test_purification_flags_are_set_only_at_posting(w):
+    entry = draft(w, [{"account": "1100", "debit": 10}, {"account": "3100", "credit": 10}])
+    JournalLine.objects.filter(entry=entry).update(requires_purification=True)  # a draft line flagged by hand
+    posted = post(w, entry)
+    assert not JournalLine.objects.filter(entry=posted, requires_purification=True).exists()
+    assert services.signed_purification([
+        JournalLine(debit=D("0"), credit=D("5"), requires_purification=True),
+        JournalLine(debit=D("2"), credit=D("0"), requires_purification=True),
+        JournalLine(debit=D("0"), credit=D("9"), requires_purification=False),
+    ]) == D("3")
 
 
 def test_prohibited_income_flagged_where_it_can_post(w):
