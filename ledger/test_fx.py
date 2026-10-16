@@ -548,7 +548,7 @@ def test_r18_over_settlement_and_wrong_settlements_rejected(w):
         {"account": "1100", "currency": "EUR", "txn_debit": "100.00"},
         {"account": "1200", "currency": "EUR", "txn_credit": "100.00", "settles_line": item, "credit": "412.50"},
     ])
-    with pytest.raises(LedgerError, match="neither the carrying rate"):
+    with pytest.raises(LedgerError, match="at the carrying rate"):
         post(w, entry)
     # settling another entity's line
     with pytest.raises(LedgerError, match="another entity"):
@@ -1016,3 +1016,53 @@ def test_rerate_needs_draft_rights_in_that_entity(w):
     post(w, entry)
     with pytest.raises(LedgerError, match="Only draft"):
         services.rerate_entry(entry, user=w.clerk)
+
+
+# --- R18: no residue after the final settlement (P3); settlements serialised per item --------------
+
+def _tiny_invoice(w):
+    """EUR 0.03 at 4.175 = SAR 0.13; two settlements of 0.01 clear 0.04 each, leaving 0.01 EUR / 0.05 SAR."""
+    rate("EUR", "SAR", date(2027, 1, 15), "4.175")
+    inv = book(w, w.alm, date(2027, 1, 15), [
+        {"account": "1200", "currency": "EUR", "txn_debit": "0.03"},
+        {"account": "4100", "currency": "EUR", "txn_credit": "0.03"},
+    ])
+    item = line_on(inv, "1200")
+    rate("EUR", "SAR", date(2027, 2, 1), "4.175")
+    for _ in range(2):
+        book(w, w.alm, date(2027, 2, 1), [
+            {"account": "1100", "currency": "EUR", "txn_debit": "0.01"},
+            {"account": "1200", "currency": "EUR", "txn_credit": "0.01", "settles_line": item},
+        ])
+    return item
+
+
+def test_p3_final_settlement_must_clear_the_remaining_functional_balance(w):
+    """P3 (reviewer probe): a final settlement at the carrying-rate formula left SAR 0.01 on a cleared item."""
+    item = _tiny_invoice(w)
+    assert services._open_item(item) == (D("0.010"), D("0.05"))
+    formula = draft(w, w.alm, date(2027, 2, 1), [
+        {"account": "1100", "currency": "EUR", "txn_debit": "0.01"},
+        {"account": "1200", "currency": "EUR", "txn_credit": "0.01", "credit": "0.04", "settles_line": item},
+    ])
+    with pytest.raises(LedgerError, match="remaining balance 0.05"):
+        post(w, formula)
+    lines = services.fx_settlement_lines(w.alm, date(2027, 2, 1), item, "0.01", "1100", user=w.clerk)
+    book(w, w.alm, date(2027, 2, 1), lines)
+    assert services._open_item(item) == (D("0.000"), D("0.00"))
+    assert balance(w.alm, "1200") == (D("0"), D("0"))
+
+
+def test_settlement_locks_the_item_it_settles(w):
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    item = _tiny_invoice(w)
+    lines = services.fx_settlement_lines(w.alm, date(2027, 2, 1), item, "0.01", "1100", user=w.clerk)
+    entry = draft(w, w.alm, date(2027, 2, 1), lines)
+    with transaction.atomic(), CaptureQueriesContext(connection) as ctx:
+        services._lock_for_posting(entry)
+    locks = [q["sql"].upper() for q in ctx.captured_queries if "LEDGER_JOURNALLINE" in q["sql"].upper()]
+    assert any(str(item.pk) in sql for sql in locks)  # the settled item is read in the lock step
+    if connection.features.has_select_for_update:
+        assert all("FOR UPDATE" in sql for sql in locks)

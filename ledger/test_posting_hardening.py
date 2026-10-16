@@ -796,3 +796,56 @@ def test_period_lock_query_is_for_update(w):
         assert "FOR UPDATE" in sql
     else:  # SQLite: no row locks; writes are serialised by the database lock
         assert "LEDGER_FISCALPERIOD" in sql
+
+
+@postgres_only
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_settlements_cannot_over_settle():
+    """Item 3: two settlements of one item in different periods; the second waits for the first and is refused."""
+    from core.access.models import Role, RolePermission
+    from core.access.seed import apply_seed
+    from core.currency_seed import apply_currency_seed
+    from core.models import Currency
+    from ledger.models import ExchangeRate
+
+    apply_seed(Role, RolePermission)
+    apply_currency_seed(Currency)
+    alm = setup_entity("ALM", "parent")
+    clerk, cfo = make_user("clerk"), make_user("cfo")
+    member(clerk, alm, "accountant")
+    member(cfo, alm, "approver")
+    for d in (date(2027, 1, 15), date(2027, 2, 1), date(2027, 3, 1)):
+        ExchangeRate.objects.create(date=d, from_currency_id="EUR", to_currency_id="SAR", rate=D("4.1"), created_by=clerk)
+    inv = services.create_entry(alm, date(2027, 1, 15), "Invoice", [
+        {"account": "1200", "currency": "EUR", "txn_debit": "100.00"},
+        {"account": "4100", "currency": "EUR", "txn_credit": "100.00"}], user=clerk)
+    services.post_entry(inv, access.require(cfo, alm, "ledger.post_entry", document=inv))
+    item = JournalLine.objects.get(entry=inv, account__code="1200")
+    feb, mar = (
+        services.create_entry(alm, d, "Receipt", services.fx_settlement_lines(alm, d, item, "100.00", "1100", user=clerk),
+                              user=clerk)
+        for d in (date(2027, 2, 1), date(2027, 3, 1))
+    )
+    feb_grant = access.require(cfo, alm, "ledger.post_entry", document=feb)
+    mar_grant = access.require(cfo, alm, "ledger.post_entry", document=mar)
+    result = {}
+
+    def second():
+        try:
+            services.post_entry(mar, mar_grant)
+            result["outcome"] = "posted"
+        except LedgerError as exc:
+            result["outcome"] = " ".join(exc.messages)
+        finally:
+            connections.close_all()
+
+    with transaction.atomic():
+        services.post_entry(feb, feb_grant)  # holds the item's lock until this block commits
+        thread = threading.Thread(target=second)
+        thread.start()
+        thread.join(timeout=1.5)
+        assert thread.is_alive(), "the second settlement should wait for the item lock"
+    thread.join(timeout=10)
+    assert "is open" in result["outcome"], result
+    assert JournalEntry.objects.get(pk=mar.pk).status == "draft"
+    assert services._open_item(item) == (D("0.000"), D("0.00"))

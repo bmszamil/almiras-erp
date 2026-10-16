@@ -243,11 +243,16 @@ def _settlement_problems(entry, line, where, is_reversal, consumed):
         return problems + [
             f"{where}: settles {line.txn_amount} but only {open_txn} is open. / يسوي {line.txn_amount} والمفتوح {open_txn} فقط."
         ]
-    final = line.txn_amount == open_txn
-    if amount != fx.convert(line.txn_amount, line.fx_rate) and not (final and amount == open_func):
+    if line.txn_amount == open_txn:  # the final settlement clears exactly what is left: no residue (R18)
+        if amount != open_func:
+            problems.append(
+                f"{where}: this settlement clears the item, so its amount must be the remaining balance {open_func}, "
+                f"not {amount}. / هذه التسوية تُقفل البند، فيجب أن يكون مبلغها الرصيد المتبقي {open_func} وليس {amount}."
+            )
+    elif amount != fx.convert(line.txn_amount, line.fx_rate):
         problems.append(
-            f"{where}: settlement amount {amount} matches neither the carrying rate nor the remaining balance. / "
-            f"مبلغ التسوية {amount} لا يطابق السعر الدفتري ولا الرصيد المتبقي."
+            f"{where}: settlement amount {amount} should be {fx.convert(line.txn_amount, line.fx_rate)} at the carrying "
+            f"rate. / مبلغ التسوية {amount} يجب أن يكون {fx.convert(line.txn_amount, line.fx_rate)} بالسعر الدفتري."
         )
     consumed[item.pk][0] += line.txn_amount
     consumed[item.pk][1] += amount
