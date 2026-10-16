@@ -211,6 +211,7 @@ class RoleAdmin(ReadOnlyAdmin):
 
 class UserProfileInline(admin.StackedInline):
     model = UserProfile
+    fk_name = "user"  # UserProfile also has created_by -> User
     can_delete = False
     fields = ["kind", "system_code", "agent_name", "display_name_en", "display_name_ar", "preferred_language",
               "allow_external_ai", "created_by"]
