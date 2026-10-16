@@ -13,6 +13,7 @@ from core.models import Entity
 from ledger import services
 from ledger.models import JournalEntry, LedgerError
 from ledger.services_setup import create_monthly_periods, install_chart_of_accounts
+from testdocs.models import Bill, SalesDocument
 
 pytestmark = pytest.mark.django_db
 CASH = [{"account": "1100", "debit": 10}, {"account": "3100", "credit": 10}]
@@ -41,13 +42,20 @@ def draft(w, entity, lines=CASH, d=date(2027, 1, 10)):
     return services.create_entry(entity, d, "Manual journal", lines, user=w.clerk)
 
 
-def bill(entity, created_by, pk=7):
-    return SimpleNamespace(pk=pk, _meta=SimpleNamespace(label_lower="invoicing.bill"), created_by_id=created_by.pk, submitted_by_id=None)
+def bill(entity, created_by):
+    """A stored test bill (testdocs.Bill, registered for invoicing.approve_bill)."""
+    return Bill.objects.create(entity=entity, created_by=created_by)
 
 
-def sales_invoice(created_by, pk=11):
-    return SimpleNamespace(pk=pk, _meta=SimpleNamespace(label_lower="invoicing.salesdocument"), created_by_id=created_by.pk,
-                           submitted_by_id=None)
+def sales_invoice(entity, created_by):
+    return SalesDocument.objects.create(entity=entity, created_by=created_by)
+
+
+def approve(user, entity, document):
+    """An approval that was given and used (as the sub-ledger module would use it on approval)."""
+    grant = access.require(user, entity, "invoicing.approve_sales_document", document=document)
+    access.use_grant(grant, target=document)
+    return grant
 
 
 def status(entry):
@@ -64,11 +72,17 @@ def test_at21_grant_for_alm_refused_for_sub_entry_and_accepted_for_alm(w):
     assert status(sub_entry) == "draft"
     assert AccessLog.objects.filter(event="permission_denied", entity=w.sub, details__reason="grant_other_entity").exists()
     before = JournalEntry.objects.count()
-    with pytest.raises(access.AccessDenied) as exc:  # nor a SUB entry for the bill
+    with pytest.raises(access.AccessDenied) as exc:  # nor a SUB entry for the ALM bill
         services.create_entry(w.sub, date(2027, 1, 10), "Bill 7", CASH, user=w.clerk, post=True, grant=grant, document=b7)
+    assert exc.value.code == "document_other_entity" and JournalEntry.objects.count() == before
+    sub_bill = bill(w.sub, w.clerk)
+    alm_grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=sub_bill)
+    with pytest.raises(access.AccessDenied) as exc:  # nor an ALM grant for a SUB bill
+        services.create_entry(w.sub, date(2027, 1, 10), "SUB bill", CASH, user=w.clerk, post=True, grant=alm_grant,
+                              document=sub_bill)
     assert exc.value.code == "grant_other_entity" and JournalEntry.objects.count() == before
     posted = services.create_entry(w.alm, date(2027, 1, 10), "Bill 7", CASH, user=w.clerk, post=True, grant=grant, document=b7)
-    assert posted.status == "posted" and posted.posted_by == w.cfo and posted.document_ref == ("invoicing.bill", 7)
+    assert posted.status == "posted" and posted.posted_by == w.cfo and posted.document_ref == ("testdocs.bill", b7.pk)
 
 
 def test_post_without_grant_refused(w):
@@ -191,13 +205,13 @@ def test_create_entry_post_true_requires_grant_and_writes_nothing_when_refused(w
     other_grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=b7)
     with pytest.raises(access.AccessDenied) as exc:
         services.create_entry(w.sub, date(2027, 1, 10), "x", CASH, user=w.clerk, post=True, grant=other_grant, document=b7)
-    assert exc.value.code == "grant_other_entity"
+    assert exc.value.code == "document_other_entity"
     with pytest.raises(access.AccessDenied) as exc:  # the document is required and must be the grant's
         services.create_entry(w.alm, date(2027, 1, 10), "x", CASH, user=w.clerk, post=True, grant=other_grant)
     assert exc.value.code == "grant_needs_document"
     with pytest.raises(access.AccessDenied) as exc:
         services.create_entry(w.alm, date(2027, 1, 10), "x", CASH, user=w.clerk, post=True, grant=other_grant,
-                              document=bill(w.alm, w.clerk, pk=8))
+                              document=bill(w.alm, w.clerk))
     assert exc.value.code == "grant_wrong_document"
     assert JournalEntry.objects.count() == before
 
@@ -216,14 +230,14 @@ def test_create_entry_post_true_with_document_approval_grant(w):  # A1: approval
     grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=b7)
     e = services.create_entry(w.alm, date(2027, 1, 10), "Bill 7", CASH, user=w.clerk, post=True, grant=grant, document=b7)
     assert e.status == "posted" and e.posted_by == w.cfo and e.created_by == w.clerk
-    assert (e.document_type, e.document_id, e.source) == ("invoicing.bill", 7, "human")
+    assert (e.document_type, e.document_id, e.source) == ("testdocs.bill", b7.pk, "human")
 
 
 def test_post_on_clearance_records_document_approver(w):  # R23, zatca D-8
     queue = access.system_user("zatca_queue")
     member(queue, w.alm, "system_zatca_queue")
-    invoice = sales_invoice(w.clerk)
-    access.require(w.cfo, w.alm, "invoicing.approve_sales_document", document=invoice)  # the approval, logged
+    invoice = sales_invoice(w.alm, w.clerk)
+    approve(w.cfo, w.alm, invoice)  # the approval, logged and used
     grant = access.require(queue, w.alm, "invoicing.post_on_clearance", document=invoice)
 
     def clear(**kw):
@@ -240,7 +254,7 @@ def test_post_on_clearance_records_document_approver(w):  # R23, zatca D-8
     assert exc.value.code == "grant_wrong_permission"
     posted = clear(posted_by=w.cfo)
     assert (posted.posted_by, posted.created_by, posted.source) == (w.cfo, queue, "system")
-    assert posted.document_ref == ("invoicing.salesdocument", 11)
+    assert posted.document_ref == ("testdocs.salesdocument", invoice.pk)
 
 
 def test_only_clearance_may_set_another_posted_by(w):

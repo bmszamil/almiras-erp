@@ -22,6 +22,7 @@ from core.models import Entity
 from ledger import services
 from ledger.models import Account, FiscalPeriod, JournalEntry, JournalLine, LedgerError
 from ledger.services_setup import create_monthly_periods, install_chart_of_accounts
+from testdocs.models import Bill, Receipt, SalesDocument
 
 pytestmark = pytest.mark.django_db
 postgres_only = pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL-only database guard")
@@ -36,10 +37,16 @@ def setup_entity(code, consolidation="full", parent=None, **extra):
     return e
 
 
-def doc(label, pk, created_by=None):
-    """Stand-in for a sub-ledger document (invoicing not built yet)."""
-    return SimpleNamespace(pk=pk, _meta=SimpleNamespace(label_lower=label), created_by_id=getattr(created_by, "pk", None),
-                           submitted_by_id=None)
+def doc(model, entity, created_by=None):
+    """A stored test document (testdocs; invoicing is not built yet), registered in ledger.documents."""
+    return model.objects.create(entity=entity, created_by=created_by)
+
+
+def approve(user, entity, document):
+    """A sales-document approval that was given and used (as invoicing would use it on approval)."""
+    grant = access.require(user, entity, "invoicing.approve_sales_document", document=document)
+    access.use_grant(grant, target=document)
+    return grant
 
 
 @pytest.fixture
@@ -69,33 +76,176 @@ def post(w, entry, approver=None):
 # --- R23 / R30: which grant posts what -------------------------------------------------
 
 def test_accountant_with_post_receipt_grant_cannot_post_own_manual_journal(w):
+    """P1: a sub-ledger P grant never lets one accountant book a journal alone."""
     entry = draft(w)
-    receipt = doc("invoicing.receipt", 3, created_by=w.clerk)
-    for document in (receipt, entry):
+    own_receipt = doc(Receipt, w.alm, created_by=w.clerk)
+    for document in (own_receipt, entry):
         grant = access.require(w.clerk, w.alm, "invoicing.post_receipt", document=document)
-        with pytest.raises(access.AccessDenied) as exc:
+        with pytest.raises(access.AccessDenied) as exc:  # not through post_entry
             services.post_entry(entry, grant)
         assert exc.value.code == "grant_wrong_permission"
-    assert status(entry) == "draft"
-    # The receipt grant does post the receipt's own entry, once.
+    before = JournalEntry.objects.count()
+    grant = access.require(w.clerk, w.alm, "invoicing.post_receipt", document=own_receipt)
+    with pytest.raises(access.AccessDenied) as exc:  # nor for a receipt the accountant made (segregation, R14)
+        services.create_entry(w.alm, date(2027, 1, 10), "Receipt", CASH, user=w.clerk, post=True, grant=grant,
+                              document=own_receipt)
+    assert exc.value.code == "self_approval"
+    grant = access.require(w.clerk, w.alm, "invoicing.post_receipt", document=entry)
+    with pytest.raises(access.AccessDenied) as exc:  # nor with the manual draft itself as "document"
+        services.create_entry(w.alm, date(2027, 1, 10), "Receipt", CASH, user=w.clerk, post=True, grant=grant, document=entry)
+    assert exc.value.code == "document_not_registered"
+    assert JournalEntry.objects.count() == before and status(entry) == "draft"
+    # A receipt someone else recorded is posted by the accountant, once.
+    receipt = doc(Receipt, w.alm, created_by=w.cfo)
     grant = access.require(w.clerk, w.alm, "invoicing.post_receipt", document=receipt)
     booked = services.create_entry(w.alm, date(2027, 1, 10), "Receipt 3", CASH, user=w.clerk, post=True, grant=grant,
                                    document=receipt)
-    assert booked.status == "posted" and booked.document_ref == ("invoicing.receipt", 3) and booked.posted_by == w.clerk
+    assert booked.status == "posted" and booked.document_ref == ("testdocs.receipt", receipt.pk) and booked.posted_by == w.clerk
+
+
+def test_p1_tuple_documents_never_post(w):
+    """P1 (reviewer probe): a grant bound to a made-up (type, id) tuple posted any journal, repeatedly."""
+    with pytest.raises(access.AccessUsageError):
+        access.require(w.clerk, w.alm, "invoicing.post_receipt", document=("invoicing.receipt", 1))
+    receipt = doc(Receipt, w.alm, created_by=w.cfo)
+    grant = access.require(w.clerk, w.alm, "invoicing.post_receipt", document=receipt)
+    with pytest.raises((access.AccessDenied, access.AccessUsageError)):
+        services.create_entry(w.alm, date(2027, 1, 5), "anything", CASH, user=w.clerk, post=True, grant=grant,
+                              document=("testdocs.receipt", receipt.pk))
+    stand_in = SimpleNamespace(pk=receipt.pk, _meta=receipt._meta, created_by_id=None, submitted_by_id=None, entity_id=w.alm.pk)
+    with pytest.raises(access.AccessDenied) as exc:  # a look-alike object is not the document either
+        services.create_entry(w.alm, date(2027, 1, 5), "anything", CASH, user=w.clerk, post=True, grant=grant,
+                              document=stand_in)
+    assert exc.value.code == "grant_needs_document"
+    assert not JournalEntry.objects.exists()
+    assert not GrantUse.objects.filter(log_id=grant.log_id).exists()
+
+
+def test_p1_reversal_grant_never_posts_a_new_entry(w):
+    """P1: invoicing.reverse_document used to post new entries through create_entry(post=True)."""
+    from core.access import catalogue
+
+    assert "invoicing.reverse_document" not in catalogue.DOCUMENT_POST_PERMISSIONS
+    bill = doc(Bill, w.alm, created_by=w.cfo)
+    grant = access.require(w.clerk, w.alm, "invoicing.reverse_document", document=bill)
+    with pytest.raises(access.AccessDenied) as exc:
+        services.create_entry(w.alm, date(2027, 1, 5), "via reverse grant", CASH, user=w.clerk, post=True, grant=grant,
+                              document=bill)
+    assert exc.value.code == "grant_wrong_permission" and not JournalEntry.objects.exists()
+
+
+def test_unregistered_missing_and_other_entity_documents_refused(w):
+    from testdocs.models import Unregistered
+
+    before = JournalEntry.objects.count()
+    unregistered = doc(Unregistered, w.alm, created_by=w.cfo)
+    gone = doc(Receipt, w.alm, created_by=w.cfo)
+    other = doc(Receipt, w.sub, created_by=w.cfo)
+    for document, code in ((unregistered, "document_not_registered"), (gone, "document_not_found"),
+                           (other, "document_other_entity")):
+        grant = access.require(w.clerk, w.alm, "invoicing.post_receipt", document=document)
+        if document is gone:
+            Receipt.objects.filter(pk=gone.pk).delete()
+        with pytest.raises(access.AccessDenied) as exc:
+            services.create_entry(w.alm, date(2027, 1, 5), "x", CASH, user=w.clerk, post=True, grant=grant, document=document)
+        assert exc.value.code == code
+    assert JournalEntry.objects.count() == before
+
+
+def test_document_permission_must_be_registered_for_its_type(w):
+    bill = doc(Bill, w.alm, created_by=w.clerk)
+    grant = access.require(w.clerk, w.alm, "invoicing.post_receipt", document=bill)  # receipts' right, on a bill
+    with pytest.raises(access.AccessDenied) as exc:
+        services.create_entry(w.alm, date(2027, 1, 5), "x", CASH, user=w.cfo, post=True, grant=grant, document=bill)
+    assert exc.value.code == "grant_wrong_permission" and not JournalEntry.objects.exists()
+
+
+def test_segregation_uses_the_stored_document(w):
+    """The stored creator / submitter / last modifier counts, not attributes of the object passed in."""
+    receipt = Receipt.objects.create(entity=w.alm, created_by=w.cfo, submitted_by=w.clerk)
+    receipt.submitted_by = None  # in memory only
+    grant = access.require(w.clerk, w.alm, "invoicing.post_receipt", document=receipt)
+    with pytest.raises(access.AccessDenied) as exc:
+        services.create_entry(w.alm, date(2027, 1, 5), "x", CASH, user=w.clerk, post=True, grant=grant, document=receipt)
+    assert exc.value.code == "self_approval"
+    modified = Receipt.objects.create(entity=w.alm, created_by=w.cfo, modified_by=w.clerk)
+    grant = access.require(w.clerk, w.alm, "invoicing.post_receipt", document=modified)
+    with pytest.raises(access.AccessDenied):
+        services.create_entry(w.alm, date(2027, 1, 5), "x", CASH, user=w.clerk, post=True, grant=grant, document=modified)
+    assert not JournalEntry.objects.exists()
+
+
+def test_a_document_books_once_also_with_a_second_grant(w):
+    bill = doc(Bill, w.alm, created_by=w.clerk)
+    first = services.create_entry(w.alm, date(2027, 1, 10), "Bill", CASH, user=w.clerk, post=True, document=bill,
+                                  grant=access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill))
+    second = access.require(w.mp, w.alm, "invoicing.approve_bill", document=bill)
+    with pytest.raises(LedgerError, match="already booked"):
+        services.create_entry(w.alm, date(2027, 1, 10), "Bill again", CASH, user=w.clerk, post=True, grant=second,
+                              document=bill)
+    assert not GrantUse.objects.filter(log_id=second.log_id).exists()
+    services.reverse_entry(first, access.require(w.clerk, w.alm, "ledger.reverse_entry", document=first))
+    with pytest.raises(LedgerError, match="already booked"):  # also after its reversal: correct by a new document
+        services.create_entry(w.alm, date(2027, 1, 10), "Bill again", CASH, user=w.clerk, post=True, grant=second,
+                              document=bill)
+    assert JournalEntry.objects.filter(document_type="testdocs.bill", reversal_of__isnull=True).count() == 1
+
+
+def test_database_refuses_a_second_entry_for_one_document(w):
+    from django.db import IntegrityError
+
+    bill = doc(Bill, w.alm, created_by=w.clerk)
+    services.create_entry(w.alm, date(2027, 1, 10), "Bill", CASH, user=w.clerk, post=True, document=bill,
+                          grant=access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill))
+    with pytest.raises(IntegrityError), transaction.atomic():
+        JournalEntry.objects.create(entity=w.alm, date=date(2027, 1, 10), description="dup", document_type="testdocs.bill",
+                                    document_id=bill.pk)
+
+
+def test_documents_without_post_are_refused(w):
+    bill = doc(Bill, w.alm, created_by=w.clerk)
+    with pytest.raises(LedgerError):  # a draft never claims a document (it would block the real booking)
+        services.create_entry(w.alm, date(2027, 1, 10), "x", CASH, user=w.clerk, document=bill)
+    assert not JournalEntry.objects.exists()
+
+
+def test_document_registry_validates_registrations():
+    from ledger import documents
+    from ledger.models import JournalEntry as Entry
+    from testdocs.models import Unregistered
+
+    with pytest.raises(documents.DocumentRegistryError):
+        documents.register(Entry, post_permissions={"invoicing.approve_bill"})
+    for perms in (set(), {"ledger.post_entry"}, {"invoicing.reverse_document"}, {"invoicing.view"}):
+        with pytest.raises(documents.DocumentRegistryError):
+            documents.register(Unregistered, post_permissions=perms)
+    with pytest.raises(documents.DocumentRegistryError):
+        documents.register(Unregistered, post_permissions={"invoicing.post_receipt"}, reverse_permissions={"ledger.reverse_entry"})
+    with pytest.raises(documents.DocumentRegistryError):  # another registration for a registered type
+        documents.register(Bill, post_permissions={"invoicing.post_receipt"})
+    assert documents.get("testdocs.unregistered") is None
+    assert all(label.startswith("testdocs.") for label in documents.registered())  # nothing else registers yet
+    try:
+        documents.register(Unregistered, post_permissions={"invoicing.post_receipt"})
+        assert documents.get("testdocs.unregistered").post_permissions == {"invoicing.post_receipt"}
+    finally:
+        documents.unregister(Unregistered)
 
 
 def test_approve_bill_grant_for_bill_7_cannot_post_an_unrelated_draft(w):
-    bill7 = doc("invoicing.bill", 7, created_by=w.clerk)
+    bill7 = doc(Bill, w.alm, created_by=w.clerk)
     grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill7)
     unrelated = draft(w)
     with pytest.raises(access.AccessDenied) as exc:
         services.post_entry(unrelated, grant)
     assert exc.value.code == "grant_wrong_permission" and status(unrelated) == "draft"
     before = JournalEntry.objects.count()
-    for other in (doc("invoicing.bill", 8, created_by=w.clerk), doc("invoicing.receipt", 7), unrelated):
+    for other, code in ((doc(Bill, w.alm, created_by=w.clerk), "grant_wrong_document"),
+                        (doc(Receipt, w.alm), "grant_wrong_permission"),
+                        (unrelated, "document_not_registered")):
         with pytest.raises(access.AccessDenied) as exc:
             services.create_entry(w.alm, date(2027, 1, 10), "Bill", CASH, user=w.clerk, post=True, grant=grant, document=other)
-        assert exc.value.code == "grant_wrong_document"
+        assert exc.value.code == code
     assert JournalEntry.objects.count() == before
     assert not GrantUse.objects.filter(log_id=grant.log_id).exists()
 
@@ -110,7 +260,7 @@ def test_grant_used_twice_refused(w):
         services.post_entry(entry, grant)
     assert exc.value.code == "grant_used"
 
-    bill7 = doc("invoicing.bill", 7, created_by=w.clerk)
+    bill7 = doc(Bill, w.alm, created_by=w.clerk)
     bill_grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill7)
     services.create_entry(w.alm, date(2027, 1, 10), "Bill 7", CASH, user=w.clerk, post=True, grant=bill_grant, document=bill7)
     before = JournalEntry.objects.count()
@@ -130,7 +280,7 @@ def test_reversal_grant_used_once(w):
 
 
 def test_reverse_document_grant_reverses_only_its_documents_entry(w):
-    bill7 = doc("invoicing.bill", 7, created_by=w.clerk)
+    bill7 = doc(Bill, w.alm, created_by=w.clerk)
     booked = services.create_entry(
         w.alm, date(2027, 1, 10), "Bill 7", CASH, user=w.clerk, post=True, document=bill7,
         grant=access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill7),
@@ -141,14 +291,38 @@ def test_reverse_document_grant_reverses_only_its_documents_entry(w):
         services.reverse_entry(manual, grant)
     assert exc.value.code == "grant_wrong_document" and status(manual) == "posted"
     rev = services.reverse_entry(booked, grant)
-    assert status(booked) == "reversed" and rev.document_ref == ("invoicing.bill", 7)
+    assert status(booked) == "reversed" and rev.document_ref == ("testdocs.bill", bill7.pk)
+
+
+def test_reverse_document_grant_needs_a_registered_reversal_right(w):
+    from ledger import documents
+
+    receipt = doc(Receipt, w.alm, created_by=w.cfo)
+    booked = services.create_entry(w.alm, date(2027, 1, 10), "Receipt", CASH, user=w.clerk, post=True, document=receipt,
+                                   grant=access.require(w.clerk, w.alm, "invoicing.post_receipt", document=receipt))
+    original = documents.get("testdocs.receipt")
+    documents.unregister(Receipt)
+    try:
+        documents.register(Receipt, post_permissions={"invoicing.post_receipt"})  # no reversal right registered
+        with pytest.raises(access.AccessDenied) as exc:
+            services.reverse_entry(booked, access.require(w.clerk, w.alm, "invoicing.reverse_document", document=receipt))
+        assert exc.value.code == "grant_wrong_permission"
+        documents.unregister(Receipt)
+        with pytest.raises(access.AccessDenied) as exc:
+            services.reverse_entry(booked, access.require(w.clerk, w.alm, "invoicing.reverse_document", document=receipt))
+        assert exc.value.code == "document_not_registered"
+    finally:
+        documents.unregister(Receipt)
+        documents.register(Receipt, post_permissions=original.post_permissions,
+                           reverse_permissions=original.reverse_permissions)
+    assert status(booked) == "posted"
 
 
 def test_zatca_queue_grant_cannot_post_a_manual_journal(w):
     queue = access.system_user("zatca_queue")
     member(queue, w.alm, "system_zatca_queue")
-    invoice = doc("invoicing.salesdocument", 11, created_by=w.clerk)
-    access.require(w.cfo, w.alm, "invoicing.approve_sales_document", document=invoice)
+    invoice = doc(SalesDocument, w.alm, created_by=w.clerk)
+    approve(w.cfo, w.alm, invoice)
     entry = draft(w)
     for grant in (
         access.require(queue, w.alm, "invoicing.post_on_clearance", document=invoice),
@@ -163,33 +337,53 @@ def test_zatca_queue_grant_cannot_post_a_manual_journal(w):
     assert status(entry) == "draft"
 
 
-def test_clearance_posted_by_must_be_a_recorded_active_human_approver(w):
+def test_clearance_posted_by_must_be_a_recorded_human_approver(w):
     queue = access.system_user("zatca_queue")
     member(queue, w.alm, "system_zatca_queue")
-    invoice = doc("invoicing.salesdocument", 11, created_by=w.clerk)
-    other_invoice = doc("invoicing.salesdocument", 12, created_by=w.clerk)
-    access.require(w.cfo, w.alm, "invoicing.approve_sales_document", document=other_invoice)  # approved another one
+    invoice = doc(SalesDocument, w.alm, created_by=w.clerk)
+    other_invoice = doc(SalesDocument, w.alm, created_by=w.clerk)
+    approve(w.cfo, w.alm, other_invoice)  # approved another one
     grant = access.require(queue, w.alm, "invoicing.post_on_clearance", document=invoice)
 
     def clear(posted_by):
         return services.create_entry(w.alm, date(2027, 1, 10), "Invoice 11", CASH, user=queue, post=True, grant=grant,
                                      document=invoice, posted_by=posted_by)
 
-    for candidate in (w.cfo, queue, make_agent()):  # not the approver of invoice 11 / not a human
+    for candidate in (w.cfo, queue, make_agent()):  # not the approver of this invoice / not a human
         with pytest.raises(access.AccessDenied) as exc:
             clear(candidate)
         assert exc.value.code == "posted_by_not_approver"
-    access.require(w.cfo, w.alm, "invoicing.approve_sales_document", document=invoice)
-    w.cfo.is_active = False
-    with pytest.raises(access.AccessDenied):
+    access.require(w.cfo, w.alm, "invoicing.approve_sales_document", document=invoice)  # issued, never used
+    with pytest.raises(access.AccessDenied) as exc:
         clear(w.cfo)
-    w.cfo.is_active = True
-    assert clear(w.cfo).posted_by == w.cfo
+    assert exc.value.code == "posted_by_not_approver"
+    approve(w.cfo, w.alm, invoice)
+    access_services.set_user_active(w.mp, w.cfo, False, "Left the company")
+    posted = clear(w.cfo)  # the right was checked when the CFO approved (owner default)
+    assert posted.posted_by == w.cfo
     assert not JournalEntry.objects.filter(description="Invoice 11").exclude(posted_by=w.cfo).exists()
+    from core.access.models import AccessLog
+
+    row = AccessLog.objects.get(details__action="post_on_clearance")
+    assert (row.actor, row.permission, row.details["posted_by"], row.details["entry"]) == (
+        queue, "invoicing.post_on_clearance", w.cfo.pk, posted.pk)
+
+
+def test_clearance_approval_given_before_the_last_change_does_not_count(w):
+    queue = access.system_user("zatca_queue")
+    member(queue, w.alm, "system_zatca_queue")
+    invoice = doc(SalesDocument, w.alm, created_by=w.clerk)
+    approve(w.cfo, w.alm, invoice)
+    SalesDocument.objects.filter(pk=invoice.pk).update(modified_at=access_services.now() + timedelta(seconds=1))
+    grant = access.require(queue, w.alm, "invoicing.post_on_clearance", document=invoice)
+    with pytest.raises(access.AccessDenied) as exc:
+        services.create_entry(w.alm, date(2027, 1, 10), "Invoice", CASH, user=queue, post=True, grant=grant,
+                              document=invoice, posted_by=w.cfo)
+    assert exc.value.code == "posted_by_not_approver" and not JournalEntry.objects.exists()
 
 
 def test_create_entry_post_true_needs_grant_user_or_create_right(w):  # item 5
-    bill7 = doc("invoicing.bill", 7, created_by=w.clerk)
+    bill7 = doc(Bill, w.alm, created_by=w.clerk)
     grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill7)
     outsider = make_user("outsider")
     member(outsider, w.sub, "accountant")
@@ -458,7 +652,7 @@ def test_posting_waits_for_period_lock_and_sees_the_close():
     clerk, cfo = make_user("clerk"), make_user("cfo")
     member(clerk, alm, "accountant")
     member(cfo, alm, "approver")
-    bill7 = doc("invoicing.bill", 7, created_by=clerk)
+    bill7 = Bill.objects.create(entity=alm, created_by=clerk)
     grant = access.require(cfo, alm, "invoicing.approve_bill", document=bill7)
     jan = FiscalPeriod.objects.get(entity=alm, name="2027-01")
     result = {}

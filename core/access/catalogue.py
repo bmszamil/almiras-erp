@@ -160,11 +160,13 @@ SYSTEM_EXTRA = {
 
 # Ledger postings (R23, R30): which P grants each ledger service accepts.
 # - post_entry (an existing draft): only ledger.post_entry, issued for that draft.
-# - create_entry(post=True, document=...): a sub-ledger P grant issued for that document.
+# - create_entry(post=True, document=...): a sub-ledger P grant issued for that document, for a
+#   document type registered in ledger.documents with that permission.
 # - reverse_entry: ledger.reverse_entry for that entry, or invoicing.reverse_document for its document.
+#   Reversal grants only reverse: they never post a new entry.
 REVERSE_PERMISSIONS = frozenset({"ledger.reverse_entry", "invoicing.reverse_document"})
 DRAFT_POST_PERMISSIONS = frozenset({"ledger.post_entry"})
-DOCUMENT_POST_PERMISSIONS = frozenset(c for c, p in CATALOGUE.items() if p.posts) - {"ledger.post_entry", "ledger.reverse_entry"}
+DOCUMENT_POST_PERMISSIONS = frozenset(c for c, p in CATALOGUE.items() if p.posts) - DRAFT_POST_PERMISSIONS - REVERSE_PERMISSIONS
 POST_PERMISSIONS = DRAFT_POST_PERMISSIONS | DOCUMENT_POST_PERMISSIONS
 
 

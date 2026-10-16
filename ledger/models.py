@@ -175,6 +175,12 @@ class JournalEntry(models.Model):
                 | (~models.Q(document_type="") & models.Q(document_id__isnull=False)),
                 name="entry_document_ref_complete",
             ),
+            # A sub-ledger document books once; its reversal carries the same reference (R30).
+            models.UniqueConstraint(
+                fields=["entity", "document_type", "document_id"],
+                condition=~models.Q(document_type="") & models.Q(reversal_of__isnull=True),
+                name="one_entry_per_document",
+            ),
         ]
 
     @property

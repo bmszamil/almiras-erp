@@ -15,7 +15,7 @@ from pathlib import Path
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import models, transaction
 from django.db.models import Case, F, Q, Sum, When
 from django.utils import timezone
 
@@ -27,7 +27,7 @@ from core.access.services import kind_of
 from core.access.services import log as access_log
 from core.models import Currency, Entity
 
-from . import fx
+from . import documents, fx
 from .fx import ONE, error
 from .models import (
     Account,
@@ -278,36 +278,93 @@ def _authorise_draft_post(entry, grant, posted_by):
     return user
 
 
+def _resolve_document(entity, grant, document):
+    """(DocumentType, stored document) for a sub-ledger posting, else AccessDenied (R23, R30).
+
+    The document must be a saved model instance of a type registered in
+    ledger.documents, exist in the database and belong to ``entity``. The
+    stored row is returned, so segregation is checked on what the database
+    holds, not on attributes of the object the caller passed.
+    """
+    if not isinstance(document, models.Model) or document.pk is None:
+        _deny_grant(grant, entity, "grant_needs_document")
+    doc_type = documents.get(document._meta.label_lower)
+    if doc_type is None:
+        _deny_grant(grant, entity, "document_not_registered")
+    stored = doc_type.model._default_manager.filter(pk=document.pk).first()
+    if stored is None:
+        _deny_grant(grant, entity, "document_not_found")
+    if doc_type.entity_id_of(stored) != entity.pk:
+        _deny_grant(grant, entity, "document_other_entity")
+    return doc_type, stored
+
+
 def _authorise_document_post(entity, grant, posted_by, document, created_by):
     """R23 / R30: create_entry(post=True) needs a sub-ledger P grant issued for ``document``.
 
+    ``document`` is a registered, stored document of ``entity`` (see
+    :func:`_resolve_document`) whose type lists the grant's permission. Its
+    creator, submitter and last modifier cannot post it (access R14). A
+    document books once: a second (non-reversal) entry for it is refused.
     Only ``invoicing.post_on_clearance`` records a different ``posted_by``:
-    the approver recorded in the access log for the grant's document (zatca
-    D-8), a human who is not the entry's creator.
+    the approver whose used approval for the document is recorded in the
+    access log (zatca D-8; see :func:`_clearance_approver`).
+    Returns (posted_by, stored document).
     """
     if not isinstance(grant, access.Grant):
         _deny_grant(grant, entity, "grant_missing")
     if grant.permission in catalogue.DRAFT_POST_PERMISSIONS:  # a manual journal: draft first, then post_entry
         _deny_grant(grant, entity, "grant_needs_draft")
-    if access_services._document_ref(document) is None:
-        _deny_grant(grant, entity, "grant_needs_document")
-    user = access.verify_grant(grant, entity, catalogue.DOCUMENT_POST_PERMISSIONS, document=document, use=False)
-    if grant.permission == CLEARANCE_PERMISSION:
-        if posted_by is None:
-            raise LedgerError("Posting on clearance needs the approver recorded on the document (posted_by).")
-        approver_ok = (
-            getattr(posted_by, "pk", None) is not None
-            and posted_by.is_active
-            and kind_of(posted_by) == Kind.HUMAN
-            and posted_by.pk != getattr(created_by, "pk", None)
-            and posted_by.pk in access_services.recorded_approvers(entity, APPROVE_SALES_PERMISSION, document)
+    if grant.permission in catalogue.REVERSE_PERMISSIONS:  # reversal grants only reverse
+        _deny_grant(grant, entity, "grant_wrong_permission")
+    doc_type, stored = _resolve_document(entity, grant, document)
+    user = access.verify_grant(grant, entity, doc_type.post_permissions, document=stored, use=False)
+    if user.pk in access_services._document_people(stored):
+        access.deny(user, entity, grant.permission, "self_approval")
+    if _document_booked(entity, stored):
+        raise error(
+            f"{doc_type.label} {stored.pk} is already booked; a document posts once (reverse it to correct it).",
+            f"المستند {doc_type.label} {stored.pk} مرحّل مسبقًا؛ يُرحَّل المستند مرة واحدة (اعكسه للتصحيح).",
+            code="document_booked",
         )
-        if not approver_ok:
-            access.deny(user, entity, grant.permission, "posted_by_not_approver")
-        return posted_by
+    if grant.permission == CLEARANCE_PERMISSION:
+        return _clearance_approver(entity, user, grant, posted_by, stored, doc_type, created_by), stored
     if posted_by is not None and posted_by != user:
-        raise LedgerError("posted_by is set from the grant; only posting on clearance records another approver.")
-    return user
+        raise error("posted_by is set from the grant; only posting on clearance records another approver.",
+                    "يُحدَّد المرحِّل من التفويض؛ الترحيل عند الاعتماد من الهيئة وحده يسجل معتمدًا آخر.")
+    return user, stored
+
+
+def _document_booked(entity, document):
+    return JournalEntry.objects.filter(
+        entity=entity, document_type=document._meta.label_lower, document_id=document.pk, reversal_of__isnull=True,
+    ).exists()
+
+
+def _clearance_approver(entity, user, grant, posted_by, document, doc_type, created_by):
+    """zatca D-8: ``posted_by`` is a human whose approval of ``document`` was used and is still current.
+
+    Counted approvals are ``invoicing.approve_sales_document`` grants issued
+    for this document, actually used (GrantUse), and issued after the
+    document's last change. The approver need not still be active: the right
+    was checked when they approved (owner-facing default).
+    """
+    if posted_by is None:
+        raise error("Posting on clearance needs the approver recorded on the document (posted_by).",
+                    "الترحيل عند الاعتماد من الهيئة يحتاج إلى المعتمد المسجل على المستند (posted_by).")
+    approvals = access_services.recorded_approvers(
+        entity, APPROVE_SALES_PERMISSION, document, used=True, since=doc_type.changed_at_of(document),
+    )
+    approver_ok = (
+        getattr(posted_by, "pk", None) is not None
+        and kind_of(posted_by) == Kind.HUMAN
+        and posted_by.pk != getattr(created_by, "pk", None)
+        and posted_by.pk not in access_services._document_people(document)
+        and posted_by.pk in approvals
+    )
+    if not approver_ok:
+        access.deny(user, entity, grant.permission, "posted_by_not_approver")
+    return posted_by
 
 
 def _purification_flags(entry, lines):
@@ -366,17 +423,27 @@ def reverse_entry(entry, grant=None, date=None, reason=""):
     """Reverse a posted entry (R23, R30).
 
     ``grant`` is ``require(user, entity, "ledger.reverse_entry", document=entry)``,
-    or ``invoicing.reverse_document`` issued for the document the entry books.
+    or a reversal permission registered for the entry's document type (e.g.
+    ``invoicing.reverse_document``), issued for that document.
     """
     entry = JournalEntry.objects.select_related("entity").get(pk=entry.pk)
     if not isinstance(grant, access.Grant):
         _deny_grant(grant, entry.entity, "grant_missing")
-    if grant.permission == "invoicing.reverse_document":
+    if grant.permission == "ledger.reverse_entry":
+        document = entry
+    elif grant.permission in catalogue.REVERSE_PERMISSIONS:
         if entry.document_ref is None:
             _deny_grant(grant, entry.entity, "grant_wrong_document")
-        document = entry.document_ref
+        doc_type = documents.get(entry.document_type)
+        if doc_type is None:
+            _deny_grant(grant, entry.entity, "document_not_registered")
+        if grant.permission not in doc_type.reverse_permissions:
+            _deny_grant(grant, entry.entity, "grant_wrong_permission")
+        document = doc_type.model._default_manager.filter(pk=entry.document_id).first()
+        if document is None:
+            _deny_grant(grant, entry.entity, "document_not_found")
     else:
-        document = entry
+        _deny_grant(grant, entry.entity, "grant_wrong_permission")
     user = access.verify_grant(grant, entry.entity, catalogue.REVERSE_PERMISSIONS, document=document, use=False)
     with transaction.atomic():
         access.use_grant(grant, target=entry)
@@ -455,7 +522,10 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
 
     With ``post=True`` (a sub-ledger document is approved and posts at once,
     access A1) ``grant`` is a sub-ledger P grant issued for ``document``, which
-    the entry records (R30); ``user`` is the grant's user or holds
+    the entry records (R30). ``document`` is a saved instance of a type
+    registered in :mod:`ledger.documents` for the grant's permission, in
+    ``entity``; it books once, and its creator, submitter and last modifier
+    cannot post it. ``user`` is the grant's user or holds
     ``ledger.create_entry`` in ``entity``. Everything is checked before
     anything is written (R23), and the grant is used once. A
     ``ledger.post_entry`` grant cannot be used here: manual journals are
@@ -464,20 +534,29 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
     otherwise it follows the user's kind.
     """
     entry_source = _source_for(user, source)
+    ref = None
     if post:
-        posted_by = _authorise_document_post(entity, grant, posted_by, document, user)
+        posted_by, document = _authorise_document_post(entity, grant, posted_by, document, user)
         if not (getattr(user, "pk", None) is not None and user == grant.user):
             access.require(user, entity, "ledger.create_entry")
+        ref = (document._meta.label_lower, document.pk)
     else:
-        if grant is not None or posted_by is not None:
-            raise LedgerError("A grant or posted_by is only used with post=True. / يُستخدم التفويض أو المرحِّل مع الترحيل المباشر فقط.")
+        if grant is not None or posted_by is not None or document is not None:
+            raise error("A grant, posted_by or document is only used with post=True.",
+                        "يُستخدم التفويض أو المرحِّل أو المستند مع الترحيل المباشر فقط.")
         # A draft is still a business record in ``entity``: ledger.create_entry there (access.md 3.6).
         access.require(user, entity, "ledger.create_entry")
-    ref = access_services._document_ref(document)
     with transaction.atomic():
         if post:
             access.use_grant(grant, target=document)
-        return _create(entity, date, description, lines, user, reference, post, posted_by, entry_source, ref)
+        entry = _create(entity, date, description, lines, user, reference, post, posted_by, entry_source, ref)
+        if post and grant.permission == CLEARANCE_PERMISSION:  # zatca D-8: who posted for whom, logged
+            access_log(
+                AccessLog.Event.PERMISSION_GRANTED, actor=grant.user, entity=entity, permission=CLEARANCE_PERMISSION,
+                details={"action": "post_on_clearance", "posted_document": list(ref), "entry": entry.pk,
+                         "posted_by": posted_by.pk},
+            )
+        return entry
 
 
 @transaction.atomic

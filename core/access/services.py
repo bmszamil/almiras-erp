@@ -128,6 +128,18 @@ MESSAGES = {
         "The person recorded as poster must be the approver recorded for this document.",
         "يجب أن يكون المرحِّل المسجَّل هو المعتمد المسجَّل لهذا المستند.",
     ),
+    "document_not_registered": (
+        "This kind of document cannot post to the ledger yet; its module has not registered it.",
+        "لا يمكن لهذا النوع من المستندات الترحيل إلى دفتر الأستاذ بعد؛ لم تسجله الوحدة المختصة.",
+    ),
+    "document_not_found": (
+        "The document this authorisation names does not exist.",
+        "المستند الذي يحدده هذا التفويض غير موجود.",
+    ),
+    "document_other_entity": (
+        "The document belongs to another entity.",
+        "المستند يخص كيانًا آخر.",
+    ),
     "delegation_dates": (
         "A delegation starts now or later, and not before the delegator's own membership.",
         "يبدأ التفويض الآن أو لاحقًا، ولا يبدأ قبل عضوية المفوِّض نفسه.",
@@ -200,9 +212,13 @@ def _language(user):
 
 
 def _document_ref(document):
-    """``(app_label.model, pk)`` of a document, or the reference itself when a tuple is passed."""
-    if isinstance(document, (tuple, list)):
-        return (str(document[0]), document[1]) if len(document) == 2 and document[1] is not None else None
+    """``(app_label.model, pk)`` of a document object; None for no document or an unsaved one.
+
+    A bare reference (tuple or list) is a programming error: a grant is issued
+    for a document the caller holds, never for a name it made up (R30).
+    """
+    if isinstance(document, (tuple, list, str)):
+        raise AccessUsageError("Pass the document itself, not a reference to it (R30).")
     if document is None or getattr(document, "pk", None) is None:
         return None
     return (document._meta.label_lower, document.pk)
@@ -217,7 +233,7 @@ def _user_id(value):
 def _document_people(document):
     """Users who may not approve ``document``: its creator, submitter and last modifier (R14)."""
     people = set()
-    if document is None or isinstance(document, (tuple, list)):
+    if document is None:
         return people
     for attr in ("created_by", "submitted_by", "modified_by"):
         uid = getattr(document, f"{attr}_id", None)
@@ -563,11 +579,22 @@ def use_grant(grant, *, target=None):
         _deny(grant.user, grant.entity, grant.permission, "grant_used")
 
 
-def recorded_approvers(entity, permission, document):
-    """Users recorded in the access log as having been granted ``permission`` for ``document`` in ``entity``."""
+def recorded_approvers(entity, permission, document, *, used=False, since=None):
+    """Users recorded in the access log as having been granted ``permission`` for ``document`` in ``entity``.
+
+    With ``used`` only grants that were actually used (a GrantUse row) count;
+    with ``since`` only grants issued at or after that moment (e.g. the
+    document's last change, so a stale approval does not count).
+    """
     expected = list(_document_ref(document) or ())
+    if not expected:
+        return set()
     rows = AccessLog.objects.filter(event=AccessLog.Event.PERMISSION_GRANTED, entity=entity, permission=permission)
-    return {r.actor_id for r in rows.only("actor_id", "details") if expected and (r.details or {}).get("document") == expected}
+    if used:
+        rows = rows.filter(grant_use__isnull=False)
+    if since is not None:
+        rows = rows.filter(at__gte=since)
+    return {r.actor_id for r in rows.only("actor_id", "details") if (r.details or {}).get("document") == expected}
 
 
 # --- memberships -------------------------------------------------------------
