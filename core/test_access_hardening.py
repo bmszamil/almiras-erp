@@ -204,6 +204,28 @@ def test_reactivate_entity_command_is_logged_and_only_for_inactive_entities(w):
         call_command("reactivate_entity", entity="NOPE", reason="x")
 
 
+def test_reactivate_entity_command_only_where_nobody_else_can(w, monkeypatch):
+    """R39: the command reactivates an inactive top-level entity, or one whose group parent is inactive, only."""
+    import os
+    import pwd
+
+    from django.core.management import CommandError, call_command
+
+    Entity.objects.filter(pk=w.sub.pk).update(is_active=False)
+    with pytest.raises(CommandError, match="active group ALM"):  # the group's managing partner can do it
+        call_command("reactivate_entity", entity="SUB", reason="x")
+    assert Entity.objects.get(pk=w.sub.pk).is_active is False
+    Entity.objects.filter(pk=w.alm.pk).update(is_active=False)
+    monkeypatch.setenv("USER", "someone-else")  # the logged OS user comes from the process uid, not the environment
+    monkeypatch.setenv("LOGNAME", "someone-else")
+    call_command("reactivate_entity", entity="SUB", reason="Group locked out")
+    assert Entity.objects.get(pk=w.sub.pk).is_active is True
+    row = AccessLog.objects.get(event="entity_settings_changed", entity=w.sub)
+    assert row.details["os_user"] == pwd.getpwuid(os.getuid()).pw_name != "someone-else"
+    call_command("reactivate_entity", entity="ALM", reason="Group locked out")
+    assert Entity.objects.get(pk=w.alm.pk).is_active is True
+
+
 def test_functional_currency_change_is_logged(w):
     from ledger import services as ledger
 

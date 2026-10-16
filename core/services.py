@@ -218,19 +218,30 @@ def _require_settings_right(access, user, group, changes):
 
 @transaction.atomic
 def reactivate_entity_by_operator(entity, reason, os_user):
-    """Recovery (R32): set ``is_active`` back on an inactive entity from the ``reactivate_entity`` command.
+    """Recovery (R32, R39): set ``is_active`` back on an inactive entity from the ``reactivate_entity`` command.
 
-    For when nobody holds ``core.change_entity_settings`` any more. Logged as
-    an ``entity_settings_changed`` row with the operator's OS user and no actor.
+    Only where nobody can do it through :func:`change_entity_settings`: the
+    entity is inactive and is either a top-level entity (no parent) or in a
+    group whose group parent is inactive (every right on the group is checked
+    on that parent). An inactive subsidiary of an active group is reactivated
+    by the group's managing partner instead. Logged as an
+    ``entity_settings_changed`` row with the operator's OS user and no actor.
     """
     from core.access.models import AccessLog
-    from core.access.services import log
+    from core.access.services import group_parent_of, log
 
     if not reason or not str(reason).strip():
         raise ValidationError("A reason is required. / السبب مطلوب.")
     entity = Entity.objects.select_for_update().get(pk=entity.pk)
     if entity.is_active:
         raise ValidationError(f"{entity.code} is already active. / الكيان {entity.code} نشط بالفعل.")
+    group = group_parent_of(entity)
+    if entity.parent_id is not None and group.is_active:
+        raise ValidationError(
+            f"{entity.code} is in the active group {group.code}: reactivate it with change_entity_settings "
+            f"(core.change_entity_settings on {group.code}). / الكيان {entity.code} ضمن المجموعة النشطة {group.code}: "
+            "أعد تفعيله من خلال خدمة إعدادات الكيان."
+        )
     entity.is_active = True
     entity.save(update_fields=["is_active"])
     log(
