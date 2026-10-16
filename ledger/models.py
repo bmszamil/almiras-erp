@@ -233,7 +233,7 @@ class JournalEntry(models.Model):
 
     def delete(self, *args, **kwargs):
         if self._stored_status() != self.Status.DRAFT:
-            raise LedgerError("Only draft entries can be deleted.")
+            raise LedgerError("Only draft entries can be deleted. / يمكن حذف المسودات فقط.")
         return super().delete(*args, **kwargs)
 
     @property
@@ -367,7 +367,7 @@ class JournalLine(models.Model):
     def save(self, *args, **kwargs):
         # Both the new entry and the stored one: a line is never moved off (or onto) a posted entry.
         if self._entry_locked():
-            raise LedgerError("Lines of a posted entry cannot be changed.")
+            raise LedgerError("Lines of a posted entry cannot be changed. / لا تُعدَّل بنود القيد المرحّل.")
         self._fill_functional_defaults()
         super().save(*args, **kwargs)
 
@@ -390,7 +390,7 @@ class JournalLine(models.Model):
 
     def delete(self, *args, **kwargs):
         if self._entry_locked():
-            raise LedgerError("Lines of a posted entry cannot be deleted.")
+            raise LedgerError("Lines of a posted entry cannot be deleted. / لا تُحذف بنود القيد المرحّل.")
         return super().delete(*args, **kwargs)
 
     def __str__(self):

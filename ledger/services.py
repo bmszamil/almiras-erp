@@ -83,29 +83,36 @@ def _next_number(entity, year):
     return f"{entity.code}-JE-{year}-{seq.last_number:06d}"
 
 
+def _bi(en, ar):
+    """One problem text in both languages, as fx.error formats it (ledger-fx R37)."""
+    return f"{en} / {ar}"
+
+
 def validate_entry(entry):
-    """Return a list of problems; empty means the entry can be posted."""
+    """Return a list of problems ("English / العربية"); empty means the entry can be posted."""
     problems = []
     lines = list(entry.lines.select_related("account", "account__entity"))
     if len(lines) < 2:
-        problems.append("An entry needs at least two lines.")
+        problems.append(_bi("An entry needs at least two lines.", "يحتاج القيد إلى بندين على الأقل."))
     debit = sum((l.debit for l in lines), ZERO)
     credit = sum((l.credit for l in lines), ZERO)
     if debit != credit:
-        problems.append(f"Entry does not balance: debits {debit} vs credits {credit}.")
+        problems.append(_bi(f"Entry does not balance: debits {debit} vs credits {credit}.",
+                            f"القيد غير متوازن: المدين {debit} والدائن {credit}."))
     if debit == ZERO:
-        problems.append("Entry total is zero.")
+        problems.append(_bi("Entry total is zero.", "مجموع القيد صفر."))
     if not entry.entity.is_active:
-        problems.append(f"Entity {entry.entity.code} is inactive.")
+        problems.append(_bi(f"Entity {entry.entity.code} is inactive.", f"الكيان {entry.entity.code} غير نشط."))
     for line in lines:
         acc = line.account
         if acc.entity_id != entry.entity_id:
-            problems.append(f"Account {acc.code} belongs to another entity.")
+            problems.append(_bi(f"Account {acc.code} belongs to another entity.", f"الحساب {acc.code} يخص كيانًا آخر."))
         if not acc.is_postable or not acc.is_active:
-            problems.append(f"Account {acc.code} is not open for posting.")
+            problems.append(_bi(f"Account {acc.code} is not open for posting.", f"الحساب {acc.code} غير مفتوح للترحيل."))
         # A reversal only undoes what was booked (e.g. before the entity enforced Sharia): never blocked here.
         if acc.sharia_prohibited and entry.entity.sharia_enforced and entry.reversal_of_id is None:
-            problems.append(f"Account {acc.code} ({acc.name_en}) is Sharia-prohibited.")
+            problems.append(_bi(f"Account {acc.code} ({acc.name_en}) is Sharia-prohibited.",
+                                f"الحساب {acc.code} ({acc.name_ar}) محظور شرعًا."))
         if acc.code == TRANSLATION_RESERVE:  # R46, OQ-6: report-only, in every entity
             problems.append(
                 f"Account {TRANSLATION_RESERVE} (translation reserve) is used by the translation report only; "
@@ -113,9 +120,10 @@ def validate_entry(entry):
                 f"الحساب {TRANSLATION_RESERVE} (احتياطي ترجمة العملات) للتقرير فقط؛ لا يُرحَّل إليه شيء."
             )
         if acc.is_intercompany and line.counterparty_entity_id is None:
-            problems.append(f"Intercompany account {acc.code} needs a counterparty entity.")
+            problems.append(_bi(f"Intercompany account {acc.code} needs a counterparty entity.",
+                                f"حساب المعاملات بين الشركات {acc.code} يحتاج إلى كيان مقابل."))
         if line.counterparty_entity_id == entry.entity_id:
-            problems.append("Counterparty cannot be the same entity.")
+            problems.append(_bi("Counterparty cannot be the same entity.", "لا يكون الطرف المقابل هو الكيان نفسه."))
     problems += _currency_problems(entry, lines)
     return problems
 
@@ -287,7 +295,8 @@ def _authorise_draft_post(entry, grant, posted_by):
     if entry.modified_at is not None and entry.modified_at > grant.checked_at:  # approved before the last change
         access.deny(user, entry.entity, grant.permission, "grant_document_changed")
     if posted_by is not None and posted_by != user:
-        raise LedgerError("posted_by is set from the grant; only posting on clearance records another approver.")
+        raise error("posted_by is set from the grant; only posting on clearance records another approver.",
+                    "يُحدَّد المرحِّل من التفويض؛ الترحيل عند الاعتماد من الهيئة وحده يسجل معتمدًا آخر.")
     return user
 
 
@@ -537,7 +546,7 @@ def reverse_entry(entry, grant=None, date=None, reason=""):
 def _reverse(entry, user, date, reason):
     entry = JournalEntry.objects.select_for_update(of=("self",)).get(pk=entry.pk)
     if entry.status != JournalEntry.Status.POSTED:
-        raise LedgerError("Only posted entries can be reversed.")
+        raise error("Only posted entries can be reversed.", "يمكن عكس القيود المرحّلة فقط.")
     date = date or entry.date
     reversal = JournalEntry.objects.create(
         entity=entry.entity,
@@ -901,7 +910,7 @@ def close_period(period, *, user):
         date__gte=period.start_date, date__lte=period.end_date,
     )
     if drafts.exists():
-        raise LedgerError("Draft entries exist in this period.")
+        raise error("Draft entries exist in this period.", "توجد مسودات قيود في هذه الفترة.")
     period.status = FiscalPeriod.Status.CLOSED
     period.save(update_fields=["status"])
     return period
@@ -1008,7 +1017,7 @@ def intercompany_balances(as_of, *, user, group, by_currency=False):
     own membership (OQ-3).
     """
     if group.consolidation != Entity.Consolidation.PARENT:
-        raise LedgerError(f"{group.code} is not a group parent entity.")
+        raise error(f"{group.code} is not a group parent entity.", f"{group.code} ليس الكيان الأم للمجموعة.")
     access.require(user, group, "ledger.view")
     visible = access.entities_for(user, "ledger.view").filter(pk__in=_group_tree(group))
     return _intercompany_balances(as_of, visible, by_currency=by_currency)
