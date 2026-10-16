@@ -1,6 +1,6 @@
 # Access: users, roles and permissions per entity (user × entity × role)
 
-Django app: `core` (package `core/access/`: `models.py`, `services.py`, `catalogue.py`, `backends.py`). Status: **draft spec**. Written 2026-10-16 by the spec-writer agent.
+Django app: `core` (package `core/access/`: `models.py`, `services.py`, `catalogue.py`, `backends.py`). Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (A11, A12: billing versions/corrections, unseal delegation).
 Depended on by: `docs/specs/invoicing.md` (OQ-25, OQ-42), `docs/specs/billing.md` §7, `docs/specs/zatca.md` §7, R-41, OQ-14, OQ-25, `docs/specs/ledger-fx.md` §7. Gateway design: `docs/ai-agent-gateway.md`.
 Role names and permission codenames in this spec replace the provisional names in those four specs (reconciliation table in §3.1).
 
@@ -22,6 +22,8 @@ The access module decides who may do what, in which entity. It holds the role ca
 | A8 | Creator ≠ approver is on by default, switchable per entity per module. | Project owner (invoicing D19 / OQ-5) | 2026-10-16 |
 | A9 | Switching a ZATCA EGS unit to production needs a second approver. | Project owner (zatca D-9 approving OQ-14 default; task brief) | 2026-10-16 |
 | A10 | Grants and revocations of access are logged. | Project owner (task brief), zatca R-41 | 2026-10-16 |
+| A11 | Contracts are amended, terminated or cancelled (also retroactively) through CFO-approved versions; correction credit/debit notes are drafted by the billing system user, reviewed and submitted by a person, and approved by the CFO. Auto-generated invoices from a CFO-approved contract need no per-invoice approval. | Project owner (billing D8, D9; invoicing D20, D21) | 2026-10-16 |
+| A12 | The ZATCA master key stays with the Managing Partner; no Shamir shares. The MP may delegate key access, including unsealing the secret store, to named custodians. | Project owner (zatca D-10) | 2026-10-16 |
 
 Not decided (in §9): who approves when the CFO is absent or is the creator (OQ-1), who may grant memberships (OQ-2), which entities group-wide roles cover (OQ-3), and others.
 
@@ -164,6 +166,11 @@ Flags: **A** = approval (creator ≠ approver, R14); **S!** = segregation that c
 | `billing.release_period` | | accountant, approver |
 | `billing.issue_from_contract` | Sys:billing | system_billing |
 | `billing.create_credit_note_draft` | | accountant, approver |
+| `billing.edit_version_draft` (amendment, termination, cancellation; billing R39, R40) | | accountant, approver (not Ag: billing OQ-28 default). *Added 2026-10-16 (A11)* |
+| `billing.approve_version` (billing R39, R40) | A | approver. Termination and cancellation versions also accept `billing.approve_termination`. *Added 2026-10-16 (A11)* |
+| `billing.review_correction` (complete, submit or discard a correction draft; billing R44, R48) | | accountant, receivables_clerk. *Added 2026-10-16 (A11)* |
+| `billing.recompute_corrections` | | accountant, approver. *Added 2026-10-16 (A11)* |
+| `invoicing.create_adjustment_from_billing` (draft CN/DN only; invoicing R73) | Sys:billing | system_billing. *Added 2026-10-16 (A11)*. Issuing the note is `invoicing.approve_sales_document` (A, P): approver, not the reviewer (R14) |
 | `billing.view` / `billing.view_employee_ref` | Ag (view only) / | accountant, approver, viewer / accountant, approver |
 | `zatca.manage_profile` (profile, EGS unit) | | zatca_admin |
 | `zatca.onboard` (CSR, OTP, renew, revoke, restore; plus R-41 delegation) | S! | zatca_admin |
@@ -229,7 +236,7 @@ Enforcement: **S** = `core/access/services.py`; **M** = model `save`/`delete`/`c
 
 **Delegation**
 16. A CFO delegate is an `approver` membership with `delegated_from` = the delegator's active approver membership, the same entity, and `valid_to` required and no later than the delegator's own `valid_to`. It is created by the delegator (`core.delegate_approval`) or by `managing_partner`. Revoking or expiring the source membership ends the delegation at the same moment. A delegate cannot delegate further. **[S; test AT-17]**
-17. Key custody delegation stays in `zatca.KeyCustodianDelegation` (zatca 3.9, R-41). Granting needs `zatca.grant_key_delegation` (managing_partner only); the custodian must hold an active `zatca_admin` membership in that entity; grant and revoke also write `delegation_granted` / `delegation_revoked` in `AccessLog`. ZATCA key actions need **both** `require(user, entity, "zatca.onboard")` and an active delegation. **[S in zatca + core; test AT-18]**
+17. Key custody delegation stays in `zatca.KeyCustodianDelegation` (zatca 3.9, R-41). Granting needs `zatca.grant_key_delegation` (managing_partner only); the custodian must hold an active `zatca_admin` membership in that entity; grant and revoke also write `delegation_granted` / `delegation_revoked` in `AccessLog`. ZATCA key actions need **both** `require(user, entity, "zatca.onboard")` and an active delegation. Exception (added 2026-10-16, A12; zatca R-49): an `unseal` delegation is recorded on the group parent entity, because unsealing opens the store for all entities; the custodian must hold `zatca_admin` on the group parent (this rule applied to the parent), and the ERP performs no unseal action, it only records who may do it (zatca OQ-32). **[S in zatca + core; test AT-18, AT-28]**
 18. When the user who should approve is absent, the document waits; the system never routes approval to another person on its own. **[S]**
 
 **Dual control**
@@ -313,6 +320,8 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 | AT-24 | MP in ALM (Sharia enforced) | MP posts an entry to a Sharia-prohibited account and into a closed period | Both refused by ledger rules despite full rights (R7) |
 | AT-25 | User with `preferred_language="ar"` | Is refused | `AccessDenied.message_ar` shown; every seeded role and catalogue permission has non-empty en and ar labels (R28) |
 | AT-26 | Code scan | Run the test listing public service functions | Every function calls `require` or is on the reviewed allow-list (R1) |
+| AT-27 | *Added 2026-10-16 (A11).* In ALM: accountant S drafts and submits a contract version; approver C; `system_billing`; agent user | C approves S's version; S approves it; `system_billing` creates a correction draft, then submits it; S submits it; S approves the note; C approves it; agent edits a version draft | C's approval allowed; S refused (A, R14). Draft creation allowed; `system_billing` submit refused (R13); S submit allowed; S approve refused (submitter, R14); C approve allowed. Agent refused (R12). |
+| AT-28 | *Added 2026-10-16 (A12).* Group parent ALM, child SUB; K is `zatca_admin` in ALM and SUB; K2 has no `zatca_admin` | MP grants K `unseal` on ALM; MP grants K `unseal` on SUB; MP grants K2 `unseal` on ALM; an `access_admin` grants `unseal` on ALM | First allowed, `delegation_granted` in `AccessLog`; second refused (not the group parent); third refused (no `zatca_admin`); fourth refused (`zatca.grant_key_delegation` is MP only) (R17) |
 
 ## 9. Open questions
 
@@ -334,7 +343,7 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 | OQ-12 | Who closes fiscal periods? Not in any spec. | Accountant / CFO | D | `approver` |
 | OQ-13 | **Conflict with an approved decision:** zatca D-9 approved the OQ-14 default "Superuser only for onboarding"; zatca §7 and R24 here give onboarding to `zatca_admin` + key delegation, and superusers get no business rights. | Managing Partner | **B** for zatca onboarding permission wiring | `zatca_admin` + delegation; a technical admin who onboards gets a `zatca_admin` membership, not superuser rights |
 | OQ-14 | **Conflict:** `docs/ai-agent-gateway.md` rule 3 allows agent posting per action/entity with an amount limit; A7 says never. | Managing Partner | D | A7 holds (never); gateway doc to be amended by its owner |
-| OQ-15 | Should `billing.approve_termination` be "not own"? billing §7 does not say so; invoicing does for all approvals. | Managing Partner | D | Yes, all **A** permissions are segregated |
+| OQ-15 | Should `billing.approve_termination` be "not own"? billing §7 does not say so; invoicing does for all approvals. | Managing Partner | D | Yes, all **A** permissions are segregated. Billing R39/R40 (D9) now state CFO ≠ creator/submitter for every version, terminations included |
 | OQ-16 | Maximum delegation length (CFO and key custody; zatca OQ-25). | Managing Partner | D | No maximum; `valid_to` required for CFO delegates, optional for key custody (zatca default) |
 | OQ-17 | Should WHT entry and verification be separate people (enter ≠ verify)? | Accountant | D | No rule; same person may do both |
 

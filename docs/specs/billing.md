@@ -6,7 +6,7 @@ Depends on: `core` (Entity), `docs/specs/invoicing.md` (sales documents, custome
 
 ## 1. Purpose
 
-The billing module holds customer contracts for **every entity** in the group (Almiras, subsidiaries and any entity added later as an `Entity` row). It covers leases (commercial and residential), vehicle rentals, staff secondments, services (consulting, IP licences) and other recurring charges, for third-party customers and for other group entities (intercompany). From each approved contract it builds a billing schedule. On each due date it creates sales invoices automatically, through `invoicing.services` only, with `source="system"`. It never bills the same period twice. It prorates partial periods. It stops billing when a contract ends, is terminated, or (for secondments) when the HR assignment ends. It creates and posts no journal entries itself: invoicing posts them, and sales documents go through ZATCA as described in invoicing.md. Each entity's Sharia setting applies to every contract line, every user-facing text is in English and Arabic, and no contract, schedule or run crosses entity boundaries.
+The billing module holds customer contracts for **every entity** in the group (Almiras, subsidiaries and any entity added later as an `Entity` row). It covers leases (commercial and residential), vehicle rentals, staff secondments, services (consulting, IP licences) and other recurring charges, for third-party customers and for other group entities (intercompany). From each approved contract it builds a billing schedule. On each due date it creates sales invoices automatically, through `invoicing.services` only, with `source="system"`. It never bills the same period twice. It prorates partial periods. It stops billing when a contract ends, is terminated, or (for secondments) when the HR assignment ends. Contracts stay amendable, terminable and cancellable after approval, also with a past effective date, through CFO-approved versions; already-billed periods are then corrected by system-drafted credit or debit notes that a person reviews and the CFO approves, never by editing issued invoices. It creates and posts no journal entries itself: invoicing posts them, and sales documents go through ZATCA as described in invoicing.md. Each entity's Sharia setting applies to every contract line, every user-facing text is in English and Arabic, and no contract, schedule or run crosses entity boundaries.
 
 ## 2. Decisions
 
@@ -120,7 +120,7 @@ Only explicit stepped amounts are supported until escalation types are decided (
 | end_recorded_by / end_recorded_at / end_source | FK User / DateTime / Choice `manual`, `hr_event` | at end | | |
 
 Interface the HR module must call (until then, the accounting-staff UI calls it):
-`billing.services.end_secondment(entity, assignment, end_date, user, source)`. It is idempotent: the same end date twice is a no-op. A different end date applies the earlier or later date per R20.
+`billing.services.end_secondment(entity, assignment, end_date, user, source)`. It is idempotent: the same end date twice is a no-op. A different end date applies the earlier or later date per R49 (was R20, withdrawn by D9).
 
 ### 3.7 BillingRun and BillingRunItem
 
@@ -298,7 +298,8 @@ A backdated decrease gives the B7 shape for the delta. Intercompany: 1210 + coun
 
 | System | Direction | What flows | Status |
 |---|---|---|---|
-| `invoicing` (internal) | Out | Create and issue sales invoice (lines, supply period, customer, currency, VAT category, account, `source="system"`); draft credit notes | invoicing must add `system` to its `source` choices (it lists human/import/agent) |
+| `invoicing` (internal) | Out | Create and issue sales invoice (lines, supply period, customer, currency, VAT category, account, `source="system"`); draft credit and debit notes from `BillingAdjustment` via `create_adjustment_from_billing` (R43; invoicing R73), never issued by billing | invoicing must add `system` to its `source` choices (it lists human/import/agent) |
+| `invoicing` (internal) | In | Note status (`issued`, `final`, `rejected`) and deletion of superseded drafts | Drives R46, R47 |
 | `invoicing` (internal) | In | Document status (`final`, `rejected`) via callback or polling | Drives R12 |
 | ZATCA (via invoicing → zatca only) | Out/In | Clearance (B2B, incl. intercompany) or reporting (B2C, e.g. residential tenants who are individuals) | No direct call from billing |
 | `ledger-fx` (internal) | In | Currency list, rate for (currency, date) | Spec not in repo yet |
@@ -401,12 +402,12 @@ Added 2026-10-16 (D8 to D10). Common fixture for AT-23 to AT-30: ALM commercial 
 | OQ-3 | Proration method (actual days vs 30/360 vs whole months) and period anchor (calendar vs contract start). | Accountant | Default: actual days; `calendar` anchor (R16, R17). |
 | OQ-4 | Escalation types: fixed %, fixed amount, compounding, index-linked (index-linked needs a Sharia check), mid-period effect. | Accountant + Sharia board | Default: explicit stepped amounts only, from the next period. |
 | OQ-5 | Billing date vs supply date for ZATCA/VAT: tax point for continuous supplies (rent, rentals, secondments), whether the issue date may precede the supply period (lead days), and the rule against backdating **[CC-verify]**. | compliance-checker / tax adviser | Default: issue on run date, `bill_lead_days=0`, supply = period. |
-| OQ-6 | Refunds or credit for already-billed days after an early end (lease and rental terms may forbid refunds). | Accountant / Managing Partner | Default: draft credit note, human issues (R20). |
-| OQ-7 | Amendments and termination: does every change need CFO approval, and is there a notice-period rule? | Project owner | Default: CFO approves amendments and terminations; secondment end dates need none (D6). |
+| OQ-6 | Refunds or credit for already-billed days after an early end (lease and rental terms may forbid refunds). | Accountant / Managing Partner | **Resolved by D9**: draft credit notes, reviewed by a person, CFO approves (R42 to R44); where terms forbid a refund the reviewer discards the draft with a reason (R48). |
+| OQ-7 | Amendments and termination: does every change need CFO approval, and is there a notice-period rule? | Project owner | **Resolved by D9** for approval: amendments, terminations and cancellations are versioned and CFO-approved, effective date may be past (R38 to R40); secondment end dates need none (D6). Still open: notice-period rule (default: none enforced). |
 | OQ-8 | Is there one CFO per entity or a group CFO? May a CFO approve a contract they created? | Project owner | Default: CFO role per entity; approver ≠ creator. |
 | OQ-9 | Open-ended contracts and auto-renewal (leases, vehicle rentals). | Accountant | Default: end date required except secondment/service; no auto-renewal. |
 | OQ-10 | Ejar: is registration of residential (and commercial) leases mandatory for these entities, and should the ERP integrate (contract number, payment schedule) **[CC-verify]**? | compliance-checker / Managing Partner | Default: Ejar number recorded only; no integration. |
-| OQ-11 | Should an intercompany invoice create a draft mirror bill in the receiving entity? | Accountant | Default: no (R4). Mismatches show in `intercompany_balances`. |
+| OQ-11 | Should an intercompany invoice create a draft mirror bill in the receiving entity? | Accountant | **Resolved by D10**: no automatic bill; the buyer entity's staff enter it (R4). Mismatches show in `intercompany_balances`. |
 | OQ-12 | PDPL: which secondment data may appear on invoices to the receiving entity (name, role, days)? | Legal / HR | Default: role title and pseudonymous `employee_ref` only. |
 | OQ-13 | Billing for a supply period in a closed fiscal period: issue in the current period, or require a human decision? | Accountant | Default: `held` until released (R23). |
 | OQ-14 | Contract number format. | Accountant | Default `{entity.code}-CTR-{year}-{000001}`. |
@@ -417,6 +418,13 @@ Added 2026-10-16 (D8 to D10). Common fixture for AT-23 to AT-30: ALM commercial 
 | OQ-19 | Scheduled job runner (section 6 options). | Dev | Default for build: management command; runner chosen before deployment. |
 | OQ-20 | Advance (386) and security deposit handling: accounts, VAT treatment of deposits, offset against invoices. **Needs tax adviser.** | Accountant / tax adviser | **BLOCKING** for advance offsets (R30). Deposits memo only (R31). |
 | OQ-21 | Vehicle rental extras (excess mileage, damage, traffic fines recharge). | Accountant | Default: out of scope; billed manually through invoicing. |
-| OQ-22 | Exact invoicing service names and the status callback (invoicing.md OQ-2); adding `source="system"` to invoicing. | invoicing spec author | **BLOCKING** for R13; build against a stub. |
+| OQ-22 | Exact invoicing service names and the status callback (invoicing.md OQ-2); adding `source="system"` to invoicing. | invoicing spec author | **BLOCKING** for R13; build against a stub. Now also covers `create_adjustment_from_billing` (R43; invoicing R73). |
+| OQ-23 | *Added 2026-10-16 (D9).* Which terms may an amendment change retroactively: customer, currency, contract type, billing frequency/timing/anchor? | Accountant / Managing Partner | Default (R39): customer, currency, type never (new contract); frequency/timing/anchor only after the last generated period. |
+| OQ-24 | *Added 2026-10-16 (D9).* Mid-period effect of an amendment: actual days from the effective date (R42) or from the next period (as OQ-4 does for price steps)? | Accountant | Default: actual days by segment, rounded per segment. |
+| OQ-25 | *Added 2026-10-16 (D9).* VAT timing of backdated corrections: which date is the note's `adjustment_event_date` (effective date vs date the change was recorded) for the 15-day note rule (invoicing R71, TIR §7.2), and how far back corrections may go (prior VAT periods, prior audited fiscal years). **[Needs expert sign-off: tax]** | Tax adviser / accountant | Default: effective date; warning only (invoicing R71); no limit other than `start_date`. |
+| OQ-26 | *Added 2026-10-16 (D9).* May the reviewer change computed correction amounts (e.g. a negotiated partial refund)? | Accountant / CFO | Default: no; discard (R48) and record a new version. |
+| OQ-27 | *Added 2026-10-16 (D9).* Amending `ended` or `terminated` contracts: extension after end, undoing a termination, re-activation. | Accountant / Managing Partner | Default: versions with effective date ≤ the end/termination date allowed (corrections); extension, undo and re-activation need a new contract. |
+| OQ-28 | *Added 2026-10-16 (D9).* May agents draft contract versions (R36 lets them draft contracts)? | Managing Partner | Default: no. |
+| OQ-29 | *Added 2026-10-16 (CLAUDE.md rule 7 amended).* Contracts in 3-decimal currencies (KWD, BHD, OMR, JOD) or 0-decimal (JPY): billing money fields are 2 dp; invoicing documents too (invoicing OQ-48). | Accountant + Dev | Default: contracts in currencies with `minor_units` ≠ 2 rejected (R37). |
 
-**Blocking:** OQ-2 (multi-month in-advance), OQ-16 (non-base currency), OQ-20 (advance offsets), OQ-22 (invoicing interface), and invoicing OQ-25 (role model) for views. **Before building:** the compliance-checker verifies every [CC-verify] item (R15, R24, OQ-5, OQ-10, OQ-15).
+**Blocking:** OQ-2 (multi-month in-advance), OQ-16 (non-base currency), OQ-20 (advance offsets), OQ-22 (invoicing interface, incl. R43), and invoicing OQ-25 (role model) for views. **Expert sign-off:** OQ-25 (tax). **Before building:** the compliance-checker verifies every [CC-verify] item (R15, R24, OQ-5, OQ-10, OQ-15).
