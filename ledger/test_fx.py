@@ -377,6 +377,41 @@ def test_r11_at17_corrections_are_new_rows_and_posted_lines_keep_their_rate(w):
         ])
 
 
+def test_p4_rate_used_by_a_posted_line_is_locked_also_in_bulk(w):
+    """P4 (reviewer probe): QuerySet.update() rewrote a rate used by a posted line."""
+    inv = f1_invoice(w)
+    used = line_on(inv, "1200").exchange_rate
+    unused = rate("USD", "SAR", date(2027, 1, 15), "3.7500")
+    for attempt in (
+        lambda: ExchangeRate.objects.filter(pk=used.pk).update(rate=D("9.9")),
+        lambda: ExchangeRate.objects.all().update(source_reference="x"),
+        lambda: ExchangeRate.objects.filter(pk=used.pk).delete(),
+    ):
+        with pytest.raises(LedgerError, match="used by posted entries"):
+            attempt()
+    assert ExchangeRate.objects.get(pk=used.pk).rate == D("4.1")
+    assert ExchangeRate.objects.filter(pk=unused.pk).update(source_reference="typo fixed") == 1  # unused rows are free
+    on_draft = rate("GBP", "SAR", date(2027, 1, 15), "4.7000")
+    draft(w, w.alm, date(2027, 1, 15), [{"account": "1200", "currency": "GBP", "txn_debit": "1.00"},
+                                        {"account": "4100", "currency": "GBP", "txn_credit": "1.00"}])
+    assert ExchangeRate.objects.filter(pk=on_draft.pk).update(source_reference="still a draft") == 1
+
+
+@pytest.mark.skipif(not __import__("django.db").db.connection.vendor == "postgresql", reason="PostgreSQL-only database guard")
+def test_database_rejects_raw_changes_to_a_used_rate(w):
+    from django.db import DatabaseError, connection
+
+    inv = f1_invoice(w)
+    used = line_on(inv, "1200").exchange_rate
+    unused = rate("USD", "SAR", date(2027, 1, 15), "3.7500")
+    for sql in ("UPDATE ledger_exchangerate SET rate = 9 WHERE id = %s", "DELETE FROM ledger_exchangerate WHERE id = %s"):
+        with pytest.raises(DatabaseError), transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute(sql, [used.pk])
+    with transaction.atomic(), connection.cursor() as cursor:
+        cursor.execute("UPDATE ledger_exchangerate SET source_reference = 'ok' WHERE id = %s", [unused.pk])
+    assert ExchangeRate.objects.get(pk=used.pk).rate == D("4.1")
+
+
 def test_r12_at11_rate_age_limit_and_inverse(w):
     usd = [{"account": "1200", "currency": "USD", "txn_debit": "100.00"}, {"account": "4100", "currency": "USD", "txn_credit": "100.00"}]
     rate("USD", "SAR", date(2027, 3, 4), "3.7400")  # 6 days before: too old

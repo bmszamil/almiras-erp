@@ -408,6 +408,31 @@ class EntrySequence(models.Model):
         unique_together = [("entity", "year")]
 
 
+RATE_LOCK = (
+    "This rate is used by posted entries and cannot be changed or deleted, also not in bulk; add a new rate row. / "
+    "هذا السعر مستخدم في قيود مرحّلة ولا يمكن تعديله أو حذفه، ولا جماعيًا؛ أضف سجل سعر جديدًا."
+)
+
+
+class ExchangeRateQuerySet(models.QuerySet):
+    """Bulk writes skip ``save()``/``delete()``, so rows used by booked lines are locked here too (R11)."""
+
+    def _touches_locked(self):
+        return JournalLine.objects.filter(exchange_rate__in=self.values("pk")).exclude(
+            entry__status=JournalEntry.Status.DRAFT
+        ).exists()
+
+    def update(self, **kwargs):
+        if self._touches_locked():
+            raise LedgerError(RATE_LOCK)
+        return super().update(**kwargs)
+
+    def delete(self):
+        if self._touches_locked():
+            raise LedgerError(RATE_LOCK)
+        return super().delete()
+
+
 class ExchangeRate(models.Model):
     """Units of ``to_currency`` per 1 unit of ``from_currency`` (ledger-fx.md 3.3).
 
@@ -450,6 +475,8 @@ class ExchangeRate(models.Model):
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
     created_at = models.DateTimeField(auto_now_add=True)
     import_batch = models.CharField(bi("Import batch", "دفعة الاستيراد"), max_length=40, blank=True)
+
+    objects = ExchangeRateQuerySet.as_manager()
 
     class Meta:
         verbose_name = bi("exchange rate", "سعر صرف")
