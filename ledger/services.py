@@ -1694,6 +1694,7 @@ def _post_revaluation(run, user):
     run.reversal = reversal
     run.status = RevaluationRun.Status.POSTED
     run.posted_by, run.posted_at = user, timezone.now()
+    run._allow_transition(RevaluationRun.Status.DRAFT, RevaluationRun.Status.POSTED)
     run.save(update_fields=["reversal", "status", "posted_by", "posted_at"])
     return run
 
@@ -1720,6 +1721,7 @@ def discard_revaluation(run, *, user):
     run.entry = None
     run.status = RevaluationRun.Status.DISCARDED
     run.discarded_by, run.discarded_at = user, timezone.now()
+    run._allow_transition(RevaluationRun.Status.DRAFT, RevaluationRun.Status.DISCARDED)
     run.save(update_fields=["entry", "status", "discarded_by", "discarded_at"])
     if entry is not None:
         entry.delete()

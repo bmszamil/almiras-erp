@@ -620,6 +620,12 @@ class ExchangeRate(models.Model):
 class RevaluationRunQuerySet(models.QuerySet):
     """Runs are kept for audit (R44, R45): never deleted, status changes only through ledger.services."""
 
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        if any(obj.status != RevaluationRun.Status.DRAFT for obj in objs):
+            raise LedgerError(REVALUATION_RUN_LOCK)
+        return super().bulk_create(objs, *args, **kwargs)
+
     def update(self, **kwargs):
         raise LedgerError(REVALUATION_RUN_LOCK)
 
@@ -685,13 +691,38 @@ class RevaluationRun(models.Model):
             ),
         ]
 
+    def _allow_transition(self, before, after):
+        """Set only by ledger.services (_post_revaluation, discard_revaluation) right before their save."""
+        self._status_transition = (before, after)
+
     def save(self, *args, **kwargs):
         if self.period.entity_id != self.entity_id:
             raise LedgerError("The period belongs to another entity. / الفترة تخص كيانًا آخر.")
+        allowed, self._status_transition = getattr(self, "_status_transition", None), None
+        stored = None
         if self.pk is not None:
             stored = RevaluationRun.objects.filter(pk=self.pk).values_list("status", flat=True).first()
             if stored is not None and stored != self.Status.DRAFT:
                 raise LedgerError(REVALUATION_RUN_LOCK)
+        before = stored or self.Status.DRAFT
+        # draft -> posted only from post_revaluation, draft -> discarded only from discard_revaluation.
+        if before != self.status and allowed != (before, self.status):
+            raise LedgerError(REVALUATION_RUN_LOCK)
+        if stored is None and self.status != self.Status.DRAFT:
+            raise LedgerError(REVALUATION_RUN_LOCK)
+        posted = (self.posted_by_id, self.posted_at)
+        discarded = (self.discarded_by_id, self.discarded_at)
+        required = {
+            self.Status.DRAFT: posted == (None, None) and discarded == (None, None),
+            self.Status.POSTED: None not in posted and discarded == (None, None) and self.reversal_id is not None,
+            self.Status.DISCARDED: None not in discarded and posted == (None, None) and self.entry_id is None,
+        }
+        if not required.get(self.status, False):
+            raise LedgerError(
+                "A draft run has no poster or discarder; a posted run records who posted it and when, with its "
+                "reversal; a discarded run who discarded it and when. / "
+                "تشغيل المسودة بلا مرحِّل أو ملغٍ؛ والتشغيل المرحّل يسجل من رحّله ومتى مع عكسه؛ والملغى من ألغاه ومتى."
+            )
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
