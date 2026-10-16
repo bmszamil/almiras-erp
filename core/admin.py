@@ -2,7 +2,7 @@ from django.contrib import admin
 
 from core import access
 
-from .models import Entity
+from .models import Currency, Entity
 
 
 class EntityScopedAdmin(admin.ModelAdmin):
@@ -103,11 +103,29 @@ class EntityAdmin(admin.ModelAdmin):
                     "consolidation",
                     "reporting_standard",
                     "base_currency",
+                    "presentation_currency",
                     "sharia_enforced",
                 ]
             },
         ),
     ]
+
+
+@admin.register(Currency)
+class CurrencyAdmin(admin.ModelAdmin):
+    """Read-only: ISO 4217 reference data is loaded and changed by migration (ledger-fx.md 3.1)."""
+
+    list_display = ["code", "numeric_code", "name_en", "name_ar", "minor_units", "symbol", "is_active"]
+    search_fields = ["code", "name_en", "name_ar"]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 from core.access import admin as _access_admin  # noqa: E402,F401  (registers access admins)

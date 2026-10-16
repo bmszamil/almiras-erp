@@ -15,7 +15,8 @@ from core.access import services as access_services
 from core.access.models import AccessLog, Role, RolePermission
 from core.access.seed import apply_seed
 from core.access.testing import make_user, member
-from core.models import Entity
+from core.currency_seed import apply_currency_seed
+from core.models import Currency, Entity
 from ledger import services as ledger
 from ledger.models import FiscalPeriod
 from ledger.services_setup import create_monthly_periods, install_chart_of_accounts
@@ -35,6 +36,7 @@ def denials(**filters):
 @pytest.fixture
 def world():
     apply_seed(Role, RolePermission)  # transactional tests start from a flushed database
+    apply_currency_seed(Currency)  # Entity.base_currency is a FK to Currency (ledger-fx.md 3.2)
     alm = Entity.objects.create(code="ALM", name_en="ALM", name_ar="كيان", consolidation="parent")
     install_chart_of_accounts(alm)
     create_monthly_periods(alm, 2027)

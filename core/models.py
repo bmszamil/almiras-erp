@@ -6,7 +6,7 @@ not as new code.
 from decimal import Decimal
 
 from django.core.exceptions import ValidationError
-from django.core.validators import RegexValidator
+from django.core.validators import MaxValueValidator, RegexValidator
 from django.db import models
 
 from .iso3166 import ISO_3166_ALPHA2
@@ -71,6 +71,57 @@ def label_part(label, language):
     """The English (``"en"``) or Arabic (``"ar"``) half of a :func:`bi` label."""
     en, _, ar = str(label).partition(" / ")
     return ar if language == "ar" and ar else en
+
+
+# Highest ISO 4217 exponent the ledger stores (txn_amount has 3 decimals; D5, R40).
+MAX_MINOR_UNITS = 3
+
+
+class Currency(models.Model):
+    """ISO 4217 currency (ledger-fx.md 3.1). Global reference data: no entity FK, same for every entity."""
+
+    code = models.CharField(
+        bi("Code", "الرمز"), max_length=3, primary_key=True,
+        validators=[RegexValidator(r"^[A-Z]{3}\Z", "ISO 4217 code: three capital letters. / رمز ISO 4217: ثلاثة أحرف لاتينية كبيرة.")],
+    )
+    numeric_code = models.CharField(
+        bi("Numeric code", "الرمز الرقمي"), max_length=3,
+        validators=[_digits(3, "Numeric code", "الرمز الرقمي")],
+    )
+    name_en = models.CharField(bi("Name (English)", "الاسم (بالإنجليزية)"), max_length=100)
+    name_ar = models.CharField(bi("Name (Arabic)", "الاسم (بالعربية)"), max_length=100)
+    minor_units = models.PositiveSmallIntegerField(
+        bi("Minor units", "عدد الخانات العشرية"), validators=[MaxValueValidator(4)],
+        help_text=bi("ISO 4217 exponent: SAR 2, JPY 0, KWD 3", "أُسّ العملة وفق ISO 4217: الريال 2، الين 0، الدينار الكويتي 3"),
+    )
+    symbol = models.CharField(bi("Symbol", "الرمز المختصر"), max_length=8, blank=True)
+    is_active = models.BooleanField(bi("Active", "نشطة"), default=True)
+
+    class Meta:
+        verbose_name = bi("currency", "عملة")
+        verbose_name_plural = bi("currencies", "العملات")
+        ordering = ["code"]
+
+    def _check_storable(self):
+        # R40: storage holds at most 3 decimals, so such a currency cannot be active.
+        if self.is_active and self.minor_units is not None and self.minor_units > MAX_MINOR_UNITS:
+            raise ValidationError(
+                f"Currency {self.code} has {self.minor_units} minor units; at most {MAX_MINOR_UNITS} can be stored, "
+                "so it cannot be active. / "
+                f"للعملة {self.code} عدد {self.minor_units} خانات عشرية؛ الحد الأقصى للتخزين {MAX_MINOR_UNITS}، "
+                "فلا يمكن تفعيلها.",
+                code="too_many_minor_units",
+            )
+
+    def clean(self):
+        self._check_storable()
+
+    def save(self, *args, **kwargs):
+        self._check_storable()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.code
 
 
 # Bilingual country names for the national address (ISO 3166-1 alpha-2 code stored).
@@ -153,7 +204,17 @@ class Entity(models.Model):
     )
     short_address = models.CharField(bi("Short address", "العنوان المختصر"), max_length=8, blank=True)
 
-    base_currency = models.CharField(bi("Base currency", "العملة الأساسية"), max_length=3, default="SAR")
+    # The entity's functional currency (ledger-fx.md 3.2; name kept, OQ-10). Column name unchanged.
+    base_currency = models.ForeignKey(
+        Currency, to_field="code", db_column="base_currency", on_delete=models.PROTECT, default="SAR",
+        related_name="+", verbose_name=bi("Functional currency", "العملة الوظيفية"),
+        help_text=bi("Must have 2 minor units; locked after the first posting", "يجب أن تكون بخانتين عشريتين؛ تُقفل بعد أول ترحيل"),
+    )
+    presentation_currency = models.ForeignKey(
+        Currency, to_field="code", on_delete=models.PROTECT, null=True, blank=True, related_name="+",
+        verbose_name=bi("Presentation currency", "عملة العرض"),
+        help_text=bi("Group reporting entity only (default SAR, OQ-7)", "للكيان المُعِدّ لتقارير المجموعة فقط (الافتراضي الريال، OQ-7)"),
+    )
     reporting_standard = models.CharField(
         bi("Reporting standard", "معيار إعداد التقارير"), max_length=10, choices=Standard.choices,
         default=Standard.IFRS_SME,
@@ -186,6 +247,36 @@ class Entity(models.Model):
             )
         if not (Decimal("0") < self.ownership_pct <= Decimal("100")):
             raise ValidationError("Ownership must be above 0% and at most 100%. / يجب أن تكون نسبة الملكية أكبر من 0% ولا تتجاوز 100%.")
+        self._check_functional_currency()
+
+    def _check_functional_currency(self):
+        """R4: the functional currency has 2 minor units. R5: it is locked once the entity has a posted entry."""
+        if self.base_currency_id is None:
+            return
+        currency = Currency.objects.filter(code=self.base_currency_id).first()
+        if currency is None or currency.minor_units != 2 or not currency.is_active:
+            raise ValidationError(
+                {"base_currency": f"Functional currency {self.base_currency_id} must be an active currency with 2 minor units. / "
+                 f"يجب أن تكون العملة الوظيفية {self.base_currency_id} عملة نشطة بخانتين عشريتين."},
+                code="functional_currency_decimals",
+            )
+        if self.pk:
+            stored = Entity.objects.filter(pk=self.pk).values_list("base_currency", flat=True).first()
+            if stored is not None and stored != self.base_currency_id and self.has_posted_entries():
+                raise ValidationError(
+                    {"base_currency": f"{self.code} already has posted entries; its functional currency cannot change. / "
+                     f"للكيان {self.code} قيود مرحّلة؛ لا يمكن تغيير عملته الوظيفية."},
+                    code="functional_currency_locked",
+                )
+
+    def has_posted_entries(self):
+        # Reverse relation from ledger.JournalEntry; core does not import ledger.
+        return self.journal_entries.exclude(status="draft").exists()
+
+    def save(self, *args, **kwargs):
+        # Checked on every save, not only in full_clean, so no code path skips R4 / R5.
+        self._check_functional_currency()
+        super().save(*args, **kwargs)
 
     @property
     def legal_form_en(self):
