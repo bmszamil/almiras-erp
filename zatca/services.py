@@ -20,8 +20,8 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
-from django.db import transaction
-from django.db.models import Q
+from django.db import models, transaction
+from django.db.models import Exists, ExpressionWrapper, OuterRef, Q
 from django.utils import timezone
 from lxml import etree
 
@@ -81,6 +81,8 @@ EGS_TRANSITIONS = {
     EgsStatus.RENEWAL_DUE: {EgsStatus.ACTIVE, EgsStatus.EXPIRED},
 }
 RETRIED_HOLDS = ("", EInvoice.Hold.NO_EGS, EInvoice.Hold.EGS_NOT_READY)
+# Signed with a unit's current certificate and not finished with ZATCA yet (renewal and production switch wait).
+IN_FLIGHT = (Status.STAMPED, Status.QUEUED, Status.SUBMITTING, Status.FAILED_RETRYABLE)
 PROCESS = "zatca.process_queue"
 SWITCH = "zatca.switch_to_production"
 
@@ -362,11 +364,31 @@ def switch_to_production(profile, *, user, request):
     if not _setting("ZATCA_PRODUCTION_ALLOWED", False):
         raise ZatcaError("Production cannot be selected in this installation (test or development settings, R-29).",
                          "لا يمكن اختيار بيئة الإنتاج في هذا التثبيت (إعدادات اختبار أو تطوير).", code="production_blocked")
-    access.require_dual_control(user, profile.entity, SWITCH, request, _production_payload(profile), target=profile)
+    entity = profile.entity
+    if EInvoice.objects.filter(entity=entity, status__in=IN_FLIGHT).exists():
+        raise ZatcaError("Documents signed in the current environment are still waiting for ZATCA (stamped, queued, "
+                         "submitting or retrying); let them finish before switching to production (R-36).",
+                         "ما زالت مستندات موقعة في البيئة الحالية بانتظار الهيئة (مختومة أو في الطابور أو قيد الإرسال أو "
+                         "بانتظار إعادة المحاولة)؛ انتظر انتهاءها قبل الانتقال إلى بيئة الإنتاج.", code="documents_in_flight")
+    access.require_dual_control(user, entity, SWITCH, request, _production_payload(profile), target=profile)
     old = profile.environment
-    profile.environment = "production"
-    _save(profile)
-    _event(profile.entity, None, Action.ENVIRONMENT_CHANGED, user, old=old, new="production")
+    with transaction.atomic():
+        profile.environment = "production"
+        _save(profile)
+        _event(entity, None, Action.ENVIRONMENT_CHANGED, user, old=old, new="production")
+        # R-36 / finding 3: units onboarded in another environment can never sign here; they are retired and the
+        # entity onboards new units in production.
+        retired = []
+        for egs in EgsUnit.objects.filter(entity=entity).exclude(status=EgsStatus.REVOKED):
+            _revoke_unit(egs)
+            _event(entity, egs, Action.REVOKED, user, reason=f"environment_changed: {old} -> production (R-36)")
+            retired.append(egs.code)
+        if retired:
+            _alert(entity, _zatca_admins(entity), "environment_changed",
+                   f"{entity.code} is now on ZATCA production. EGS units {', '.join(retired)} were onboarded in {old} "
+                   "and are retired; onboard production units before documents can be signed.",
+                   f"انتقل الكيان {entity.code} إلى بيئة الإنتاج. أُوقفت وحدات الفوترة {', '.join(retired)} المسجلة في "
+                   "البيئة السابقة؛ سجّل وحدات في بيئة الإنتاج قبل توقيع المستندات.")
     return profile
 
 
@@ -708,6 +730,7 @@ def renew_production_csid(egs, otp, *, user):
     if egs.status not in (EgsStatus.ACTIVE, EgsStatus.RENEWAL_DUE):
         raise ZatcaError("Only an active unit (or one due for renewal) is renewed (R-5, R-10).",
                          "تُجدَّد الوحدة النشطة أو المستحقة للتجديد فقط.", code="egs_transition")
+    _refuse_renewal_in_flight(egs)
     profile = _profile_of(entity)
     old = _active_credential(egs, EgsCredential.Kind.PRODUCTION)
     try:
@@ -724,6 +747,13 @@ def renew_production_csid(egs, otp, *, user):
     new_public = keystore.get_store().public_key_der(ref, master)
     with transaction.atomic():
         egs = EgsUnit.objects.select_for_update().select_related("entity").get(pk=egs.pk)
+        late = list(_in_flight_numbers(egs))
+        if late:  # stamped between the check and now: ZATCA already issued the new CSID, so keep it and alert
+            _alert(entity, _zatca_admins(entity), "renewal_in_flight",
+                   f"EGS unit {egs.code} was renewed while {', '.join(late)} (signed with the old certificate) were "
+                   "still with ZATCA; check their results.",
+                   f"جُددت شهادة وحدة الفوترة {egs.code} بينما المستندات {', '.join(late)} الموقعة بالشهادة السابقة "
+                   "ما زالت لدى الهيئة؛ راجع نتائجها.", egs=egs)
         new = _store_credential(egs, EgsCredential.Kind.PRODUCTION, profile.environment, response, user)
         if crypto.spki_der(crypto.cert_from_pem(new.certificate_pem).public_key()) != new_public:
             raise ZatcaError("The renewed certificate is not for the new key pair; nothing changed.",
@@ -738,6 +768,24 @@ def renew_production_csid(egs, otp, *, user):
         _save(egs)
         _event(entity, egs, Action.PCSID_RENEWED, user, credential=new.pk, replaces=old.pk, private_key_ref=ref)
     return egs
+
+
+def _in_flight_numbers(egs):
+    return EInvoice.objects.filter(egs_unit=egs, status__in=IN_FLIGHT).order_by("icv").values_list(
+        "source_document__number", flat=True)[:20]
+
+
+def _refuse_renewal_in_flight(egs):
+    """Finding 7: ZATCA revokes the old CSID when it issues the new one (DTG p.32), so documents signed with the
+    old certificate must finish first (drain), before any key or OTP is used."""
+    numbers = list(_in_flight_numbers(egs))
+    if numbers:
+        raise ZatcaError(
+            f"EGS unit {egs.code} still has documents with ZATCA ({', '.join(numbers)}: stamped, queued, submitting "
+            "or retrying). Renewal revokes the current certificate, so let them finish first; the OTP was not used.",
+            f"لدى وحدة الفوترة {egs.code} مستندات ما زالت لدى الهيئة ({', '.join(numbers)}: مختومة أو في الطابور أو قيد "
+            "الإرسال أو بانتظار إعادة المحاولة). التجديد يلغي الشهادة الحالية، فانتظر انتهاءها أولًا؛ لم يُستخدم رمز "
+            "التحقق.", code="documents_in_flight")
 
 
 def revoke_egs_unit(egs, *, user, reason):
@@ -849,10 +897,24 @@ def _retention_until(einv, doc, acquisition_date=None):
     return max(d for d in (computed, doc.retention_until, einv.retention_until) if d)
 
 
-def _pick_egs(entity, category):
+def _pick_egs(entity, category, now=None):
+    """Finding 3: the unit is chosen at stamping time (while the ICV is empty), never at hand-off. First choice: an
+    active unit for the category holding a production credential that is active, valid now and issued in the
+    profile's environment (R-9, R-10, R-36). Failing that, any active unit for the category, so that stamping
+    holds the document with the exact reason (expired credential, wrong environment); None if there is none."""
     field = "supports_standard" if category == EInvoice.Category.STANDARD else "supports_simplified"
-    return (EgsUnit.objects.filter(entity=entity, status__in=(EgsStatus.ACTIVE, EgsStatus.RENEWAL_DUE),
-                                   **{field: True}).order_by("code").first())
+    units = EgsUnit.objects.filter(entity=entity, status__in=(EgsStatus.ACTIVE, EgsStatus.RENEWAL_DUE),
+                                   **{field: True}).order_by("code")
+    profile = ZatcaProfile.objects.filter(entity=entity).first()
+    if profile is not None:
+        now = now or _now()
+        valid = EgsCredential.objects.filter(egs_unit=OuterRef("pk"), kind=EgsCredential.Kind.PRODUCTION,
+                                             status=EgsCredential.Status.ACTIVE, environment=profile.environment,
+                                             valid_from__lte=now, valid_to__gt=now)
+        unit = units.filter(Exists(valid)).first()
+        if unit is not None:
+            return unit
+    return units.first()
 
 
 def _go_live_ok(profile, today):
@@ -890,8 +952,7 @@ def submit_document(document, user):
                 type_code=doc.zatca_type_code, billing_reference=original, issue_datetime=issue,
                 api=EInvoice.Api.CLEARANCE if category == EInvoice.Category.STANDARD else EInvoice.Api.REPORTING,
                 reporting_deadline=issue + timedelta(hours=24) if category == EInvoice.Category.SIMPLIFIED else None,
-                retention_class=_retention_class(doc), created_by=user, source=_source(user),
-                egs_unit=_pick_egs(doc.entity, category))
+                retention_class=_retention_class(doc), created_by=user, source=_source(user))
             einv.retention_until = _retention_until(einv, doc)
             if not _go_live_ok(profile, _now().astimezone(RIYADH).date()):
                 einv.hold_reason = EInvoice.Hold.NOT_LIVE
@@ -987,10 +1048,16 @@ def _hold(einv, reason, problems, origin=ValidationMessage.Origin.LOCAL_RULES, *
         last = einv.messages.order_by("-id").values_list("code", flat=True).first()
         if einv.hold_reason != reason or last != (problems[0][0] if problems else None):
             _messages(einv, problems, origin=origin)
+            number = einv.source_document.number
             if reason == EInvoice.Hold.LOCAL_VALIDATION:
                 _alert(einv.entity, _zatca_admins(einv.entity), "local_validation",
-                       f"Document {einv.source_document.number} failed the local ZATCA checks and is held.",
-                       f"لم يجتز المستند {einv.source_document.number} الفحص المحلي للهيئة وتوقف.", einvoice=einv)
+                       f"Document {number} failed the local ZATCA checks and is held.",
+                       f"لم يجتز المستند {number} الفحص المحلي للهيئة وتوقف.", einvoice=einv)
+            elif reason in (EInvoice.Hold.EGS_NOT_READY, EInvoice.Hold.NO_EGS):  # finding 3
+                en, ar = (problems[0][1], problems[0][2]) if problems else ("", "")
+                _alert(einv.entity, _zatca_admins(einv.entity), str(reason),
+                       f"Document {number} is waiting for a usable EGS unit and is not signed: {en}".strip(),
+                       f"المستند {number} ينتظر وحدة فوترة صالحة ولم يُوقَّع: {ar}".strip(), einvoice=einv)
         einv.hold_reason, einv.next_attempt_at = reason, retry_at
         _save(einv)
     _sync_invoicing(einv)
@@ -1048,7 +1115,7 @@ def _stamp(einv, user, now):
     if einv.status != Status.PENDING or einv.hold_reason not in RETRIED_HOLDS:
         return einv
     profile = ZatcaProfile.objects.filter(entity=einv.entity).first()
-    egs = einv.egs_unit or _pick_egs(einv.entity, einv.zatca_category)
+    egs = _pick_egs(einv.entity, einv.zatca_category, now)  # chosen now: the ICV is still empty (finding 3)
     if egs is None:
         code, en, ar = local("no_egs")
         return _hold(einv, EInvoice.Hold.NO_EGS, [(code, en, ar)], retry_at=now + _backoff(1))
@@ -1060,7 +1127,7 @@ def _stamp(einv, user, now):
         with transaction.atomic():
             egs = EgsUnit.objects.select_for_update().get(pk=egs.pk)
             einv = EInvoice.objects.select_for_update().select_related("entity").get(pk=einv.pk)
-            if einv.status != Status.PENDING:
+            if einv.status != Status.PENDING or einv.icv is not None:
                 return einv
             credential = _signing_credential(einv, egs, profile, now)
             master = _master_ref(einv.entity)
