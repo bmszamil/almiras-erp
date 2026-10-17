@@ -280,9 +280,12 @@ def test_recipient_bank_is_derived_from_the_iban(w):
             name_en="Charity", name_ar="جمعية", bank="riyad", iban=make_iban("10", "000000000000501236"))
 
 
-@pytest.mark.skipif(connection.vendor == "postgresql", reason="the PostgreSQL trigger refuses the raw change itself")
 def test_approval_refused_when_the_stored_bank_differs_from_the_iban(w):
     rec = recipient(w, approve=False)
+    if connection.vendor == "postgresql":  # the recipient trigger refuses the raw change itself
+        _db_refused("UPDATE invoicing_charityrecipient SET bank_id = %s WHERE id = %s",
+                    [Bank.objects.get(code="riyad").pk, rec.pk])
+        return
     models.QuerySet.update(CharityRecipient.objects.filter(pk=rec.pk), bank=Bank.objects.get(code="riyad"))
     refused("charity_recipient_invalid", services.approve_charity_recipient, rec, user=managing_partner(w))
 
