@@ -13,8 +13,26 @@ from invoicing.test_purification import flagged_invoice
 pytestmark = pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL-only locking test")
 
 
+@pytest.fixture
+def seeded(transactional_db):
+    """Earlier transactional tests flush the database: put back the seeded rows the ``w`` fixture relies on."""
+    from django.apps import apps
+    from django.contrib.auth import get_user_model
+
+    from core.access.models import Role, RolePermission, UserProfile
+    from core.access.seed import apply_seed, apply_system_users
+    from core.currency_seed import apply_currency_seed
+    from core.models import Currency
+    from invoicing import reference_seed
+
+    apply_seed(Role, RolePermission)
+    apply_currency_seed(Currency)
+    apply_system_users(get_user_model(), UserProfile)
+    reference_seed.apply_all(apps)
+
+
 @pytest.mark.django_db(transaction=True)
-def test_r54_concurrent_transfers_serialise_on_the_entity(w):
+def test_r54_concurrent_transfers_serialise_on_the_entity(seeded, w):
     flagged_invoice(w, "1000.00")
     first, second = (services.create_purification_transfer(w.alm, user=w.accountant, kind="transfer",
                                                             date=date(2027, 1, 31), amount="600.00")
