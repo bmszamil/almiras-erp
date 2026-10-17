@@ -31,6 +31,13 @@ ALLOW = {
     "core/access/services.py:recorded_approvers": "reads the access log for a ledger check that already verified a grant",
     "core/access/services.py:visible_access_log": "the scope mechanism for access-log rows (entities_for + group parent)",
     "ledger/services.py:counterparty_choices": "choice list for admin; posting checks every line",
+    "invoicing/services.py:party_problems": "pure check of a party record the caller passes (model clean, services)",
+    "invoicing/services.py:customers": "the scope mechanism for customers (access.scope with invoicing.view, R2)",
+    "invoicing/services.py:vendors": "the scope mechanism for vendors (access.scope with invoicing.view, R2)",
+    "invoicing/services.py:sales_documents": "the scope mechanism for sales documents (access.scope, R2)",
+    "invoicing/services.py:purchase_documents": "the scope mechanism for purchase documents (access.scope, R2)",
+    "invoicing/services.py:create_from_billing": "stub until billing.md is built: always raises NotImplementedError",
+    "invoicing/services.py:create_adjustment_from_billing": "stub until billing.md is built: always raises",
     # Setup run by operators (setup_almiras, new-entity setup); no user action.
     "ledger/services_setup.py:install_chart_of_accounts": "operator setup of a new entity (CLAUDE.md: entities are data)",
     "ledger/services_setup.py:create_monthly_periods": "operator setup of a new entity",

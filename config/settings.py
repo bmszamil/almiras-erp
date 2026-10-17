@@ -40,7 +40,12 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "core",
     "ledger",
+    "invoicing",
 ]
+
+# ZATCA hand-off (invoicing.zatca_port): the default keeps sales documents pending until the zatca
+# module exists; it never clears anything, so nothing posts without a ZATCA result.
+INVOICING_ZATCA_PORT = "invoicing.zatca_port.PendingZatcaPort"
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
