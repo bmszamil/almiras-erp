@@ -278,3 +278,56 @@ Per entity; a role on ALM gives nothing on LFN.
 | Q15 | IFRS 16 under full IFRS will change how receivers book rentals (right-of-use asset, not rent expense). When does the group move to full IFRS, and should rental agreements already record lease terms for that? | Accountant / auditor |
 | Q16 | Approval matrix later: amount thresholds, per entity, per service type? Not needed now; confirm `required_approvals()` hook is enough. | MP |
 | Q17 | Secondment: is the seconded employee's cost billed at cost, cost-plus, or a day rate, and are there Mudad/Ajeer labour-law requirements for seconding staff between group companies? | HR / legal |
+
+## Build notes
+
+Backend build on branch `module/intercompany` (17 Oct 2026). Where the spec, D1–D12 and the approvals spec did not decide, the most conservative option was taken. Items marked **confirm** need a decision.
+
+**Structure**
+1. **App name:** `intercompany` (not `billing`). Permission codes `intercompany.*`; approvable types `intercompany.agreement`, `intercompany.invoice` (invoices and credit notes) and `intercompany.bill` (mirror bills), each with one group-wide policy, one step, Managing Partner (data migration).
+2. **Approvals (3.10, R10, Q16):** the spec's own `Approval` model and `required_approvals()` are not built; the existing approvals engine and its policy matrix do this job. Adapters in `intercompany/approval.py` follow `ledger/approval.py`. T23 is tested with a two-step policy (data only).
+3. **Issue on approval (approvals D11):** final approval issues and posts the invoice in the same transaction (number, `create_entry(system=True)` + `post_entry`, mirror bill). `approved` is therefore only a passing state. `issue_invoice()` still exists (needs `intercompany.invoice.issue` and an approved invoice); refused calls are audited (`intercompany.invoice.issue_refused`). Journal entries carry no human poster; the approval record holds the approver (approvals review C).
+4. **Editors:** every create/edit of a draft is stored in `intercompany.DraftEditor` (the counterpart of `ledger.JournalEntryEditor`) and passed to the approval request, so editors cannot approve (approvals R8). `ledger.services.record_editor` is not called: this module never edits journal-entry drafts; its entries are created and posted in one step.
+5. **Core change:** `Entity.books_in_erp` and `books_in_erp_from` (required when on) added with a migration; `setup_almiras` sets Almiras on from 1 January of the setup year.
+6. **Admin:** read-only for all documents (no path around locks, numbering or approval). Actions: submit for approval, cancel drafts, submit/approve timesheets, submit bills. Records are created through the API or services. Service types can be edited only by holders of `intercompany.servicetype.manage` in a root entity.
+7. **Bulk changes:** `update()`/`delete()` are refused on every intercompany document model.
+
+**Permissions (§7)**
+8. MP: all. Accountant: create, run billing, approve timesheets, cost pools, suspend/end agreements, issue, mirror-bill coding/dispute/submit, report. CFO: same as accountant minus issue (as the approvals build notes: no post). PA (`pa_drafter`) and agents (`agent_drafter`): draft agreements, timesheets, invoices and credit notes; they see only their own drafts. Auditor: read agreements, invoices, bills and the report. Business analyst, chairman and viewer: nothing. Service users can never run billing, approve timesheets, issue, code bills or manage pools/service types.
+9. **Billing clerk:** there is no separate role; the PA role is the "billing clerk" of §7 (own timesheet entries only). Holders of `intercompany.timesheet.approve` may record hours for others.
+10. **PA/agent lookups:** they reference agreements by id when drafting; they cannot list all agreements (no `intercompany.agreement.view`). **Confirm** whether the PA should see all agreements of the entity.
+11. **Agents (R20 vs approvals D17):** agents may create drafts and submit agreements and invoices for approval, as the approvals engine allows (approvals T15, D17). They cannot approve, issue, run billing, approve or submit timesheets (the worker submits), or touch bills. R20's "can only be draft" was read as "agents never move a record past the approval step". **Confirm.** The approvals engine does not audit refused approve calls by agents (gap in the approvals module); refused issue calls are audited here.
+
+**Agreements**
+12. Once submitted, an agreement is locked; changes need a new agreement. Suspend and end need `intercompany.agreement.manage` and a reason. Resuming a suspended agreement goes through approval again. A rejected new agreement becomes `ended`. An end date can only be shortened and never before an invoiced period.
+13. **Currency (Q10):** agreements are in the issuer's base currency and the counterparty must have the same base currency. No FX. Approval policies exist for SAR only (approvals build note 10).
+14. **VAT rate:** not stored on the agreement (spec: "not typed in"). A small tax table `VatRate` (15% from 1 Jul 2020) lives in this app until the tax/ZATCA module takes it over; the rate is taken at the supply end date. Non-standard VAT treatments need a bilingual exemption reason (ZATCA).
+15. **TP documentation (Q3, Q9):** `tp_documentation_ref` is a text reference (no document module yet). TP method optional; no benchmark is enforced.
+16. **Accounts (R18, Q8):** income and expense account overrides must be open accounts of the right type, never Sharia-prohibited, never the purification account 4900. The 5.6 mapping is seeded as proposed.
+
+**Billing**
+17. **Run:** only calendar-month periods that have ended, are open and belong to the entity. Agreement-level problems are logged as `skipped` with a code (e.g. `partial_period`, `drivers_missing`, `pool_empty`, `no_vat_rate`); already-billed agreements are logged as `already billed` (T2). An unexpected error rolls the whole run back and records a `failed` run. Cron: `manage.py run_intercompany_billing --entity --period --as`.
+18. **Coverage (R3):** fixed fee and cost-plus need the agreement to cover the whole supply period (pro-rating not decided, **confirm**); timesheets need only overlap.
+19. **Frequencies (Q14):** quarterly and annual are billed in the run for the calendar quarter/year-end month; one-off is fixed fee only, billed in the month the agreement starts; cost-plus is monthly only. Invoice date is always the last day of the run month (D12).
+20. **Cost pools (Q5, Q6, D12):** fixed-% allocations on one pool may not exceed 100% in total (pending, active and suspended agreements). Headcount/revenue share = the counterparty's driver ÷ the sum of all driver rows for the pool and period, including the issuer's own row, which stays unbilled. Missing drivers skip the agreement. Pool cost = posted (and reversed) ledger lines of the issuer on the pool accounts in the period. Zakat (5800) can never be pooled, besides the R7 rules. Recharges are booked gross as income (5.7); no netting.
+21. **Billable items (D9):** open items whose period ends on or before the supply end are billed on the agreement's next invoice, so late items roll into the next period. Items are accepted only for active or suspended agreements.
+22. **Rounding (R8):** VAT per line, half-up to 2 decimals; cost-plus rounded once at the end. **Compliance-checker to confirm.**
+23. **VAT number:** an invoice with VAT cannot be submitted or issued while the issuer has no VAT number.
+
+**Invoices and credit notes**
+24. **Statuses:** `rejected` was added (approval rejection). Rejecting or cancelling a draft releases timesheets, billable items and pool locks (R14); the period can then be billed again. A pending invoice is cancelled through its approval request first.
+25. **Draft edits:** creator only (like ledger manual drafts), text only: line descriptions and credit reasons. Amounts change only by cancelling the draft and billing again.
+26. **Credit notes (R13):** every live credit note (draft, pending, issued) counts against the balance, and each line has its own limit. A full credit takes exactly the remaining VAT. Dated today by default, never before the original; supply dates copied; a credit note cannot itself be credited. Numbering `-ICC-`.
+
+**Mirror bills (D8, R15–R17, Q7, Q11)**
+27. A bill is created when the counterparty keeps books in the ERP on the invoice date. A bill credit is created only when the original invoice had a mirror bill. If the receiver's expense account is missing, issuing fails and the approval is rolled back.
+28. Bills and bill credits share one `-ICB-` sequence per receiver. Statuses add `pending_approval`. Rejection in approval sets `disputed` (the comment becomes the reason). Disputed bills can be set back to draft by the receiver. A bill credit can be submitted only after its original bill is posted, and it uses the original bill's expense coding.
+29. The receiver user who first submits a system-made bill becomes its preparer (the "creator" for segregation of duties); the receiver's MP approves. Bills stay in this app until an AP module exists (Q11).
+30. **Input VAT (Q7):** the bill posts the full VAT to 1310 as in 5.2. Partial recovery is not handled; **confirm with the tax adviser** (a manual entry is needed meanwhile).
+
+**Reporting and ZATCA**
+31. **Reconciliation report:** pairs come from issued invoices. Each side's balances are shown only if the user holds `intercompany.report.view` in that entity, otherwise "restricted"; disputed bills are listed only with rights on the receiver. JSON at `GET /api/v1/intercompany/reconciliation?as_of=`; XLSX with `&export=xlsx&lang=en|ar` (Arabic sheet right-to-left). `openpyxl` (MIT) added to requirements.
+32. **ZATCA hand-off (R22):** on issue the invoice gets `zatca_ready`, `zatca_uuid`, issue time, seller/buyer VAT numbers, type code 388/381 and, per line, VAT category S/Z/E/O, rate, amount and bilingual exemption reason. `intercompany.zatca.zatca_submit()` raises `NotImplementedError` and is not called on issue. `zatca_status`/`zatca_hash` are written only through `zatca.set_zatca_status()` (model guard). `handoff_payload()` lists the data the ZATCA module needs.
+
+**Not built (open questions)**
+33. Settlement (5.4, Q12), VAT groups (Q2), unrealised profit on associates (Q4), exports for off-ERP counterparties (Q13), IFRS 16 lease terms (Q15), secondment labour-law checks (Q17), late penalties (D11: none). Tests run on SQLite; PostgreSQL row locking is used but not exercised by the test suite.
