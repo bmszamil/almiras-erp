@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
 
 from core.models import Entity
 
@@ -58,6 +58,19 @@ class Account(models.Model):
         return f"{self.code} {self.name_en}"
 
 
+class FiscalPeriodQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        if "status" in kwargs:
+            raise LedgerError("Period status changes only through ledger.services (close/reopen).")
+        return super().update(**kwargs)
+
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        if any(o.status != "open" for o in objs):
+            raise LedgerError("New periods start open.")
+        return super().bulk_create(objs, *args, **kwargs)
+
+
 class FiscalPeriod(models.Model):
     class Status(models.TextChoices):
         OPEN = "open", "Open"
@@ -68,6 +81,8 @@ class FiscalPeriod(models.Model):
     start_date = models.DateField()
     end_date = models.DateField()
     status = models.CharField(max_length=6, choices=Status.choices, default=Status.OPEN)
+
+    objects = FiscalPeriodQuerySet.as_manager()
 
     class Meta:
         unique_together = [("entity", "name")]
@@ -82,8 +97,71 @@ class FiscalPeriod(models.Model):
         if overlap.exists():
             raise ValidationError("Period overlaps an existing period for this entity.")
 
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = FiscalPeriod.objects.filter(pk=self.pk).values_list("status", flat=True).first()
+            if stored != self.status and getattr(self, "_via_service", False) is not True:
+                raise LedgerError("Period status changes only through ledger.services (close/reopen).")
+        elif self.status != self.Status.OPEN:
+            raise LedgerError("New periods start open.")
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.entity.code} {self.name} ({self.status})"
+
+
+class JournalEntryQuerySet(models.QuerySet):
+    """Bulk update/delete cannot bypass the posting lock: allowed only when every affected row is a
+    draft, and never for workflow fields (status, numbering, approval flag, creator, source)."""
+
+    WORKFLOW_FIELDS = {"status", "number", "period", "period_id", "posted_by", "posted_by_id", "posted_at",
+                       "requires_approval", "source", "created_by", "created_by_id", "reversal_of",
+                       "reversal_of_id", "entity", "entity_id"}
+
+    def _only_drafts(self, what):
+        with transaction.atomic():
+            if self.exclude(status=JournalEntry.Status.DRAFT).exists():
+                raise LedgerError(f"Bulk {what} is allowed on draft entries only. / التعديل الجماعي للمسودات فقط.")
+
+    def update(self, **kwargs):
+        if set(kwargs) & self.WORKFLOW_FIELDS:
+            raise LedgerError("Status and workflow fields change only through ledger.services.")
+        self._only_drafts("update")
+        return super().update(**kwargs)
+
+    def delete(self):
+        self._only_drafts("delete")
+        return super().delete()
+
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        if any(o.status != JournalEntry.Status.DRAFT or not o.requires_approval for o in objs):
+            raise LedgerError("Only manual drafts can be bulk-created; use ledger.services.create_entry.")
+        return super().bulk_create(objs, *args, **kwargs)
+
+
+class JournalLineQuerySet(models.QuerySet):
+    def _only_draft_entries(self, what):
+        with transaction.atomic():
+            if self.exclude(entry__status=JournalEntry.Status.DRAFT).exists():
+                raise LedgerError(f"Bulk {what} of lines is allowed on draft entries only.")
+
+    def update(self, **kwargs):
+        if "entry" in kwargs or "entry_id" in kwargs:
+            raise LedgerError("Lines cannot be moved to another entry.")
+        self._only_draft_entries("update")
+        return super().update(**kwargs)
+
+    def delete(self):
+        self._only_draft_entries("delete")
+        return super().delete()
+
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        ids = {o.entry_id for o in objs}
+        if JournalEntry.objects.filter(pk__in=ids).exclude(status=JournalEntry.Status.DRAFT).exists():
+            raise LedgerError("Lines can only be added to draft entries.")
+        return super().bulk_create(objs, *args, **kwargs)
 
 
 class JournalEntry(models.Model):
@@ -110,9 +188,11 @@ class JournalEntry(models.Model):
     )
     requires_approval = models.BooleanField(
         default=True,
-        help_text="Manual entries need approval before posting. System entries made by module services "
-        "through create_entry (and reversals) are exempt until OQ3 is answered.",
+        help_text="Manual entries need approval before posting (the default). Only module services may "
+        "create system entries (create_entry(system=True)); reversals follow D15.",
     )
+
+    objects = JournalEntryQuerySet.as_manager()
     reversal_of = models.OneToOneField(
         "self", null=True, blank=True, on_delete=models.PROTECT, related_name="reversed_by"
     )
@@ -190,6 +270,8 @@ class JournalEntry(models.Model):
 
 
 class JournalLine(models.Model):
+    objects = JournalLineQuerySet.as_manager()
+
     entry = models.ForeignKey(JournalEntry, on_delete=models.CASCADE, related_name="lines")
     account = models.ForeignKey(Account, on_delete=models.PROTECT, related_name="lines")
     description = models.CharField(max_length=300, blank=True)

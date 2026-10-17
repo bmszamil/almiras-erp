@@ -17,7 +17,7 @@ from django.utils import timezone
 
 from core.models import Entity
 
-from .catalogue import AGENT_FORBIDDEN
+from .catalogue import SERVICE_FORBIDDEN
 from .errors import AccessDenied, RuleError
 from .models import AuditLog, EntityAccess, Role, User
 
@@ -36,9 +36,26 @@ class Context:
         meta = getattr(request, "META", {})
         return cls(
             channel=channel,
-            ip=meta.get("REMOTE_ADDR", "") or "",
+            ip=client_ip(request),
             user_agent=(meta.get("HTTP_USER_AGENT", "") or "")[:300],
         )
+
+
+def client_ip(request):
+    """Client address. X-Forwarded-For is trusted only when the direct peer is a configured proxy
+    (settings.ERP_TRUSTED_PROXIES); then the right-most address that is not a trusted proxy wins."""
+    from django.conf import settings
+
+    meta = getattr(request, "META", {}) or {}
+    remote = (meta.get("REMOTE_ADDR") or "").strip()
+    trusted = set(getattr(settings, "ERP_TRUSTED_PROXIES", []) or [])
+    forwarded = meta.get("HTTP_X_FORWARDED_FOR", "")
+    if not forwarded or remote not in trusted:
+        return remote[:45]
+    for hop in reversed([h.strip() for h in forwarded.split(",") if h.strip()]):
+        if hop not in trusted:
+            return hop[:45]
+    return remote[:45]
 
 
 SYSTEM_USERNAME = "system"
@@ -86,8 +103,8 @@ def permissions_for(user, entity):
     codes = set(
         active_grants(user, entity).values_list("role__permissions__code", flat=True)
     ) - {None}
-    if user.is_service_agent:
-        codes -= AGENT_FORBIDDEN
+    if not user.is_human:
+        codes -= SERVICE_FORBIDDEN  # R18, D17: service users are drafts-only
     return codes
 
 
@@ -111,7 +128,7 @@ def has_role(user, entity, role_code):
 def entities_with_perm(user, perm):
     if user is None or not user.is_authenticated or not user.is_active:
         return Entity.objects.none()
-    if user.is_service_agent and perm in AGENT_FORBIDDEN:
+    if not user.is_human and perm in SERVICE_FORBIDDEN:
         return Entity.objects.none()
     ids = active_grants(user).filter(role__permissions__code=perm).values_list("entity_id", flat=True)
     return Entity.objects.filter(pk__in=ids)
@@ -207,6 +224,15 @@ def visible_audit(user):
     return AuditLog.objects.filter(q)
 
 
+def can_view_security(user, row):
+    """IP address and user agent are shown only with access.audit.view_security for the row's entity
+    (global rows: in a root entity)."""
+    entities = entities_with_perm(user, "access.audit.view_security")
+    if row.entity_id is None:
+        return entities.filter(parent__isnull=True).exists()
+    return entities.filter(pk=row.entity_id).exists()
+
+
 # ---------------------------------------------------------------- user and access management
 
 
@@ -216,7 +242,7 @@ def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ct
         require_perm(granter, entity, "access.entity_access.manage")
     if isinstance(role, str):
         role = Role.objects.get(code=role)
-    if user.is_service_agent and role.permissions.filter(code__in=AGENT_FORBIDDEN).exists():
+    if not user.is_human and role.permissions.filter(code__in=SERVICE_FORBIDDEN).exists():
         # The permissions would be stripped anyway (R18); refuse to make intent explicit.
         raise RuleError(
             "agent_role_not_allowed",
@@ -280,7 +306,8 @@ def deactivate_user(actor, user, ctx=None):
     before = snapshot(user, ["is_active"])
     user.is_active = False
     user.save(update_fields=["is_active"])
-    user.service_tokens.filter(revoked_at__isnull=True).update(revoked_at=timezone.now())
+    for token in user.service_tokens.filter(revoked_at__isnull=True):
+        revoke_service_token(actor, token, ctx=ctx)
     audit(actor, "access.user.deactivate", user, before=before, after=snapshot(user, ["is_active"]), ctx=ctx)
     return user
 
@@ -299,3 +326,107 @@ def update_profile(user, *, language=None, default_entity=None, ctx=None):
     audit(user, "access.user.update_profile", user, before=before,
           after=snapshot(user, ["language", "default_entity"]), ctx=ctx)
     return user
+
+
+# ---------------------------------------------------------------- service tokens and TOTP (audited)
+
+
+def _token_hash(key):
+    import hashlib
+
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+@transaction.atomic
+def issue_service_token(actor, user, *, expires_at, label="", ctx=None):
+    """Return the plain token once; only its hash is stored. Expiry is mandatory."""
+    import secrets
+
+    from .models import ServiceToken
+
+    if actor is not None and not _can_manage_users(actor):
+        raise AccessDenied("permission_denied", "You cannot manage users.", "لا يمكنك إدارة المستخدمين.")
+    if user.is_human:
+        raise RuleError("token_for_human", "Tokens are for service users only.", "الرموز لمستخدمي الخدمة فقط.")
+    if not user.is_active:
+        raise RuleError("inactive", "The user is inactive.", "المستخدم غير نشط.")
+    if expires_at is None or expires_at <= timezone.now():
+        raise RuleError("token_expiry_required", "A service token needs a future expiry date.",
+                        "يحتاج رمز الخدمة إلى تاريخ انتهاء مستقبلي.")
+    key = secrets.token_urlsafe(32)
+    token = ServiceToken.objects.create(user=user, key_hash=_token_hash(key), label=label, expires_at=expires_at)
+    audit(actor or system_user(), "access.token.issue", token, object_type="access.servicetoken",
+          after={"user": user.username, "label": label, "expires_at": expires_at}, ctx=ctx)
+    return key
+
+
+@transaction.atomic
+def revoke_service_token(actor, token, ctx=None):
+    if actor is not None and actor.pk != token.user_id and not _can_manage_users(actor):
+        raise AccessDenied("permission_denied", "You cannot manage users.", "لا يمكنك إدارة المستخدمين.")
+    if token.revoked_at is None:
+        token.revoked_at = timezone.now()
+        token.save(update_fields=["revoked_at"])
+        audit(actor or system_user(), "access.token.revoke", token, object_type="access.servicetoken",
+              after={"user": token.user.username, "label": token.label, "revoked_at": token.revoked_at}, ctx=ctx)
+    return token
+
+
+@transaction.atomic
+def enroll_totp(actor, user, name="Authenticator app", ctx=None):
+    """Create a confirmed TOTP device (D14). Replaces a device of the same name. Returns the device."""
+    from django_otp.plugins.otp_totp.models import TOTPDevice
+
+    if actor is not None and actor.pk != user.pk and not _can_manage_users(actor):
+        raise AccessDenied("permission_denied", "You cannot manage users.", "لا يمكنك إدارة المستخدمين.")
+    if not user.is_human or not user.is_active:
+        raise RuleError("totp_for_human", "Authenticator apps are for active human users.",
+                        "تطبيقات المصادقة للمستخدمين البشريين النشطين فقط.")
+    replaced = list(TOTPDevice.objects.filter(user=user, name=name).values_list("pk", flat=True))
+    TOTPDevice.objects.filter(pk__in=replaced).delete()
+    device = TOTPDevice.objects.create(user=user, name=name, confirmed=True)
+    audit(actor or system_user(), "access.totp.enroll", user,
+          after={"device_id": device.pk, "name": name, "replaced_devices": replaced}, ctx=ctx)
+    return device
+
+
+# ---------------------------------------------------------------- quarterly access review
+
+
+def access_review_report(viewer, on=None, ctx=None):
+    """Who holds which role in which entity, with last login and 2FA status, for the quarterly review.
+
+    Covers entities where the viewer holds access.audit.view or access.entity_access.manage.
+    Generating the report is itself audited.
+    """
+    from django_otp import user_has_device
+
+    on = on or timezone.localdate()
+    entities = entities_with_perm(viewer, "access.audit.view") | entities_with_perm(viewer, "access.entity_access.manage")
+    grants = (
+        EntityAccess.objects.filter(entity__in=entities)
+        .select_related("user", "entity", "role", "granted_by")
+        .order_by("entity__code", "user__username", "role__code")
+    )
+    rows = []
+    for g in grants:
+        active = (g.revoked_at is None and g.valid_from <= on and (g.valid_to is None or g.valid_to >= on)
+                  and g.user.is_active)
+        rows.append({
+            "entity": g.entity.code,
+            "username": g.user.username,
+            "name": {"en": g.user.full_name_en, "ar": g.user.full_name_ar},
+            "user_type": g.user.user_type,
+            "role": g.role.code,
+            "valid_from": g.valid_from.isoformat(),
+            "valid_to": g.valid_to.isoformat() if g.valid_to else None,
+            "revoked_at": g.revoked_at.isoformat() if g.revoked_at else None,
+            "granted_by": g.granted_by.username if g.granted_by_id else None,
+            "active": active,
+            "user_active": g.user.is_active,
+            "last_login": g.user.last_login.isoformat() if g.user.last_login else None,
+            "two_factor": user_has_device(g.user) if g.user.is_human else None,
+        })
+    audit(viewer, "access.review_report", viewer, object_type="access.review", object_id=on.isoformat(),
+          after={"as_of": on, "rows": len(rows), "entities": sorted(e.code for e in entities)}, ctx=ctx)
+    return rows

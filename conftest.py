@@ -119,9 +119,8 @@ def api():
             session[DEVICE_ID_SESSION_KEY] = device.persistent_id
             session.save()
         else:
-            from access.api_auth import issue_service_token
-
-            c.credentials(HTTP_AUTHORIZATION=f"Bearer {issue_service_token(user)}")
+            key = access.issue_service_token(None, user, expires_at=timezone.now() + datetime.timedelta(days=30))
+            c.credentials(HTTP_AUTHORIZATION=f"Bearer {key}")
         return c
 
     return client_for

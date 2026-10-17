@@ -15,7 +15,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from access import services as access
-from access.errors import AccessDenied, BilingualError, NotFound, RuleError
+from access.errors import AccessDenied, BilingualError, Conflict, NotFound, RuleError
 from access.models import AuditLog
 from access.services import Context
 from core.models import Entity
@@ -303,13 +303,27 @@ class DeviceView(APIView):
         if platform not in PushDevice.Platform.values or not token:
             raise RuleError("invalid_device", "platform (ios/android) and token are required.",
                             "المنصة (ios/android) والرمز مطلوبان.")
-        device, _ = PushDevice.objects.update_or_create(
-            token=token, defaults={"user": request.user, "platform": platform, "is_active": True, "last_seen_at": timezone.now()}
-        )
+        with transaction.atomic():
+            existing = PushDevice.objects.select_for_update().filter(token=token).first()
+            if existing is not None and existing.user_id != request.user.pk:
+                # Review item 10: a token registered by another user is never taken over.
+                raise Conflict("device_token_taken", "This device token is registered to another user.",
+                               "رمز هذا الجهاز مسجل لمستخدم آخر.")
+            if existing is None:
+                device = PushDevice.objects.create(user=request.user, platform=platform, token=token)
+            else:
+                existing.platform, existing.is_active, existing.last_seen_at = platform, True, timezone.now()
+                existing.save(update_fields=["platform", "is_active", "last_seen_at"])
+                device = existing
+        access.audit(request.user, "device.register", device, after={"platform": platform}, ctx=ctx_for(request))
         return Response({"id": device.pk, "platform": device.platform}, status=status.HTTP_201_CREATED)
 
     def delete(self, request):
-        PushDevice.objects.filter(user=request.user, token=request.data.get("token", "")).update(is_active=False)
+        devices = PushDevice.objects.filter(user=request.user, token=request.data.get("token", ""), is_active=True)
+        for device in devices:
+            device.is_active = False
+            device.save(update_fields=["is_active"])
+            access.audit(request.user, "device.unregister", device, ctx=ctx_for(request))
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -325,17 +339,32 @@ class AuditView(APIView):
             qs = qs.filter(object_type=ot)
         if oid := request.query_params.get("object_id"):
             qs = qs.filter(object_id=oid)
-        rows = [
-            {
+        security_entities = set(access.entities_with_perm(request.user, "access.audit.view_security").values_list("pk", flat=True))
+        security_global = access.entities_with_perm(request.user, "access.audit.view_security").filter(parent__isnull=True).exists()
+        rows = []
+        for a in qs.select_related("actor", "on_behalf_of", "entity")[:500]:
+            row = {
                 "id": a.pk, "at": a.at, "actor": a.actor.username,
                 "on_behalf_of": a.on_behalf_of.username if a.on_behalf_of_id else None,
                 "entity": a.entity.code if a.entity_id else None, "action": a.action,
                 "object_type": a.object_type, "object_id": a.object_id, "before": a.before, "after": a.after,
                 "source": a.source, "channel": a.channel, "request_id": str(a.request_id),
             }
-            for a in qs.select_related("actor", "on_behalf_of", "entity")[:500]
-        ]
+            # IP address and device only with access.audit.view_security (compliance).
+            if (a.entity_id in security_entities) if a.entity_id else security_global:
+                row["ip"], row["user_agent"] = a.ip, a.user_agent
+            rows.append(row)
         return Response(rows)
+
+
+class AccessReviewView(APIView):
+    """Quarterly access review (compliance): user x entity x role, last login, 2FA."""
+
+    def get(self, request):
+        if not (access.entities_with_perm(request.user, "access.audit.view").exists()
+                or access.entities_with_perm(request.user, "access.entity_access.manage").exists()):
+            raise AccessDenied("permission_denied", "You cannot read the access review.", "لا يمكنك الاطلاع على مراجعة الصلاحيات.")
+        return Response(access.access_review_report(request.user, ctx=ctx_for(request)))
 
 
 class SelfApprovalReportView(APIView):

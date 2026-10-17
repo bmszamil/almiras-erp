@@ -1,5 +1,12 @@
-"""Test settings: adds the test-only `testdocs` app (sample payment and bill documents)."""
-from .settings import *  # noqa: F401,F403
+"""Test settings: adds the test-only `testdocs` app (sample payment and bill documents).
+
+DEBUG stays off (production-like); a throwaway secret key is set before the base settings load.
+"""
+import os
+
+os.environ.setdefault("DJANGO_SECRET_KEY", "test-only-not-secret")
+
+from .settings import *  # noqa: E402,F401,F403
 
 INSTALLED_APPS = [*INSTALLED_APPS, "testdocs"]  # noqa: F405
 
@@ -9,4 +16,5 @@ APPROVAL_ADAPTERS = {
     "payables.bill": "testdocs.approval.BillApproval",
 }
 
+SECURE_SSL_REDIRECT = False  # the test client speaks plain HTTP
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]

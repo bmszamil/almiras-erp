@@ -13,19 +13,26 @@ from .models import Account, EntrySequence, FiscalPeriod, JournalEntry, JournalL
 ZERO = Decimal("0")
 
 
-def _is_service_agent(user):
-    return getattr(user, "user_type", None) == "service_agent"
+def _is_service_user(user):
+    """AI agents and integrations are drafts-only (D8, R18, D17)."""
+    return getattr(user, "user_type", "human") in ("service_agent", "service_integration")
 
 
-def _audit(user, action, entry, before=None):
-    """R19 / D7: audit ledger actions made by a user (system calls without a user are not audited here)."""
-    if user is None:
-        return
-    from access.services import audit
+def _audit(user, action, entry, before=None, extra=None):
+    """R19 / D7: audit ledger actions. Calls without a user are recorded as the system user."""
+    from access.services import audit, system_user
 
     after = {"status": entry.status, "number": entry.number, "source": entry.source,
              "total_debit": str(sum((l.debit for l in entry.lines.all()), ZERO))}
-    audit(user, action, entry, entity=entry.entity, before=before, after=after)
+    if extra:
+        after.update(extra)
+    audit(user or system_user(), action, entry, entity=entry.entity, before=before, after=after)
+
+
+def _has_perm(user, entity, perm):
+    from access.services import has_perm
+
+    return has_perm(user, entity, perm)
 
 
 def _find_open_period(entity, date):
@@ -76,8 +83,8 @@ def validate_entry(entry):
 @transaction.atomic
 def post_entry(entry, user=None):
     """Post an entry. Entries that require approval must be approved first (approvals engine, D11)."""
-    if _is_service_agent(user):
-        raise LedgerError("AI agents cannot post entries. / لا يمكن لوكلاء الذكاء الاصطناعي ترحيل القيود.")
+    if _is_service_user(user):
+        raise LedgerError("Service users cannot post entries. / لا يمكن لمستخدمي الخدمة ترحيل القيود.")
     entry = JournalEntry.objects.select_for_update().get(pk=entry.pk)
     if entry.requires_approval:
         if entry.status in (JournalEntry.Status.DRAFT, JournalEntry.Status.PENDING_APPROVAL):
@@ -102,20 +109,37 @@ def post_entry(entry, user=None):
 
 
 @transaction.atomic
-def reverse_entry(entry, date=None, user=None, reason=""):
+def reverse_entry(entry, date=None, user=None, reason="", system=False):
+    """Reverse a posted entry (D15): no approval needed, but the user must hold ledger.entry.reverse
+    or ledger.entry.post in the entry's entity, and a reason is mandatory. Every reversal is audited.
+
+    system=True is for module services correcting their own system entries (no user check).
+    """
+    reason = (reason or "").strip()
+    if not reason:
+        raise LedgerError("A reason is required to reverse an entry. / سبب العكس مطلوب.")
+    if _is_service_user(user):
+        raise LedgerError("Service users cannot reverse entries. / لا يمكن لمستخدمي الخدمة عكس القيود.")
     entry = JournalEntry.objects.select_for_update().get(pk=entry.pk)
+    if not system:
+        if user is None or not getattr(user, "is_active", False) or not (
+            _has_perm(user, entry.entity, "ledger.entry.reverse") or _has_perm(user, entry.entity, "ledger.entry.post")
+        ):
+            raise LedgerError(
+                f"You need permission to reverse entries in {entry.entity.code}. / تحتاج صلاحية عكس القيود."
+            )
     if entry.status != JournalEntry.Status.POSTED:
         raise LedgerError("Only posted entries can be reversed.")
     date = date or entry.date
     reversal = JournalEntry.objects.create(
         entity=entry.entity,
         date=date,
-        description=f"Reversal of {entry.number}" + (f": {reason}" if reason else ""),
+        description=f"Reversal of {entry.number}: {reason}"[:500],
         reference=entry.number,
         reversal_of=entry,
         created_by=user,
         source=getattr(user, "source", "human") if user is not None else "human",
-        requires_approval=False,  # correction of an already approved/posted entry (see Build notes)
+        requires_approval=False,  # D15: reversals need no approval
     )
     for line in entry.lines.all():
         JournalLine.objects.create(
@@ -129,28 +153,32 @@ def reverse_entry(entry, date=None, user=None, reason=""):
     post_entry(reversal, user=user)
     entry.status = JournalEntry.Status.REVERSED
     entry.save(update_fields=["status"])
-    _audit(user, "entry.reverse", entry, before={"status": JournalEntry.Status.POSTED})
+    _audit(user, "entry.reverse", entry, before={"status": JournalEntry.Status.POSTED},
+           extra={"reason": reason, "reversal_id": reversal.pk, "reversal_number": reversal.number,
+                  "system": system})
     reversal.refresh_from_db()
     return reversal
 
 
 @transaction.atomic
-def create_entry(entity, date, description, lines, user=None, reference="", post=False, manual=False, source=None):
+def create_entry(entity, date, description, lines, user=None, reference="", post=False, system=False, source=None):
     """lines: iterable of dicts with account (code or Account), debit, credit, description, counterparty.
 
-    manual=False: system entry made by a module service (e.g. from an approved bill); may post directly.
-    manual=True: a person's or agent's manual entry; it is a draft that must go through approvals
-    (approvals.services.submit) and cannot be posted here.
+    Default (safe): a manual draft with requires_approval=True. It is posted only by final approval
+    (approvals.services.submit -> approve, D11), never here.
+    system=True: only for module services creating entries from already-approved documents (e.g. an
+    approved bill). Such entries skip approval and may be posted here with post=True. Service users
+    (AI agents, integrations) can never create system entries (D17).
     """
-    if _is_service_agent(user):
-        manual = True  # agents create drafts only (D8, R18)
-    if manual and post:
+    if system and _is_service_user(user):
+        raise LedgerError("Service users create drafts only. / مستخدمو الخدمة ينشئون مسودات فقط.")
+    if post and not system:
         raise LedgerError("Manual entries are posted by approval, not directly. / تُرحّل القيود اليدوية بالاعتماد.")
     if source is None:
         source = getattr(user, "source", "human") if user is not None else "human"
     entry = JournalEntry.objects.create(
         entity=entity, date=date, description=description, reference=reference, created_by=user,
-        source=source, requires_approval=manual,
+        source=source, requires_approval=not system,
     )
     for spec in lines:
         account = spec["account"]
@@ -173,17 +201,50 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
     return entry
 
 
-def close_period(period):
-    if JournalEntry.objects.filter(period=period, status=JournalEntry.Status.DRAFT).exists():
+def _entries_in(period):
+    return JournalEntry.objects.filter(entity=period.entity, date__gte=period.start_date, date__lte=period.end_date)
+
+
+@transaction.atomic
+def close_period(period, user=None):
+    """Close a period. With a user, needs ledger.period.manage in the entity. Always audited."""
+    from access.services import audit, system_user
+
+    if user is not None and not _has_perm(user, period.entity, "ledger.period.manage"):
+        raise LedgerError("You need permission to close periods. / تحتاج صلاحية إقفال الفترات.")
+    period = FiscalPeriod.objects.select_for_update().get(pk=period.pk)
+    if _entries_in(period).filter(status=JournalEntry.Status.DRAFT).exists():
         raise LedgerError("Draft entries exist in this period.")
-    in_approval = JournalEntry.objects.filter(
-        entity=period.entity, date__gte=period.start_date, date__lte=period.end_date,
-        status__in=[JournalEntry.Status.PENDING_APPROVAL, JournalEntry.Status.APPROVED],
-    )
-    if in_approval.exists():
+    if _entries_in(period).filter(
+        status__in=[JournalEntry.Status.PENDING_APPROVAL, JournalEntry.Status.APPROVED]
+    ).exists():
         raise LedgerError("Entries in this period are still in approval.")
+    before = {"status": period.status}
     period.status = FiscalPeriod.Status.CLOSED
+    period._via_service = True
     period.save(update_fields=["status"])
+    audit(user or system_user(), "period.close", period, before=before, after={"status": period.status})
+    return period
+
+
+@transaction.atomic
+def reopen_period(period, user, reason=""):
+    """Reopen a closed period. Default deny: needs ledger.period.reopen, which no role holds by default.
+    Reason mandatory; audited."""
+    from access.services import audit
+
+    reason = (reason or "").strip()
+    if not reason:
+        raise LedgerError("A reason is required to reopen a period. / سبب إعادة الفتح مطلوب.")
+    if user is None or _is_service_user(user) or not _has_perm(user, period.entity, "ledger.period.reopen"):
+        raise LedgerError("You cannot reopen closed periods. / لا يمكنك إعادة فتح الفترات المقفلة.")
+    period = FiscalPeriod.objects.select_for_update().get(pk=period.pk)
+    if period.status != FiscalPeriod.Status.CLOSED:
+        raise LedgerError("The period is not closed.")
+    period.status = FiscalPeriod.Status.OPEN
+    period._via_service = True
+    period.save(update_fields=["status"])
+    audit(user, "period.reopen", period, before={"status": "closed"}, after={"status": "open", "reason": reason})
     return period
 
 

@@ -161,7 +161,24 @@ class ApprovalStep(models.Model):
         return f"step {self.sequence}: {who}"
 
 
+class ApprovalRequestQuerySet(models.QuerySet):
+    """Requests change only one at a time through approvals.services: no bulk update/delete/create."""
+
+    def update(self, **kwargs):
+        raise RuleError("request_bulk_change", "Approval requests cannot be bulk-changed.",
+                        "لا يمكن تعديل طلبات الموافقة جماعياً.")
+
+    def delete(self):
+        raise RuleError("request_no_delete", "Approval requests cannot be deleted.", "لا يمكن حذف طلبات الموافقة.")
+
+    def bulk_create(self, *args, **kwargs):
+        raise RuleError("request_bulk_change", "Approval requests are created by approvals.services.submit only.",
+                        "تُنشأ طلبات الموافقة عبر خدمة التقديم فقط.")
+
+
 class ApprovalRequest(models.Model):
+    objects = ApprovalRequestQuerySet.as_manager()
+
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         APPROVED = "approved", "Approved"

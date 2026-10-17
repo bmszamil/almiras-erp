@@ -196,9 +196,7 @@ def test_r4_service_token_auth_and_revocation(agent, api):
     c = api(agent)
     assert c.get("/api/v1/me").status_code == 200
     for t in agent.service_tokens.all():
-        from access.api_auth import revoke_service_token
-
-        revoke_service_token(t)
+        access.revoke_service_token(None, t)
     assert c.get("/api/v1/me").status_code in (401, 403)
 
 

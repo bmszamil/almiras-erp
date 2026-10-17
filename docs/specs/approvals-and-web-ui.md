@@ -26,6 +26,10 @@ All by Badr Alzamil, Managing Partner (MP), 16 Oct 2026.
 | D13 | (16 Oct 2026) **Go-live users at Almiras:** Managing Partner; Chairman; Accountant; Faisal (PA, prepares drafts and uploads documents); External auditor (read-only); Almiras CFO; Business Analyst (access to some modules only). Roles must allow module-level scoping (e.g. analyst sees investments and deals, not payroll). |
 | D14 | (16 Oct 2026) **Two-factor authentication for every user** (password + authenticator app). |
 | D12 | **Access is per entity:** a role at Almiras gives no access to subsidiaries; each entity is granted separately through `EntityAccess`. |
+| D15 | (17 Oct 2026) **Reversals without approval:** an accountant, or anyone holding `ledger.entry.post` or `ledger.entry.reverse` in that entity, may reverse a posted entry without approval. The permission is required, the reason is mandatory, and every reversal is audit-logged with its reason. |
+| D16 | (17 Oct 2026) **Delegation beats self-approval:** if the MP has an active delegation covering the document, the delegate approves; MP self-approval (D10) is not allowed while that delegation exists. |
+| D17 | (17 Oct 2026) **Integrations are drafts-only:** `service_integration` users are treated exactly like AI agents: they may create and submit drafts, never post or approve. |
+| D18 | (17 Oct 2026) **Retention:** all accounting records, approval records and audit logs are kept forever. No purge code. PDPL storage-limitation review is pending legal sign-off. |
 
 ## 3. Data model
 

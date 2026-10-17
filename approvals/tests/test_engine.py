@@ -399,8 +399,12 @@ def test_r10_final_states_cannot_change(alm, mp, accountant, make_payment):
     r.status = S.PENDING
     with pytest.raises(RuleError):
         r.save()
-    with pytest.raises(IntegrityError), transaction.atomic():
+    with pytest.raises(RuleError):
         ApprovalRequest.objects.filter(pk=r.pk).update(status="weird")
+    from django.db import connection
+
+    with pytest.raises(IntegrityError), transaction.atomic(), connection.cursor() as cur:
+        cur.execute("UPDATE approvals_approvalrequest SET status = 'weird' WHERE id = %s", [r.pk])
 
 
 def test_one_pending_request_per_document(alm, accountant, make_payment):

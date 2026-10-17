@@ -20,11 +20,17 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-change-me")
+# SECURITY WARNING: don't run with debug turned on in production! Off unless DJANGO_DEBUG=1.
+DEBUG = os.environ.get("DJANGO_DEBUG", "0") == "1"
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
+if not SECRET_KEY:
+    if not DEBUG:
+        from django.core.exceptions import ImproperlyConfigured
+
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set when DJANGO_DEBUG is not 1.")
+    SECRET_KEY = "dev-only-insecure-key"
 
 ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
@@ -155,9 +161,35 @@ MAILERS = {
 ERP_IDENTITY_ADAPTER = os.environ.get("ERP_IDENTITY_ADAPTER", "access.identity.LocalTotpIdentity")
 OTP_TOTP_ISSUER = "Almiras ERP"
 LOGIN_URL = "/admin/login/"
+AUTHENTICATION_BACKENDS = ["access.throttle.LockoutModelBackend"]
+ERP_LOCKOUT_FAILURES = 5        # failed sign-ins per username ...
+ERP_LOCKOUT_IP_FAILURES = 20    # ... or per client address ...
+ERP_LOCKOUT_MINUTES = 15        # ... within this window lock password sign-in
+
+# Admin setup mode: superusers bypass entity scoping only while this is on (initial setup).
+ERP_ADMIN_SETUP_MODE = os.environ.get("ERP_ADMIN_SETUP_MODE", "0") == "1"
+
+# Reverse proxies whose X-Forwarded-For header is trusted for the client IP (comma-separated IPs).
+ERP_TRUSTED_PROXIES = [p for p in os.environ.get("ERP_TRUSTED_PROXIES", "").split(",") if p.strip()]
+
+# Sessions: 30-minute idle timeout, renewed on each request; secure cookies outside DEBUG.
+SESSION_COOKIE_AGE = 30 * 60
+SESSION_SAVE_EVERY_REQUEST = True
+SESSION_EXPIRE_AT_BROWSER_CLOSE = True
 SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
+SECURE_SSL_REDIRECT = os.environ.get("DJANGO_SSL_REDIRECT", "0" if DEBUG else "1") == "1"
+SECURE_HSTS_SECONDS = 0 if DEBUG else int(os.environ.get("DJANGO_HSTS_SECONDS", "31536000"))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = not DEBUG
+SECURE_HSTS_PRELOAD = False
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "same-origin"
+X_FRAME_OPTIONS = "DENY"
+if ERP_TRUSTED_PROXIES:
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [

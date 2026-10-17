@@ -1,0 +1,13 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+<form method="post">{% csrf_token %}
+  <p>Reverse these posted entries / عكس هذه القيود المرحّلة:</p>
+  <ul>{% for e in entries %}<li><bdi dir="ltr">{{ e.number }}</bdi> {{ e.date }} {{ e.description }}</li>{% endfor %}</ul>
+  {% for e in entries %}<input type="hidden" name="_selected_action" value="{{ e.pk }}">{% endfor %}
+  <input type="hidden" name="action" value="reverse_selected">
+  <input type="hidden" name="reason_confirmed" value="1">
+  <p><label for="id_reason">Reason (required) / السبب (مطلوب)</label><br>
+     <input type="text" id="id_reason" name="reason" maxlength="300" required size="80"></p>
+  <input type="submit" value="Reverse / عكس">
+</form>
+{% endblock %}

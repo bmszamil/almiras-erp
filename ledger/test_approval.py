@@ -21,7 +21,7 @@ def manual(entity, user, amount="100", day=15):
     return services.create_entry(
         entity, date(2027, 1, day), "Office supplies accrual",
         [{"account": "5200", "debit": amount}, {"account": "2300", "credit": amount}],
-        user=user, manual=True,
+        user=user,
     )
 
 
@@ -40,7 +40,7 @@ def test_manual_entry_has_source_and_needs_approval(alm, accountant):
 def test_manual_entry_cannot_be_created_already_posted(alm, accountant):
     with pytest.raises(LedgerError):
         services.create_entry(alm, date(2027, 1, 2), "x", [{"account": "1100", "debit": 1}, {"account": "3100", "credit": 1}],
-                              user=accountant, manual=True, post=True)
+                              user=accountant, post=True)
 
 
 def test_status_cannot_be_set_directly(alm, accountant):
@@ -83,11 +83,11 @@ def test_r11_pending_entry_and_lines_locked(alm, accountant):
 def test_t17_posting_failure_rolls_back_whole_approval(alm, mp, accountant):
     e = manual(alm, accountant)
     r = approvals.submit(e, accountant)
-    # A ledger rule now fails at posting time (period closed after submission); content hash unchanged.
-    FiscalPeriod.objects.filter(entity=alm, name="2027-01").update(status=FiscalPeriod.Status.CLOSED)
+    # A ledger rule now fails at posting time (account closed after submission); content hash unchanged.
+    Account.objects.filter(entity=alm, code="5200").update(is_active=False)
     with pytest.raises(PostingFailed) as exc:
         approve(r, mp)
-    assert "closed" in exc.value.message_en and exc.value.message_ar
+    assert "not open for posting" in exc.value.message_en and exc.value.message_ar
     r.refresh_from_db()
     e.refresh_from_db()
     assert r.status == "pending" and not r.actions.filter(action="approve").exists()
@@ -95,8 +95,8 @@ def test_t17_posting_failure_rolls_back_whole_approval(alm, mp, accountant):
     assert not AuditLog.objects.filter(action="approval.approve", object_id=str(r.pk)).exists()
     assert AuditLog.objects.filter(action="approval.posting_failed", object_id=str(r.pk)).exists()
     assert Notification.objects.filter(user=mp, alert_code="posting_failed").exists()
-    # Once the period is reopened, the same approval succeeds.
-    FiscalPeriod.objects.filter(entity=alm, name="2027-01").update(status=FiscalPeriod.Status.OPEN)
+    # Once the account is reopened, the same approval succeeds.
+    Account.objects.filter(entity=alm, code="5200").update(is_active=True)
     assert approve(r, mp).status == "approved"
 
 
@@ -111,7 +111,14 @@ def test_t17_sharia_rule_still_enforced_after_approval(alm, mp, accountant):
 def test_t17_unbalanced_change_is_caught_by_version_check(alm, mp, accountant):
     e = manual(alm, accountant)
     r = approvals.submit(e, accountant)
-    JournalLine.objects.filter(entry=e, credit__gt=0).update(credit=D("90"))  # bypasses the model lock
+    # The ORM refuses to change lines of a pending entry (guarded queryset) ...
+    with pytest.raises(LedgerError):
+        JournalLine.objects.filter(entry=e, credit__gt=0).update(credit=D("90"))
+    # ... so simulate tampering below the ORM (raw SQL); the version check must still catch it.
+    from django.db import connection
+
+    with connection.cursor() as cur:
+        cur.execute("UPDATE ledger_journalline SET credit = 90 WHERE entry_id = %s AND credit > 0", [e.pk])
     with pytest.raises(Conflict):
         approve(r, mp)
     r.refresh_from_db()
@@ -125,7 +132,7 @@ def test_t17_unbalanced_change_is_caught_by_version_check(alm, mp, accountant):
 
 def test_unbalanced_draft_cannot_be_submitted(alm, accountant):
     e = services.create_entry(alm, date(2027, 1, 5), "bad", [{"account": "1100", "debit": 100}, {"account": "3100", "credit": 90}],
-                              user=accountant, manual=True)
+                              user=accountant)
     with pytest.raises(Exception, match="balance"):
         approvals.submit(e, accountant)
     assert not ApprovalRequest.objects.exists()

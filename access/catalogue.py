@@ -11,6 +11,7 @@ PERMISSIONS = [
     ("access.user.manage", "Create and deactivate users", "إنشاء المستخدمين وتعطيلهم"),
     ("access.entity_access.manage", "Grant and revoke roles in the entity", "منح الأدوار وسحبها في المنشأة"),
     ("access.audit.view", "Read the audit log of the entity", "الاطلاع على سجل التدقيق للمنشأة"),
+    ("access.audit.view_security", "See IP address and device in the audit log", "عرض عنوان IP والجهاز في سجل التدقيق"),
     ("approvals.request.view", "See approval requests of the entity", "عرض طلبات الموافقة للمنشأة"),
     ("approvals.request.view_own", "See own approval requests only", "عرض طلبات الموافقة الخاصة فقط"),
     ("approvals.request.submit", "Submit own drafts for approval", "تقديم المسودات الخاصة للموافقة"),
@@ -21,7 +22,11 @@ PERMISSIONS = [
     ("approvals.delegation.manage_any", "Create delegations for others", "إنشاء تفويضات للآخرين"),
     ("ledger.entry.view", "View journal entries", "عرض القيود اليومية"),
     ("ledger.entry.create", "Create draft journal entries", "إنشاء مسودات القيود اليومية"),
-    ("ledger.entry.post", "Post journal entries after approval", "ترحيل القيود بعد الموافقة"),
+    ("ledger.entry.post", "Post system journal entries", "ترحيل قيود النظام"),
+    ("ledger.entry.reverse", "Reverse posted journal entries (D15)", "عكس القيود المرحّلة"),
+    ("ledger.account.manage", "Add and edit accounts", "إضافة الحسابات وتعديلها"),
+    ("ledger.period.manage", "Add and close fiscal periods", "إضافة الفترات المالية وإقفالها"),
+    ("ledger.period.reopen", "Reopen a closed fiscal period", "إعادة فتح فترة مالية مقفلة"),
     ("documents.document.upload", "Upload documents", "رفع المستندات"),
     ("investments.investment.view", "View investments", "عرض الاستثمارات"),
     ("deals.deal.view", "View deals", "عرض الصفقات"),
@@ -30,10 +35,13 @@ PERMISSIONS = [
 
 ALL = [code for code, _, _ in PERMISSIONS]
 
+# Granted to no role by default (default deny); an access manager must add it to a role deliberately.
+NO_ROLE_BY_DEFAULT = {"ledger.period.reopen"}
+
 _READ_FINANCE = ["core.entity.view", "approvals.request.view", "ledger.entry.view", "reports.report.view"]
 
 ROLES = {
-    "managing_partner": ("Managing Partner", "الشريك المدير", ALL),
+    "managing_partner": ("Managing Partner", "الشريك المدير", [c for c in ALL if c not in NO_ROLE_BY_DEFAULT]),
     "chairman": (
         "Chairman", "رئيس مجلس الإدارة",
         _READ_FINANCE + [
@@ -49,7 +57,7 @@ ROLES = {
     ),
     "accountant": (
         "Accountant", "المحاسب",
-        _READ_FINANCE + ["approvals.request.submit", "ledger.entry.create"],
+        _READ_FINANCE + ["approvals.request.submit", "ledger.entry.create", "ledger.entry.reverse"],  # D15
     ),
     # D13: limited modules (investments, deals, reports), read only. No ledger, no approvals.
     "business_analyst": (
@@ -76,8 +84,9 @@ ROLES = {
     ),
 }
 
-# Permissions a service agent may never hold, whatever its roles (R18). Checked in has_perm.
-AGENT_FORBIDDEN = {
+# Permissions a service user (AI agent or integration) may never hold, whatever its roles
+# (R18, D17). Checked in has_perm. Service users are drafts-only.
+SERVICE_FORBIDDEN = {
     "approvals.request.act",
     "approvals.request.cancel_any",
     "approvals.policy.manage",
@@ -86,7 +95,13 @@ AGENT_FORBIDDEN = {
     "access.user.manage",
     "access.entity_access.manage",
     "ledger.entry.post",
+    "ledger.entry.reverse",
+    "ledger.account.manage",
+    "ledger.period.manage",
+    "ledger.period.reopen",
+    "access.audit.view_security",
 }
+AGENT_FORBIDDEN = SERVICE_FORBIDDEN  # old name
 
 
 def seed(Permission, Role):

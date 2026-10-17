@@ -199,8 +199,8 @@ def _eligible_others(request, step, exclude_id):
     }
 
 
-def _self_approval_allowed(request, step, principal):
-    """D10: only the MP, only when he created (and submitted) the document and nobody else is eligible."""
+def _mp_sole_approver(request, step, principal):
+    """The D10 situation: the MP created and submitted the document and nobody else is eligible."""
     return (
         principal.pk == request.document_created_by_id
         and principal.pk == request.submitted_by_id
@@ -211,19 +211,11 @@ def _self_approval_allowed(request, step, principal):
     )
 
 
-@dataclass
-class Eligibility:
-    step: ApprovalStep
-    on_behalf_of: User | None = None
-    self_approval: bool = False
-
-
-def _active_delegations(request, delegate, at):
-    qs = Delegation.objects.filter(delegate=delegate, starts_at__lte=at, ends_at__gt=at).filter(
-        Q(entity__isnull=True) | Q(entity=request.entity)
-    )
+def _covering(delegations, request):
+    """Delegations whose entity, document types and amount limit cover the request."""
     out = []
-    for d in qs.select_related("delegator").prefetch_related("document_types"):
+    qs = delegations.filter(Q(entity__isnull=True) | Q(entity=request.entity))
+    for d in qs.select_related("delegator", "delegate").prefetch_related("document_types"):
         types = list(d.document_types.all())
         if types and request.document_type not in types:
             continue
@@ -234,8 +226,31 @@ def _active_delegations(request, delegate, at):
     return out
 
 
-def _direct_eligibility(request, principal):
-    if not principal.is_active or not has_perm(principal, request.entity, "approvals.request.act"):
+def _active_delegations(request, delegate, at):
+    """Active delegations to `delegate` covering the request."""
+    return _covering(Delegation.objects.filter(delegate=delegate, starts_at__lte=at, ends_at__gt=at), request)
+
+
+def _delegations_from(request, delegator, at):
+    """Active delegations from `delegator` covering the request (D16)."""
+    return _covering(Delegation.objects.filter(delegator=delegator, starts_at__lte=at, ends_at__gt=at), request)
+
+
+def _self_approval_allowed(request, step, principal, at=None):
+    """D10 + D16: MP self-approval only when he is the sole eligible approver AND has no active
+    delegation covering the document (then the delegate approves instead)."""
+    return _mp_sole_approver(request, step, principal) and not _delegations_from(request, principal, at or now())
+
+
+@dataclass
+class Eligibility:
+    step: ApprovalStep
+    on_behalf_of: User | None = None
+    self_approval: bool = False
+
+
+def _direct_eligibility(request, principal, at, via_delegate=False):
+    if not principal.is_active or not principal.is_human or not has_perm(principal, request.entity, "approvals.request.act"):
         return None
     if principal.pk in _approved_principals(request):
         return None  # one person counts once per request
@@ -244,31 +259,42 @@ def _direct_eligibility(request, principal):
             continue
         if not _sod_blocked(request, principal.pk):
             return Eligibility(step)
-        if _self_approval_allowed(request, step, principal):
+        if via_delegate:
+            # D16: the delegate of an MP who is the sole approver of his own document approves for him.
+            if _mp_sole_approver(request, step, principal):
+                return Eligibility(step)
+        elif _self_approval_allowed(request, step, principal, at):
             return Eligibility(step, self_approval=True)
     return None
+
+
+def _delegate_can_act(request, delegate):
+    """R16 + R8: active human delegate with view access, not creator/submitter, not already counted."""
+    return (
+        delegate.is_active and delegate.is_human
+        and has_perm(delegate, request.entity, "approvals.request.view")
+        and not _sod_blocked(request, delegate.pk)
+        and delegate.pk not in _approved_principals(request)
+    )
 
 
 def eligibility(request, actor, on_behalf_of=None, at=None):
     """Return how `actor` may act on the current step, or None. Never raises."""
     if request.status != S.PENDING or not actor.is_active or not actor.is_human:
-        return None  # R18: service users never act
+        return None  # R18, D17: service users never act
     at = at or now()
     if on_behalf_of is None:
-        direct = _direct_eligibility(request, actor)
+        direct = _direct_eligibility(request, actor, at)
         if direct:
             return direct
         candidates = [d.delegator for d in _active_delegations(request, actor, at)]
     else:
         candidates = [d.delegator for d in _active_delegations(request, actor, at) if d.delegator_id == on_behalf_of.pk]
-    # R16: the delegate needs view access to the entity; R8: neither delegate nor delegator may be creator/submitter.
-    if not candidates or not has_perm(actor, request.entity, "approvals.request.view"):
-        return None
-    if _sod_blocked(request, actor.pk) or actor.pk in _approved_principals(request):
+    if not candidates or not _delegate_can_act(request, actor):
         return None
     for delegator in candidates:
-        e = _direct_eligibility(request, delegator)
-        if e and not e.self_approval:
+        e = _direct_eligibility(request, delegator, at, via_delegate=True)
+        if e:
             return Eligibility(e.step, on_behalf_of=delegator)
     return None
 
@@ -287,6 +313,8 @@ def allowed_actions(request, user):
 
 def visible_requests(user):
     """Requests the user may see: entity-wide view, own requests, or delegated to them."""
+    if user is None or not user.is_authenticated or not user.is_active:
+        return ApprovalRequest.objects.none()
     entities = access.entities_with_perm(user, "approvals.request.view")
     own_entities = access.entities_with_perm(user, "approvals.request.view_own")
     q = Q(entity__in=entities) | (Q(entity__in=own_entities) & (Q(submitted_by=user) | Q(document_created_by=user)))
@@ -318,9 +346,13 @@ def _notify_step(request, ctx):
         for uid in _eligible_others(request, step, exclude_id=None):
             notified.add(uid)
         creator = request.document_created_by
-        if not _eligible_others(request, step, None) and _self_approval_allowed(request, step, creator):
-            self_case = True
-            notified.add(creator.pk)
+        if not _eligible_others(request, step, None) and _mp_sole_approver(request, step, creator):
+            delegations = _delegations_from(request, creator, now())
+            if delegations:  # D16: the delegate approves
+                notified |= {d.delegate_id for d in delegations if _delegate_can_act(request, d.delegate)}
+            else:
+                self_case = True
+                notified.add(creator.pk)
     for user in User.objects.filter(pk__in=notified):
         notifications.notify(
             user, Notification.Kind.APPROVAL_PENDING, entity=request.entity, link=_link(request),
@@ -449,8 +481,16 @@ def act(request, actor, action, *, comment="", document_version=None, on_behalf_
         with transaction.atomic():
             result, changed = _act(request.pk, actor, action, comment, document_version, on_behalf_of, ctx)
     except _PostingError as failure:
-        # D11: the approval (and the post) were rolled back with the savepoint above.
-        _record_posting_failure(failure, actor, ctx)
+        # D11: the approval (and the post) were rolled back with the block above. Record the failure
+        # in its own transaction; if even that fails, log it and still return the posting error.
+        try:
+            with transaction.atomic():
+                _record_posting_failure(failure, actor, ctx)
+        except Exception:  # pragma: no cover - defensive
+            import logging
+
+            logging.getLogger("approvals").exception("Could not record posting failure for request %s",
+                                                     failure.request_id)
         raise PostingFailed(
             "posting_failed",
             f"Approval rolled back: posting was refused. {failure.reason}",
@@ -471,7 +511,11 @@ class _PostingError(Exception):
     def __init__(self, request_id, original):
         self.request_id = request_id
         self.original = original
-        msgs = getattr(original, "messages", None) or [str(original)]
+        if isinstance(original, (ValidationError, BilingualError)):
+            msgs = getattr(original, "messages", None) or [str(original)]
+        else:
+            # Unexpected error: do not leak internals to the approver; the type is kept for the audit row.
+            msgs = [f"Unexpected error while posting ({type(original).__name__}). The administrator has been alerted."]
         self.messages = [str(m) for m in msgs]
         self.reason = " ".join(self.messages)
 
@@ -572,7 +616,7 @@ def _advance(request, adapter, doc, actor, at, ctx):
     try:
         with transaction.atomic():
             adapter.on_approved(doc, request, actor)
-    except (ValidationError, BilingualError) as exc:
+    except Exception as exc:  # any failure of the owning module rolls the approval back (D11)
         raise _PostingError(request.pk, exc)
     _notify_submitter(request, Notification.Kind.APPROVAL_DECIDED, "Approved", "معتمد")
 
@@ -739,6 +783,8 @@ def end_delegation(user, delegation, at=None, ctx=None):
 
 
 def visible_delegations(user):
+    if user is None or not user.is_authenticated:
+        return Delegation.objects.none()
     q = Q(delegator=user) | Q(delegate=user) | Q(created_by=user)
     any_entities = access.entities_with_perm(user, "approvals.delegation.manage_any")
     q |= Q(entity__in=any_entities)
@@ -811,6 +857,9 @@ def _require_policy_perm(user, entity):
                            "السياسات على مستوى المجموعة تتطلب صلاحية في المنشأة الأم.")
 
 
+POLICY_FIXED_FIELDS = {"entity", "entity_id", "document_type", "document_type_id", "currency"}
+
+
 def manageable_policies(user):
     entities = access.entities_with_perm(user, "approvals.policy.manage")
     q = Q(entity__in=entities)
@@ -839,9 +888,52 @@ def create_policy(user, *, steps, ctx=None, **fields):
 def update_policy(user, policy, *, ctx=None, **fields):
     """Unused policies can be edited; used ones only retired (is_active / valid_to)."""
     _require_policy_perm(user, policy.entity)
+    fixed = set(fields) & POLICY_FIXED_FIELDS
+    changed = {k for k in fixed if getattr(policy, k) != fields[k]}
+    if changed:
+        raise RuleError("policy_scope_fixed",
+                        "Entity, document type and currency of a policy cannot change; create a new policy.",
+                        "لا يمكن تغيير المنشأة أو نوع المستند أو العملة لسياسة؛ أنشئ سياسة جديدة.",
+                        detail=sorted(changed))
     before = snapshot(policy)
     for k, v in fields.items():
         setattr(policy, k, v)
     policy.save()
     audit(user, "policy.update", policy, entity=policy.entity, before=before, after=snapshot(policy), ctx=ctx)
     return policy
+
+
+def _policy_extra(policy):
+    return {"steps": [snapshot(s) for s in policy.steps.all()]}
+
+
+def check_policy_admin(user, policy, original=None):
+    """Admin: permission on the policy's (new and old) scope; scope fields fixed after creation."""
+    _require_policy_perm(user, policy.entity)
+    if original is not None:
+        _require_policy_perm(user, original.entity)
+        changed = {f for f in ("entity_id", "document_type_id", "currency")
+                   if getattr(original, f) != getattr(policy, f)}
+        if changed:
+            raise RuleError("policy_scope_fixed",
+                            "Entity, document type and currency of a policy cannot change; create a new policy.",
+                            "لا يمكن تغيير المنشأة أو نوع المستند أو العملة لسياسة؛ أنشئ سياسة جديدة.",
+                            detail=sorted(changed))
+
+
+def record_policy_change(user, policy, before, created, ctx=None):
+    """Audit a policy saved through the admin, including its steps (R7, R19)."""
+    audit(user, "policy.create" if created else "policy.update", policy, entity=policy.entity,
+          before=before, after=snapshot(policy) | _policy_extra(policy), ctx=ctx)
+
+
+@transaction.atomic
+def delete_policy(user, policy, ctx=None):
+    _require_policy_perm(user, policy.entity)
+    before = snapshot(policy) | _policy_extra(policy)
+    pk = policy.pk
+    for step in list(policy.steps.all()):
+        step.delete()
+    policy.delete()
+    audit(user, "policy.delete", None, entity=policy.entity, object_type="approvals.approvalpolicy",
+          object_id=str(pk), before=before, ctx=ctx)

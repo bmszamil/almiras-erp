@@ -219,13 +219,12 @@ class ServiceToken(models.Model):
     key_hash = models.CharField(max_length=64, unique=True)
     label = models.CharField(max_length=100, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
-    expires_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(help_text="Mandatory; tokens never live forever")
     revoked_at = models.DateTimeField(null=True, blank=True)
 
     @property
     def is_valid(self):
-        now = timezone.now()
-        return self.revoked_at is None and (self.expires_at is None or self.expires_at > now)
+        return self.revoked_at is None and self.expires_at > timezone.now()
 
     def __str__(self):
         return f"token {self.label or self.pk} for {self.user}"
