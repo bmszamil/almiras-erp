@@ -1,6 +1,6 @@
 """``python manage.py invoicing_anonymise [--date YYYY-MM-DD] [--apply]`` (invoicing R52, AT-43).
 
-Dry run by default: lists the sales documents and individual customers whose retention period has passed and that
+Dry run by default: lists the sales documents, individual customers, individual vendors and their bills whose retention period has passed and that
 would be anonymised. ``--apply`` changes them, and only when the setting ``INVOICING_ANONYMISATION_ENABLED`` is
 True (off by default until the retention rules are confirmed; zatca OQ-8, OQ-31). An operator job, never a user
 action; journal entries, amounts, VAT, numbers and ZATCA data are never touched.
@@ -28,8 +28,13 @@ class Command(BaseCommand):
             raise CommandError(" ".join(exc.messages)) from None
         mode = "applied" if result["applied"] else "dry run"
         self.stdout.write(f"{mode} ({result['date']}): {len(result['documents'])} document(s), "
-                          f"{len(result['customers'])} customer(s)")
+                          f"{len(result['customers'])} customer(s), {len(result['vendors'])} vendor(s), "
+                          f"{len(result['purchase_documents'])} purchase document(s)")
         for pk in result["documents"]:
             self.stdout.write(f"  sales document {pk}")
         for pk in result["customers"]:
             self.stdout.write(f"  customer {pk}")
+        for pk in result["vendors"]:
+            self.stdout.write(f"  vendor {pk}")
+        for pk in result["purchase_documents"]:
+            self.stdout.write(f"  purchase document {pk}")

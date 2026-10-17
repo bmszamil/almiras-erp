@@ -3094,10 +3094,59 @@ _ANON_PARTY_TEXT_AR = ("name_ar", "street_ar", "district_ar", "city_ar")
 _ANON_PARTY_BLANK = ("vat_number", "building_no", "additional_no", "postal_code")
 
 
+def _tax_period_end(entity, d):
+    """The last day of the VAT return period (calendar month or quarter) holding ``d`` (zatca R-38)."""
+    month = ((d.month - 1) // 3 + 1) * 3 if entity.vat_return_period == Entity.VatReturnPeriod.QUARTERLY else d.month
+    return date_type(d.year, month, calendar.monthrange(d.year, month)[1])
+
+
+def _plus_years(d, years):
+    year = d.year + years
+    return date_type(year, d.month, min(d.day, calendar.monthrange(year, d.month)[1]))
+
+
+WHT_RECORD_YEARS = 10  # R52 / OQ-8: WHT payment records kept at least 10 years after payment (WHT p.31)
+
+
+def vendor_retention_until(vendor):
+    """R52 (review finding 2): the last day an individual vendor's personal data must be kept, or None while it
+    cannot be anonymised (no bill or payment yet, or one still a draft or submitted).
+
+    The latest of: each posted or reversed bill or vendor credit note, 6 years after the end of the tax period of
+    its accounting date (15 years when a line books to an asset account: capital-asset records, conservative);
+    each posted or reversed payment, 6 years after the end of the tax period of its date; and each withholding tax
+    deduction, 10 years after its payment date.
+    """
+    entity = vendor.entity
+    dates = []
+    docs = list(PurchaseDocument.objects.filter(vendor=vendor).values_list("pk", "status", "accounting_date"))
+    payments = list(VendorPayment.objects.filter(vendor=vendor).values_list("status", "date"))
+    if not docs and not payments:
+        return None
+    if any(status in (PStatus.DRAFT, PStatus.SUBMITTED) for _, status, _ in docs) or any(
+            status in (VendorPayment.Status.DRAFT, VendorPayment.Status.SUBMITTED) for status, _ in payments):
+        return None
+    assets = set(PurchaseDocumentLine.objects.filter(document__vendor=vendor, account__type=Account.Type.ASSET)
+                 .values_list("document_id", flat=True))
+    for pk, _, on in docs:
+        dates.append(_plus_years(_tax_period_end(entity, on), 15 if pk in assets else 6))
+    for _, on in payments:
+        dates.append(_plus_years(_tax_period_end(entity, on), 6))
+    for on in WhtDeduction.objects.filter(payment__vendor=vendor).values_list("payment__date", flat=True):
+        dates.append(_plus_years(on, WHT_RECORD_YEARS))
+    return max(dates)
+
+
 def anonymisation_candidates(today):
-    """R52: what the anonymisation job would change on ``today``: final or rejected sales documents of individual
-    customers whose ``retention_until`` has passed, and individual customers whose every document is (or is about
-    to be) anonymised. Customers without documents have no retention date and are left alone."""
+    """R52: what the anonymisation job would change on ``today``.
+
+    - ``documents``: final or rejected sales documents of individual customers whose ``retention_until`` passed;
+    - ``customers``: individual customers whose every document is (or is about to be) anonymised;
+    - ``vendors``: individual vendors whose :func:`vendor_retention_until` passed (review finding 2);
+    - ``purchase_documents``: the posted or reversed bills of those vendors (their ``vendor_vat_number``).
+
+    Parties without documents have no retention date and are left alone.
+    """
     docs = SalesDocument.objects.filter(
         customer__customer_kind=Customer.Kind.INDIVIDUAL, status__in=[Status.FINAL, Status.REJECTED],
         retention_until__lt=today, anonymised_at__isnull=True,
@@ -3109,23 +3158,42 @@ def anonymisation_candidates(today):
         mine = list(c.documents.values_list("pk", "anonymised_at"))
         if all(pk in doc_ids or at is not None for pk, at in mine):
             customers.append(c.pk)
-    return sorted(doc_ids), customers
+    vendors = []
+    for v in Vendor.objects.filter(vendor_kind=Vendor.Kind.INDIVIDUAL, anonymised_at__isnull=True).select_related(
+            "entity").order_by("pk"):
+        until = vendor_retention_until(v)
+        if until is not None and until < today:
+            vendors.append(v.pk)
+    bills = list(PurchaseDocument.objects.filter(vendor_id__in=vendors, status__in=[PStatus.POSTED, PStatus.REVERSED],
+                                                 anonymised_at__isnull=True).order_by("pk").values_list("pk", flat=True))
+    return {"documents": sorted(doc_ids), "customers": customers, "vendors": vendors, "purchase_documents": bills}
+
+
+def _anonymise_party(party, now):
+    for name in _ANON_PARTY_TEXT:
+        setattr(party, name, ANONYMISED_EN)
+    for name in _ANON_PARTY_TEXT_AR:
+        setattr(party, name, ANONYMISED_AR)
+    for name in _ANON_PARTY_BLANK:
+        setattr(party, name, "")
+    party.is_vat_registered, party.is_active, party.anonymised_at = False, False, now
 
 
 def anonymise_expired_personal_data(*, today=None, apply=False):
     """R52 / AT-43: the anonymisation job (operator command ``invoicing_anonymise``; never a user action).
 
     Dry run by default: it only reports what it would change. With ``apply=True`` it replaces individuals' names,
-    IDs and addresses on those documents and customers by a fixed token; amounts, VAT, numbers, dates and the ZATCA
-    hash and QR are kept, and journal entries are never touched. Applying is refused unless the setting
+    IDs and addresses on those documents and customers, and individual vendors' names, addresses, VAT numbers and
+    IBANs (and the VAT number on their bills), by a fixed token; amounts, VAT, numbers, dates and the ZATCA hash and
+    QR are kept, and journal entries are never touched. The signed or cleared ZATCA XML keeps the buyer data under
+    ZATCA retention (open question in the spec). Applying is refused unless the setting
     ``INVOICING_ANONYMISATION_ENABLED`` is True: the retention rules await confirmation (zatca OQ-8, OQ-31), so
-    it is off by default. Returns {"documents": [...], "customers": [...], "applied": bool}.
+    it is off by default. Returns {"documents", "customers", "vendors", "purchase_documents", "applied", "date"}.
     """
     from django.conf import settings
 
     today = today or _riyadh_now().date()
-    doc_ids, customer_ids = anonymisation_candidates(today)
-    result = {"documents": doc_ids, "customers": customer_ids, "applied": False, "date": today}
+    result = {**anonymisation_candidates(today), "applied": False, "date": today}
     if not apply:
         return result
     if not getattr(settings, "INVOICING_ANONYMISATION_ENABLED", False):
@@ -3137,7 +3205,7 @@ def anonymise_expired_personal_data(*, today=None, apply=False):
         raise error("The anonymisation date cannot be in the future.", "لا يكون تاريخ إخفاء الهوية في المستقبل.",
                     code="anonymisation_future")
     with transaction.atomic():
-        for doc in SalesDocument.objects.select_for_update(of=("self",)).filter(pk__in=doc_ids):
+        for doc in SalesDocument.objects.select_for_update(of=("self",)).filter(pk__in=result["documents"]):
             for name in _ANON_DOC_TEXT:
                 setattr(doc, name, ANONYMISED_EN)
             for name in _ANON_DOC_TEXT_AR:
@@ -3148,16 +3216,19 @@ def anonymise_expired_personal_data(*, today=None, apply=False):
             doc._service_write = True
             doc.save(update_fields=[*_ANON_DOC_TEXT, *_ANON_DOC_TEXT_AR, *_ANON_DOC_BLANK, "anonymised_at",
                                     "updated_at"])
-        for c in Customer.objects.select_for_update(of=("self",)).filter(pk__in=customer_ids):
-            for name in _ANON_PARTY_TEXT:
-                setattr(c, name, ANONYMISED_EN)
-            for name in _ANON_PARTY_TEXT_AR:
-                setattr(c, name, ANONYMISED_AR)
-            for name in _ANON_PARTY_BLANK:
-                setattr(c, name, "")
-            c.is_vat_registered, c.is_active, c.anonymised_at = False, False, now
+        for c in Customer.objects.select_for_update(of=("self",)).filter(pk__in=result["customers"]):
+            _anonymise_party(c, now)
             c.save()
             CustomerIdentifier.objects.filter(customer=c).delete()
+        for bill in PurchaseDocument.objects.select_for_update(of=("self",)).filter(
+                pk__in=result["purchase_documents"]):
+            bill.vendor_vat_number, bill.anonymised_at = "", now
+            bill._service_write = True
+            bill.save(update_fields=["vendor_vat_number", "anonymised_at", "updated_at"])
+        for v in Vendor.objects.select_for_update(of=("self",)).filter(pk__in=result["vendors"]):
+            _anonymise_party(v, now)
+            v.bank_iban = ""
+            v.save()
     result["applied"] = True
     return result
 

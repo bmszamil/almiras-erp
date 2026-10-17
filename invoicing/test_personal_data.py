@@ -11,7 +11,8 @@ from core.access.testing import make_agent
 from invoicing import services
 from invoicing.conftest import ADDRESS, D, final, invoice
 from invoicing.testing import approval_day
-from invoicing.models import Customer, CustomerIdentifier, InvoicingError, SalesDocument, Vendor
+from invoicing.models import (Customer, CustomerIdentifier, InvoicingError, PurchaseDocument, SalesDocument, Vendor,
+                               WhtDeduction)
 
 pytestmark = pytest.mark.django_db
 
@@ -163,3 +164,79 @@ def test_r52_anonymised_documents_still_never_change(w):
     doc.buyer_name_ar = "x"
     with pytest.raises(InvoicingError):
         doc.save()
+
+
+# --- R52 / AT-43, review finding 2: individual vendors --------------------------------------------------------------
+
+def _individual_vendor(w, code="VI9", **fields):
+    return services.create_vendor(w.alm, user=w.ap, vendor_kind="individual", code=code, name_ar="مورد فرد تجريبي",
+                                  name_en="Test Sole Trader", is_vat_registered=True, vat_number="399999999900003",
+                                  bank_iban="SA0000000000000000000009", **{**ADDRESS, **fields})
+
+
+def _paid_bill(w, vendor, number="VI-1", on=date(2027, 1, 15)):
+    from invoicing.test_purchases import bill
+
+    b = services.approve_purchase_document(bill(w, vendor=vendor, number=number, on=on), user=w.cfo)
+    p = services.create_vendor_payment(w.alm, user=w.ap, vendor=vendor, date=date(2027, 1, 25), amount=b.total_gross)
+    services.add_payment_application(p, b, b.total_gross, user=w.ap)
+    services.approve_vendor_payment(services.submit_vendor_payment(p, user=w.ap), user=w.cfo)
+    return PurchaseDocument.objects.get(pk=b.pk)
+
+
+def test_at43_vendor_retention_follows_its_bills_and_payments(w):
+    v = _individual_vendor(w)
+    assert services.vendor_retention_until(v) is None  # no bill yet: left alone
+    b = _paid_bill(w, v)
+    # quarterly returns: Q1 2027 ends 2027-03-31; standard retention 6 years after it
+    assert services.vendor_retention_until(v) == date(2033, 3, 31)
+    assert services.anonymise_expired_personal_data(today=date(2033, 3, 31))["vendors"] == []
+    result = services.anonymise_expired_personal_data(today=date(2033, 4, 1))
+    assert (result["vendors"], result["purchase_documents"], result["applied"]) == ([v.pk], [b.pk], False)
+    assert w.vendor.pk not in result["vendors"]  # a business vendor never
+    from invoicing.test_purchases import bill
+
+    bill(w, vendor=v, number="VI-2", submit=False)  # a draft in progress: not anonymised yet
+    assert services.vendor_retention_until(v) is None
+    assert services.anonymise_expired_personal_data(today=date(2050, 1, 1))["vendors"] == []
+
+
+@override_settings(INVOICING_ANONYMISATION_ENABLED=True)
+def test_at43_expired_individual_vendor_is_anonymised_amounts_kept(w):
+    v = _individual_vendor(w)
+    b = _paid_bill(w, v)
+    entry_lines = list(b.journal_entry.lines.values_list("account__code", "debit", "credit"))
+    with approval_day(date(2033, 4, 1)):
+        result = services.anonymise_expired_personal_data(today=date(2033, 4, 1), apply=True)
+    assert result["applied"] and result["vendors"] == [v.pk]
+    v.refresh_from_db()
+    assert (v.name_en, v.name_ar, v.street_ar, v.city_en, v.vat_number, v.bank_iban) == (
+        "ANONYMISED", "مجهّل", "مجهّل", "ANONYMISED", "", "")
+    assert (v.is_active, v.is_vat_registered) == (False, False) and v.anonymised_at is not None
+    stored = PurchaseDocument.objects.get(pk=b.pk)
+    assert stored.vendor_vat_number == "" and stored.anonymised_at is not None
+    for name in ("number", "total_net", "total_vat", "total_gross", "accounting_date", "status"):
+        assert getattr(stored, name) == getattr(b, name)
+    assert list(stored.journal_entry.lines.values_list("account__code", "debit", "credit")) == entry_lines
+    w.vendor.refresh_from_db()
+    assert w.vendor.name_en == "Test Supplier"  # business vendor untouched
+    assert services.anonymise_expired_personal_data(today=date(2033, 4, 1))["vendors"] == []  # done once
+
+
+@override_settings(INVOICING_ANONYMISATION_ENABLED=True)
+def test_at43_wht_records_keep_a_non_resident_individual_for_ten_years(w):
+    from invoicing.test_withholding_tax import nr_bill, pay
+
+    nr = services.create_vendor(w.alm, user=w.ap, vendor_kind="individual", code="NRI", name_ar="مستشار فرد",
+                                name_en="Test Consultant", is_resident=False, residence_country="GB",
+                                wht_category="technical_services", bank_iban="GB00TEST0000000000000001")
+    b = nr_bill(w, nr, "1000.00", number="NRI-1")
+    pay(w, nr, "950.00", [(b, "1000.00")], on=date(2027, 1, 25))
+    assert services.vendor_retention_until(nr) == date(2037, 1, 25)  # 10 years after the WHT payment
+    assert services.anonymise_expired_personal_data(today=date(2033, 4, 1))["vendors"] == []
+    with approval_day(date(2037, 1, 26)):
+        result = services.anonymise_expired_personal_data(today=date(2037, 1, 26), apply=True)
+    assert result["vendors"] == [nr.pk]
+    nr.refresh_from_db()
+    assert (nr.name_en, nr.bank_iban) == ("ANONYMISED", "")
+    assert WhtDeduction.objects.filter(payment__vendor=nr).count() == 1  # the WHT record itself is kept

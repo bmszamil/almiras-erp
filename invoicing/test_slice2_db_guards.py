@@ -87,3 +87,32 @@ def test_unverified_certificate_edits_record_the_modifier_and_a_third_person_ver
              [w.accountant.pk, cert.pk])  # nor the last modifier
     _refused("DELETE FROM invoicing_treatycertificate WHERE id = %s", [cert.pk])
 
+
+
+def test_bills_change_only_for_vendor_anonymisation_after_retention(w):
+    """Review finding 2: a posted bill of an individual vendor loses its vendor VAT number once, after retention
+    (6 years after its quarter; 10 years after a WHT payment); a business vendor's bill never."""
+    from invoicing.test_personal_data import _individual_vendor, _paid_bill
+    from invoicing.test_purchases import bill
+
+    after = "2033-04-01T12:00:00+03:00"
+    business = services.approve_purchase_document(bill(w, number="B-9"), user=w.cfo)
+    _refused("UPDATE invoicing_purchasedocument SET vendor_vat_number = '', anonymised_at = %s WHERE id = %s",
+             [after, business.pk])
+    b = _paid_bill(w, _individual_vendor(w))
+    _refused("UPDATE invoicing_purchasedocument SET vendor_vat_number = '', anonymised_at = %s WHERE id = %s",
+             ["2033-03-31T12:00:00+03:00", b.pk])  # retention not over
+    _refused("UPDATE invoicing_purchasedocument SET vendor_vat_number = '', total_net = 0, anonymised_at = %s "
+             "WHERE id = %s", [after, b.pk])  # nothing else
+    with transaction.atomic(), connection.cursor() as cursor:
+        cursor.execute("UPDATE invoicing_purchasedocument SET vendor_vat_number = '', anonymised_at = %s "
+                       "WHERE id = %s", [after, b.pk])
+    _refused("UPDATE invoicing_purchasedocument SET anonymised_at = now() WHERE id = %s", [b.pk])  # once only
+    nr = services.create_vendor(w.alm, user=w.ap, vendor_kind="individual", code="NRI", name_ar="مستشار فرد",
+                                is_resident=False, residence_country="GB", wht_category="technical_services")
+    nb = nr_bill(w, nr, "1000.00", number="NRI-1")
+    pay(w, nr, "950.00", [(nb, "1000.00")], on=date(2027, 1, 25))
+    _refused("UPDATE invoicing_purchasedocument SET anonymised_at = %s WHERE id = %s", [after, nb.pk])  # WHT: 10 years
+    with transaction.atomic(), connection.cursor() as cursor:
+        cursor.execute("UPDATE invoicing_purchasedocument SET anonymised_at = %s WHERE id = %s",
+                       ["2037-01-26T12:00:00+03:00", nb.pk])

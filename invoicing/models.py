@@ -441,6 +441,13 @@ class Vendor(Tracked, Address):
     currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Default currency", "العملة الافتراضية"))
     is_active = models.BooleanField(bi("Active", "نشط"), default=True)
+    anonymised_at = models.DateTimeField(
+        bi("Anonymised at", "تاريخ إخفاء الهوية"), null=True, blank=True, editable=False,
+        help_text=bi("R52: an individual vendor's name, address, VAT number and IBAN replaced after the retention of "
+                     "its bills, payments and withholding tax records",
+                     "استُبدل اسم المورد الفرد وعنوانه ورقمه الضريبي والآيبان بعد انتهاء مدة حفظ فواتيره ومدفوعاته "
+                     "وسجلات الاستقطاع"),
+    )
 
     class Meta:
         verbose_name = bi("vendor", "مورد")
@@ -1042,6 +1049,11 @@ class PurchaseDocument(Tracked, Guarded):
         verbose_name=bi("Requires purification", "يتطلب التطهير"))
     is_intercompany = models.BooleanField(bi("Intercompany", "بين شركات المجموعة"), default=False)
     attachment = models.FileField(bi("Vendor document", "مستند المورد"), upload_to="invoicing/purchase/%Y/", blank=True)
+    anonymised_at = models.DateTimeField(
+        bi("Vendor data anonymised at", "تاريخ إخفاء هوية المورد"), null=True, blank=True, editable=False,
+        help_text=bi("R52: an individual vendor's VAT number removed after retention; amounts, VAT and numbers kept",
+                     "حُذف الرقم الضريبي للمورد الفرد بعد انتهاء مدة الحفظ؛ تبقى المبالغ والضريبة والأرقام"),
+    )
     journal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
                                       related_name="+", verbose_name=bi("Journal entry", "القيد اليومي"))
     reversal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
