@@ -93,6 +93,7 @@ def test_at2_backfill_sets_currency_fields_and_leaves_amounts_and_status_alone()
     # 0005: the proposed FX accounts reach existing charts; the monetary flag is set on existing accounts
     assert set(Account.objects.filter(entity__code="ALM", code__in=["3400", "4700", "4710", "5750", "5760", "5770"])
                .values_list("code", flat=True)) == {"3400", "4700", "4710", "5750", "5760", "5770"}
-    # (0016 later adds the proposed WHT payable 2220, monetary, to every chart; invoicing D14)
+    # (0016 later adds the proposed WHT payable 2220, monetary, to every chart, invoicing D14; 0017 the proposed
+    # purification bank account 1140, monetary, D31b)
     assert set(Account.objects.filter(entity__code="SUB", is_monetary=True).values_list("code", flat=True)) == {
-        "1100", "1210", "2220"}
+        "1100", "1140", "1210", "2220"}
