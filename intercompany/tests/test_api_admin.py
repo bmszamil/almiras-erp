@@ -1,5 +1,4 @@
 """REST API /api/v1/intercompany/, admin scoping and the seeded permissions/approval policies (§7)."""
-import datetime
 import io
 import uuid
 from decimal import Decimal
@@ -14,7 +13,6 @@ from approvals.models import ApprovableType, ApprovalPolicy, ApprovalRequest
 from intercompany import services
 from intercompany.models import IntercompanyBill, IntercompanyInvoice, ServiceAgreement, ServiceType, VatRate
 
-from .conftest import approve
 
 pytestmark = pytest.mark.django_db
 D = Decimal

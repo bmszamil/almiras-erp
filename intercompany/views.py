@@ -14,7 +14,6 @@ from rest_framework.views import APIView
 from access import services as access
 from access.errors import AccessDenied, BilingualError, NotFound, RuleError
 from access.models import User
-from approvals import services as approvals
 from approvals.serializers import RequestDetailSerializer
 from approvals.views import ctx_for
 from core.models import Entity
