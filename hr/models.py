@@ -782,6 +782,8 @@ class LeaveRequest(Tracked, ServiceGuarded):
     document_ref = models.CharField(bi("Document reference", "مرجع المستند"), max_length=100, blank=True)
     reason_en = models.TextField(bi("Reason (English)", "السبب (بالإنجليزية)"), blank=True)
     reason_ar = models.TextField(bi("Reason (Arabic)", "السبب (بالعربية)"), blank=True)
+    # E.g. a year with no Eid dates in calendar.official_holidays (nit 12), en/ar.
+    warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
 
     class Meta:
         verbose_name = bi("leave request", "طلب إجازة")
@@ -826,8 +828,18 @@ class LeaveLedger(models.Model):
         verbose_name = bi("leave ledger row", "قيد رصيد إجازة")
         verbose_name_plural = bi("leave ledger", "سجل أرصدة الإجازات")
         ordering = ["employee", "date", "id"]
-        constraints = [models.UniqueConstraint(fields=["employee", "leave_type", "period"], condition=Q(kind="accrual"),
-                                               name="hr_accrual_once_per_month")]
+        constraints = [
+            # R30: the monthly job accrues a month once; a termination approval writes at most one row per month
+            # (finding 2: the partial last month, or a correction); a row is reversed at most once (R41 withdrawal).
+            models.UniqueConstraint(fields=["employee", "leave_type", "period"],
+                                    condition=Q(kind="accrual", source_type="hr_accrue_leave"),
+                                    name="hr_accrual_once_per_month"),
+            models.UniqueConstraint(fields=["employee", "leave_type", "period", "source_id"],
+                                    condition=Q(kind="accrual", source_type="hr.termination"),
+                                    name="hr_termination_accrual_once"),
+            models.UniqueConstraint(fields=["source_id"], condition=Q(kind="reversal", source_type="hr.leaveledger"),
+                                    name="hr_ledger_row_reversed_once"),
+        ]
 
     def save(self, *args, **kwargs):
         if self.pk:
@@ -841,12 +853,17 @@ class LeaveLedger(models.Model):
 
 
 class LeaveAdjustment(Tracked, ServiceGuarded):
-    """A correction of a leave balance, approved before its ledger row is written (R29)."""
+    """A correction of a leave balance, or an imported opening balance, approved before its ledger row is written
+    (R29; finding 1)."""
 
     class Status(models.TextChoices):
         DRAFT = "draft", bi("Draft", "مسودة")
         APPROVED = "approved", bi("Approved", "معتمد")
         REJECTED = "rejected", bi("Rejected", "مرفوض")
+
+    class Kind(models.TextChoices):
+        ADJUSTMENT = "adjustment", bi("Adjustment", "تسوية")
+        OPENING = "opening", bi("Opening balance (import)", "رصيد افتتاحي (ترحيل)")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     employee = models.ForeignKey(Employee, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Employee", "الموظف"))
@@ -854,6 +871,7 @@ class LeaveAdjustment(Tracked, ServiceGuarded):
                                    verbose_name=bi("Leave type", "نوع الإجازة"))
     date = models.DateField(bi("Date", "التاريخ"))
     days = models.DecimalField(bi("Days", "الأيام"), max_digits=7, decimal_places=2)
+    kind = models.CharField(bi("Kind", "النوع"), max_length=10, choices=Kind.choices, default=Kind.ADJUSTMENT)
     reason_en = models.TextField(bi("Reason (English)", "السبب (بالإنجليزية)"), blank=True)
     reason_ar = models.TextField(bi("Reason (Arabic)", "السبب (بالعربية)"))
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)

@@ -10,7 +10,8 @@ import pytest
 from core import access
 from hr import services
 from hr.conftest import employee, hired
-from hr.models import Assignment, AssignmentEvent, EosbCalculation, FinalSettlementInput, HrError, LeaveRequest
+from hr.models import (Assignment, AssignmentEvent, EosbCalculation, FinalSettlementInput, HrError, LeaveLedger,
+                       LeaveRequest)
 
 D = Decimal
 AS_OF = date(2027, 5, 31)
@@ -154,11 +155,13 @@ def test_at21_snapshot_immutable_recalc_supersedes_then_refused(w):
 # --- R27, R35, R38 / AT-20 ----------------------------------------------------------------------------------
 
 def _seconded_with_leave(w, opening="10"):
-    emp = employee(w)
-    services.record_opening_leave_balance(emp, "ANNUAL", D(opening), emp.hire_date, user=w.h)
+    """Hired 2025-01-01, approved opening balance as of 2026-12-31, no accrual written since (the job has not run)."""
+    emp = employee(w, hire_date=date(2025, 1, 1))
+    adj = services.record_opening_leave_balance(emp, "ANNUAL", D(opening), date(2026, 12, 31), user=w.h)
     from hr.conftest import contract
 
     contract(w, emp)
+    services.approve_leave_adjustment(adj, user=w.c)
     emp.refresh_from_db()
     a = services.create_assignment(emp, user=w.h, kind="secondment", receiving_entity=w.sub, role_title_en="Analyst",
                                    role_title_ar="محلل", start_date=date(2027, 2, 1))
@@ -179,11 +182,12 @@ def test_at20_termination_approval_does_everything_in_one_transaction(w):
     assert a.status == "ended" and a.end_date == date(2027, 6, 30)
     assert AssignmentEvent.objects.get(assignment=a).end_date == date(2027, 6, 30)
     assert LeaveRequest.objects.get(pk=future.pk).status == "cancelled"
-    assert services.leave_balance(emp, "ANNUAL", user=w.h) == 10
+    # Finding 2: January to June 2027 (6 x 1.75) are accrued up to the last working day before the balance is taken.
+    assert services.leave_balance(emp, "ANNUAL", user=w.h) == D("20.50")
     snap = EosbCalculation.objects.get(termination=t)
     si = FinalSettlementInput.objects.get(termination=t)
-    assert si.eosb_calculation == snap and si.leave_balance_days == D("10.00")
-    assert si.daily_wage == D("266.67") and si.leave_encashment == D("2666.67") and si.includes_statutory_lines
+    assert si.eosb_calculation == snap and si.leave_balance_days == D("20.50")
+    assert si.daily_wage == D("266.67") and si.leave_encashment == D("5466.67") and si.includes_statutory_lines
     assert w.payroll.drafts == [si.pk]
     services.refresh_statuses(today=date(2027, 7, 1))
     emp.refresh_from_db()
@@ -305,3 +309,50 @@ def test_r51_local_eosb_refused_until_parameters(w):
     with pytest.raises(HrError) as exc:
         services.calculate_eosb(local, AS_OF, "employer_termination", user=w.he)
     assert exc.value.code == "jurisdiction_not_configured" and "EG" in exc.value.messages[0]
+
+
+# --- Finding 2 (review probe P2): the partial last month accrues before the settlement balance is taken -------
+
+def test_r35_partial_last_month_accrues_up_to_the_last_working_day(w):
+    emp = hired(w, hire_date=date(2027, 1, 1))
+    for month in (1, 2, 3, 4, 5):
+        services.accrue_leave(2027, month)
+    w.clock.set(date(2027, 6, 1))
+    t = _approve(w, emp, last_working_day=date(2027, 6, 20), notice_given_on=date(2027, 4, 21))
+    row = LeaveLedger.objects.get(employee=emp, period="2027-06")
+    assert row.date == date(2027, 6, 20) and row.days == D("1.17") and row.source_id == t.pk  # 21 x 20 / (12 x 30)
+    si = FinalSettlementInput.objects.get(termination=t)
+    assert si.leave_balance_days == D("9.92")  # 5 x 1.75 + 1.17
+    services.accrue_leave(2027, 6)  # the month-end job does not accrue June again
+    assert LeaveLedger.objects.filter(employee=emp, period="2027-06").count() == 1
+    assert services.leave_balance(emp, "ANNUAL", user=w.h) == D("9.92")
+
+
+def test_r35_a_month_the_job_accrued_in_full_is_corrected_to_the_last_working_day(w):
+    emp = hired(w, hire_date=date(2027, 1, 1))
+    for month in (1, 2, 3, 4, 5, 6):
+        services.accrue_leave(2027, month)
+    w.clock.set(date(2027, 7, 2))
+    t = _approve(w, emp, last_working_day=date(2027, 6, 20), notice_given_on=date(2027, 4, 21))
+    assert FinalSettlementInput.objects.get(termination=t).leave_balance_days == D("9.92")
+    rows = list(LeaveLedger.objects.filter(employee=emp, period="2027-06").order_by("id").values_list("days", flat=True))
+    assert rows == [D("1.75"), D("-0.58")]
+
+
+def test_r40_recalculation_accrues_up_to_the_last_day_too(w):
+    emp = hired(w, hire_date=date(2027, 1, 1))
+    t = _approve(w, emp, last_working_day=date(2027, 6, 20), notice_given_on=date(2027, 4, 21))
+    first = FinalSettlementInput.objects.get(termination=t)
+    assert first.leave_balance_days == D("9.92")  # Jan to May in full, June to the 20th
+    services.recalculate_eosb(t, user=w.h)
+    latest = FinalSettlementInput.objects.get(termination=t, status="draft")
+    assert latest.leave_balance_days == D("9.92") and LeaveLedger.objects.filter(employee=emp).count() == 6
+
+
+def test_r41_withdrawal_reverses_the_partial_month_accrual(w):
+    emp = hired(w, hire_date=date(2027, 1, 1))
+    t = _approve(w, emp, last_working_day=date(2027, 6, 20), notice_given_on=date(2027, 4, 21))
+    services.withdraw_termination(t, user=w.c, reason_ar="تراجع")
+    assert services.leave_balance(emp, "ANNUAL", user=w.h) == D("8.75")  # the June part is reversed
+    services.accrue_leave(2027, 6)  # the job accrues June in full again
+    assert services.leave_balance(emp, "ANNUAL", user=w.h) == D("10.50")

@@ -8,9 +8,10 @@ from decimal import Decimal
 import pytest
 
 from core import access
+from core.access.testing import member
 from hr import services
 from hr.conftest import contract, employee, hired
-from hr.models import HrError, LeaveLedger, LeaveType, SickLeaveDay
+from hr.models import FinalSettlementInput, HrError, LeaveLedger, LeaveType, SickLeaveDay, StatutoryParameter
 
 D = Decimal
 
@@ -20,10 +21,17 @@ def _approved_leave(w, emp, code, start, end, approver=None, **fields):
     return services.approve_leave(req, user=approver or w.h2)
 
 
+OPENING_ON = date(2026, 12, 31)
+
+
 def _with_opening(w, days, **fields):
+    """An employee hired 2025-01-01 with an approved opening balance as of 2026-12-31 (finding 1: an opening balance
+    is an approved, capped adjustment) and no accrual since."""
+    fields.setdefault("hire_date", date(2025, 1, 1))
     emp = employee(w, **fields)
-    services.record_opening_leave_balance(emp, "ANNUAL", D(days), emp.hire_date, user=w.h)
+    adj = services.record_opening_leave_balance(emp, "ANNUAL", D(days), OPENING_ON, user=w.h)
     contract(w, emp)
+    services.approve_leave_adjustment(adj, user=w.c)
     emp.refresh_from_db()
     return emp
 
@@ -273,10 +281,153 @@ def test_r51_local_employee_leave_refused_until_parameters(w):
     assert exc.value.code in ("jurisdiction_not_configured", "leave_invalid")
 
 
-def test_r29_opening_only_once_before_activation(w):
+def test_r29_opening_only_once(w):
     e = _with_opening(w, "3")
+    with pytest.raises(HrError) as exc:
+        services.record_opening_leave_balance(e, "ANNUAL", D("1"), OPENING_ON + timedelta(days=1), user=w.h)
+    assert exc.value.code == "opening_once"
+
+
+# --- Finding 1 (review probe P13): an opening balance is an approved, capped import adjustment -------------------
+
+def test_r29_opening_balance_needs_an_approver_other_than_its_creator(w):
+    emp = employee(w, hire_date=date(2025, 1, 1))
+    adj = services.record_opening_leave_balance(emp, "ANNUAL", D("12"), OPENING_ON, user=w.h)
+    assert adj.status == "draft" and adj.kind == "opening" and adj.source == "import"
+    contract(w, emp)
+    assert services.leave_balance(emp, "ANNUAL", user=w.h) == 0  # nothing in the ledger before approval
+    with pytest.raises(access.AccessDenied):
+        services.approve_leave_adjustment(adj, user=w.h)  # hr_officer holds no approval right
+    member(w.h, w.alm, "approver")
+    with pytest.raises(access.AccessDenied) as denied:
+        services.approve_leave_adjustment(adj, user=w.h)  # the creator never approves it
+    assert denied.value.code == "self_approval"
+    services.approve_leave_adjustment(adj, user=w.c)
+    row = LeaveLedger.objects.get(employee=emp, kind="opening")
+    assert row.days == D("12") and row.date == OPENING_ON and row.source_id == adj.pk
+    assert services.leave_balance(emp, "ANNUAL", user=w.h) == D("12")
+
+
+def test_r29_opening_balance_is_capped_at_the_service_years_entitlement(w):
+    emp = employee(w, hire_date=date(2027, 1, 1))
+    big = services.record_opening_leave_balance(emp, "ANNUAL", D("400"), date(2027, 1, 1), user=w.h)
+    contract(w, emp)
+    emp.refresh_from_db()
+    with pytest.raises(HrError) as exc:
+        services.approve_leave_adjustment(big, user=w.c)
+    assert exc.value.code == "opening_cap" and "/" in exc.value.messages[0]
+    assert not LeaveLedger.objects.filter(employee=emp).exists()
+    t = services.record_termination(emp, user=w.h, kind="employer_termination", last_working_day=date(2027, 6, 20),
+                                    notice_given_on=date(2027, 4, 21), reason_ar="سبب")
+    services.approve_termination(services.submit_termination(t, user=w.h), user=w.c)
+    assert FinalSettlementInput.objects.get(termination=t).leave_balance_days < D("11")  # no 400-day encashment
+    two_years = employee(w, hire_date=date(2025, 1, 1))
+    over = services.record_opening_leave_balance(two_years, "ANNUAL", D("42.01"), OPENING_ON, user=w.h)
+    contract(w, two_years)
     with pytest.raises(HrError):
-        services.record_opening_leave_balance(e, "ANNUAL", D("1"), e.hire_date + timedelta(days=1), user=w.h)
+        services.approve_leave_adjustment(over, user=w.c)  # 2 years x 21 days = 42.00
+    services.reject_leave_adjustment(over, user=w.c, reason_ar="يتجاوز الاستحقاق")
+    ok = services.record_opening_leave_balance(two_years, "ANNUAL", D("42.00"), OPENING_ON, user=w.h)
+    assert services.approve_leave_adjustment(ok, user=w.c).status == "approved"
+
+
+def test_r29_opening_balance_refused_for_remuneration_and_without_contract(w):
+    r = employee(w, basis="remuneration")
+    with pytest.raises(HrError) as exc:
+        services.record_opening_leave_balance(r, "ANNUAL", D("1"), date(2027, 1, 1), user=w.h)
+    assert exc.value.code == "remuneration_no_leave"
+    emp = employee(w, hire_date=date(2025, 1, 1))
+    adj = services.record_opening_leave_balance(emp, "ANNUAL", D("1"), OPENING_ON, user=w.h)
+    with pytest.raises(HrError) as exc:
+        services.approve_leave_adjustment(adj, user=w.c)
+    assert exc.value.code == "no_terms"
+    with pytest.raises(HrError):  # SICK has no balance
+        services.record_opening_leave_balance(emp, "SICK", D("1"), OPENING_ON, user=w.h)
+
+
+# --- Finding 6 (review probe P3): reversals are netted, use the ANNUAL rule, and sick cancellation re-deducts -----
+
+def test_r31_cancelling_annual_after_sick_suspension_never_returns_days_twice(w):
+    e = _with_opening(w, "21")
+    a = _approved_leave(w, e, "ANNUAL", date(2027, 7, 1), date(2027, 7, 10))
+    assert services.leave_balance(e, "ANNUAL", user=w.h) == 11
+    _approved_leave(w, e, "SICK", date(2027, 7, 3), date(2027, 7, 5), document_ref="MED-1")
+    assert services.leave_balance(e, "ANNUAL", user=w.h) == 14
+    services.cancel_leave(a, user=w.h)
+    assert services.leave_balance(e, "ANNUAL", user=w.h) == 21  # not 24
+
+
+def test_r31_partly_used_annual_after_sick_returns_only_what_it_still_deducts(w):
+    e = _with_opening(w, "21")
+    a = _approved_leave(w, e, "ANNUAL", date(2027, 6, 1), date(2027, 6, 10))
+    _approved_leave(w, e, "SICK", date(2027, 6, 8), date(2027, 6, 9), document_ref="MED-1")
+    w.clock.set(date(2027, 6, 5))
+    services.cancel_leave(a, user=w.h)  # days 5..10 go back; 8 and 9 were already back
+    assert services.leave_balance(e, "ANNUAL", user=w.h) == D("17")  # 21 - 4 days used (1..4)
+
+
+def test_r31_cancelled_sick_leave_deducts_the_suspended_annual_days_again(w):
+    e = _with_opening(w, "21")
+    _approved_leave(w, e, "ANNUAL", date(2027, 7, 1), date(2027, 7, 10))
+    sick = _approved_leave(w, e, "SICK", date(2027, 7, 3), date(2027, 7, 5), document_ref="MED-1")
+    assert services.leave_balance(e, "ANNUAL", user=w.h) == 14
+    services.cancel_leave(sick, user=w.h)
+    assert services.leave_balance(e, "ANNUAL", user=w.h) == 11
+    assert not services.sick_pay_days(e, date(2027, 7, 1), date(2027, 7, 31), user=w.p)
+
+
+def test_regs_art26_suspension_uses_the_annual_counting_rule(w):
+    annual = services.param("SA", "leave.annual", date(2027, 1, 1))
+    annual.value = {**annual.value, "count": "working"}  # test parameter: working days
+    annual.save()
+    e = _with_opening(w, "21")
+    a = _approved_leave(w, e, "ANNUAL", date(2027, 7, 4), date(2027, 7, 15))  # Sun 4 to Thu 15: 10 working days
+    assert a.days == 10 and services.leave_balance(e, "ANNUAL", user=w.h) == 11
+    _approved_leave(w, e, "SICK", date(2027, 7, 8), date(2027, 7, 11), document_ref="MED-1")  # Thu to Sun
+    assert services.leave_balance(e, "ANNUAL", user=w.h) == 13  # Thu 8 and Sun 11 only; Fri/Sat were never deducted
+
+
+def test_nit18_shortened_sick_leave_trims_its_days(w):
+    e = hired(w, hire_date=date(2025, 1, 1))
+    _approved_leave(w, e, "SICK", date(2027, 6, 25), date(2027, 7, 10), document_ref="MED-1")
+    t = services.record_termination(e, user=w.h, kind="employer_termination", last_working_day=date(2027, 6, 30),
+                                    notice_given_on=date(2027, 5, 1), reason_ar="سبب")
+    services.approve_termination(services.submit_termination(t, user=w.h), user=w.c, acknowledge_protection=True)
+    days = services.sick_pay_days(e, date(2027, 6, 1), date(2027, 7, 31), user=w.p)
+    assert [d for d, *_ in days] == [date(2027, 6, d) for d in range(25, 31)]
+    assert SickLeaveDay.objects.filter(employee=e).count() == 16  # append-only: the rows stay, trimmed by the dates
+
+
+# --- Finding 3 (review probe P5): accrual checks its parameters ------------------------------------------------
+
+def test_r7_accrual_skips_and_reports_unverified_parameters(w, settings):
+    e = hired(w, hire_date=date(2027, 1, 1))
+    settings.HR_REQUIRE_VERIFIED_PARAMETERS = True
+    report = services.accrue_leave(2027, 1)
+    assert report["accrued"] == 0 and not LeaveLedger.objects.filter(employee=e).exists()
+    (code, why), = report["skipped"]
+    assert code == e.employee_code and "leave.annual" in why and "غير متحقق" in why
+    for row in StatutoryParameter.objects.filter(jurisdiction="SA", status="unverified"):
+        services.verify_statutory_parameter(row, user=w.mp)
+    report = services.accrue_leave(2027, 1)
+    assert report == {"accrued": 1, "skipped": []}
+    assert services.param("SA", "leave.annual", date(2027, 1, 1)).used_at is not None
+
+
+def test_r7_leave_approval_and_cancellation_check_parameters(w, settings):
+    e = _with_opening(w, "10")
+    req = services.request_leave(e, "ANNUAL", user=w.h, start_date=date(2027, 7, 1), end_date=date(2027, 7, 3))
+    settings.HR_REQUIRE_VERIFIED_PARAMETERS = True
+    with pytest.raises(HrError) as exc:
+        services.approve_leave(req, user=w.h2)
+    assert exc.value.code == "parameter_unverified"
+    assert services.leave_balance(e, "ANNUAL", user=w.h) == 10
+    settings.HR_REQUIRE_VERIFIED_PARAMETERS = False
+    services.approve_leave(req, user=w.h2)
+    settings.HR_REQUIRE_VERIFIED_PARAMETERS = True
+    with pytest.raises(HrError):
+        services.cancel_leave(req, user=w.h)
+    assert services.leave_balance(e, "ANNUAL", user=w.h) == 7
 
 
 def test_art116_unpaid_leave_beyond_twenty_days_extends_a_fixed_term(w):

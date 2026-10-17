@@ -26,7 +26,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.db import IntegrityError, transaction
-from django.db.models import Max, Q, Sum
+from django.db.models import F, Max, Q, Sum
 from django.utils import timezone
 from hijridate import Gregorian, Hijri
 
@@ -209,32 +209,77 @@ def param(jurisdiction, code, on, *, required=True):
     return None
 
 
+def _required_verified():
+    return getattr(settings, "HR_REQUIRE_VERIFIED_PARAMETERS", True)
+
+
+def _unverified_error(rows):
+    names = ", ".join(f"{r.jurisdiction} {r.code} ({r.valid_from})" for r in rows)
+    return error(f"This uses unverified statutory parameters: {names}. They must be verified first (R7).",
+                 f"يستخدم هذا الإجراء معايير نظامية غير متحقق منها: {names}. يجب التحقق منها أولًا.",
+                 code="parameter_unverified")
+
+
 @dataclass
 class ParamUse:
-    """The parameter rows one calculation or approval read (R7)."""
+    """The parameter rows one calculation or approval read (R7).
+
+    Every path that writes an approved record or a leave-ledger row calls :meth:`check_verified` before its first
+    write and :meth:`mark_used` after its last one. After ``check_verified`` the use is *strict*: a row read later in
+    the same transaction is checked as it is read, so a write that needed an unverified row is refused (and rolled
+    back) even when the row was first read after the check."""
 
     rows: dict = field(default_factory=dict)
+    warnings: list = field(default_factory=list)
+    strict: bool = False
+
+    def _take(self, row):
+        if self.strict and _required_verified() and row.status != StatutoryParameter.Status.VERIFIED:
+            raise _unverified_error([row])
+        self.rows[row.pk] = row
 
     def get(self, jurisdiction, code, on, what_en="", what_ar=""):
         row = param(jurisdiction, code, on, required=False)
         if row is None:
             raise _not_configured(jurisdiction, code, on, what_en, what_ar)
-        self.rows[row.pk] = row
+        self._take(row)
         return row.value
+
+    def get_span(self, jurisdiction, code, start, end, what_en="", what_ar=""):
+        """Every current row of ``code`` valid on some day of ``start``..``end``, as ``[(first, last, value)]``
+        day ranges in date order (nit 12: a span is read from all overlapping rows, not only the row valid on its
+        first day). A day no row covers refuses the calculation ("jurisdiction not configured", R5)."""
+        rows = list(StatutoryParameter.objects.filter(jurisdiction=jurisdiction, code=code, valid_from__lte=end)
+                    .filter(Q(valid_to__isnull=True) | Q(valid_to__gte=start))
+                    .exclude(status=StatutoryParameter.Status.SUPERSEDED).order_by("valid_from"))
+        result, day = [], start
+        while day <= end:
+            row = next((r for r in reversed(rows) if r.valid_from <= day and (r.valid_to is None or r.valid_to >= day)),
+                       None)
+            if row is None:
+                raise _not_configured(jurisdiction, code, day, what_en, what_ar)
+            later = [r.valid_from for r in rows if r.valid_from > day]
+            last = min([end, row.valid_to or end] + [d - timedelta(days=1) for d in later])
+            self._take(row)
+            result.append((day, last, row.value))
+            day = last + timedelta(days=1)
+        return result
 
     @property
     def ids(self):
         return sorted(self.rows)
 
+    def unverified(self):
+        """The rows read that are not verified, when the setting requires verified rows (else none)."""
+        if not _required_verified():
+            return []
+        return [r for r in self.rows.values() if r.status != StatutoryParameter.Status.VERIFIED]
+
     def check_verified(self):
-        if not getattr(settings, "HR_REQUIRE_VERIFIED_PARAMETERS", True):
-            return
-        bad = [r for r in self.rows.values() if r.status != StatutoryParameter.Status.VERIFIED]
+        bad = self.unverified()
         if bad:
-            names = ", ".join(f"{r.jurisdiction} {r.code} ({r.valid_from})" for r in bad)
-            raise error(f"This approval uses unverified statutory parameters: {names}. They must be verified first (R7).",
-                        f"يستخدم هذا الاعتماد معايير نظامية غير متحقق منها: {names}. يجب التحقق منها أولًا.",
-                        code="parameter_unverified")
+            raise _unverified_error(bad)
+        self.strict = True
 
     def mark_used(self):
         now = timezone.now()
@@ -243,6 +288,10 @@ class ParamUse:
             if stored.used_at is None:
                 stored.used_at = now
                 stored.save(update_fields=["used_at"])
+
+    def warn(self, text):
+        if text not in self.warnings:
+            self.warnings.append(text)
 
 
 def _jurisdiction(employee, what_en="statutory calculations", what_ar="الحسابات النظامية"):
@@ -969,8 +1018,7 @@ def _probation_end(use, contract, jurisdiction="SA"):
         return None
     far = contract.start_date + timedelta(days=days * 2 + 60)
     skip = _holidays(use, jurisdiction, contract.start_date, far) | set(
-        SickLeaveDay.objects.filter(employee=contract.employee, leave_request__status__in=("approved", "taken"))
-        .values_list("date", flat=True))
+        _live_sick_days(SickLeaveDay.objects.filter(employee=contract.employee)).values_list("date", flat=True))
     counted, d = 0, contract.start_date
     while True:
         if d not in skip:
@@ -1503,8 +1551,9 @@ def _leave_type(entity, code):
 def _balance(employee, leave_type, on=None):
     qs = LeaveLedger.objects.filter(employee=employee, leave_type=leave_type)
     if on is not None:
-        # Leave already taken or returned counts whatever its date; accruals only up to ``on``.
-        qs = qs.filter(Q(date__lte=on) | Q(kind__in=(LeaveLedger.Kind.TAKEN, LeaveLedger.Kind.REVERSAL)))
+        # Leave already taken or returned counts whatever its date; accruals (and their reversals) only up to ``on``.
+        qs = qs.filter(Q(date__lte=on) | Q(kind__in=(LeaveLedger.Kind.TAKEN, LeaveLedger.Kind.REVERSAL),
+                                           source_type="hr.leaverequest"))
     return qs.aggregate(s=Sum("days"))["s"] or ZERO
 
 
@@ -1514,9 +1563,9 @@ def leave_balance(employee, leave_type_code, *, user, on=None):
     return _balance(employee, _leave_type(employee.entity, leave_type_code), on)
 
 
-def _count_days(use, jurisdiction, req, rule, start, end):
-    """Days of a request: calendar or working days per the type's parameter; official holidays inside annual
-    leave extend it (Regs Art. 24)."""
+def _counted_dates(use, jurisdiction, req, rule, start, end):
+    """The days of a request that count: calendar or working days per the type's parameter; official holidays
+    inside annual leave do not count and extend it (Regs Art. 24)."""
     count = rule.get("count", "calendar")
     skip = set()
     if count == "working":
@@ -1524,7 +1573,63 @@ def _count_days(use, jurisdiction, req, rule, start, end):
         skip |= {d for d in _days(start, end) if d.weekday() in weekend}
     if req.leave_type.code == "ANNUAL":
         skip |= _holidays(use, jurisdiction, start, end)
-    return sum(1 for d in _days(start, end) if d not in skip)
+    return [d for d in _days(start, end) if d not in skip]
+
+
+def _count_days(use, jurisdiction, req, rule, start, end):
+    return len(_counted_dates(use, jurisdiction, req, rule, start, end))
+
+
+def _type_rule(use, jurisdiction, req):
+    """The counting parameter of the request's type (``leave.annual`` for ANNUAL, R31)."""
+    lt = req.leave_type
+    return use.get(jurisdiction, lt.parameter_code, req.start_date) if lt.parameter_code else {}
+
+
+def _live_sick_days(qs=None):
+    """Sick days that still count: their request is approved or taken and the day lies inside the request's
+    current dates (nit 18: a shortened sick leave keeps its append-only rows; the days cut off are trimmed here,
+    for payroll, probation, the sick-leave year and the Art. 82 warning)."""
+    qs = SickLeaveDay.objects.all() if qs is None else qs
+    return qs.filter(leave_request__status__in=(LR.APPROVED, LR.TAKEN), date__gte=F("leave_request__start_date"),
+                     date__lte=F("leave_request__end_date"))
+
+
+def _sick_dates(emp, start, end, exclude=None):
+    """Days of ``emp``'s approved sick leave between start and end (Regs Art. 26)."""
+    qs = LeaveRequest.objects.filter(employee=emp, leave_type__code="SICK", status__in=(LR.APPROVED, LR.TAKEN),
+                                     start_date__lte=end, end_date__gte=start)
+    if exclude is not None:
+        qs = qs.exclude(pk=exclude)
+    result = set()
+    for s in qs:
+        result |= set(_days(max(s.start_date, start), min(s.end_date, end)))
+    return result
+
+
+def _resync_annual(a, use, jurisdiction, user, on):
+    """R31, Regs Art. 24 and 26: bring the ledger rows of annual request ``a`` to what it deducts now: its counted
+    days (ANNUAL counting rule, holidays excluded) between its current dates, less the days approved sick leave
+    suspends; nothing once cancelled. One correcting row (``taken`` or ``reversal``) for the difference, so days
+    already returned are never returned twice and a cancelled sick leave deducts its days again."""
+    expected = ZERO
+    if a.status in (LR.APPROVED, LR.TAKEN):
+        rule = _type_rule(use, jurisdiction, a)
+        dates = set(_counted_dates(use, jurisdiction, a, rule, a.start_date, a.end_date))
+        expected = -Decimal(len(dates - _sick_dates(a.employee, a.start_date, a.end_date)))
+    actual = (LeaveLedger.objects.filter(employee=a.employee, leave_type=a.leave_type, source_type="hr.leaverequest",
+                                         source_id=a.pk).aggregate(s=Sum("days"))["s"] or ZERO)
+    diff = expected - actual
+    if diff:
+        LeaveLedger.objects.create(entity=a.entity, employee=a.employee, leave_type=a.leave_type, date=on,
+                                   kind=LeaveLedger.Kind.REVERSAL if diff > 0 else LeaveLedger.Kind.TAKEN, days=diff,
+                                   source_type="hr.leaverequest", source_id=a.pk, created_by=user)
+
+
+def _resync_annual_around(emp, start, end, use, jurisdiction, user, on):
+    for a in LeaveRequest.objects.filter(employee=emp, leave_type__code="ANNUAL", start_date__lte=end,
+                                         end_date__gte=start).exclude(status__in=(LR.DRAFT, LR.SUBMITTED, LR.REJECTED)):
+        _resync_annual(_lock(LeaveRequest, a.pk), use, jurisdiction, user, max(on, a.start_date))
 
 
 def _service_years(use, jurisdiction, emp, terms, on):
@@ -1552,7 +1657,7 @@ def _sick_cycles(dates, basis):
 def _sick_plan(use, jurisdiction, req, terms):
     rule = use.get(jurisdiction, "leave.sick", req.start_date)
     _year_days(use, jurisdiction, terms.calendar_basis, req.start_date)  # the calendar basis is configured
-    prior = set(SickLeaveDay.objects.filter(employee=req.employee, leave_request__status__in=(LR.APPROVED, LR.TAKEN))
+    prior = set(_live_sick_days(SickLeaveDay.objects.filter(employee=req.employee))
                 .exclude(leave_request_id=req.pk).values_list("date", flat=True))
     new = list(_days(req.start_date, req.end_date))
     cycles = _sick_cycles(prior | set(new), terms.calendar_basis)
@@ -1701,9 +1806,12 @@ def request_leave(employee, leave_type, *, user, start_date, end_date, event_dat
 @transaction.atomic
 def approve_leave(leave_request, *, user):
     """R31: ``hr.approve_leave`` (A): never the requester, never the approver's own leave. Annual leave writes its
-    ``taken`` row; sick leave its ``SickLeaveDay`` tiers (R32) and suspends overlapping annual leave."""
+    ``taken`` row; sick leave its ``SickLeaveDay`` tiers (R32) and suspends overlapping annual leave (Regs Art. 26).
+    The employee row is locked first so two approvals cannot both spend one balance (nit 17). The parameter rows
+    used are checked (R7) before anything is written."""
     req = _lock(LeaveRequest, leave_request.pk)
     access.require(user, req.entity, "hr.approve_leave", document=req)
+    _lock(Employee, req.employee_id)
     _deny_own(user, req.entity, "hr.approve_leave", req.employee)
     if req.status != LR.SUBMITTED:
         raise error("Only submitted requests are approved.", "تُعتمد الطلبات المقدمة فقط.", code="not_submitted")
@@ -1711,36 +1819,23 @@ def approve_leave(leave_request, *, user):
     problems = _leave_problems(req, use)
     if problems:
         raise _problems(problems, "leave_invalid")
-    use.check_verified()
-    use.mark_used()
-    req.status, req.approved_by, req.approved_at = LR.APPROVED, user, timezone.now()
-    _save(req)
     jurisdiction = _jurisdiction(req.employee)
+    plan = None
+    if req.leave_type.code == "SICK":
+        plan, _, _ = _sick_plan(use, jurisdiction, req, _terms_on(req.employee, req.start_date))
+    use.check_verified()
+    req.status, req.approved_by, req.approved_at = LR.APPROVED, user, timezone.now()
+    req.warnings = list(use.warnings)
+    _save(req)
     if req.leave_type.code == "ANNUAL":
-        LeaveLedger.objects.create(entity=req.entity, employee=req.employee, leave_type=req.leave_type,
-                                   date=req.start_date, kind=LeaveLedger.Kind.TAKEN, days=-req.days,
-                                   source_type="hr.leaverequest", source_id=req.pk, created_by=user)
-    elif req.leave_type.code == "SICK":
-        terms = _terms_on(req.employee, req.start_date)
-        plan, _, _ = _sick_plan(use, jurisdiction, req, terms)
+        _resync_annual(req, use, jurisdiction, user, req.start_date)
+    elif plan is not None:
         for d, cycle_start, tier, pct, holiday in plan:
             SickLeaveDay.objects.create(entity=req.entity, employee=req.employee, date=d, leave_request=req,
                                         cycle_start=cycle_start, tier_no=tier, pay_pct=pct, official_holiday=holiday)
-        _suspend_annual_for_sick(req, use, jurisdiction, user)
+        _resync_annual_around(req.employee, req.start_date, req.end_date, use, jurisdiction, user, req.start_date)
+    use.mark_used()
     return req
-
-
-def _suspend_annual_for_sick(sick, use, jurisdiction, user):
-    """Regs Art. 26: approved sick leave inside annual leave suspends it; the overlapping annual days go back."""
-    annual = LeaveRequest.objects.filter(employee=sick.employee, leave_type__code="ANNUAL", status=LR.APPROVED,
-                                         start_date__lte=sick.end_date, end_date__gte=sick.start_date)
-    for a in annual:
-        start, end = max(a.start_date, sick.start_date), min(a.end_date, sick.end_date)
-        days = Decimal(_count_days(use, jurisdiction, a, {}, start, end))
-        if days:
-            LeaveLedger.objects.create(entity=a.entity, employee=a.employee, leave_type=a.leave_type, date=start,
-                                       kind=LeaveLedger.Kind.REVERSAL, days=days, source_type="hr.leaverequest",
-                                       source_id=sick.pk, created_by=user)
 
 
 @transaction.atomic
@@ -1755,53 +1850,78 @@ def reject_leave(leave_request, *, user, reason_ar=""):
     return _save(req)
 
 
-def _cancel_leave(req, user, from_day):
-    """Cancel an approved request from ``from_day`` on: the unused annual days go back (R31, R35)."""
-    use = ParamUse()
+def _cancel_leave(req, user, from_day, use):
+    """Cancel an approved request from ``from_day`` on (R31, R35). Annual leave gets back exactly the days it still
+    deducts after the cut, never days sick leave already returned; a shortened or cancelled sick leave deducts the
+    annual days it had suspended again (Regs Art. 26); a shortened sick leave's days after the cut stop counting
+    (nit 18)."""
     jurisdiction = _jurisdiction(req.employee)
-    if req.leave_type.code == "ANNUAL":
-        start = max(req.start_date, from_day)
-        if start <= req.end_date:
-            days = Decimal(_count_days(use, jurisdiction, req, {}, start, req.end_date))
-            if days:
-                LeaveLedger.objects.create(entity=req.entity, employee=req.employee, leave_type=req.leave_type,
-                                           date=start, kind=LeaveLedger.Kind.REVERSAL, days=days,
-                                           source_type="hr.leaverequest", source_id=req.pk, created_by=user)
+    first, last = req.start_date, req.end_date
     if from_day <= req.start_date:
         req.status = LR.CANCELLED
     else:
         req.end_date = from_day - timedelta(days=1)
-        req.days = Decimal(_count_days(use, jurisdiction, req, {}, req.start_date, req.end_date))
-    return _save(req)
+        req.days = Decimal(_count_days(use, jurisdiction, req, _type_rule(use, jurisdiction, req), req.start_date,
+                                       req.end_date))
+    req.modified_by, req.modified_at = user, timezone.now()
+    _save(req)
+    if req.leave_type.code == "ANNUAL":
+        _resync_annual(req, use, jurisdiction, user, max(from_day, first))
+    elif req.leave_type.code == "SICK":
+        _resync_annual_around(req.employee, max(from_day, first), last, use, jurisdiction, user, max(from_day, first))
+    return req
 
 
 @transaction.atomic
 def cancel_leave(leave_request, *, user):
     """Cancel an approved leave from today on (unused days return). Sick leave is cancelled only before it starts:
-    its tier rows are then ignored (they are append-only)."""
+    its tier rows then stop counting (they are append-only) and suspended annual days are deducted again."""
     req = _lock(LeaveRequest, leave_request.pk)
     access.require(user, req.entity, "hr.request_leave")
+    _lock(Employee, req.employee_id)
     if req.status != LR.APPROVED:
         raise error("Only approved leave is cancelled.", "تُلغى الإجازات المعتمدة فقط.", code="leave_status")
     if req.leave_type.code == "SICK" and req.start_date <= _today():
         raise error("Started sick leave is not cancelled; record an adjustment instead.",
                     "لا تُلغى الإجازة المرضية بعد بدئها؛ سجّل تسوية بدلًا من ذلك.", code="leave_status")
-    return _cancel_leave(req, user, max(_today(), req.start_date))
+    use = ParamUse()
+    _jurisdiction(req.employee)
+    _type_rule(use, _jurisdiction(req.employee), req)
+    use.check_verified()
+    req = _cancel_leave(req, user, max(_today(), req.start_date), use)
+    use.mark_used()
+    return req
 
 
 @transaction.atomic
-def record_opening_leave_balance(employee, leave_type, days, on, *, user):
-    """Opening balance from a migration (``source=import``): only before any other row of that employee and type,
-    and while the employee is still a draft (afterwards corrections are approved adjustments, R29)."""
+def record_opening_leave_balance(employee, leave_type, days, on, *, user, reason_ar="رصيد افتتاحي من ترحيل البيانات",
+                                 reason_en="Opening balance from the data migration"):
+    """An opening balance from a migration (Daftra or another system, hr §6) as of ``on``. It is an **approved
+    adjustment**, not a direct ledger row (R29, review finding 1): this records a draft ``LeaveAdjustment`` of kind
+    ``opening`` with ``source=import``; ``approve_leave_adjustment`` (``hr.adjust_leave_balance``, A, someone other
+    than its creator) writes the ``opening`` ledger row, capped at what the service years up to ``on`` could have
+    earned (R30, R56). Only one opening per employee and leave type, before any other row of that type."""
     emp = _lock(Employee, employee.pk)
     access.require(user, emp.entity, "hr.manage_employee")
     lt = _leave_type(emp.entity, leave_type)
-    if emp.status != Employee.Status.DRAFT or LeaveLedger.objects.filter(employee=emp, leave_type=lt).exists():
-        raise error("Opening balances are loaded once, before the employee is active (R29).",
-                    "يُحمَّل الرصيد الافتتاحي مرة واحدة قبل تفعيل الموظف.", code="opening_once")
-    return LeaveLedger.objects.create(entity=emp.entity, employee=emp, leave_type=lt, date=on,
-                                      kind=LeaveLedger.Kind.OPENING, days=_decimal(days, "days"), created_by=user,
-                                      source_type="import")
+    if emp.employment_basis == Basis.REMUNERATION:
+        raise error("Remuneration staff have no leave (R52).", "لا إجازات لأصحاب المكافأة الشهرية.", code="remuneration_no_leave")
+    if not lt.deducts_balance:
+        raise error(f"{lt.code} has no balance: opening balances are for annual leave.",
+                    f"لا رصيد لنوع الإجازة {lt.code}: الرصيد الافتتاحي للإجازة السنوية.", code="opening_type")
+    if on < emp.hire_date:
+        raise error("The opening balance date is on or after the hire date.", "تاريخ الرصيد الافتتاحي في تاريخ التعيين أو بعده.",
+                    code="opening_date")
+    if not reason_ar:
+        raise error("The reason in Arabic is required.", "السبب بالعربية مطلوب.", code="reason_required")
+    pending = LeaveAdjustment.objects.filter(employee=emp, leave_type=lt, kind=LeaveAdjustment.Kind.OPENING).exclude(
+        status=LeaveAdjustment.Status.REJECTED)
+    if pending.exists() or LeaveLedger.objects.filter(employee=emp, leave_type=lt).exists():
+        raise error("Opening balances are loaded once, before any other leave row of that type (R29).",
+                    "يُحمَّل الرصيد الافتتاحي مرة واحدة قبل أي قيد إجازة آخر من النوع نفسه.", code="opening_once")
+    return LeaveAdjustment.objects.create(entity=emp.entity, employee=emp, leave_type=lt, date=on,
+                                          days=_decimal(days, "days"), kind=LeaveAdjustment.Kind.OPENING,
+                                          reason_ar=reason_ar, reason_en=reason_en, created_by=user, source=Source.IMPORT)
 
 
 def _service_year_bounds(emp, terms, use, jurisdiction, on):
@@ -1827,17 +1947,61 @@ def request_leave_adjustment(employee, leave_type, days, on, *, user, reason_ar,
 
 
 @transaction.atomic
-def approve_leave_adjustment(adjustment, *, user):
-    """R29: the approver (``hr.adjust_leave_balance``, A) approves before the ledger row exists. R56: no adjustment
-    gives more than 30 days of annual leave for one service year."""
+def reject_leave_adjustment(adjustment, *, user, reason_ar):
+    """R29: the approver refuses a draft adjustment or opening balance (Arabic reason required); nothing is written
+    to the ledger."""
     adj = _lock(LeaveAdjustment, adjustment.pk)
     access.require(user, adj.entity, "hr.adjust_leave_balance", document=adj)
-    _deny_own(user, adj.entity, "hr.adjust_leave_balance", adj.employee)
+    if adj.status != LeaveAdjustment.Status.DRAFT or not reason_ar:
+        raise error("A draft adjustment is rejected with an Arabic reason.", "تُرفض التسوية المسودة مع ذكر السبب بالعربية.",
+                    code="reject")
+    adj.status = LeaveAdjustment.Status.REJECTED
+    adj.reason_ar = f"{adj.reason_ar} | {reason_ar}"
+    adj.modified_by, adj.modified_at = user, timezone.now()
+    return _save(adj)
+
+
+def _opening_cap(emp, on, use, jurisdiction):
+    """R30, R56: the most annual leave the service from the hire date to ``on`` could have earned (what the monthly
+    accrual would have written, suspended unpaid days excluded): the cap of an opening balance (finding 1)."""
+    if not _approved_versions(emp).exists():
+        raise error("Approve the employee's contract first: the opening balance is capped at the entitlement of the "
+                    "service years under it (R30, R56).",
+                    "اعتمد عقد الموظف أولًا: يُحدّ الرصيد الافتتاحي باستحقاق سنوات الخدمة وفق العقد.", code="no_terms")
+    total = Fraction(0)
+    for month_start, month_end in _months(emp.hire_date, on):
+        total += _month_accrual_fraction(emp, month_start, month_end, use, jurisdiction, until=on, opening=False)
+    return _frac_round(total)
+
+
+@transaction.atomic
+def approve_leave_adjustment(adjustment, *, user):
+    """R29: the approver (``hr.adjust_leave_balance``, A) approves before the ledger row exists. R56: no adjustment
+    gives more than 30 days of annual leave for one service year. An opening balance (kind ``opening``, from an
+    import) is capped at the entitlement of the service years up to its date and written as the ``opening`` row."""
+    adj = _lock(LeaveAdjustment, adjustment.pk)
+    access.require(user, adj.entity, "hr.adjust_leave_balance", document=adj)
+    emp = _lock(Employee, adj.employee_id)
+    _deny_own(user, adj.entity, "hr.adjust_leave_balance", emp)
     if adj.status != LeaveAdjustment.Status.DRAFT:
         raise error("Only draft adjustments are approved.", "تُعتمد التسويات المسودة فقط.", code="not_draft")
-    emp = adj.employee
-    if adj.leave_type.code == "ANNUAL" and adj.days > 0 and emp.employment_basis == Basis.KSA_EMPLOYEE:
-        use = ParamUse()
+    use = ParamUse()
+    opening = adj.kind == LeaveAdjustment.Kind.OPENING
+    if opening:
+        jurisdiction = _jurisdiction(emp, "leave", "الإجازات")
+        if LeaveLedger.objects.filter(employee=emp, leave_type=adj.leave_type).filter(
+                Q(kind=LeaveLedger.Kind.OPENING) | Q(date__lte=adj.date)).exists():
+            raise error("Opening balances are loaded once, before any other leave row of that type (R29).",
+                        "يُحمَّل الرصيد الافتتاحي مرة واحدة قبل أي قيد إجازة آخر من النوع نفسه.", code="opening_once")
+        if adj.days < 0:
+            raise error("An opening balance is not negative.", "لا يكون الرصيد الافتتاحي سالبًا.", code="opening_cap")
+        cap = _opening_cap(emp, adj.date, use, jurisdiction)
+        if adj.days > cap:
+            raise error(f"The opening balance of {adj.days} days is more than the {cap} days the service up to "
+                        f"{adj.date} could have earned (R30, R56).",
+                        f"الرصيد الافتتاحي {adj.days} يومًا يزيد على {cap} يومًا يمكن أن تكسبها الخدمة حتى {adj.date}.",
+                        code="opening_cap")
+    elif adj.leave_type.code == "ANNUAL" and adj.days > 0 and emp.employment_basis == Basis.KSA_EMPLOYEE:
         terms = _terms_on(emp, adj.date)
         if terms is None:
             raise error("No approved contract on that date.", "لا يوجد عقد معتمد في ذلك التاريخ.", code="no_terms")
@@ -1851,11 +2015,14 @@ def approve_leave_adjustment(adjustment, *, user):
                         f"{start} to {end}; the ceiling is {ANNUAL_LEAVE_CEILING} days (R56, H14).",
                         f"تمنح هذه التسوية {granted + adj.days} يومًا من الإجازة السنوية لسنة الخدمة من {start} إلى "
                         f"{end}؛ والحد الأقصى {ANNUAL_LEAVE_CEILING} يومًا.", code="annual_ceiling")
+    use.check_verified()
     adj.status, adj.approved_by, adj.approved_at = LeaveAdjustment.Status.APPROVED, user, timezone.now()
     _save(adj)
     LeaveLedger.objects.create(entity=adj.entity, employee=emp, leave_type=adj.leave_type, date=adj.date,
-                               kind=LeaveLedger.Kind.ADJUSTMENT, days=adj.days, source_type="hr.leaveadjustment",
+                               kind=LeaveLedger.Kind.OPENING if opening else LeaveLedger.Kind.ADJUSTMENT,
+                               days=adj.days, source_type="hr.leaveadjustment",
                                source_id=adj.pk, created_by=user)
+    use.mark_used()
     return adj
 
 
@@ -1882,8 +2049,8 @@ def sick_pay_days(employee, start, end, *, user):
     """R32, R64 (payroll R17): each approved sick day between start and end with its pay %, tier and whether it is
     an official holiday (paid in full whatever the tier)."""
     access.require(user, employee.entity, "hr.view")
-    return [(d.date, d.pay_pct, d.tier_no, d.official_holiday) for d in SickLeaveDay.objects.filter(
-        employee=employee, date__range=(start, end), leave_request__status__in=(LR.APPROVED, LR.TAKEN)).order_by("date")]
+    return [(d.date, d.pay_pct, d.tier_no, d.official_holiday) for d in _live_sick_days(SickLeaveDay.objects.filter(
+        employee=employee, date__range=(start, end))).order_by("date")]
 
 
 @transaction.atomic
@@ -1913,8 +2080,11 @@ def record_birth(leave_request, birth_date, *, user):
                         f"{clash.start_date} أولًا.", code="leave_overlap")
         req.unpaid_from, req.end_date = first, last
         req.days += shortfall
+    use.check_verified()
     req.modified_by, req.modified_at = user, timezone.now()
-    return _save(req)
+    _save(req)
+    use.mark_used()
+    return req
 
 
 def probation_end_date(contract, *, user):
@@ -1975,38 +2145,141 @@ def _service_anniversary(use, jurisdiction, emp, years, basis):
     return shifted
 
 
-def _month_accrual(emp, month_start, month_end, use, jurisdiction):
-    """R30, R56 with the compliance correction: per day, entitlement = min(30, max(contract days, statutory days)),
-    the 30-day statutory rate from the day after the 5-year anniversary; accrual = Σ entitlement / 12 / days in the
-    month; unpaid days beyond 20 in a work year accrue nothing."""
-    end_of_service = None
+def _months(start, end):
+    """(first day, last day) of every calendar month from ``start``'s month to ``end``'s month."""
+    year, month = start.year, start.month
+    while date(year, month, 1) <= end:
+        yield date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+
+
+def _period(day):
+    return f"{day.year:04d}-{day.month:02d}"
+
+
+def _end_of_service(emp):
     term = Termination.objects.filter(employee=emp, status=Termination.Status.APPROVED).order_by("-id").first()
-    if term is not None:
-        end_of_service = term.last_working_day
-    first = _approved_versions(emp).order_by("version_no").first()
-    if first is None:
+    return term.last_working_day if term is not None else None
+
+
+def _opening_row(emp, lt):
+    return LeaveLedger.objects.filter(employee=emp, leave_type=lt, kind=LeaveLedger.Kind.OPENING).order_by("-date").first()
+
+
+def _month_accrual_fraction(emp, month_start, month_end, use, jurisdiction, *, until=None, opening=True):
+    """R30, R56 with the compliance correction, as an exact fraction: per day, entitlement = min(30, max(contract
+    days, statutory days)), the 30-day statutory rate from the day after the 5-year anniversary; accrual = Σ
+    entitlement / 12 / days in the month; unpaid days beyond 20 in a work year accrue nothing (R62). Days after the
+    last working day of an approved termination, after ``until``, or on or before an opening balance's date (the
+    opening covers them) do not accrue. None when no day of the month is in service."""
+    versions = list(_approved_versions(emp).order_by("effective_date", "version_no"))
+    if not versions:
         return None
+    first = min(versions, key=lambda v: v.version_no)
     start = max(month_start, emp.hire_date, first.start_date)
-    end = min(month_end, end_of_service or month_end)
+    if opening:
+        lt = LeaveType.objects.filter(entity=emp.entity, code="ANNUAL").first()
+        row = _opening_row(emp, lt) if lt else None
+        if row is not None:
+            start = max(start, row.date + timedelta(days=1))
+    end = min(month_end, _end_of_service(emp) or month_end, until or month_end)
     if start > end:
         return None
-    value = use.get(jurisdiction, "leave.annual", month_start)
-    basis = (_terms_on(emp, end) or first).calendar_basis
+    terms_end = [v for v in versions if v.effective_date <= end]
+    basis = (terms_end[-1] if terms_end else first).calendar_basis
+    spans = use.get_span(jurisdiction, "leave.annual", start, end)
     suspended = _suspended_days(use, jurisdiction, emp, basis, start, end)
     _year_days(use, jurisdiction, basis, month_start)  # the calendar basis is configured
-    tiers = [(int(Decimal(t["from_years"])), int(Decimal(t["days"]))) for t in value["tiers"]]
-    anniversaries = {years: _service_anniversary(use, jurisdiction, emp, years, basis) for years, _ in tiers}
+    anniversaries = {}
     total = 0
-    for d in _days(start, end):
-        if d in suspended:
-            continue
-        terms = _terms_on(emp, d)
-        if terms is None:
-            continue
-        statutory = max(days for years, days in tiers if years == 0 or d > anniversaries[years])
-        total += min(int(ANNUAL_LEAVE_CEILING), max(terms.annual_leave_days, statutory))
+    for span_start, span_end, value in spans:
+        tiers = [(int(Decimal(t["from_years"])), int(Decimal(t["days"]))) for t in value["tiers"]]
+        for years, _ in tiers:
+            if years not in anniversaries:
+                anniversaries[years] = _service_anniversary(use, jurisdiction, emp, years, basis)
+        for d in _days(span_start, span_end):
+            if d in suspended:
+                continue
+            terms = None
+            for v in versions:  # R20: the latest effective version on the day (ties: higher version)
+                if v.effective_date <= d:
+                    terms = v
+            if terms is None:
+                continue
+            statutory = max(days for years, days in tiers if years == 0 or d > anniversaries[years])
+            total += min(int(ANNUAL_LEAVE_CEILING), max(terms.annual_leave_days, statutory))
     days_in_month = (month_end - month_start).days + 1
-    return _frac_round(Fraction(total, 12 * days_in_month))
+    return Fraction(total, 12 * days_in_month)
+
+
+def _month_accrual(emp, month_start, month_end, use, jurisdiction):
+    value = _month_accrual_fraction(emp, month_start, month_end, use, jurisdiction)
+    return None if value is None else _frac_round(value)
+
+
+def _live_accruals(emp, lt, period=None):
+    """Accrual rows that still count: not reversed by a termination withdrawal (R41)."""
+    rows = LeaveLedger.objects.filter(employee=emp, leave_type=lt, kind=LeaveLedger.Kind.ACCRUAL)
+    if period is not None:
+        rows = rows.filter(period=period)
+    reversed_ids = LeaveLedger.objects.filter(employee=emp, leave_type=lt, kind=LeaveLedger.Kind.REVERSAL,
+                                              source_type="hr.leaveledger").values("source_id")
+    return rows.exclude(pk__in=reversed_ids)
+
+
+def _accrue_to_last_day(term, use, jurisdiction, user):
+    """Finding 2 (R35, Art. 111; payroll R34): before the final-settlement balance is taken, the annual leave of
+    every month up to the last working day is accrued: the months the monthly job has not written yet and the
+    partial last month up to ``last_working_day`` (a row dated that day). A month the job already accrued in full
+    past the last working day is corrected down to what was due. The rows carry the termination as source, so a
+    withdrawal can reverse them."""
+    emp, lwd = term.employee, term.last_working_day
+    lt = LeaveType.objects.filter(entity=emp.entity, code="ANNUAL").first()
+    if lt is None:
+        return
+    live = _live_accruals(emp, lt)
+    periods = set(live.values_list("period", flat=True))
+    start_day = emp.hire_date
+    if periods:
+        last = max(periods)
+        year, month = (int(x) for x in last.split("-"))
+        start_day = max(start_day, date(year, month, calendar.monthrange(year, month)[1]) + timedelta(days=1))
+    opening = _opening_row(emp, lt)
+    if opening is not None:
+        start_day = max(start_day, opening.date + timedelta(days=1))
+
+    def write(period, month_end, days):
+        LeaveLedger.objects.create(entity=emp.entity, employee=emp, leave_type=lt, date=min(month_end, lwd),
+                                   kind=LeaveLedger.Kind.ACCRUAL, days=days, period=period,
+                                   source_type="hr.termination", source_id=term.pk, created_by=user)
+
+    for month_start, month_end in _months(start_day, lwd):
+        period = _period(month_start)
+        if period in periods:
+            continue
+        days = _month_accrual(emp, month_start, month_end, use, jurisdiction)
+        if days:
+            write(period, month_end, days)
+            periods.add(period)
+    for period in sorted(p for p in periods if p >= _period(lwd)):
+        year, month = (int(x) for x in period.split("-"))
+        month_start = date(year, month, 1)
+        month_end = date(year, month, calendar.monthrange(year, month)[1])
+        due = _month_accrual(emp, month_start, month_end, use, jurisdiction) or ZERO
+        actual = _live_accruals(emp, lt, period).aggregate(s=Sum("days"))["s"] or ZERO
+        if actual != due:
+            write(period, month_end, due - actual)
+
+
+def _reverse_termination_accruals(term, user):
+    """R41: a withdrawn termination's accrual rows for its last month and later go back (the job accrues those
+    months again at month end); the full months before it stay, as the job would have written them."""
+    rows = LeaveLedger.objects.filter(employee=term.employee, kind=LeaveLedger.Kind.ACCRUAL, source_type="hr.termination",
+                                      source_id=term.pk, period__gte=_period(term.last_working_day))
+    for row in rows:
+        LeaveLedger.objects.create(entity=row.entity, employee=row.employee, leave_type=row.leave_type, date=row.date,
+                                   kind=LeaveLedger.Kind.REVERSAL, days=-row.days, period=row.period,
+                                   source_type="hr.leaveledger", source_id=row.pk, created_by=user)
 
 
 # =====================================================================================================
@@ -2054,8 +2327,8 @@ def _protection_warnings(term, use, jurisdiction):
     found = []
     sick = use.get(jurisdiction, "leave.sick", start)
     total = sum(int(t["days"]) for t in sick["tiers"])
-    days = list(SickLeaveDay.objects.filter(employee=emp, leave_request__status__in=(LR.APPROVED, LR.TAKEN),
-                                            date__lte=lwd).order_by("date").values_list("cycle_start", flat=True))
+    days = list(_live_sick_days(SickLeaveDay.objects.filter(employee=emp, date__lte=lwd)).order_by("date")
+                .values_list("cycle_start", flat=True))
     if days:
         cycle = days[-1]
         if _sick_window_end(cycle, term.contract.calendar_basis) >= start and days.count(cycle) < total:
@@ -2366,7 +2639,9 @@ def _settlement_input(term, eosb, user, use):
     if statutory:
         jurisdiction = _jurisdiction(emp)
         lt = LeaveType.objects.filter(entity=emp.entity, code="ANNUAL").first()
-        balance = _balance(emp, lt, term.last_working_day) if lt else ZERO
+        # Every accrual row is now what was due up to the last working day (finding 2), so the whole ledger is the
+        # balance at the last working day.
+        balance = _balance(emp, lt) if lt else ZERO
         divisor = int(use.get(jurisdiction, "leave.encashment", term.last_working_day)["day_divisor"])
         wage = _actual_wage(terms)
         daily = _round(Decimal(wage) / divisor)
@@ -2427,7 +2702,6 @@ def approve_termination(termination, *, user, acknowledge_protection=False):
     if emp.employment_basis != Basis.REMUNERATION:
         eosb_result = _compute_eosb(emp, t.last_working_day, t.kind, use)
     use.check_verified()
-    use.mark_used()
     lwd = t.last_working_day
     t.status, t.approved_by, t.approved_at, t.warnings = TS.APPROVED, user, timezone.now(), warnings
     _save(t)
@@ -2442,13 +2716,16 @@ def approve_termination(termination, *, user, acknowledge_protection=False):
             _cancel_assignment_for_termination(a, t, user)
         elif a.end_date is None or a.end_date > lwd:
             _end_assignment(a, lwd, t.reason_ar, t.reason_en, user)
-    for r in LeaveRequest.objects.filter(employee=emp, status=LR.APPROVED, end_date__gt=lwd):
-        _cancel_leave(_lock(LeaveRequest, r.pk), user, lwd + timedelta(days=1))
+    for r in LeaveRequest.objects.filter(employee=emp, status=LR.APPROVED, end_date__gt=lwd).order_by("start_date"):
+        _cancel_leave(_lock(LeaveRequest, r.pk), user, lwd + timedelta(days=1), use)
     for r in LeaveRequest.objects.filter(employee=emp, status__in=(LR.DRAFT, LR.SUBMITTED), end_date__gt=lwd):
         r.status = LR.CANCELLED
         _save(r)
+    if emp.employment_basis != Basis.REMUNERATION:
+        _accrue_to_last_day(t, use, _jurisdiction(emp), user)
     eosb = _snapshot(eosb_result, t, user) if eosb_result else None
     _settlement_input(t, eosb, user, use)
+    use.mark_used()
     return t
 
 
@@ -2525,7 +2802,9 @@ def withdraw_termination(termination, *, user, reason_ar):
                             "ولا تزيل الفوترة تاريخ النهاية فيجب إعادة فتحه هناك.")
     for si in FinalSettlementInput.objects.filter(termination=t, status=FinalSettlementInput.Status.DRAFT):
         si.status = FinalSettlementInput.Status.DISCARDED
+        si._service_write = True
         si.save(update_fields=["status"])
+    _reverse_termination_accruals(t, user)
     payroll_port.get_port().discard_draft(t, user)
     return t, warnings
 
@@ -2547,12 +2826,17 @@ def recalculate_eosb(termination, *, user):
         raise error("This termination has no end-of-service calculation.", "لا يوجد حساب مكافأة لهذا الإنهاء.",
                     code="no_eosb")
     use = ParamUse()
+    _lock(Employee, t.employee_id)
     result = _compute_eosb(t.employee, t.last_working_day, t.kind, use)
+    use.check_verified()
+    _accrue_to_last_day(t, use, _jurisdiction(t.employee), user)
     snap = _snapshot(result, t, user, supersedes=latest)
     for si in FinalSettlementInput.objects.filter(termination=t, status=FinalSettlementInput.Status.DRAFT):
         si.status = FinalSettlementInput.Status.SUPERSEDED
+        si._service_write = True
         si.save(update_fields=["status"])
     _settlement_input(t, snap, user, use)
+    use.mark_used()
     return snap
 
 
@@ -2743,37 +3027,43 @@ def deliver_assignment_events(*, entity=None, event_ids=None):
 
 
 def accrue_leave(year, month, *, entity=None):
-    """``hr_accrue_leave`` (month end, R30): one accrual row per ksa employee and month, idempotent. Local entity
-    employees are skipped while their jurisdiction has no parameters (OQ-26); remuneration staff have no leave."""
+    """``hr_accrue_leave`` (month end, R30): one accrual row per ksa employee and month, idempotent (a month already
+    accrued, also by a termination approval, is skipped). Local entity employees are skipped while their
+    jurisdiction has no parameters (OQ-26); remuneration staff have no leave. R7 (finding 3): with
+    ``HR_REQUIRE_VERIFIED_PARAMETERS`` an employee whose accrual reads an unverified parameter is skipped and reported
+    (``skipped``: employee code and the bilingual reason naming the rows); the rows used are marked used."""
     month_start = date(year, month, 1)
     month_end = date(year, month, calendar.monthrange(year, month)[1])
-    period = f"{year:04d}-{month:02d}"
+    period = _period(month_start)
     report = {"accrued": 0, "skipped": []}
     qs = Employee.objects.exclude(status=Employee.Status.DRAFT).exclude(employment_basis=Basis.REMUNERATION)
     if entity is not None:
         qs = qs.filter(entity=entity)
-    for emp in qs.select_related("entity"):
-        lt = LeaveType.objects.filter(entity=emp.entity, code="ANNUAL").first()
-        if lt is None or LeaveLedger.objects.filter(employee=emp, leave_type=lt, kind=LeaveLedger.Kind.ACCRUAL,
-                                                    period=period).exists():
-            continue
-        use = ParamUse()
-        try:
-            jurisdiction = _jurisdiction(emp)
-            days = _month_accrual(emp, month_start, month_end, use, jurisdiction)
-        except HrError as exc:
-            report["skipped"].append((emp.employee_code, exc.messages[0]))
-            continue
-        if days is None:
-            continue
-        try:
-            with transaction.atomic():
-                LeaveLedger.objects.create(entity=emp.entity, employee=emp, leave_type=lt, date=month_end,
-                                           kind=LeaveLedger.Kind.ACCRUAL, days=days, period=period,
-                                           source_type="hr_accrue_leave")
-        except IntegrityError:
-            continue  # another run wrote it
-        report["accrued"] += 1
+    for emp_id in list(qs.order_by("pk").values_list("pk", flat=True)):
+        with transaction.atomic():
+            emp = _lock(Employee, emp_id)
+            lt = LeaveType.objects.filter(entity=emp.entity, code="ANNUAL").first()
+            if lt is None or _live_accruals(emp, lt, period).exists():
+                continue
+            use = ParamUse()
+            try:
+                jurisdiction = _jurisdiction(emp)
+                days = _month_accrual(emp, month_start, month_end, use, jurisdiction)
+                if days is None:
+                    continue
+                use.check_verified()
+            except HrError as exc:
+                report["skipped"].append((emp.employee_code, exc.messages[0]))
+                continue
+            try:
+                with transaction.atomic():
+                    LeaveLedger.objects.create(entity=emp.entity, employee=emp, leave_type=lt, date=month_end,
+                                               kind=LeaveLedger.Kind.ACCRUAL, days=days, period=period,
+                                               source_type="hr_accrue_leave")
+            except IntegrityError:
+                continue  # another run wrote it
+            use.mark_used()
+            report["accrued"] += 1
     return report
 
 
