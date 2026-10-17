@@ -16,7 +16,7 @@ Only recorded decisions. Items from the task brief are listed separately; they a
 | # | Decision | Source | Date |
 |---|---|---|---|
 | X1 | Every business record has an `entity` FK; queries filtered by entity and permission; new subsidiaries are data; every text en/ar; money `Decimal`, SAR 2 dp; posted entries never edited; posting only through `post_entry` / `create_entry`; closed periods reject postings; Sharia per entity, non-compliant income flagged for purification. | CLAUDE.md | in repo |
-| X2 | Almiras: VAT 310960118600003, effective 2024-04-01, **quarterly VAT returns** (setup data only, never in fixtures). | Project owner (invoicing D10) | 2026-10-16 |
+| X2 | Almiras: VAT number per setup data (core/setup_data/almiras.json), effective 2024-04-01, **quarterly VAT returns** (setup data only, never in fixtures). | Project owner (invoicing D10) | 2026-10-16 |
 | X3 | No entity is in a VAT group; each entity is a separate VAT taxpayer with its own VAT number; intercompany invoices carry VAT. | Project owner (invoicing D11) | 2026-10-16 |
 | X4 | WHT is in scope: Almiras pays non-resident suppliers; WHT per category, WHT payable account, treaty certificates, gross-up option, **monthly WHT return data**. | Project owner (invoicing D14) | 2026-10-16 |
 | X5 | Income types incl. residential rent (VAT-exempt) feed Art. 51 apportionment; ratio method needs tax-adviser sign-off. | Project owner (invoicing D16) | 2026-10-16 |
