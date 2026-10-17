@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     "hr",
     "billing",
     "zatca",
+    "banking",
 ]
 
 # ZATCA hand-off (invoicing.zatca_port), implemented by the zatca app (docs/specs/zatca.md). An entity without a
@@ -102,6 +103,14 @@ BILLING_INVOICING_PORT = "billing.invoicing_port.InvoicingServicesPort"
 # R38/R41: where HR hands a terminated employee's final-settlement inputs to payroll (payroll.md 3.8, not built).
 HR_PAYROLL_PORT = "hr.payroll_port.NoPayrollPort"
 HR_ASSIGNMENT_EVENT_MAX_ATTEMPTS = 5  # R25 default
+
+# Banking (docs/specs/banking.md R4): IBANs, account numbers, statement files and counterparty data are encrypted at
+# rest (Fernet, open-source ``cryptography``) with keys kept outside the database: comma-separated secrets in the
+# environment, first = current key. Development falls back to a key derived from SECRET_KEY; the banking.E001
+# check refuses that fallback when DEBUG is off. The same secret keys the IBAN lookup hash (HMAC-SHA256).
+BANKING_DATA_KEYS = [k for k in os.environ.get("BANKING_DATA_KEYS", "").split(",") if k]
+# R10: largest statement file accepted (bytes).
+BANKING_MAX_STATEMENT_BYTES = 10 * 1024 * 1024
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",

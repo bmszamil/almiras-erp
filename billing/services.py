@@ -804,18 +804,27 @@ def _next_number(entity, year):
 
 
 def approve_contract(contract, *, user):
-    """R8: the entity's CFO (not the creator, submitter or last modifier) approves; the number and the schedule are
-    made in the same transaction; R68 gates; R9 activation. Returns the contract with ``warnings`` (en/ar)."""
+    """R8: the entity's CFO (not the creator, submitter or last modifier) approves a **submitted** draft; the
+    number and the schedule are made in the same transaction; R68 gates; R9 activation. Returns the contract with
+    ``warnings`` (en/ar).
+
+    Submission is required (review nit 10, probe P6): the spec is silent for contracts (R6 has no ``submitted``
+    status, AT-1 skips the step) but has the ``submitted_for_approval`` / ``returned`` events (3.8) and requires it
+    for versions (R39); without it a draft still being edited could be approved. A changed draft must be submitted
+    again (``update_contract`` clears the submission)."""
     c = Contract.objects.select_related("entity", "customer", "currency", "advance_terms").get(pk=contract.pk)
     v1 = c.versions.get(version_no=1)
     access.require(user, c.entity, "billing.approve_contract", document=c)
-    if user.pk in (v1.created_by_id, v1.modified_by_id):
+    if user.pk in (v1.created_by_id, v1.modified_by_id, c.created_by_id, c.modified_by_id, c.submitted_by_id):
         access.deny(user, c.entity, "billing.approve_contract", "self_approval")
     with transaction.atomic():
         c = Contract.objects.select_for_update(of=("self",)).select_related(
             "entity", "customer", "currency", "advance_terms").get(pk=c.pk)
         if c.status != CStatus.DRAFT:
             _fail("Only draft contracts are approved.", "تُعتمد مسودات العقود فقط.", "not_draft")
+        if c.submitted_at is None:
+            _fail("Submit the contract for approval first; the CFO approves submitted drafts only (R8).",
+                  "قدّم العقد للاعتماد أولًا؛ يعتمد المدير المالي المسودات المقدمة فقط.", "not_submitted")
         v1 = c.versions.select_for_update().get(version_no=1)
         problems = _approval_problems(c, v1) + _gate_problems(c, v1)
         if problems:

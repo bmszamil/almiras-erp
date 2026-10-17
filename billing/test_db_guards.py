@@ -167,7 +167,7 @@ def test_at3_concurrent_runs_bill_once(monkeypatch):
     monkeypatch.setattr(services, "_today", lambda: date(2027, 1, 1))
     monkeypatch.setattr(inv, "_riyadh_now", lambda: datetime.combine(date(2027, 1, 1), clock_time(10),
                                                                     tzinfo=services.RIYADH))
-    c = services.approve_contract(contract(w), user=w.c)
+    c = services.approve_contract(services.submit_contract(contract(w), user=w.s), user=w.c)
     results, errors = [], []
 
     def worker():
@@ -198,7 +198,7 @@ def test_at27_version_approval_waits_for_a_running_billing_run(monkeypatch):
     w = _seeded_world()
     monkeypatch.setattr(invoicing_port, "_override", w.fake)
     monkeypatch.setattr(services, "_today", lambda: date(2027, 1, 1))
-    c = services.approve_contract(contract(w), user=w.c)
+    c = services.approve_contract(services.submit_contract(contract(w), user=w.s), user=w.c)
     v = services.create_version(c, user=w.s, kind="amendment", effective_date=date(2027, 2, 1), reason_ar="تعديل")
     v = services.submit_version(v, user=w.s)
     held, release = threading.Event(), threading.Event()

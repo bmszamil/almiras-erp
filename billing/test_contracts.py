@@ -7,7 +7,7 @@ import pytest
 from django.db import IntegrityError, transaction
 
 from billing import hooks, services
-from billing.conftest import LEASE, approved, clear, contract, period, run
+from billing.conftest import LEASE, approved, clear, contract, period, run, submitted
 from billing.models import BillingError, BillingPeriod, Contract, ContractEvent, ContractLine, ContractVersion
 from core import access
 from core.access.testing import make_user, member
@@ -30,12 +30,16 @@ def test_at1_cfo_approves_with_number_schedule_and_event(w):
     c = contract(w)
     with pytest.raises(access.AccessDenied):
         services.approve_contract(c, user=w.s)  # not CFO
-    c = services.approve_contract(c, user=w.c)
+    with pytest.raises(BillingError) as exc:  # R8: not submitted yet
+        services.approve_contract(c, user=w.c)
+    assert exc.value.code == "not_submitted"
+    c = services.approve_contract(submitted(c), user=w.c)
     assert (c.status, c.number) == ("active", "ALM-CTR-2027-000001")
     assert c.approved_by == w.c and c.current_version.version_no == 1
     assert c.current_version.status == "approved" and c.current_version.approved_by == w.c
     assert c.periods.count() == 12 and set(c.periods.values_list("status", flat=True)) == {"planned"}
-    assert list(c.events.values_list("action", flat=True)) == ["created", "approved", "activated"]
+    assert list(c.events.values_list("action", flat=True)) == ["created", "submitted_for_approval", "approved",
+                                                               "activated"]
     with pytest.raises(BillingError) as exc:  # R7: edits after approval go through versions
         services.update_contract(c, user=w.s, title_ar="عنوان آخر")
     assert exc.value.code == "not_draft"
@@ -63,7 +67,7 @@ def test_r8_creator_and_last_modifier_never_approve(w):
     services.add_line(c2, user=w.c_b, income_type="rent_commercial", amount="500.00", description_ar="خدمات")
     with pytest.raises(access.AccessDenied):  # c_b changed the draft
         services.approve_contract(c2, user=w.c_b)
-    assert services.approve_contract(c2, user=w.c).status == "active"
+    assert services.approve_contract(submitted(c2, w.s), user=w.c).status == "active"
 
 
 def test_r9_future_start_is_approved_then_active_on_the_first_run(w):
@@ -121,7 +125,7 @@ def test_at37_kwd_three_decimals_jpy_refused(w):
 def test_at47_build_gates_refuse_at_approval(w):
     quarterly = contract(w, billing_frequency="quarterly", billing_timing="advance")
     with pytest.raises(BillingError) as exc:
-        services.approve_contract(quarterly, user=w.c)
+        services.approve_contract(submitted(quarterly), user=w.c)
     assert "OQ-2" in str(exc.value) and "المؤجلة" in str(exc.value)
     assert not quarterly.periods.exists()
     assert approved(w, billing_frequency="quarterly", billing_timing="arrears").status == "active"  # arrears allowed
@@ -129,10 +133,10 @@ def test_at47_build_gates_refuse_at_approval(w):
     services.set_advance_terms(offset, user=w.s, amount="20000.00", due_date=date(2027, 1, 1),
                                recovery="offset_against_invoices", notes_ar="تخصم من الفواتير")
     with pytest.raises(BillingError) as exc:
-        services.approve_contract(offset, user=w.c)
+        services.approve_contract(submitted(offset), user=w.c)
     assert "OQ-20" in str(exc.value) and "الدفعات المقدمة" in str(exc.value)
     # a 0-decimal currency that got past the save check (e.g. an import) is refused at approval too
-    jpy = contract(w, lines=())
+    jpy = submitted(contract(w))
     Contract._base_manager.filter(pk=jpy.pk).update(currency=Currency.objects.get(code="JPY"))
     with pytest.raises(BillingError) as exc:
         services.approve_contract(jpy, user=w.c)
@@ -144,7 +148,7 @@ def test_at16_deposit_is_memo_only(w, django_capture_on_commit_callbacks):
     services.set_deposit_terms(c, user=w.s, amount="30000.00", due_date=date(2027, 1, 1), refundable=True,
                                refund_conditions_ar="يرد عند انتهاء العقد")
     services.set_advance_terms(c, user=w.s, amount="10000.00", due_date=date(2027, 1, 1), recovery="none")
-    c = services.approve_contract(c, user=w.c)
+    c = services.approve_contract(submitted(c), user=w.c)
     run(w, date(2027, 1, 1))
     assert SalesDocument.objects.filter(entity=w.alm).count() == 1  # the January rent only, no deposit invoice
     assert hooks.contract_allows(c, "deposit") and hooks.contract_allows(c, "advance")
@@ -164,7 +168,7 @@ def test_at12_residential_lease_is_exempt_commercial_is_standard(w):
     with pytest.raises(BillingError):
         services.add_line(com, user=w.s, income_type="rent_commercial", amount="1000.00", description_ar="إيجار",
                           vat_category="E", vat_exemption_reason="VATEX-SA-30")
-    res = services.approve_contract(res, user=w.c)
+    res = services.approve_contract(submitted(res), user=w.c)
     run(w, date(2027, 1, 1))
     doc = clear(w, period(res, date(2027, 1, 1)).sales_document)
     assert doc.total_vat == D("0.00")
@@ -182,7 +186,7 @@ def test_at13_sharia_prohibited_refused_purification_flagged(w):
     assert "Sharia" in str(exc.value) and "محظور شرعًا" in str(exc.value)
     services.add_line(c, user=w.s, income_type="rent_commercial", amount="100.00", description_ar="إيجار",
                       income_account="4900")
-    c = services.approve_contract(c, user=w.c)
+    c = services.approve_contract(submitted(c), user=w.c)
     assert c.requires_purification
     run(w, date(2027, 1, 1))
     assert period(c, date(2027, 1, 1)).sales_document.requires_purification
@@ -274,7 +278,7 @@ def test_at15_new_entity_bills_without_code_change(w):
     customer = inv.create_customer(new, user=staff, code="N1", name_ar="عميل جديد", is_vat_registered=True,
                                    vat_number="313333333300003", **ADDRESS)
     c = contract(w, entity=new, customer=customer, user=staff)
-    c = services.approve_contract(c, user=cfo)
+    c = services.approve_contract(submitted(c), user=cfo)
     assert c.number == "NEW-CTR-2027-000001"
     run(w, date(2027, 1, 1), entity=new)
     assert period(c, date(2027, 1, 1)).sales_document.number == "NEW-INV-2027-000001"

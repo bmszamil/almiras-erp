@@ -8,7 +8,7 @@ import pytest
 from django.core.management import CommandError, call_command
 
 from billing import services
-from billing.conftest import approved, clear, contract, period, run, set_auto_issue, version
+from billing.conftest import approved, clear, contract, period, run, set_auto_issue, submitted, version
 from billing.models import BillingNotification, BillingPeriod, BillingRun
 from core import access
 from core.access.testing import make_user, member
@@ -193,7 +193,7 @@ def test_at40_rate_required_fails_and_retries_skipped_entity(w):
     member(staff, oth, "accountant")
     cust = inv.create_customer(oth, user=staff, code="O1", name_ar="عميل", is_vat_registered=True,
                                vat_number="315555555500003", **ADDRESS)
-    other = services.approve_contract(contract(w, entity=oth, customer=cust, user=staff), user=cfo)
+    other = services.approve_contract(submitted(contract(w, entity=oth, customer=cust, user=staff)), user=cfo)
     w.clock.set(date(2027, 4, 1))
     runs = services.run_billing(date(2027, 4, 1), user=w.sys)  # every entity
     by_entity = {r.entity.code: r for r in runs}
@@ -211,7 +211,7 @@ def test_at52_entity_without_vat_number_holds(w):
     member(w.sys, novat, "system_billing")
     cust = inv.create_customer(novat, user=staff, code="N1", name_ar="عميل", is_vat_registered=True,
                                vat_number="316666666600003", **ADDRESS)
-    c = services.approve_contract(contract(w, entity=novat, customer=cust, user=staff), user=cfo)
+    c = services.approve_contract(submitted(contract(w, entity=novat, customer=cust, user=staff)), user=cfo)
     run(w, date(2027, 1, 1), entity=novat)
     p = period(c, date(2027, 1, 1))
     assert (p.status, p.error_code) == ("held", "entity_not_vat_registered")
@@ -266,10 +266,10 @@ def test_r34_cfo_alerted_after_three_failed_runs(w):
 def test_at18_price_steps(w):
     a = contract(w)
     services.add_price_step(a.lines.get(), user=w.s, effective_from=date(2027, 7, 1), new_amount="11000.00")
-    a = services.approve_contract(a, user=w.c)
+    a = services.approve_contract(submitted(a), user=w.c)
     b = contract(w)
     services.add_price_step(b.lines.get(), user=w.s, effective_from=date(2027, 7, 15), new_amount="11000.00")
-    b = services.approve_contract(b, user=w.c)
+    b = services.approve_contract(submitted(b), user=w.c)
     run(w, date(2027, 7, 1))
     run(w, date(2027, 8, 1))
     assert period(a, date(2027, 7, 1)).sales_document.total_net == D("11000.00")
@@ -298,7 +298,7 @@ def test_at45_kwd_third_decimal_held_round_amounts_issued(w):
     _rate(w, "KWD", "12.2", date(2027, 2, 1))
     w.clock.set(date(2027, 1, 10))
     c = contract(w, start=date(2027, 1, 15), currency="KWD", lines=(("rent_commercial", "1000.000"),))
-    c = services.approve_contract(c, user=w.c)
+    c = services.approve_contract(submitted(c), user=w.c)
     assert any("third decimal" in m and "الثالثة" in m for m in c.warnings)
     used = _numbers_used(w.alm)
     run(w, date(2027, 1, 15))

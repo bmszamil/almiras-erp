@@ -210,3 +210,22 @@ def test_retroactive_vat_category_change_refused_inside_billed_periods(w):
     services.update_version(v, user=w.s, effective_date=date(2027, 3, 1))  # after the last billed period
     v = services.approve_version(services.submit_version(v, user=w.s), user=w.c)
     assert v.status == "approved" and v.adjustments == []
+
+
+# --- P6 / nit 10: R8 (only submitted drafts are approved) ----------------------------------------------------
+
+def test_p6_contract_approved_only_after_submission(w):
+    from billing.conftest import contract, submitted
+
+    c = contract(w)
+    with pytest.raises(BillingError) as exc:
+        services.approve_contract(c, user=w.c)
+    assert exc.value.code == "not_submitted" and "قدّم العقد" in str(exc.value)
+    c = submitted(c)
+    services.update_contract(c, user=w.s, title_ar="عنوان معدل")  # a changed draft is submitted again
+    with pytest.raises(BillingError) as exc:
+        services.approve_contract(c, user=w.c)
+    assert exc.value.code == "not_submitted"
+    c = services.approve_contract(submitted(c), user=w.c)
+    assert (c.status, c.submitted_by, c.approved_by) == ("active", w.s, w.c)
+    assert not c.periods.exclude(status="planned").exists() and c.periods.count() == 12

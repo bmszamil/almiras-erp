@@ -105,10 +105,15 @@ def contract(w, *, entity=None, customer=None, user=None, lines=(("rent_commerci
     return c
 
 
+def submitted(c, user=None):
+    """The draft submitted for approval by ``user`` (default: its creator), as R8 requires before approval."""
+    return services.submit_contract(c, user=user or c.created_by)
+
+
 def approved(w, approver=None, **kwargs):
     c = contract(w, **kwargs)
     approver = approver or (w.c if c.entity == w.alm else w.c2)
-    return services.approve_contract(c, user=approver)
+    return services.approve_contract(submitted(c), user=approver)
 
 
 def run(w, day, entity=None):

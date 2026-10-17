@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from billing import services
-from billing.conftest import approve_note, clear, period, run
+from billing.conftest import approve_note, clear, period, run, submitted
 from billing.hr_port import BillingHrPort
 from billing.models import BillingAdjustment, BillingError
 from core import access
@@ -67,7 +67,7 @@ def secondment_contract(w, *, amount="31000.00", timing="arrears", start=date(20
     services.add_line(c, user=w.s, income_type="secondment", amount=amount, description_ar="إعارة محلل",
                       description_en="Seconded analyst", secondment=a)
     if approve:
-        c = services.approve_contract(c, user=w.c)
+        c = services.approve_contract(submitted(c), user=w.c)
     return c, a
 
 
@@ -129,7 +129,7 @@ def test_r60_end_date_limits_and_draft_contract(w):
     services.end_secondment(w.alm, a, date(2026, 12, 31), w.s)  # start - 1: nothing billable (HR cancellation)
     a.refresh_from_db()
     assert a.end_date == date(2026, 12, 31) and not c.periods.exists()  # draft: only the date is stored
-    c = services.approve_contract(c, user=w.c)
+    c = services.approve_contract(submitted(c), user=w.c)
     assert not c.periods.exclude(status="cancelled").exists()
     with pytest.raises(BillingError):
         services.end_secondment(w.sub, a, date(2027, 1, 5), w.s)  # another entity
@@ -263,6 +263,6 @@ def test_at49_link_checks_receiver_copies_billing_view_set_once(w, hw):
         services.link_hr_assignment(a, hr_a.reference, user=w.s)
     assert exc.value.code == "already_linked"
     services.add_line(c, user=w.s, income_type="secondment", amount="31000.00", description_ar="إعارة", secondment=a)
-    services.approve_contract(c, user=w.c)
+    services.approve_contract(submitted(c), user=w.c)
     with pytest.raises(BillingError):
         services.link_hr_assignment(a, "ALM-ASG-2027-000002", user=w.s)

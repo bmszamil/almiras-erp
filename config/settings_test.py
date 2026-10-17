@@ -13,3 +13,5 @@ INSTALLED_APPS = [*INSTALLED_APPS, "testdocs"]
 HR_REQUIRE_VERIFIED_PARAMETERS = False
 # A made-up key for the test database only (never a real key).
 HR_PERSONAL_DATA_KEYS = ["test-only-hr-personal-data-key-not-secret"]
+# A made-up key for banking test data only (never a real key).
+BANKING_DATA_KEYS = ["test-only-banking-data-key-not-secret"]
