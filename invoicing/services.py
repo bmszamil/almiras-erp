@@ -899,6 +899,9 @@ def approve_sales_document(document, *, user):
         if doc.status != Status.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
         _refuse_stale_grant(grant, doc)
+        if doc.original_document_id:  # R18 cap: one note at a time per original (review item 4)
+            doc.original_document = SalesDocument.objects.select_for_update(of=("self",)).get(
+                pk=doc.original_document_id)
         # 6b / BR-KSA-04: the issue date is the day of issue (approval) in Riyadh, never the draft's date and
         # never a future one; the draft's date is kept as the date requested. Time and date come from one clock.
         now = _riyadh_now()
@@ -1576,6 +1579,10 @@ def approve_purchase_document(document, *, user):
         if doc.status != PStatus.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
         _refuse_stale_grant(grant, doc)
+        targets = []
+        if doc.original_document_id:  # the credit cap counts other notes: one note at a time per bill (item 4)
+            targets = list(PurchaseDocument.objects.select_for_update(of=("self",)).filter(pk=doc.original_document_id))
+            doc.original_document = targets[0]
         problems = _purchase_problems(doc)
         if problems:
             raise _problems_error(problems, "document_invalid")
@@ -1598,9 +1605,6 @@ def approve_purchase_document(document, *, user):
         doc.approved_by, doc.approved_at = user, timezone.now()
         doc._service_write = True
         doc.save()
-        targets = []
-        if doc.doc_type == PurchaseDocument.DocType.VENDOR_CREDIT_NOTE:
-            targets = list(PurchaseDocument.objects.select_for_update(of=("self",)).filter(pk=doc.original_document_id))
         try:
             with _posting_as(user):
                 entry = ledger.create_entry(
