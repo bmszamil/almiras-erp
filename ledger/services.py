@@ -7,6 +7,7 @@ import csv
 import io
 import uuid
 from collections import defaultdict
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date as date_type
 from datetime import timedelta
@@ -729,6 +730,11 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
         return entry
 
 
+# (entity id, document label, pk) while a registered type's build_lines runs inside create_entry(post=True):
+# the only place _settlement_for_document may be called (verification review item 5).
+_building_document = ContextVar("ledger_building_document", default=None)
+
+
 def _document_lines(doc_type, document, lines):
     """(line dicts, check) for a document's posting through its registered hooks (ledger.documents).
 
@@ -741,7 +747,11 @@ def _document_lines(doc_type, document, lines):
                 f"{doc_type.label} builds its own lines; pass lines=None.",
                 f"المستند {doc_type.label} يبني بنوده بنفسه؛ لا تمرّر بنودًا.", code="document_builds_lines",
             )
-        lines = list(doc_type.build_lines(document))
+        token = _building_document.set((doc_type.entity_id_of(document), doc_type.label, document.pk))
+        try:
+            lines = list(doc_type.build_lines(document))
+        finally:
+            _building_document.reset(token)
     elif lines is None:
         raise error("An entry needs its lines.", "يحتاج القيد إلى بنوده.")
     else:
@@ -1572,14 +1582,22 @@ def fx_settlement_lines(entity, on, settles, txn_amount, counter_account, *, use
     return lines
 
 
-def settlement_for_document(item, txn_amount, description=""):
+def _settlement_for_document(item, txn_amount, description=""):
     """(line dict, functional amount) settling ``txn_amount`` of the open item ``item`` at its carrying rate (R18).
 
-    The final settlement clears exactly what is left. No counter line and no rights check: for the
+    The final settlement clears exactly what is left. No counter line and no rights check: only for the
     ``build_lines`` hook of a registered document, which runs inside create_entry(post=True) once the
     posting is authorised (so it does not depend on the rights of whoever approved the document); the
-    settlement is checked again at posting (_settlement_problems).
+    settlement is checked again at posting (_settlement_problems). Called anywhere else, or for an item of
+    another entity than the document being posted, it is refused: it reads open items without a rights check.
     """
+    building = _building_document.get()
+    if building is None:
+        raise error("A settlement is priced only inside a document's posting (its build_lines).",
+                    "تُسعَّر التسوية داخل ترحيل المستند فقط (بناء بنوده).", code="settlement_outside_posting")
+    if item.entry.entity_id != building[0]:
+        raise error("The line to settle belongs to another entity.", "البند المراد تسويته يخص كيانًا آخر.",
+                    code="settlement_other_entity")
     if item.entry.status != JournalEntry.Status.POSTED or item.line_kind != Kind_.NORMAL:
         raise error("Only a posted normal line can be settled.", "لا يُسوّى إلا بند عادي مرحّل.")
     amount = fx.to_decimal(txn_amount, "transaction amount")

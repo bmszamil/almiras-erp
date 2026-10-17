@@ -1234,7 +1234,7 @@ def _with_settlements(document, currency, plain, settlements):
 
     ``plain``: line dicts in the document currency, pinned to the document's approved rate.
     ``settlements``: (item JournalLine, transaction amount, description). Each
-    item is cleared at its carrying rate (``ledger.services.settlement_for_document``);
+    item is cleared at its carrying rate (``ledger.services._settlement_for_document``);
     plain lines get their functional amounts at the document's pinned rate; the
     difference goes to the realised FX gain (4700) or loss (5750) line. Nothing
     here depends on anyone's current rights or on the rate table today (nit 15).
@@ -1261,7 +1261,7 @@ def _with_settlements(document, currency, plain, settlements):
         else:
             credit += amount
     for item, amount, description in settlements:
-        settle, settled = ledger.settlement_for_document(item, amount, description)
+        settle, settled = ledger._settlement_for_document(item, amount, description)
         out.append(settle)
         if item.debit > 0:
             credit += settled
