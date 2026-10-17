@@ -249,3 +249,116 @@ def test_r48_a_request_is_only_for_switching_off(w):
     with pytest.raises(ValidationError, match="reason"):
         core_services.request_sharia_enforcement_off(w.sub, user=w.mp, reason=" ")
     assert DualControlRequest.objects.get(pk=req.pk).status == "approved"  # nothing used it
+
+
+# --- reviewer round 6 (blocker): non-bool values must not skip the R48 four-eyes step ------------------
+
+NOT_BOOLS = ["False", "false", "0", "f", "no", "", "True", 0, 1, None]
+
+
+def _settings_rows(e):
+    return AccessLog.objects.filter(event=AccessLog.Event.ENTITY_SETTINGS_CHANGED, entity=e).count()
+
+
+@pytest.mark.parametrize("value", NOT_BOOLS)
+def test_r48_non_bool_sharia_value_is_refused_on_change(w, value):
+    """Probe: the MP alone passed ``sharia_enforced="False"`` (truthy) and the row was saved as False."""
+    before = _settings_rows(w.sub)
+    with pytest.raises(ValidationError) as exc:
+        core_services.change_entity_settings(w.sub, user=w.mp, reason="x", sharia_enforced=value)
+    assert exc.value.code == "not_boolean"
+    assert "sharia_enforced" in str(exc.value) and "صحيحة أو خاطئة" in str(exc.value)
+    assert fresh(w.sub).sharia_enforced is True
+    assert _settings_rows(w.sub) == before
+
+
+@pytest.mark.parametrize("value", ["False", "0", 0])
+def test_r48_non_bool_value_is_refused_even_with_an_approved_request(w, value):
+    req = approved_request(w, w.sub, reason="x")
+    with pytest.raises(ValidationError) as exc:
+        core_services.change_entity_settings(w.sub, user=w.mp, reason="x", sharia_enforced=value,
+                                             dual_control_request=req)
+    assert exc.value.code == "not_boolean"
+    assert fresh(w.sub).sharia_enforced is True
+    assert DualControlRequest.objects.get(pk=req.pk).status == "approved"  # not used
+
+
+@pytest.mark.parametrize("value", ["False", "0", 0, None])
+def test_non_bool_is_active_is_refused(w, value):
+    with pytest.raises(ValidationError) as exc:
+        core_services.change_entity_settings(w.sub, user=w.mp, reason="x", is_active=value)
+    assert exc.value.code == "not_boolean"
+    assert fresh(w.sub).is_active is True
+
+
+@pytest.mark.parametrize("value", ["False", "false", "0", "f", "no", "", 0, None])
+def test_r48_non_bool_sharia_value_is_refused_on_create(w, value):
+    """Probe: ``create_entity(Entity(..., sharia_enforced="False"))`` created an entity without Sharia, no request."""
+    new = Entity(code="NEW", name_en="New", name_ar="جديد", consolidation="full", parent=w.alm, sharia_enforced=value)
+    with pytest.raises(ValidationError) as exc:
+        core_services.create_entity(new, user=w.mp)
+    assert exc.value.code == "not_boolean"
+    assert not Entity.objects.filter(code="NEW").exists()
+
+
+def test_r48_non_bool_value_on_create_is_refused_with_an_approved_request(w):
+    req = core_services.request_new_entity_sharia_off(w.alm, "NEW", user=w.mp, reason="Created in admin / أُنشئ من لوحة الإدارة")
+    req = core_services.decide_sharia_enforcement_off(req, user=w.chair, approve=True)
+    new = Entity(code="NEW", name_en="New", name_ar="جديد", consolidation="full", parent=w.alm, sharia_enforced="0")
+    with pytest.raises(ValidationError) as exc:
+        core_services.create_entity(new, user=w.mp, dual_control_request=req)
+    assert exc.value.code == "not_boolean"
+    assert not Entity.objects.filter(code="NEW").exists()
+    assert DualControlRequest.objects.get(pk=req.pk).status == "approved"
+
+
+def test_r49_real_bools_still_work_both_ways(w):
+    w.sub.sharia_enforced = False
+    Entity.objects.filter(pk=w.sub.pk).update(sharia_enforced=False)
+    core_services.change_entity_settings(w.sub, user=w.mp, reason="on", sharia_enforced=True)  # R49: MP alone
+    assert fresh(w.sub).sharia_enforced is True
+    with pytest.raises(services.AccessDenied):  # R48: no request
+        core_services.change_entity_settings(w.sub, user=w.mp, reason="off", sharia_enforced=False)
+    assert fresh(w.sub).sharia_enforced is True
+
+
+@postgres_only
+@pytest.mark.django_db(transaction=True)
+def test_r48_switch_off_decision_uses_the_locked_row():
+    """A no-op ``sharia_enforced=False`` (read: already off) must not write False over a concurrent switch-on."""
+    import threading
+
+    from django.db import connections
+
+    from core.access.models import RolePermission
+
+    from core.access.seed import apply_seed
+
+    apply_seed(Role, RolePermission)
+    alm = entity("ALM", "parent")
+    sub = entity("SUB", "full", alm)
+    Entity.objects.filter(pk=sub.pk).update(sharia_enforced=False)
+    mp = make_user("mp")
+    member(mp, alm, "managing_partner")
+    result = {}
+
+    def other():
+        try:
+            result["value"] = core_services.change_entity_settings(sub, user=mp, reason="x", sharia_enforced=False)
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            result["error"] = exc
+        finally:
+            connections.close_all()
+
+    with transaction.atomic():  # a concurrent R49 switch-on holds the row
+        row = Entity.objects.select_for_update().get(pk=sub.pk)
+        row.sharia_enforced = True
+        row.save(update_fields=["sharia_enforced"])
+        thread = threading.Thread(target=other)
+        thread.start()
+        thread.join(timeout=1.5)
+        assert thread.is_alive(), "the change should wait for the row lock"
+    thread.join(timeout=10)
+    assert isinstance(result.get("error"), ValidationError), result
+    assert result["error"].code == "concurrent_change"
+    assert fresh(sub).sharia_enforced is True

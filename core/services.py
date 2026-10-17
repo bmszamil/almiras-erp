@@ -247,11 +247,12 @@ def change_entity_settings(entity, *, user, reason, dual_control_request=None, *
         )
     if unknown:
         raise ValidationError(f"Not an entity setting: {', '.join(sorted(unknown))}. / ليس من إعدادات الكيان.")
+    _require_boolean_values({name: value for name, value in changes.items() if name in _BOOLEAN_ENTITY_FIELDS})
     _reason_required(reason)
     entity = Entity.objects.get(pk=entity.pk)
     group = access.group_parent_of(entity)
     _require_settings_right(access, user, group, changes)
-    switching_off = "sharia_enforced" in changes and not changes["sharia_enforced"] and entity.sharia_enforced
+    switching_off = "sharia_enforced" in changes and changes["sharia_enforced"] is False and entity.sharia_enforced
     if switching_off and set(changes) != {"sharia_enforced"}:
         raise ValidationError(
             "Turning Sharia enforcement off is a change of its own; change the other settings separately (R48). / "
@@ -262,13 +263,8 @@ def change_entity_settings(entity, *, user, reason, dual_control_request=None, *
             "A four-eyes request is used only to turn Sharia enforcement off. / "
             "يُستخدم طلب الرقابة المزدوجة لإيقاف تطبيق الضوابط الشرعية فقط.", code="dual_control_not_needed",
         )
-    if switching_off:
-        if dual_control_request is None:  # R48: MP request, chairman approval, then apply
-            access.deny(user, group, SHARIA_OFF_PERMISSION, "dual_control")
-        with transaction.atomic():  # the request is used only if the change is written
-            access.require_dual_control(user, group, SHARIA_OFF_PERMISSION, dual_control_request,
-                                        sharia_off_payload(entity, reason), target=entity)
-            return _change_entity_settings(entity, user, reason, changes, dual_control_request=dual_control_request)
+    if switching_off and dual_control_request is None:  # R48: MP request, chairman approval, then apply
+        access.deny(user, group, SHARIA_OFF_PERMISSION, "dual_control")
     new_parent = changes.get("parent", entity.parent)
     if new_parent is None and changes.get("is_active", entity.is_active) is False:
         # Nobody could reactivate it: every right is checked on the group parent (access.md R6, R32).
@@ -282,7 +278,44 @@ def change_entity_settings(entity, *, user, reason, dual_control_request=None, *
                 raise ValidationError("An entity cannot be placed under itself. / لا يمكن وضع الكيان تحت نفسه.")
             node = node.parent
         _require_settings_right(access, user, access.group_parent_of(new_parent), changes)
-    return _change_entity_settings(entity, user, reason, changes)
+    with transaction.atomic():  # the request is used only if the change is written
+        # The decision above was taken on an unlocked read. Re-read the row under the lock: if Sharia enforcement
+        # or the group changed meanwhile (e.g. a concurrent switch-on, R49), "False" would now be an unapproved
+        # switch-off (R48), so refuse and let the caller retry on the current row.
+        locked = Entity.objects.select_for_update().get(pk=entity.pk)
+        if (locked.sharia_enforced, locked.parent_id, locked.is_active) != (
+            entity.sharia_enforced, entity.parent_id, entity.is_active
+        ):
+            raise ValidationError(
+                f"The settings of {entity.code} changed while this change was being made; reload and try again. / "
+                f"تغيّرت إعدادات الكيان {entity.code} أثناء إجراء هذا التغيير؛ أعد التحميل وحاول مجددًا.",
+                code="concurrent_change",
+            )
+        if switching_off:
+            access.require_dual_control(user, group, SHARIA_OFF_PERMISSION, dual_control_request,
+                                        sharia_off_payload(locked, reason), target=locked)
+            return _change_entity_settings(locked, user, reason, changes, dual_control_request=dual_control_request)
+        return _change_entity_settings(locked, user, reason, changes)
+
+
+_BOOLEAN_ENTITY_FIELDS = frozenset(
+    f.name for f in Entity._meta.concrete_fields if f.get_internal_type() == "BooleanField"
+)
+
+
+def _require_boolean_values(values):
+    """Refuse any non-``bool`` value for a boolean entity setting (R48, R49).
+
+    ``"False"``, ``"0"``, ``0`` or ``None`` are not ``False``: a string would be truthy for the Sharia switch-off
+    check and then be saved as False by the database, skipping the four-eyes step. Callers (admin forms, APIs)
+    convert their input to ``bool`` before calling the service.
+    """
+    bad = sorted(name for name, value in values.items() if type(value) is not bool)
+    if bad:
+        raise ValidationError(
+            f"{', '.join(bad)} must be True or False. / يجب أن تكون قيمة {', '.join(bad)} صحيحة أو خاطئة (True/False).",
+            code="not_boolean",
+        )
 
 
 def _require_settings_right(access, user, group, changes):
@@ -374,6 +407,7 @@ def create_entity(entity, *, user, reason="Created in admin / أُنشئ من ل
 
     if entity.pk is not None:
         raise ValidationError("This entity already exists. / هذا الكيان موجود بالفعل.")
+    _require_boolean_values({name: getattr(entity, name) for name in _BOOLEAN_ENTITY_FIELDS})
     if entity.parent_id is None:
         raise ValidationError(
             "A new entity is created under a parent entity of an existing group. / يُنشأ الكيان الجديد تحت كيان أم لمجموعة قائمة."
@@ -382,7 +416,7 @@ def create_entity(entity, *, user, reason="Created in admin / أُنشئ من ل
     access.require(user, group, ENTITY_SETTINGS_PERMISSION)
     if not group.is_active:
         access.deny(user, group, ENTITY_SETTINGS_PERMISSION, "inactive_entity_reactivate_only")
-    if entity.sharia_enforced:
+    if entity.sharia_enforced is True:
         if dual_control_request is not None:
             raise ValidationError(
                 "A four-eyes request is used only to create an entity without Sharia enforcement. / "
