@@ -41,11 +41,27 @@ INSTALLED_APPS = [
     "core",
     "ledger",
     "invoicing",
+    "hr",
 ]
 
 # ZATCA hand-off (invoicing.zatca_port): the default keeps sales documents pending until the zatca
 # module exists; it never clears anything, so nothing posts without a ZATCA result.
 INVOICING_ZATCA_PORT = "invoicing.zatca_port.PendingZatcaPort"
+
+# HR (docs/specs/hr.md). R7: in production every approval that used an unverified statutory parameter is
+# refused; only the test settings switch this off.
+HR_REQUIRE_VERIFIED_PARAMETERS = os.environ.get("HR_REQUIRE_VERIFIED_PARAMETERS", "1") == "1"
+# R10: personal-data encryption keys (Fernet, from the open-source ``cryptography`` package; library choice OQ-11).
+# Kept outside the database: comma-separated secrets in the environment, first = current key (older ones decrypt
+# only, for rotation). Development falls back to a key derived from SECRET_KEY; the hr.E001 check refuses that
+# fallback when DEBUG is off.
+HR_PERSONAL_DATA_KEYS = [k for k in os.environ.get("HR_PERSONAL_DATA_KEYS", "").split(",") if k]
+# R24/R25: where ended secondments are delivered (billing.md 3.6). The default sends nothing: billing is not built,
+# so no billing assignment is linked to any HR assignment.
+HR_BILLING_PORT = "hr.billing_port.UnlinkedBillingPort"
+# R38/R41: where HR hands a terminated employee's final-settlement inputs to payroll (payroll.md 3.8, not built).
+HR_PAYROLL_PORT = "hr.payroll_port.NoPayrollPort"
+HR_ASSIGNMENT_EVENT_MAX_ATTEMPTS = 5  # R25 default
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",

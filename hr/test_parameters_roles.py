@@ -1,0 +1,202 @@
+"""hr R6, R7 (AT-4), R13 (AT-8), R57 (AT-32), R48: statutory parameters, roles, agents, rights."""
+import ast
+from datetime import date
+from pathlib import Path
+
+import pytest
+from django.core.exceptions import ValidationError
+from django.utils import timezone
+
+from core import access
+from core.access.models import AccessLog, Role, RolePermission
+from core.access.seed import ROLE_SEED
+from core.access.testing import make_user, member
+from hr import services, statutory_seed
+from hr.conftest import contract, employee, hired
+from hr.models import HrError, StatutoryParameter
+
+HR = Path(__file__).resolve().parent
+
+
+def _submitted_termination(w, emp, kind="employer_termination", **fields):
+    fields.setdefault("last_working_day", date(2027, 6, 30))
+    fields.setdefault("notice_given_on", date(2027, 5, 1))
+    t = services.record_termination(emp, user=w.h, kind=kind, reason_ar="سبب", **fields)
+    return services.submit_termination(t, user=w.h)
+
+
+# --- R6: parameters are data ------------------------------------------------------------------------
+
+def test_r6_seeded_parameters_are_unverified_sa_rows(db):
+    rows = StatutoryParameter.objects.filter(jurisdiction="SA")
+    assert set(rows.values_list("code", flat=True)) == set(statutory_seed.SA_PARAMETERS)
+    assert set(rows.values_list("status", flat=True)) == {"unverified"}
+    assert all(r.source_url and r.source_reference for r in rows)
+    assert not StatutoryParameter.objects.exclude(jurisdiction="SA").exists()  # OQ-26: none for EG, CN, AE
+
+
+def test_r6_param_reads_the_row_valid_on_the_day(db):
+    old = services.param("SA", "probation.max_days", date(2027, 1, 1))
+    StatutoryParameter.objects.create(jurisdiction="SA", code="probation.max_days", value={"days": "170"},
+                                      valid_from=date(2028, 1, 1), source_url="https://example.test",
+                                      source_reference="test row")
+    assert services.param("SA", "probation.max_days", date(2027, 12, 31)).pk == old.pk
+    assert services.param("SA", "probation.max_days", date(2028, 1, 1)).value == {"days": "170"}
+    with pytest.raises(HrError) as exc:
+        services.param("EG", "probation.max_days", date(2027, 1, 1))
+    assert exc.value.code == "jurisdiction_not_configured" and "/" in exc.value.messages[0]
+
+
+def test_r6_parameter_values_refuse_floats(db):
+    with pytest.raises(HrError):
+        StatutoryParameter.objects.create(jurisdiction="SA", code="x.y", value={"rate": 0.75},
+                                          valid_from=date(2027, 1, 1), source_url="https://example.test",
+                                          source_reference="t")
+
+
+# Regulatory figures that must only be in hr/statutory_seed.py (R6 scan).
+REGULATORY_NUMBERS = {180, 365, 354, 48, 84, 42, 28, 130, 117, 75, 45000, 1500}
+REGULATORY_STRINGS = {"0.75", "1/3", "2/3", "1/2", "0.5", "180", "365", "354"}
+
+
+def test_r6_scan_no_regulatory_literal_in_hr_code():
+    found = []
+    for path in HR.glob("*.py"):
+        if path.name in ("statutory_seed.py", "conftest.py") or path.name.startswith("test_"):
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Constant):
+                if (type(node.value) is int and node.value in REGULATORY_NUMBERS) or (
+                        isinstance(node.value, str) and node.value in REGULATORY_STRINGS):
+                    found.append(f"{path.name}:{node.lineno}: {node.value!r}")
+    assert not found, found
+
+
+# --- R7 / AT-4 ----------------------------------------------------------------------------------------
+
+def test_at4_unverified_parameters_block_approval_until_verified(w, settings):
+    emp = hired(w, hire_date=date(2023, 1, 1))
+    t = _submitted_termination(w, emp)
+    settings.HR_REQUIRE_VERIFIED_PARAMETERS = True
+    with pytest.raises(HrError) as exc:
+        services.approve_termination(t, user=w.c)
+    assert exc.value.code == "parameter_unverified"
+    assert "eosb.award_table" in exc.value.messages[0] and "غير متحقق" in exc.value.messages[0]
+
+    # MP may not verify a row MP entered; MP verifies a row H entered.
+    member(w.mp, w.alm, "hr_officer")
+    own = services.add_statutory_parameter(user=w.mp, jurisdiction="SA", code="test.own", value={"x": "1"},
+                                           valid_from=date(2027, 1, 1), source_url="https://example.test",
+                                           source_reference="test")
+    with pytest.raises(access.AccessDenied) as denied:
+        services.verify_statutory_parameter(own, user=w.mp)
+    assert denied.value.code == "self_approval"
+    other = services.add_statutory_parameter(user=w.h, jurisdiction="SA", code="test.other", value={"x": "1"},
+                                             valid_from=date(2027, 1, 1), source_url="https://example.test",
+                                             source_reference="test")
+    assert services.verify_statutory_parameter(other, user=w.mp).status == "verified"
+    with pytest.raises(access.AccessDenied):  # H holds no verification right
+        services.verify_statutory_parameter(own, user=w.h)
+
+    for row in StatutoryParameter.objects.filter(jurisdiction="SA", status="unverified").exclude(code="test.own"):
+        services.verify_statutory_parameter(row, user=w.mp)
+    t = services.approve_termination(t, user=w.c)
+    assert t.status == "approved"
+
+    used = StatutoryParameter.objects.get(code="eosb.award_table", jurisdiction="SA")
+    assert used.used_at is not None
+    used.value = {"tiers": []}
+    with pytest.raises(HrError) as exc:
+        used.save()
+    assert exc.value.code == "parameter_used"
+    with pytest.raises(HrError):
+        used.delete()
+    # A correction is a superseding row; the used row keeps its value.
+    services.supersede_statutory_parameter(used, user=w.h)
+    assert StatutoryParameter.objects.get(pk=used.pk).status == "superseded"
+
+
+def test_r7_contract_approval_also_refused_on_unverified(w, settings):
+    emp = employee(w)
+    c = contract(w, emp, approve=False)
+    settings.HR_REQUIRE_VERIFIED_PARAMETERS = True
+    with pytest.raises(HrError) as exc:
+        services.approve_contract(c, user=w.c)
+    assert "probation.max_days" in exc.value.messages[0]
+
+
+def test_r7_production_settings_require_verified_parameters():
+    from config import settings as prod
+
+    assert prod.HR_REQUIRE_VERIFIED_PARAMETERS is True
+
+
+# --- R13 / AT-8: agents ----------------------------------------------------------------------------------
+
+def test_at8_agents_cannot_read_or_draft_hr(w):
+    member_role = Role.objects.create(code="agent_hr_reader", name_en="Agent", name_ar="وكيل", scope="entity",
+                                      kind="agent")
+    member(w.agent, w.alm, "agent_hr_reader")
+    emp = hired(w)
+    assert not services.employees(w.agent).exists()
+    with pytest.raises(access.AccessDenied) as exc:
+        services.request_leave(emp, "ANNUAL", user=w.agent, start_date=date(2027, 6, 10), end_date=date(2027, 6, 11))
+    assert exc.value.code == "agent_forbidden"
+    with pytest.raises(ValidationError):
+        RolePermission.objects.create(role=member_role, codename="hr.view")
+    from core.access import catalogue
+
+    assert not [c for c in catalogue.CATALOGUE if c.startswith("hr.") and catalogue.CATALOGUE[c].agent_ok]
+    from hr.models import Source
+
+    assert "agent" not in Source.values
+
+
+# --- R57 / AT-32: roles -----------------------------------------------------------------------------------
+
+def test_at32_mp_grants_hr_roles_access_admin_cannot(w):
+    user_h, user_p, other = make_user("newh"), make_user("newp"), make_user("other")
+    hr_role, pay_role = Role.objects.get(code="hr_officer"), Role.objects.get(code="payroll_officer")
+    m = access.grant_membership(w.mp, user_h, w.alm, hr_role, timezone.now(), reason="test grant")
+    access.grant_membership(w.mp, user_p, w.alm, pay_role, timezone.now(), reason="test grant")
+    assert AccessLog.objects.filter(event="membership_granted", membership=m).exists()
+    with pytest.raises(access.AccessDenied) as exc:
+        access.grant_membership(w.aa, other, w.alm, hr_role, timezone.now(), reason="test grant")
+    assert exc.value.code == "role_not_grantable"
+    with pytest.raises(access.AccessDenied):
+        access.grant_membership(w.aa, other, w.alm, pay_role, timezone.now(), reason="test grant")
+    assert hr_role.name_ar == "مسؤول الموارد البشرية" and pay_role.name_ar == "مسؤول الرواتب"
+    assert ROLE_SEED["hr_officer"][2:4] == ("entity", "human")
+
+
+def test_r48_every_hr_service_checks_rights(w):
+    emp = hired(w)
+    stranger = make_user("stranger")
+    calls = [
+        lambda: services.create_employee(w.alm, user=stranger, full_name_en="x"),
+        lambda: services.employee_record(emp, user=stranger),
+        lambda: services.create_contract(emp, user=stranger),
+        lambda: services.calculate_eosb(emp, date(2027, 5, 31), "resignation", user=stranger),
+        lambda: services.leave_balance(emp, "ANNUAL", user=stranger),
+        lambda: services.document_flag(emp, user=stranger),
+        lambda: services.terms_on(emp, date(2027, 2, 1), user=stranger),
+    ]
+    for call in calls:
+        with pytest.raises(access.AccessDenied):
+            call()
+
+
+def test_hr_officer_of_sub_has_no_right_in_alm(w):
+    emp = hired(w)
+    with pytest.raises(access.AccessDenied):
+        services.update_employee(emp, user=w.hs, phone="0500000000")
+    assert services.employees(w.hs).filter(pk=emp.pk).count() == 0
+
+
+def test_payroll_officer_cannot_approve_contracts_or_edit(w):
+    emp = employee(w)
+    c = contract(w, emp, approve=False)
+    with pytest.raises(access.AccessDenied):
+        services.approve_contract(c, user=w.p)
+    with pytest.raises(access.AccessDenied):
+        services.update_employee(emp, user=w.p, phone="0500000001")

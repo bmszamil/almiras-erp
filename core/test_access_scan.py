@@ -41,6 +41,15 @@ ALLOW = {
     "invoicing/services.py:purchase_documents": "the scope mechanism for purchase documents (access.scope, R2)",
     "invoicing/services.py:create_from_billing": "stub until billing.md is built: always raises NotImplementedError",
     "invoicing/services.py:create_adjustment_from_billing": "stub until billing.md is built: always raises",
+    "hr/services.py:employees": "the scope mechanism for employees (access.scope with hr.view, R2)",
+    "hr/services.py:get_employee": "the scope mechanism for one employee (get_scoped_or_404 with hr.view, R2)",
+    "hr/services.py:param": "reads global statutory reference data (no entity, no personal data; hr R6)",
+    # HR operator jobs (management commands, scheduled; hr R4, R25, R30, R43); no user action.
+    "hr/services.py:setup_entity": "hr_setup_entity command only (operator setup of a new entity, hr R4)",
+    "hr/services.py:accrue_leave": "hr_accrue_leave job only (month-end accrual, hr R30)",
+    "hr/services.py:deliver_assignment_events": "hr_deliver_assignment_events job (acts as the HR user who ended it)",
+    "hr/services.py:send_document_alerts": "hr_document_alerts job only (hr R43)",
+    "hr/services.py:refresh_statuses": "hr_refresh_status job only (dated status changes, hr R8, R23, R38)",
     # Setup run by operators (setup_almiras, new-entity setup); no user action.
     "ledger/services_setup.py:install_chart_of_accounts": "operator setup of a new entity (CLAUDE.md: entities are data)",
     "ledger/services_setup.py:create_monthly_periods": "operator setup of a new entity",
