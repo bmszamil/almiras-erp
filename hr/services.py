@@ -1138,7 +1138,24 @@ def terms_on(employee, day, *, user):
 
 
 def _contract_end(contract):
-    return contract.ended_on or contract.end_date
+    """Last day of a version: its termination end, else its end date extended by the suspended days (unpaid leave
+    beyond 20 days in a work year suspends the contract and extends a fixed term, Art. 116, Regs Art. 25)."""
+    if contract.ended_on or contract.end_date is None:
+        return contract.ended_on
+    emp = contract.employee
+    if emp.employment_basis != Basis.KSA_EMPLOYEE:
+        return contract.end_date
+    use = ParamUse()
+    threshold = int(use.get("SA", "leave.annual", contract.start_date)["unpaid_suspends_after_days"])
+    suspended = _suspended_days(use, "SA", emp, contract.calendar_basis, contract.start_date, contract.end_date,
+                                threshold)
+    return contract.end_date + timedelta(days=len(suspended))
+
+
+def contract_end_date(contract, *, user):
+    """The effective last day of a contract version (termination, or fixed term extended by suspension)."""
+    access.require(user, contract.entity, "hr.view")
+    return _contract_end(contract)
 
 
 def _activate_if_started(emp):

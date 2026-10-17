@@ -277,3 +277,11 @@ def test_r29_opening_only_once_before_activation(w):
     e = _with_opening(w, "3")
     with pytest.raises(HrError):
         services.record_opening_leave_balance(e, "ANNUAL", D("1"), e.hire_date + timedelta(days=1), user=w.h)
+
+
+def test_art116_unpaid_leave_beyond_twenty_days_extends_a_fixed_term(w):
+    e = hired(w, saudi=False)  # fixed term 2027-01-01 to 2029-01-01
+    c = e.contracts.get(status="approved")
+    assert services.contract_end_date(c, user=w.h) == date(2029, 1, 1)
+    _approved_leave(w, e, "UNPAID", date(2027, 2, 1), date(2027, 2, 28), reason_ar="ظرف خاص")
+    assert services.contract_end_date(c, user=w.h) == date(2029, 1, 9)  # 8 suspended days
