@@ -11,7 +11,8 @@ class EntityAdmin(ScopedAdmin):
     (ERP_ADMIN_SETUP_MODE superuser) and is audited."""
 
     view_perm = "core.entity.view"
-    list_display = ["code", "name_en", "name_ar", "parent", "ownership_pct", "consolidation", "reporting_standard"]
+    list_display = ["code", "name_en", "name_ar", "parent", "ownership_pct", "consolidation", "reporting_standard",
+                    "books_in_erp", "books_in_erp_from"]
     search_fields = ["code", "name_en", "name_ar"]
 
     def scope_queryset(self, request, qs):

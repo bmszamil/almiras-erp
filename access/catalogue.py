@@ -31,14 +31,45 @@ PERMISSIONS = [
     ("investments.investment.view", "View investments", "عرض الاستثمارات"),
     ("deals.deal.view", "View deals", "عرض الصفقات"),
     ("reports.report.view", "View reports", "عرض التقارير"),
+    # Intercompany billing (docs/specs/intercompany-billing.md §7)
+    ("intercompany.agreement.view", "View service agreements, timesheets and cost pools",
+     "عرض اتفاقيات الخدمات وسجلات الوقت ومجمعات التكاليف"),
+    ("intercompany.agreement.create", "Create and edit draft service agreements", "إنشاء مسودات اتفاقيات الخدمات وتعديلها"),
+    ("intercompany.agreement.manage", "Suspend or end service agreements", "إيقاف اتفاقيات الخدمات أو إنهاؤها"),
+    ("intercompany.timesheet.create", "Record timesheet entries", "تسجيل ساعات العمل"),
+    ("intercompany.timesheet.approve", "Approve or reject timesheet entries", "اعتماد ساعات العمل أو رفضها"),
+    ("intercompany.costpool.manage", "Set up cost pools and allocation drivers", "إعداد مجمعات التكاليف وأسس التوزيع"),
+    ("intercompany.billing.run", "Run intercompany billing (drafts only)", "تشغيل فوترة المجموعة (مسودات فقط)"),
+    ("intercompany.invoice.view", "View intercompany invoices and credit notes", "عرض فواتير المجموعة والإشعارات الدائنة"),
+    ("intercompany.invoice.create", "Create, edit and cancel draft invoices and credit notes",
+     "إنشاء مسودات الفواتير والإشعارات الدائنة وتعديلها وإلغاؤها"),
+    ("intercompany.invoice.issue", "Issue approved intercompany invoices", "إصدار فواتير المجموعة المعتمدة"),
+    ("intercompany.bill.view", "View intercompany bills of the entity", "عرض فواتير المجموعة الواردة للمنشأة"),
+    ("intercompany.bill.edit", "Change coding of, dispute and submit intercompany bills",
+     "تعديل ترميز فواتير المجموعة الواردة والاعتراض عليها وتقديمها"),
+    ("intercompany.report.view", "View the intercompany reconciliation report", "عرض تقرير مطابقة أرصدة المجموعة"),
+    ("intercompany.servicetype.manage", "Maintain intercompany service types (group data)",
+     "إدارة أنواع خدمات المجموعة"),
+    ("intercompany.billable_item.feed", "Feed billable items into intercompany billing (integrations)",
+     "إدخال بنود قابلة للفوترة في فوترة المجموعة (التكاملات)"),
 ]
 
 ALL = [code for code, _, _ in PERMISSIONS]
 
 # Granted to no role by default (default deny); an access manager must add it to a role deliberately.
-NO_ROLE_BY_DEFAULT = {"ledger.period.reopen"}
+NO_ROLE_BY_DEFAULT = {"ledger.period.reopen", "intercompany.billable_item.feed"}
 
 _READ_FINANCE = ["core.entity.view", "approvals.request.view", "ledger.entry.view", "reports.report.view"]
+
+# Intercompany billing (spec §7). MP approves through the approvals engine; accountant creates and runs
+# billing; PA and agents draft; auditor reads; business analyst nothing.
+_IC_READ = ["intercompany.agreement.view", "intercompany.invoice.view", "intercompany.bill.view",
+            "intercompany.report.view"]
+_IC_DRAFT = ["intercompany.agreement.create", "intercompany.timesheet.create", "intercompany.invoice.create"]
+_IC_ACCOUNTANT = _IC_READ + _IC_DRAFT + [
+    "intercompany.agreement.manage", "intercompany.timesheet.approve", "intercompany.costpool.manage",
+    "intercompany.billing.run", "intercompany.invoice.issue", "intercompany.bill.edit",
+]
 
 ROLES = {
     "managing_partner": ("Managing Partner", "الشريك المدير", [c for c in ALL if c not in NO_ROLE_BY_DEFAULT]),
@@ -53,11 +84,13 @@ ROLES = {
     # accountant rights plus audit read; no approve/post until a policy decision says so.
     "cfo": (
         "Chief Financial Officer", "المدير المالي",
-        _READ_FINANCE + ["access.audit.view", "approvals.request.submit", "ledger.entry.create"],
+        _READ_FINANCE + ["access.audit.view", "approvals.request.submit", "ledger.entry.create"]
+        + [c for c in _IC_ACCOUNTANT if c != "intercompany.invoice.issue"],  # no post (Build notes)
     ),
     "accountant": (
         "Accountant", "المحاسب",
-        _READ_FINANCE + ["approvals.request.submit", "ledger.entry.create", "ledger.entry.reverse"],  # D15
+        _READ_FINANCE + ["approvals.request.submit", "ledger.entry.create", "ledger.entry.reverse"]  # D15
+        + _IC_ACCOUNTANT,
     ),
     # D13: limited modules (investments, deals, reports), read only. No ledger, no approvals.
     "business_analyst": (
@@ -70,17 +103,18 @@ ROLES = {
         [
             "core.entity.view", "approvals.request.view_own", "approvals.request.submit",
             "ledger.entry.create", "documents.document.upload",
-        ],
+        ] + _IC_DRAFT,
     ),
     "auditor": (
         "External Auditor (read-only)", "المراجع الخارجي (قراءة فقط)",
-        _READ_FINANCE + ["access.audit.view"],
+        _READ_FINANCE + ["access.audit.view"] + _IC_READ,
     ),
     "viewer": ("Viewer", "مشاهد", ["core.entity.view", "approvals.request.view", "ledger.entry.view"]),
     # R18: drafts only, never act.
     "agent_drafter": (
         "AI agent (drafts only)", "وكيل ذكاء اصطناعي (مسودات فقط)",
-        ["core.entity.view", "approvals.request.view_own", "approvals.request.submit", "ledger.entry.create"],
+        ["core.entity.view", "approvals.request.view_own", "approvals.request.submit", "ledger.entry.create"]
+        + _IC_DRAFT,
     ),
 }
 
@@ -100,6 +134,14 @@ SERVICE_FORBIDDEN = {
     "ledger.period.manage",
     "ledger.period.reopen",
     "access.audit.view_security",
+    # Intercompany: service users draft only (R20); no billing runs, timesheet approval, issue or bill coding.
+    "intercompany.agreement.manage",
+    "intercompany.timesheet.approve",
+    "intercompany.costpool.manage",
+    "intercompany.billing.run",
+    "intercompany.invoice.issue",
+    "intercompany.bill.edit",
+    "intercompany.servicetype.manage",
 }
 AGENT_FORBIDDEN = SERVICE_FORBIDDEN  # old name
 

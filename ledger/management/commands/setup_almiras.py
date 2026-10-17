@@ -1,3 +1,5 @@
+import datetime
+
 from django.core.management.base import BaseCommand
 
 from core.models import Entity
@@ -18,6 +20,8 @@ class Command(BaseCommand):
                 name_ar="المراس",
                 consolidation=Entity.Consolidation.PARENT,
                 reporting_standard=Entity.Standard.IFRS_SME,
+                books_in_erp=True,  # intercompany spec 3.1: Almiras keeps its books here
+                books_in_erp_from=datetime.date(opts["year"], 1, 1),
             ),
         )
         accounts = install_chart_of_accounts(entity)
