@@ -12,4 +12,5 @@ admin.site.__class__ = OTPAdminSite
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/v1/", include("approvals.urls")),
+    path("api/v1/intercompany/", include("intercompany.urls")),
 ]
