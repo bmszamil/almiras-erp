@@ -7,6 +7,8 @@ Money is ``Decimal``: SAR amounts with 2 decimals, document-currency amounts wit
 data with effective dates (3.2).
 """
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from decimal import Decimal
 
 from django.conf import settings
@@ -529,6 +531,17 @@ class GuardedLineQuerySet(models.QuerySet):
     def _touches_locked(self):
         return self.exclude(document__status="draft").exists()
 
+    def bulk_create(self, objs, *args, **kwargs):
+        """bulk_create skips save(): lines are added in bulk only to drafts of their own entity."""
+        objs = list(objs)
+        document_model = self.model._meta.get_field("document").related_model
+        ids = {o.document_id for o in objs}
+        docs = dict(document_model._base_manager.filter(pk__in=ids).values_list("pk", "entity_id"))
+        statuses = set(document_model._base_manager.filter(pk__in=ids).values_list("status", flat=True))
+        if statuses - {"draft"} or any(docs.get(o.document_id) != o.entity_id for o in objs):
+            raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
+        return super().bulk_create(objs, *args, **kwargs)
+
     def update(self, **kwargs):
         if self._touches_locked():
             raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
@@ -868,6 +881,41 @@ BILLING_LINES_EN = ("The lines of a document created from billing are read-only;
                     "instead (R73, billing R56).")
 BILLING_LINES_AR = "بنود المستند المنشأ من الفوترة للقراءة فقط؛ صحّح العقد في وحدة الفوترة بدلًا من ذلك."
 
+# R73 / billing R56 (review finding 5): lines of a document linked to billing are written only inside
+# ``billing_line_writes()`` (the billing hooks, the approval's re-pricing and the discard of a correction draft).
+# The flag is per context in Python and transaction-local (``set_config(..., true)``) in PostgreSQL, where the
+# line-lock trigger refuses every other insert, update or delete.
+_BILLING_LINE_WRITES = ContextVar("invoicing_billing_line_writes", default=False)
+BILLING_LINES_SETTING = "invoicing.billing_lines"
+
+
+@contextmanager
+def billing_line_writes():
+    """Allow writes to billing-linked sales lines for the enclosed block of the current transaction only."""
+    from django.db import connection
+
+    if not connection.in_atomic_block:
+        raise RuntimeError("billing_line_writes() is used inside a transaction (SET LOCAL).")
+    token = _BILLING_LINE_WRITES.set(True)
+    postgres = connection.vendor == "postgresql"
+    if postgres:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT set_config(%s, 'on', true)", [BILLING_LINES_SETTING])
+    try:
+        yield
+    finally:
+        _BILLING_LINE_WRITES.reset(token)
+        if postgres and not connection.needs_rollback:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT set_config(%s, 'off', true)", [BILLING_LINES_SETTING])
+
+
+def _billing_lines_refused():
+    raise error(BILLING_LINES_EN, BILLING_LINES_AR, code="billing_lines_read_only")
+
+
+_BILLING_LINK = models.Q(billing_item__isnull=False) | models.Q(billing_adjustment__isnull=False)
+
 
 class SalesLineQuerySet(GuardedLineQuerySet):
     def _touches_billing(self):
@@ -875,14 +923,22 @@ class SalesLineQuerySet(GuardedLineQuerySet):
                            | models.Q(document__billing_adjustment__isnull=False)).exists()
 
     def update(self, **kwargs):
-        if self._touches_billing():
-            raise error(BILLING_LINES_EN, BILLING_LINES_AR, code="billing_lines_read_only")
+        if not _BILLING_LINE_WRITES.get() and self._touches_billing():
+            _billing_lines_refused()
         return super().update(**kwargs)
 
     def delete(self):
-        if self._touches_billing():
-            raise error(BILLING_LINES_EN, BILLING_LINES_AR, code="billing_lines_read_only")
+        if not _BILLING_LINE_WRITES.get() and self._touches_billing():
+            _billing_lines_refused()
         return super().delete()
+
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        if not _BILLING_LINE_WRITES.get() and SalesDocument._base_manager.filter(
+                _BILLING_LINK, pk__in={o.document_id for o in objs}).exists():
+            _billing_lines_refused()
+        return super().bulk_create(objs, *args, **kwargs)
+
 
 
 class SalesDocumentLine(LineAmounts, GuardedLine):
@@ -902,21 +958,18 @@ class SalesDocumentLine(LineAmounts, GuardedLine):
                                          max_length=300, blank=True)
 
     def _billing_locked(self):
-        return SalesDocument._base_manager.filter(pk=self.document_id).filter(
-            models.Q(billing_item__isnull=False) | models.Q(billing_adjustment__isnull=False)).exists()
+        return SalesDocument._base_manager.filter(_BILLING_LINK, pk=self.document_id).exists()
 
     def save(self, *args, **kwargs):
-        # R73 / billing R56: lines of a billing document are written only by the billing hooks and the approval's
-        # re-pricing (both set a flag); nobody adds, edits or deletes them.
-        if not (getattr(self, "_billing_write", False) or getattr(self, "_service_write", False)) \
-                and self._billing_locked():
-            raise error(BILLING_LINES_EN, BILLING_LINES_AR, code="billing_lines_read_only")
-        self._billing_write = False
+        # R73 / billing R56: lines of a billing document are written only inside billing_line_writes() (the
+        # billing hooks and the approval's re-pricing); nobody else adds, edits or deletes them.
+        if not _BILLING_LINE_WRITES.get() and self._billing_locked():
+            _billing_lines_refused()
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
-        if self._billing_locked():
-            raise error(BILLING_LINES_EN, BILLING_LINES_AR, code="billing_lines_read_only")
+        if not _BILLING_LINE_WRITES.get() and self._billing_locked():
+            _billing_lines_refused()
         return super().delete(*args, **kwargs)
 
     class Meta:

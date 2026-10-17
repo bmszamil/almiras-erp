@@ -8,7 +8,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
-from django.db import IntegrityError, transaction
+from django.db import DatabaseError, IntegrityError, connection, transaction
 
 from billing import invoicing_port
 from billing import services as billing
@@ -376,6 +376,37 @@ def test_r56_lines_of_billing_documents_are_read_only_for_everyone(bw):
     assert note.lines.get().unit_price == D("1000.000")
 
 
+def test_r56_bulk_create_cannot_add_billing_lines(bw):
+    """Review finding 5: bulk_create skipped save(), so a line could be added to a billing note in Python."""
+    w = bw
+    _, _, note = _note(w)
+    line = note.lines.get()
+    twin = SalesDocumentLine(entity=w.alm, document=note, line_no=2, income_type=line.income_type,
+                             income_account=line.income_account, quantity=D("1"), unit_price=D("5.000"),
+                             description_ar="بند مضاف")
+    with pytest.raises(InvoicingError) as exc:
+        SalesDocumentLine.objects.bulk_create([twin])
+    assert exc.value.code == "billing_lines_read_only"
+    assert note.lines.count() == 1
+
+
+def test_bulk_create_cannot_add_lines_to_issued_documents(bw):
+    w = bw
+    c = approved(w, start=date(2027, 3, 1))
+    doc = _invoice(w, c, date(2027, 3, 1))  # issued
+    manual = inv.create_sales_document(w.alm, user=w.s, customer=doc.customer, issue_date=date(2027, 3, 1))
+    line = doc.lines.get()
+    extra = SalesDocumentLine(entity=w.alm, document=doc, line_no=9, income_type=line.income_type,
+                              income_account=line.income_account, quantity=D("1"), unit_price=D("5.000"),
+                              description_ar="بند")
+    with pytest.raises(InvoicingError):
+        SalesDocumentLine.objects.bulk_create([extra])
+    extra.document, extra.entity = manual, w.sub  # another entity's line onto this entity's draft
+    with pytest.raises(InvoicingError) as exc:
+        SalesDocumentLine.objects.bulk_create([extra])
+    assert exc.value.code == "service_only"
+
+
 def test_r56_billing_invoice_lines_are_read_only_too(bw):
     w = bw
     set_auto_issue(w.alm, False)
@@ -428,3 +459,42 @@ def test_r73_note_waits_for_a_final_original(bw):
         inv.create_adjustment_from_billing(adj, w.sys)
     assert exc.value.code == "original_not_final"
     assert not SalesDocument.objects.filter(billing_adjustment=adj).exists()
+
+
+def _pg_refused(sql, params=()):
+    with pytest.raises(DatabaseError), transaction.atomic(), connection.cursor() as cursor:
+        cursor.execute(sql, params)
+
+
+@pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL triggers")
+def test_r56_billing_lines_are_read_only_in_the_database(bw):
+    """Review finding 5: raw SQL (or bulk_create) on the lines of a billing document is refused unless the
+    transaction-local flag of billing_line_writes() is on; the flag does not outlive its block."""
+    from invoicing.models import billing_line_writes
+
+    w = bw
+    _, _, note = _note(w)
+    line = note.lines.get()
+    _pg_refused("UPDATE invoicing_salesdocumentline SET unit_price = 1 WHERE id = %s", [line.pk])
+    _pg_refused("DELETE FROM invoicing_salesdocumentline WHERE id = %s", [line.pk])
+    _pg_refused("INSERT INTO invoicing_salesdocumentline (entity_id, document_id, line_no, income_type_id, "
+             "income_account_id, quantity, unit_price, line_discount, net_amount, vat_amount, vat_category, "
+             "description_ar, description_en, unit_code, exemption_text_en, exemption_text_ar) "
+             "SELECT entity_id, document_id, 2, income_type_id, income_account_id, quantity, unit_price, line_discount, "
+             "net_amount, vat_amount, vat_category, description_ar, description_en, unit_code, '', '' "
+             "FROM invoicing_salesdocumentline WHERE id = %s", [line.pk])
+    with pytest.raises(DatabaseError), transaction.atomic():  # bulk_create past the Python guard
+        from django.db.models import QuerySet
+
+        twin = type(line)(entity=w.alm, document=note, line_no=3, income_type=line.income_type,
+                          income_account=line.income_account, quantity=line.quantity, unit_price=line.unit_price,
+                          description_ar="بند")
+        QuerySet.bulk_create(type(line).objects.all(), [twin])
+    with transaction.atomic():
+        with billing_line_writes(), connection.cursor() as cursor:
+            cursor.execute("UPDATE invoicing_salesdocumentline SET description_en = 'by the hook' WHERE id = %s",
+                           [line.pk])
+        with pytest.raises(DatabaseError), transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute("UPDATE invoicing_salesdocumentline SET unit_price = 1 WHERE id = %s", [line.pk])
+    assert note.lines.get().description_en == "by the hook"
+    assert SalesDocument.objects.get(pk=note.pk).lines.count() == 1

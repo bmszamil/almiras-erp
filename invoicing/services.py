@@ -13,7 +13,7 @@ receipts may be posted by the person who recorded them (D26, access R46);
 refunds are posted by a second person (R33, OQ-26).
 """
 import calendar
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date as date_type
@@ -22,7 +22,7 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 from zoneinfo import ZoneInfo
 
 from django.db import transaction
-from django.db.models import Q, QuerySet, Sum
+from django.db.models import Q, Sum
 from django.utils import timezone
 
 from core import access
@@ -64,6 +64,7 @@ from .models import (
     VendorPayment,
     WhtCategory,
     WhtDeduction,
+    billing_line_writes,
     error,
 )
 
@@ -1167,10 +1168,11 @@ def _issue_submitted(doc, *, rate_user, approved_by, approved_at):
     on = doc.supply_date or doc.issue_date
     fx_rate, rate_date, rate_source, rate_row = _fx_for(entity, doc.currency_id, doc.issue_date, rate_user)
     sar_rate = _sar_rate(entity, doc.currency_id, fx_rate, doc.issue_date, rate_user)
-    for line in lines:
-        _price_line(line, on, _doc_places(doc))
-        line._service_write = True
-        line.save()
+    with billing_line_writes() if doc.from_billing else nullcontext():  # the approval re-prices billing lines too
+        for line in lines:
+            _price_line(line, on, _doc_places(doc))
+            line._service_write = True
+            line.save()
     breakdown, net, vat, vat_sar = _sales_breakdown(doc, lines, sar_rate)
     gross = net + vat
     gross_sar = _round(gross * sar_rate, 2)
@@ -3310,8 +3312,8 @@ def _billing_line(doc, row, *, unit_price):
         vat_category=row.get("vat_category") or None, vat_exemption_reason=row.get("vat_exemption_reason") or None,
         income_account=row.get("income_account") or None, line_discount="0", unit_code=row.get("unit_code") or "C62",
     )
-    line._billing_write = True
-    line.save()
+    with billing_line_writes():  # R73 / billing R56: the only writer of billing lines besides the re-pricing
+        line.save()
     return line
 
 
@@ -3519,5 +3521,6 @@ def discard_adjustment_draft(document, user):
             _bump(doc)
             doc._service_write = True
             doc.save()
-        QuerySet.delete(SalesDocumentLine.objects.filter(document=doc))  # the billing-line guard refuses all others
+        with billing_line_writes():  # billing R46c: the one delete of billing lines (the guards refuse all others)
+            SalesDocumentLine.objects.filter(document=doc).delete()
         doc.delete()

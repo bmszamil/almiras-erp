@@ -86,3 +86,4 @@ def test_unverified_certificate_edits_record_the_modifier_and_a_third_person_ver
     _refused("UPDATE invoicing_treatycertificate SET verified_by_id = %s, verified_at = now() WHERE id = %s",
              [w.accountant.pk, cert.pk])  # nor the last modifier
     _refused("DELETE FROM invoicing_treatycertificate WHERE id = %s", [cert.pk])
+
