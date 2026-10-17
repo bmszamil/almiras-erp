@@ -913,8 +913,13 @@ def billing_line_writes():
     finally:
         _BILLING_LINE_WRITES.reset(token)
         if postgres and not connection.needs_rollback:
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT set_config(%s, 'off', true)", [BILLING_LINES_SETTING])
+            from django.db import DatabaseError
+
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT set_config(%s, 'off', true)", [BILLING_LINES_SETTING])
+            except DatabaseError:  # the transaction is already aborted: it rolls back, setting included
+                pass
 
 
 def _billing_lines_refused():
