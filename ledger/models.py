@@ -326,6 +326,16 @@ class JournalLine(models.Model):
         return f"{self.account.code} Dr {self.debit} Cr {self.credit}"
 
 
+class JournalEntryEditorQuerySet(models.QuerySet):
+    """Append-only (follow-up 2b): rows leave only with their deleted draft (database cascade)."""
+
+    def update(self, **kwargs):
+        raise LedgerError("Editor records cannot be changed.")
+
+    def delete(self):
+        raise LedgerError("Editor records cannot be deleted.")
+
+
 class JournalEntryEditor(models.Model):
     """Every user who created or edited a draft entry (review A). Editors count as creators for
     segregation of duties (R8) and D10. Rows are never changed; they go only with a deleted draft."""
@@ -336,6 +346,8 @@ class JournalEntryEditor(models.Model):
     action = models.CharField(max_length=10, choices=[("create", "Create"), ("edit", "Edit")])
     at = models.DateTimeField(auto_now_add=True)
 
+    objects = JournalEntryEditorQuerySet.as_manager()
+
     class Meta:
         ordering = ["entry", "at", "id"]
 
@@ -343,6 +355,9 @@ class JournalEntryEditor(models.Model):
         if not self._state.adding:
             raise LedgerError("Editor records cannot be changed.")
         super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise LedgerError("Editor records cannot be deleted.")
 
 
 class EntrySequence(models.Model):

@@ -469,7 +469,7 @@ def submit_by_code(code, object_id, user, ctx=None):
         raise Conflict("already_pending", "This document already has a pending approval request.",
                        "يوجد طلب موافقة معلق لهذا المستند.")
     editors = set(adapter.editor_ids(doc)) | {creator.pk}
-    request.document_editors.set(User.objects.filter(pk__in=editors))
+    request.document_editors.add(*User.objects.filter(pk__in=editors))  # append-only through table
     request._involved_ids = None
     ApprovalAction.objects.create(request=request, actor=user, action=A.SUBMIT, at=at, channel=_channel(ctx))
     adapter.on_submitted(doc, request)

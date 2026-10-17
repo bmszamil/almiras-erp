@@ -30,6 +30,7 @@ All by Badr Alzamil, Managing Partner (MP), 16 Oct 2026.
 | D16 | (17 Oct 2026) **Delegation beats self-approval:** if the MP has an active delegation covering the document, the delegate approves; MP self-approval (D10) is not allowed while that delegation exists. |
 | D17 | (17 Oct 2026) **Integrations are drafts-only:** `service_integration` users are treated exactly like AI agents: they may create and submit drafts, never post or approve. |
 | D18 | (17 Oct 2026) **Retention:** all accounting records, approval records and audit logs are kept forever. No purge code. PDPL storage-limitation review is pending legal sign-off. |
+| D19 | (17 Oct 2026) **Managing Partner protection:** only a user holding the Chairman role may deactivate, lock, reset the password of, change roles/privileges of, revoke tokens/TOTP of, or otherwise disable a user holding the Managing Partner role (in any entity). Nobody else may, including other MPs and user managers; setup mode is excepted. This applies in services, admin and API, and every such action is audited. |
 
 ## 3. Data model
 
@@ -137,6 +138,7 @@ A document model becomes approvable by:
 2. Having `entity`, `created_by`, `source`, `status` fields and an `approval_status`-compatible state (`draft` → `pending_approval` → `approved` → module-specific next step).
 3. Implementing in its `services.py`: `approval_amount(doc)`, `approval_summary(doc)` (en/ar), `on_approved(doc, request)`, `on_rejected(doc, request)`, `on_returned(doc, request)`.
 4. Calling `approvals.services.submit(doc, user)` — never creating `ApprovalRequest` rows directly.
+5. Recording every person who creates or edits a draft. Any service, API endpoint, admin form or import that creates or edits a draft journal entry **must call `ledger.services.record_editor(entry, user, action)`** (`create_entry` and the ledger admin already do). Other modules provide the same record for their own documents through the adapter's `editor_ids(doc)`. The engine copies these editors to `ApprovalRequest.document_editors` at submission and treats them like the creator: they cannot approve (R8), and an MP editor who is the only approver can approve only as a logged D10 self-approval override. An edit that is not recorded would let its author approve their own change, so a missing call is a segregation-of-duties defect.
 
 Note: `ledger.JournalEntry` today has no `source` field and no `pending_approval`/`approved` status; adding them is part of plugging the ledger in (see OQ3).
 
@@ -370,6 +372,10 @@ Backend build on branch `module/approvals` (16 Oct 2026). Where the spec and D1�
     - **Lockout (E):** attempts refused while locked are logged as `access.sign_in_locked` and do not extend the lock. `manage.py unlock_user` and an admin action (needs user-management rights over that user) write `access.unlock`. Unlock clears the per-username count only; the per-IP count expires with its window.
     - **Line accounts (F):** admin line account choices are limited to the entry's entity, and the formset refuses lines from another entity.
     - Deployment items are in `docs/deployment-checklist.md`.
-22. **Retention (D18):** there is no purge or anonymisation code. Accounting records, approval records, notifications and audit logs are kept forever. **PDPL storage-limitation review is pending legal sign-off;** nothing is anonymised until then.
+22. **Follow-ups, 17 Oct 2026 (branch `fix/approvals-followups`):**
+    - **D19:** `access.services.can_manage_user` is the single check used by deactivate, unlock, TOTP enrolment, token issue/revoke, grant/revoke of roles, and the admin user form, password change and unlock action. For a target holding `managing_partner` in any entity (any non-revoked grant), the actor must hold an active `chairman` grant in every entity where the target is MP. Other MPs and `access.user.manage` holders cannot act, and nobody acts on themselves. Setup mode (`ERP_ADMIN_SETUP_MODE` superuser) is excepted through the admin; operator commands with no acting user (`grant_access`, `unlock_user`, `setup_totp`, `issue_service_token`) also bypass it, as server-side bootstrap. Editing a role held by any MP (including `managing_partner` itself) needs the Chairman role in addition to the normal role-edit right, or setup mode. Successful actions are audited as before. Refused attempts raise `mp_protected` and are not written to the audit log, because the refusal rolls back. The API has no endpoint that changes another user (only `/me`, limited to language and default entity).
+    - **System user (2a):** the reserved `system` user cannot be renamed, changed, given a password, roles, tokens or TOTP, unlocked or deactivated, even in setup mode. No other account can take the name.
+    - **Append-only editors (2b):** `ledger.JournalEntryEditor` and the new `approvals.RequestEditor` (explicit through table of `document_editors`, mapped onto the existing table by a state-only migration) refuse update and delete. Editor rows of a deleted draft go with it by database cascade.
+23. **Retention (D18):** there is no purge or anonymisation code. Accounting records, approval records, notifications and audit logs are kept forever. **PDPL storage-limitation review is pending legal sign-off;** nothing is anonymised until then.
 
 Left for later: Keycloak adapter; React web UI (§4.2, T19 front-end part); PostgreSQL triggers, exclusion constraint and DB role grants; mobile push sending; audit retention (OQ18); audit for admin role edits.
