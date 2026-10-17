@@ -1015,7 +1015,7 @@ def test_r33_fx_accounts_are_ordinary_and_template_accounts_are_bilingual(w):
         assert acc.name_en and acc.name_ar and not acc.sharia_prohibited and not acc.requires_purification
     assert not Account.objects.get(entity=w.alm, code="3400").is_postable  # report / consolidation use only
     monetary = set(Account.objects.filter(entity=w.alm, is_monetary=True).values_list("code", flat=True))
-    assert monetary == {"1100", "1110", "1200", "1210", "1220", "1300", "1310", "2100", "2110", "2200", "2210",
+    assert monetary == {"1100", "1110", "1200", "1210", "1220", "1300", "1310", "2100", "2110", "2200", "2210", "2220",
                         "2300", "2400", "2500", "2600"}
 
 

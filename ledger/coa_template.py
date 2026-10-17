@@ -34,6 +34,8 @@ TEMPLATE = [
     ("2110", "Due to group entities", "مستحق لشركات المجموعة", L, {"intercompany": True, "monetary": True}),
     ("2200", "VAT output", "ضريبة القيمة المضافة - مخرجات", L, {"monetary": True}),
     ("2210", "Zakat payable", "الزكاة المستحقة", L, {"monetary": True}),
+    # PROPOSED (invoicing.md §5, D14, D18, D29): accountant / CFO to review; WHT on payments to non-residents (E20 to E22).
+    ("2220", "Withholding tax payable", "ضريبة الاستقطاع المستحقة", L, {"monetary": True}),
     ("2300", "Accrued expenses", "مصروفات مستحقة", L, {"monetary": True}),
     ("2400", "Islamic financing (murabaha, tawarruq)", "تمويل إسلامي", L, {"monetary": True}),
     ("2410", "Conventional interest-bearing loans", "قروض تقليدية بفائدة", L, {"prohibited": True}),
@@ -81,4 +83,6 @@ TEMPLATE = [
     ("5770", "Currency rounding differences", "فروقات تقريب العملات", X, {}),  # PROPOSED (OQ-6); may carry credits
     ("5800", "Zakat", "الزكاة", X, {}),
     ("5900", "General and administrative", "مصروفات عمومية وإدارية", X, {}),
+    # PROPOSED (invoicing.md §5, E21, D18, D29): WHT the entity bears when it grosses up a payment (R63).
+    ("5920", "Withholding tax borne (gross-up)", "ضريبة استقطاع محملة على الشركة", X, {}),
 ]

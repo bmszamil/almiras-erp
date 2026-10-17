@@ -40,6 +40,16 @@ Optional segregation exception (access R46, A16):
   ``CREATOR_MAY_POST_TYPES``; every other type keeps creator != poster (R35).
   The poster still needs a posting grant issued for that document.
 
+Optional contract-approval hook (billing.md R53; invoicing R60):
+
+- ``contract_approval(document)`` returns a :class:`RecordedApproval` (or None) for a stored document that was
+  issued without a per-document approval because a person approved the contract terms it was generated from
+  (an invoice auto-issued from billing). Posting on clearance then accepts that person as ``posted_by`` only
+  if the access log holds their granted approval (``permission``) of that very record (``target``), given no
+  later than the recorded approval time. Accepted only for the types in ``CONTRACT_APPROVAL_TYPES`` and the
+  permissions in ``CONTRACT_APPROVAL_PERMISSIONS``. Nobody approves the document in that person's name: the
+  hook only names the approval that already exists.
+
 Optional period hook:
 
 - ``pending_documents(entity, start_date, end_date)`` returns descriptions of
@@ -67,6 +77,17 @@ class DocumentRegistryError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class RecordedApproval:
+    """The approval of the terms a document was generated from (billing R53): ``approver_id`` was granted
+    ``permission`` for ``target`` (a stored record, e.g. the billed contract version) at or before ``approved_at``."""
+
+    permission: str
+    target: object
+    approver_id: int
+    approved_at: object
+
+
+@dataclass(frozen=True)
 class DocumentType:
     """One registered document model and what may post or reverse its entries."""
 
@@ -84,6 +105,8 @@ class DocumentType:
     pending_documents: Callable | None = None
     # access R46: True for a stored document its creator / submitter / modifier may post (receipts only).
     creator_may_post: Callable | None = None
+    # billing R53: the contract approval recorded for a document auto-issued from approved terms.
+    contract_approval: Callable | None = None
 
     def entity_id_of(self, document):
         return getattr(document, f"{self.entity_field}_id")
@@ -107,6 +130,9 @@ REVERSING_PERMISSIONS = catalogue.REVERSE_PERMISSIONS - {"ledger.reverse_entry"}
 # access R46 / A16: the only document types whose creator may post them (customer receipts; the kind is
 # decided by the type's own creator_may_post hook). Refunds, bills, payments and sales documents are not here.
 CREATOR_MAY_POST_TYPES = frozenset({"invoicing.customerreceipt"})
+# billing R53: the only type whose clearance posting may rely on a contract approval, and the approvals that count.
+CONTRACT_APPROVAL_TYPES = frozenset({"invoicing.salesdocument"})
+CONTRACT_APPROVAL_PERMISSIONS = frozenset({"billing.approve_contract", "billing.approve_version"})
 
 
 def _frozen():
@@ -129,7 +155,7 @@ def _check_caller(model, module_name):
 
 def register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
              creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None,
-             creator_may_post=None):
+             creator_may_post=None, contract_approval=None):
     """Register ``model`` as a document type that books journal entries. Idempotent for the same arguments.
 
     Call it from the ``AppConfig.ready()`` of the app that defines ``model``.
@@ -143,6 +169,7 @@ def register(model, *, post_permissions, reverse_permissions=(), entity_field="e
         model, post_permissions=post_permissions, reverse_permissions=reverse_permissions, entity_field=entity_field,
         changed_at_field=changed_at_field, creator_field=creator_field, build_lines=build_lines,
         validate_lines=validate_lines, pending_documents=pending_documents, creator_may_post=creator_may_post,
+        contract_approval=contract_approval,
     )
 
 
@@ -155,7 +182,7 @@ def _field(model, name, label):
 
 def _register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
               creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None,
-              creator_may_post=None):
+              creator_may_post=None, contract_approval=None):
     """Validate and store one registration (no caller or freeze check; tests use it through the helpers below)."""
     if not (isinstance(model, type) and issubclass(model, models.Model)) or model._meta.abstract:
         raise DocumentRegistryError(f"{model!r} is not a concrete Django model.")
@@ -180,7 +207,8 @@ def _register(model, *, post_permissions, reverse_permissions=(), entity_field="
     if changed_at_field is not None:
         _field(model, changed_at_field, label)
     for name, hook in (("build_lines", build_lines), ("validate_lines", validate_lines),
-                       ("pending_documents", pending_documents), ("creator_may_post", creator_may_post)):
+                       ("pending_documents", pending_documents), ("creator_may_post", creator_may_post),
+                       ("contract_approval", contract_approval)):
         if hook is not None and not callable(hook):
             raise DocumentRegistryError(f"{label}: {name} must be callable.")
     if build_lines is None and validate_lines is None:
@@ -189,8 +217,11 @@ def _register(model, *, post_permissions, reverse_permissions=(), entity_field="
     if creator_may_post is not None and label not in CREATOR_MAY_POST_TYPES:
         # access R46: the exception is for customer receipts only; every other type keeps creator != poster (R35).
         raise DocumentRegistryError(f"{label}: creator_may_post is allowed only for {sorted(CREATOR_MAY_POST_TYPES)}.")
+    if contract_approval is not None and label not in CONTRACT_APPROVAL_TYPES:
+        # billing R53: only invoices auto-issued from an approved contract post on a contract approval.
+        raise DocumentRegistryError(f"{label}: contract_approval is allowed only for {sorted(CONTRACT_APPROVAL_TYPES)}.")
     doc_type = DocumentType(label, model, post, reverse, entity_field, changed_at_field, creator_field, build_lines,
-                            validate_lines, pending_documents, creator_may_post)
+                            validate_lines, pending_documents, creator_may_post, contract_approval)
     existing = _REGISTRY.get(label)
     if existing is not None and existing != doc_type:
         raise DocumentRegistryError(f"{label} is already registered with other settings.")

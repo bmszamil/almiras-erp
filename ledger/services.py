@@ -406,7 +406,9 @@ def _authorise_document_post(entity, grant, posted_by, document, created_by):
     if _document_booked(entity, stored):
         raise _document_booked_error((doc_type.label, stored.pk))
     if grant.permission == CLEARANCE_PERMISSION:
-        return _clearance_approver(entity, user, grant, posted_by, stored, doc_type, created_by), stored
+        approver, basis = _clearance_approver(entity, user, grant, posted_by, stored, doc_type, created_by)
+        _approval_basis.set(basis)
+        return approver, stored
     if posted_by is not None and posted_by != user:
         raise error("posted_by is set from the grant; only posting on clearance records another approver.",
                     "يُحدَّد المرحِّل من التفويض؛ الترحيل عند الاعتماد من الهيئة وحده يسجل معتمدًا آخر.")
@@ -442,16 +444,43 @@ def _clearance_approver(entity, user, grant, posted_by, document, doc_type, crea
     approvals = access_services.recorded_approvers(
         entity, APPROVE_SALES_PERMISSION, document, used=True, since=doc_type.changed_at_of(document),
     )
-    approver_ok = (
+    person_ok = (
         getattr(posted_by, "pk", None) is not None
         and kind_of(posted_by) == Kind.HUMAN
         and posted_by.pk != getattr(created_by, "pk", None)
         and posted_by.pk not in access_services._document_people(document)
-        and posted_by.pk in approvals
     )
-    if not approver_ok:
+    if person_ok and posted_by.pk in approvals:
+        return posted_by, {"permission": APPROVE_SALES_PERMISSION, "document": list(_ref(document))}
+    contract = _contract_approval(entity, posted_by, document, doc_type) if person_ok else None
+    if contract is None:
         access.deny(user, entity, grant.permission, "posted_by_not_approver")
-    return posted_by
+    return posted_by, contract
+
+
+def _ref(obj):
+    return (obj._meta.label_lower, obj.pk)
+
+
+def _contract_approval(entity, posted_by, document, doc_type):
+    """billing R53: an invoice auto-issued from billing has no per-document approval; the approval that counts
+    is ``posted_by``'s granted approval of the billed contract version, named by the type's registered
+    ``contract_approval`` hook and found in the access log for that very record, no later than the recorded
+    approval time. Returns the basis for the access log, or None."""
+    if doc_type.contract_approval is None or doc_type.label not in documents.CONTRACT_APPROVAL_TYPES:
+        return None
+    ref = doc_type.contract_approval(document)
+    if not isinstance(ref, documents.RecordedApproval) or ref.permission not in documents.CONTRACT_APPROVAL_PERMISSIONS:
+        return None
+    target = ref.target
+    if getattr(target, "pk", None) is None or getattr(target, "entity_id", None) != entity.pk:
+        return None
+    if ref.approver_id != posted_by.pk or ref.approved_at is None:
+        return None
+    approvers = access_services.recorded_approvers(entity, ref.permission, target, until=ref.approved_at)
+    if posted_by.pk not in approvers:
+        return None
+    return {"permission": ref.permission, "document": list(_ref(target))}
 
 
 def _purification_flags(entry, lines):
@@ -728,10 +757,14 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
             access_log(
                 AccessLog.Event.PERMISSION_GRANTED, actor=grant.user, entity=entity, permission=CLEARANCE_PERMISSION,
                 details={"action": "post_on_clearance", "posted_document": list(ref), "entry": entry.pk,
-                         "posted_by": posted_by.pk},
+                         "posted_by": posted_by.pk, "approval": _approval_basis.get()},
             )
         return entry
 
+
+# The approval a clearance posting relied on (the document's own approval, or the contract approval of billing
+# R53), recorded in its access-log row.
+_approval_basis = ContextVar("ledger_approval_basis", default=None)
 
 # (entity id, document label, pk) while a registered type's build_lines runs inside create_entry(post=True):
 # the only place _settlement_for_document may be called (verification review item 5).

@@ -605,12 +605,14 @@ def use_grant(grant, *, target=None):
         _deny(grant.user, grant.entity, grant.permission, "grant_used")
 
 
-def recorded_approvers(entity, permission, document, *, used=False, since=None):
+def recorded_approvers(entity, permission, document, *, used=False, since=None, until=None):
     """Users recorded in the access log as having been granted ``permission`` for ``document`` in ``entity``.
 
     With ``used`` only grants that were actually used (a GrantUse row) count;
     with ``since`` only grants issued at or after that moment (e.g. the
-    document's last change, so a stale approval does not count).
+    document's last change, so a stale approval does not count); with ``until``
+    only grants issued at or before that moment (e.g. the recorded approval time,
+    billing R53).
     """
     expected = list(_document_ref(document) or ())
     if not expected:
@@ -620,6 +622,8 @@ def recorded_approvers(entity, permission, document, *, used=False, since=None):
         rows = rows.filter(grant_use__isnull=False)
     if since is not None:
         rows = rows.filter(at__gte=since)
+    if until is not None:
+        rows = rows.filter(at__lte=until)
     return {r.actor_id for r in rows.only("actor_id", "details") if (r.details or {}).get("document") == expected}
 
 
