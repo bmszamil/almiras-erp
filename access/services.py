@@ -279,6 +279,33 @@ def _can_manage_users(actor):
     return entities_with_perm(actor, "access.user.manage").exists()
 
 
+def can_manage_user(actor, target):
+    """Review B: privilege, active-status, password, token and unlock changes to `target` need
+    access.user.manage in EVERY entity where the target holds a grant. Nobody manages themselves.
+    Superusers are managed only in admin setup mode (checked by the admin)."""
+    if actor is None or not actor.is_active or not actor.is_human or actor.pk == target.pk:
+        return False
+    if target.is_superuser:
+        return False
+    managed = set(entities_with_perm(actor, "access.user.manage").values_list("pk", flat=True))
+    if not managed:
+        return False
+    target_entities = set(
+        EntityAccess.objects.filter(user=target, revoked_at__isnull=True).values_list("entity_id", flat=True)
+    )
+    return target_entities <= managed
+
+
+def require_manage_user(actor, target):
+    if not can_manage_user(actor, target):
+        raise AccessDenied(
+            "cannot_manage_user",
+            "You cannot change this user: you need user-management rights in every entity they belong to, "
+            "and you cannot change your own privileges.",
+            "لا يمكنك تعديل هذا المستخدم: تحتاج صلاحية إدارة المستخدمين في كل منشآته، ولا يمكنك تعديل صلاحياتك.",
+        )
+
+
 @transaction.atomic
 def create_user(actor, *, username, full_name_en, full_name_ar, email="", language="en",
                 user_type=User.UserType.HUMAN, agent_name="", password=None, ctx=None):
@@ -301,8 +328,7 @@ def create_user(actor, *, username, full_name_en, full_name_ar, email="", langua
 @transaction.atomic
 def deactivate_user(actor, user, ctx=None):
     """R3: users are deactivated, never deleted."""
-    if not _can_manage_users(actor):
-        raise AccessDenied("permission_denied", "You cannot manage users.", "لا يمكنك إدارة المستخدمين.")
+    require_manage_user(actor, user)
     before = snapshot(user, ["is_active"])
     user.is_active = False
     user.save(update_fields=["is_active"])
@@ -344,8 +370,8 @@ def issue_service_token(actor, user, *, expires_at, label="", ctx=None):
 
     from .models import ServiceToken
 
-    if actor is not None and not _can_manage_users(actor):
-        raise AccessDenied("permission_denied", "You cannot manage users.", "لا يمكنك إدارة المستخدمين.")
+    if actor is not None:
+        require_manage_user(actor, user)
     if user.is_human:
         raise RuleError("token_for_human", "Tokens are for service users only.", "الرموز لمستخدمي الخدمة فقط.")
     if not user.is_active:
@@ -362,8 +388,8 @@ def issue_service_token(actor, user, *, expires_at, label="", ctx=None):
 
 @transaction.atomic
 def revoke_service_token(actor, token, ctx=None):
-    if actor is not None and actor.pk != token.user_id and not _can_manage_users(actor):
-        raise AccessDenied("permission_denied", "You cannot manage users.", "لا يمكنك إدارة المستخدمين.")
+    if actor is not None and actor.pk != token.user_id:
+        require_manage_user(actor, token.user)
     if token.revoked_at is None:
         token.revoked_at = timezone.now()
         token.save(update_fields=["revoked_at"])
@@ -377,8 +403,8 @@ def enroll_totp(actor, user, name="Authenticator app", ctx=None):
     """Create a confirmed TOTP device (D14). Replaces a device of the same name. Returns the device."""
     from django_otp.plugins.otp_totp.models import TOTPDevice
 
-    if actor is not None and actor.pk != user.pk and not _can_manage_users(actor):
-        raise AccessDenied("permission_denied", "You cannot manage users.", "لا يمكنك إدارة المستخدمين.")
+    if actor is not None and actor.pk != user.pk:
+        require_manage_user(actor, user)
     if not user.is_human or not user.is_active:
         raise RuleError("totp_for_human", "Authenticator apps are for active human users.",
                         "تطبيقات المصادقة للمستخدمين البشريين النشطين فقط.")
@@ -430,3 +456,15 @@ def access_review_report(viewer, on=None, ctx=None):
     audit(viewer, "access.review_report", viewer, object_type="access.review", object_id=on.isoformat(),
           after={"as_of": on, "rows": len(rows), "entities": sorted(e.code for e in entities)}, ctx=ctx)
     return rows
+
+
+# ---------------------------------------------------------------- sign-in lockout reset (review E)
+
+
+@transaction.atomic
+def unlock_user(actor, user, ctx=None):
+    """Clear a sign-in lockout for `user` (failures before this point stop counting). Audited.
+    actor=None is the `unlock_user` management command (server operator)."""
+    if actor is not None:
+        require_manage_user(actor, user)
+    return audit(actor or system_user(), "access.unlock", user, after={"username": user.username}, ctx=ctx)

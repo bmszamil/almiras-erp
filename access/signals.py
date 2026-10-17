@@ -13,9 +13,14 @@ def on_sign_in(sender, request, user, **kwargs):
 
 
 def on_sign_in_failed(sender, credentials, request=None, **kwargs):
+    from .throttle import is_locked_out
+
     username = (credentials or {}).get("username", "") or ""
     target = User.objects.filter(username=username).first()
-    audit(system_user(), "access.sign_in_failed", None, ctx=_ctx(request), object_type="access.user",
+    ctx = _ctx(request)
+    # Review E: attempts refused while locked are recorded but do not extend the lockout.
+    action = "access.sign_in_locked" if is_locked_out(username, ctx.ip) else "access.sign_in_failed"
+    audit(system_user(), action, None, ctx=ctx, object_type="access.user",
           object_id=str(target.pk) if target else "", after={"username": username[:150]})
 
 

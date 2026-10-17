@@ -2,7 +2,9 @@
 LOCKOUT_MINUTES (or IP_FAILURES from one address), password checks are refused until the window passes.
 
 Failures are counted from the append-only audit log (`access.sign_in_failed`), so the evidence and
-the lockout use the same records. TOTP tokens are additionally throttled per device by django-otp.
+the lockout use the same records. Attempts refused while locked are logged as `access.sign_in_locked`
+and do not count, so the lock ends LOCKOUT_MINUTES after the last real failure. A successful sign-in
+or `access.unlock` (command `unlock_user` / admin action) resets the per-username count. TOTP tokens are additionally throttled per device by django-otp.
 """
 import datetime
 
@@ -26,10 +28,13 @@ def is_locked_out(username, ip=""):
     per_user, per_ip, minutes = _limits()
     since = timezone.now() - datetime.timedelta(minutes=minutes)
     failed = AuditLog.objects.filter(action="access.sign_in_failed", at__gte=since)
-    last_ok = (
+    resets = [
         AuditLog.objects.filter(action="access.sign_in", at__gte=since, actor__username=username)
-        .order_by("-at").values_list("at", flat=True).first()
-    )
+        .order_by("-at").values_list("at", flat=True).first(),
+        AuditLog.objects.filter(action="access.unlock", at__gte=since, after__username=username)
+        .order_by("-at").values_list("at", flat=True).first(),
+    ]
+    last_ok = max([r for r in resets if r is not None], default=None)
     user_failures = failed.filter(after__username=username)
     if last_ok:
         user_failures = user_failures.filter(at__gt=last_ok)

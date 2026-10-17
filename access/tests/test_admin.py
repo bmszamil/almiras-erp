@@ -168,18 +168,37 @@ def test_period_admin_close_action_uses_service(alm, mp, make_user, admin_for):
 # ---------------------------------------------------------------- users and roles audited
 
 
+def _fake_form(obj):
+    return type("F", (), {"instance": obj, "save_m2m": lambda self: None})()
+
+
 def test_user_privilege_change_is_audited_and_superuser_readonly(alm, mp, make_user):
     target = make_user("target", (alm, "viewer"))
     ma = model_admin(User)
-    assert "is_superuser" in ma.get_readonly_fields(req(mp), target)
+    assert {"is_superuser", "user_type"} <= set(ma.get_readonly_fields(req(mp), target))
     request = req(mp)
     target.is_staff = True
-    target.user_type = "service_integration"
     ma.save_model(request, target, form=None, change=True)
-    ma.save_related(request, type("F", (), {"instance": target, "save_m2m": lambda self: None})(), [], True)
+    ma.save_related(request, _fake_form(target), [], True)
     row = AuditLog.objects.get(action="access.user.privilege_change", object_id=str(target.pk))
-    assert row.before["user_type"] == "human" and row.after["user_type"] == "service_integration"
-    assert row.after["is_staff"] is False  # service users never get admin access
+    assert row.before["is_staff"] is False and row.after["is_staff"] is True
+
+
+def test_user_type_change_only_in_setup_mode(alm, mp, make_user):
+    from django.core.exceptions import PermissionDenied
+
+    target = make_user("target", (alm, "viewer"))
+    ma = model_admin(User)
+    target.user_type = "service_integration"
+    with pytest.raises(PermissionDenied):
+        ma.save_model(req(mp), target, form=None, change=True)
+    assert User.objects.get(pk=target.pk).user_type == "human"
+    with override_settings(ERP_ADMIN_SETUP_MODE=True):
+        mp.is_superuser = True
+        mp.save()
+        ma.save_model(req(mp), target, form=None, change=True)
+    target.refresh_from_db()
+    assert target.user_type == "service_integration" and target.is_staff is False
 
 
 def test_role_permission_edit_is_audited(alm, mp, admin_for):
@@ -222,7 +241,7 @@ def test_policy_admin_checks_permission_and_audits(alm, sub, mp, make_user):
     p.entity = alm
     request = req(mp)
     ma.save_model(request, p, form=None, change=False)
-    ma.save_related(request, type("F", (), {"instance": p, "save_m2m": lambda self: None})(), [], False)
+    ma.save_related(request, _fake_form(p), [], False)
     assert AuditLog.objects.filter(action="policy.create", object_id=str(p.pk), actor=mp).exists()
     p.currency = "USD"
     with pytest.raises(PermissionDenied):

@@ -118,20 +118,24 @@ class JournalEntryQuerySet(models.QuerySet):
                        "requires_approval", "source", "created_by", "created_by_id", "reversal_of",
                        "reversal_of_id", "entity", "entity_id"}
 
-    def _only_drafts(self, what):
-        with transaction.atomic():
-            if self.exclude(status=JournalEntry.Status.DRAFT).exists():
-                raise LedgerError(f"Bulk {what} is allowed on draft entries only. / التعديل الجماعي للمسودات فقط.")
+    def _locked_drafts(self, what):
+        """Lock the targeted rows and return a queryset of exactly those rows if all are drafts.
+        Must run inside a transaction (review D: no check-then-act race)."""
+        ids = list(self.select_for_update().values_list("pk", flat=True))
+        drafts = JournalEntry.objects.filter(pk__in=ids, status=JournalEntry.Status.DRAFT)
+        if drafts.count() != len(ids):
+            raise LedgerError(f"Bulk {what} is allowed on draft entries only. / التعديل الجماعي للمسودات فقط.")
+        return drafts
 
     def update(self, **kwargs):
         if set(kwargs) & self.WORKFLOW_FIELDS:
             raise LedgerError("Status and workflow fields change only through ledger.services.")
-        self._only_drafts("update")
-        return super().update(**kwargs)
+        with transaction.atomic():
+            return models.QuerySet.update(self._locked_drafts("update"), **kwargs)
 
     def delete(self):
-        self._only_drafts("delete")
-        return super().delete()
+        with transaction.atomic():
+            return models.QuerySet.delete(self._locked_drafts("delete"))
 
     def bulk_create(self, objs, *args, **kwargs):
         objs = list(objs)
@@ -141,20 +145,29 @@ class JournalEntryQuerySet(models.QuerySet):
 
 
 class JournalLineQuerySet(models.QuerySet):
-    def _only_draft_entries(self, what):
-        with transaction.atomic():
-            if self.exclude(entry__status=JournalEntry.Status.DRAFT).exists():
-                raise LedgerError(f"Bulk {what} of lines is allowed on draft entries only.")
+    def _locked_draft_lines(self, what):
+        """Lock the parent entries, then act only on lines of entries that are still drafts (review D)."""
+        rows = list(self.values_list("pk", "entry_id"))
+        line_ids = [r[0] for r in rows]
+        entry_ids = {r[1] for r in rows}
+        locked = list(JournalEntry.objects.select_for_update()
+                      .filter(pk__in=entry_ids, status=JournalEntry.Status.DRAFT).values_list("pk", flat=True))
+        if len(locked) != len(entry_ids):
+            raise LedgerError(f"Bulk {what} of lines is allowed on draft entries only.")
+        lines = JournalLine.objects.filter(pk__in=line_ids, entry__status=JournalEntry.Status.DRAFT)
+        if lines.count() != len(line_ids):
+            raise LedgerError(f"Bulk {what} of lines is allowed on draft entries only.")
+        return lines
 
     def update(self, **kwargs):
         if "entry" in kwargs or "entry_id" in kwargs:
             raise LedgerError("Lines cannot be moved to another entry.")
-        self._only_draft_entries("update")
-        return super().update(**kwargs)
+        with transaction.atomic():
+            return models.QuerySet.update(self._locked_draft_lines("update"), **kwargs)
 
     def delete(self):
-        self._only_draft_entries("delete")
-        return super().delete()
+        with transaction.atomic():
+            return models.QuerySet.delete(self._locked_draft_lines("delete"))
 
     def bulk_create(self, objs, *args, **kwargs):
         objs = list(objs)
@@ -311,6 +324,25 @@ class JournalLine(models.Model):
 
     def __str__(self):
         return f"{self.account.code} Dr {self.debit} Cr {self.credit}"
+
+
+class JournalEntryEditor(models.Model):
+    """Every user who created or edited a draft entry (review A). Editors count as creators for
+    segregation of duties (R8) and D10. Rows are never changed; they go only with a deleted draft."""
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
+    entry = models.ForeignKey(JournalEntry, on_delete=models.CASCADE, related_name="editors")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
+    action = models.CharField(max_length=10, choices=[("create", "Create"), ("edit", "Edit")])
+    at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["entry", "at", "id"]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise LedgerError("Editor records cannot be changed.")
+        super().save(*args, **kwargs)
 
 
 class EntrySequence(models.Model):

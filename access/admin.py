@@ -1,6 +1,7 @@
 from django.contrib import admin, messages
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.models import Group
+from django.core.exceptions import PermissionDenied
 from django.db.models import Q
 
 from . import services as access
@@ -59,23 +60,44 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
             return qs.none()
         return qs.filter(Q(entity_access__entity__in=managed) | Q(entity_access__isnull=True)).distinct()
 
+    actions = ["unlock_selected"]
+
+    def _may_manage(self, request, obj):
+        return setup_mode(request) and obj.pk != request.user.pk or access.can_manage_user(request.user, obj)
+
     def get_readonly_fields(self, request, obj=None):
         ro = ["last_login", "date_joined"]
-        if not setup_mode(request):
-            ro.append("is_superuser")  # superuser is a setup-only flag
-        return ro
+        if obj is None:
+            return ro + ([] if setup_mode(request) else ["is_superuser"])
+        if not setup_mode(request) or obj.pk == request.user.pk:
+            ro += ["is_superuser", "user_type", "agent_name"]  # user_type changes are setup-only (review B)
+        if not self._may_manage(request, obj):
+            ro += ["is_staff", "is_active"]  # own privileges, or a user outside the editor's entities
+        return sorted(set(ro))
 
     def has_add_permission(self, request, *args):
         return setup_mode(request) or _manages_users(request)
 
     def has_change_permission(self, request, obj=None):
-        if setup_mode(request):
-            return True
-        if not _manages_users(request):
-            return False
-        return obj is None or self.visible(request, obj)
+        if obj is None:
+            return setup_mode(request) or _manages_users(request)
+        if obj.pk == request.user.pk:
+            return True  # own profile (name, email, language); privileges stay read-only
+        return self._may_manage(request, obj)
 
     def save_model(self, request, obj, form, change):
+        if change:
+            stored = User.objects.get(pk=obj.pk)
+            changed = {f for f in PRIVILEGE_FIELDS if getattr(stored, f) != getattr(obj, f)}
+            if changed:
+                if obj.pk == request.user.pk:
+                    raise PermissionDenied("You cannot change your own privileges.")
+                if not setup_mode(request) and changed & {"user_type", "agent_name", "is_superuser"}:
+                    raise PermissionDenied("User type and superuser status change only in setup mode.")
+                if not self._may_manage(request, obj):
+                    raise PermissionDenied("You need user-management rights in every entity of this user.")
+            elif obj.pk != request.user.pk and not self._may_manage(request, obj):
+                raise PermissionDenied("You cannot change this user.")
         if not obj.is_human:
             obj.is_staff = obj.is_superuser = False  # service users never use the admin
             obj.set_unusable_password()
@@ -88,11 +110,22 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
         return "access.user.privilege_change" if changed else "access.user.update"
 
     def user_change_password(self, request, id, form_url=""):
+        target = User.objects.filter(pk=id).first()
+        if target is not None and target.pk != request.user.pk and not self._may_manage(request, target):
+            raise PermissionDenied("You cannot change this user's password.")
         response = super().user_change_password(request, id, form_url)
         if request.method == "POST" and getattr(response, "status_code", 200) == 302:
-            target = User.objects.get(pk=id)
             access.audit(request.user, "access.user.password_change", target, ctx=admin_ctx(request))
         return response
+
+    @admin.action(description="Clear sign-in lockout / إلغاء قفل تسجيل الدخول")
+    def unlock_selected(self, request, queryset):
+        for user in queryset:
+            try:
+                access.unlock_user(request.user, user, ctx=admin_ctx(request))
+                self.message_user(request, f"Unlocked {user.username}.")
+            except Exception as exc:
+                self.message_user(request, f"{user.username}: {exc}", messages.ERROR)
 
 
 @admin.register(Role)

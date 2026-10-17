@@ -115,9 +115,29 @@ def test_create_entry_without_user_requires_approval_too(alm):
     assert draft(alm).requires_approval is True
 
 
-def test_system_flag_skips_approval_for_module_services(alm, mp):
-    e = posted(alm, mp)
-    assert e.requires_approval is False and e.status == S.POSTED
+def test_system_flag_skips_approval_for_module_services(alm):
+    from access.services import system_user
+
+    for user in (None, system_user()):
+        e = posted(alm, user)
+        assert e.requires_approval is False and e.status == S.POSTED
+
+
+@pytest.mark.parametrize("role", ["managing_partner", "accountant"])
+def test_review_c_system_flag_refused_for_human_users(alm, make_user, role):
+    u = make_user(f"h-{role}", (alm, role))
+    with pytest.raises(LedgerError, match="module services"):
+        services.create_entry(alm, date(2027, 1, 10), "x", LINES, user=u, system=True)
+    with pytest.raises(LedgerError, match="module services"):
+        services.reverse_entry(posted(alm), user=u, reason="x", system=True)
+    assert not JournalEntry.objects.filter(requires_approval=False, created_by=u).exists()
+
+
+def test_review_c_system_username_is_reserved():
+    from access.models import User
+
+    u = User.objects.get(username="system")
+    assert u.user_type == "service_integration" and not u.has_usable_password()
 
 
 # ---------------------------------------------------------------- 8. D17 integrations

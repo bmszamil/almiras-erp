@@ -18,6 +18,16 @@ def _is_service_user(user):
     return getattr(user, "user_type", "human") in ("service_agent", "service_integration")
 
 
+def _is_system_context(user):
+    """Review C: system entries come from module code with no user, or the ERP system user only;
+    never from a human (who would bypass approval) and never from an AI agent or integration (D17)."""
+    if user is None:
+        return True
+    from access.services import SYSTEM_USERNAME
+
+    return user.username == SYSTEM_USERNAME and getattr(user, "user_type", "") == "service_integration"
+
+
 def _audit(user, action, entry, before=None, extra=None):
     """R19 / D7: audit ledger actions. Calls without a user are recorded as the system user."""
     from access.services import audit, system_user
@@ -33,6 +43,15 @@ def _has_perm(user, entity, perm):
     from access.services import has_perm
 
     return has_perm(user, entity, perm)
+
+
+def record_editor(entry, user, action="edit"):
+    """Remember who created/edited a draft; they cannot approve it (R8, review A)."""
+    from .models import JournalEntryEditor
+
+    if user is None or not getattr(user, "pk", None):
+        return
+    JournalEntryEditor.objects.create(entity_id=entry.entity_id, entry=entry, user=user, action=action)
 
 
 def _find_open_period(entity, date):
@@ -83,7 +102,7 @@ def validate_entry(entry):
 @transaction.atomic
 def post_entry(entry, user=None):
     """Post an entry. Entries that require approval must be approved first (approvals engine, D11)."""
-    if _is_service_user(user):
+    if _is_service_user(user) and not _is_system_context(user):
         raise LedgerError("Service users cannot post entries. / لا يمكن لمستخدمي الخدمة ترحيل القيود.")
     entry = JournalEntry.objects.select_for_update().get(pk=entry.pk)
     if entry.requires_approval:
@@ -118,7 +137,9 @@ def reverse_entry(entry, date=None, user=None, reason="", system=False):
     reason = (reason or "").strip()
     if not reason:
         raise LedgerError("A reason is required to reverse an entry. / سبب العكس مطلوب.")
-    if _is_service_user(user):
+    if system and not _is_system_context(user):
+        raise LedgerError("system=True is for module services only (no user). / للعكس الآلي من خدمات الوحدات فقط.")
+    if _is_service_user(user) and not _is_system_context(user):
         raise LedgerError("Service users cannot reverse entries. / لا يمكن لمستخدمي الخدمة عكس القيود.")
     entry = JournalEntry.objects.select_for_update().get(pk=entry.pk)
     if not system:
@@ -170,8 +191,9 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
     approved bill). Such entries skip approval and may be posted here with post=True. Service users
     (AI agents, integrations) can never create system entries (D17).
     """
-    if system and _is_service_user(user):
-        raise LedgerError("Service users create drafts only. / مستخدمو الخدمة ينشئون مسودات فقط.")
+    if system and not _is_system_context(user):
+        raise LedgerError("Only module services (no user, or the ERP system user) may create system entries. "
+                          "/ قيود النظام لخدمات الوحدات فقط.")
     if post and not system:
         raise LedgerError("Manual entries are posted by approval, not directly. / تُرحّل القيود اليدوية بالاعتماد.")
     if source is None:
@@ -195,6 +217,8 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
             description=spec.get("description", ""),
             counterparty_entity=counterparty,
         )
+    if user is not None:
+        record_editor(entry, user, "create")
     _audit(user, "entry.create", entry)
     if post:
         entry = post_entry(entry, user=user)

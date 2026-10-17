@@ -33,6 +33,11 @@ class ApprovalAdapter:
     def created_by(self, doc):
         return doc.created_by
 
+    def editor_ids(self, doc):
+        """Users who edited the document while it was a draft (review A). Default: the creator only."""
+        creator = self.created_by(doc)
+        return {creator.pk} if creator is not None else set()
+
     def source(self, doc):
         return getattr(doc, "source", "human") or "human"
 

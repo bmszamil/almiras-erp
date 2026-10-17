@@ -7,6 +7,8 @@
 - Periods: add with ledger.period.manage; close through the service; reopening is not offered (default deny).
 """
 from django.contrib import admin, messages
+from django.core.exceptions import ValidationError
+from django.forms.models import BaseInlineFormSet
 from django.template.response import TemplateResponse
 
 from access import services as access
@@ -76,18 +78,42 @@ class FiscalPeriodAdmin(ScopedAdmin):
 
 
 def _entry_editable(request, entry):
-    """Manual drafts only, by someone who may create entries in that entity."""
+    """Manual drafts only, only by their creator (review A), who still needs ledger.entry.create there."""
     return (
         entry.status == S.DRAFT
         and entry.requires_approval
+        and entry.created_by_id == request.user.pk
         and access.has_perm(request.user, entry.entity, "ledger.entry.create")
     )
 
 
+class JournalLineFormSet(BaseInlineFormSet):
+    """Lines must use accounts of the entry's own entity (review F)."""
+
+    def clean(self):
+        super().clean()
+        entity_id = self.instance.entity_id
+        for form in self.forms:
+            if not hasattr(form, "cleaned_data") or form.cleaned_data.get("DELETE"):
+                continue
+            account = form.cleaned_data.get("account")
+            if account is not None and account.entity_id != entity_id:
+                raise ValidationError("Every line must use an account of the entry's entity. / "
+                                      "يجب أن تكون حسابات البنود من منشأة القيد.")
+
+
 class JournalLineInline(admin.TabularInline):
     model = JournalLine
+    formset = JournalLineFormSet
     extra = 2
     fields = ["account", "description", "debit", "credit", "counterparty_entity"]
+
+    def get_formset(self, request, obj=None, **kwargs):
+        formset = super().get_formset(request, obj, **kwargs)
+        if obj is not None and "account" in formset.form.base_fields:
+            field = formset.form.base_fields["account"]
+            field.queryset = field.queryset.filter(entity_id=obj.entity_id)
+        return formset
 
     def _can_edit(self, request, obj):
         if obj is None:
@@ -152,6 +178,10 @@ class JournalEntryAdmin(ScopedAdmin):
         elif not _entry_editable(request, obj):
             raise PermissionError("Entry is not editable.")
         super().save_model(request, obj, form, change)
+
+    def save_related(self, request, form, formsets, change):
+        super().save_related(request, form, formsets, change)
+        services.record_editor(form.instance, request.user, "edit" if change else "create")
 
     def audit_extra(self, obj):
         if obj is None or obj.pk is None:

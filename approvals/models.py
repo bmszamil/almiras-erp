@@ -203,6 +203,10 @@ class ApprovalRequest(models.Model):
     step_started_at = models.DateTimeField(default=timezone.now)
     submitted_by = models.ForeignKey(USER, on_delete=models.PROTECT, related_name="+")
     document_created_by = models.ForeignKey(USER, on_delete=models.PROTECT, related_name="+")
+    document_editors = models.ManyToManyField(
+        USER, blank=True, related_name="+",
+        help_text="Everyone who edited the draft before submission; treated like the creator under R8/D10",
+    )
     source = models.CharField(max_length=60, default="human")
     submitted_at = models.DateTimeField(default=timezone.now)
     decided_at = models.DateTimeField(null=True, blank=True)

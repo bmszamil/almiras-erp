@@ -186,9 +186,20 @@ def _step_done(request, step):
     return request.actions.filter(action=A.APPROVE, step=step).count() >= step.min_approvals
 
 
+def _involved(request):
+    """Creator, submitter and every editor of the draft (review A). Cached per request object."""
+    ids = getattr(request, "_involved_ids", None)
+    if ids is None:
+        ids = {request.document_created_by_id, request.submitted_by_id}
+        if request.pk:
+            ids |= set(request.document_editors.values_list("pk", flat=True))
+        request._involved_ids = ids
+    return ids
+
+
 def _sod_blocked(request, user_id):
-    """R8: creator and submitter never approve (D10 override handled separately)."""
-    return user_id in {request.document_created_by_id, request.submitted_by_id}
+    """R8: creator, submitter and editors never approve (D10 override handled separately)."""
+    return user_id in _involved(request)
 
 
 def _eligible_others(request, step, exclude_id):
@@ -200,10 +211,9 @@ def _eligible_others(request, step, exclude_id):
 
 
 def _mp_sole_approver(request, step, principal):
-    """The D10 situation: the MP created and submitted the document and nobody else is eligible."""
+    """The D10 situation: the MP created, submitted or edited the document and nobody else is eligible."""
     return (
-        principal.pk == request.document_created_by_id
-        and principal.pk == request.submitted_by_id
+        principal.pk in _involved(request)
         and principal.is_human
         and has_role(principal, request.entity, MP_ROLE)
         and principal.pk in step_candidates(request, step)
@@ -458,10 +468,14 @@ def submit_by_code(code, object_id, user, ctx=None):
     except IntegrityError:
         raise Conflict("already_pending", "This document already has a pending approval request.",
                        "يوجد طلب موافقة معلق لهذا المستند.")
+    editors = set(adapter.editor_ids(doc)) | {creator.pk}
+    request.document_editors.set(User.objects.filter(pk__in=editors))
+    request._involved_ids = None
     ApprovalAction.objects.create(request=request, actor=user, action=A.SUBMIT, at=at, channel=_channel(ctx))
     adapter.on_submitted(doc, request)
     audit(user, "approval.submit", request, entity=entity, before={"document": before_doc},
-          after={"request": snapshot(request), "document": adapter.snapshot(doc)}, ctx=ctx, source=request.source)
+          after={"request": snapshot(request), "document": adapter.snapshot(doc), "editors": sorted(editors)},
+          ctx=ctx, source=request.source)
     _notify_step(request, ctx)
     return request
 

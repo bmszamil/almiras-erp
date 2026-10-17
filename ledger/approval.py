@@ -38,6 +38,12 @@ class JournalEntryApproval(ApprovalAdapter):
     def is_submittable(self, entry):
         return entry.status == S.DRAFT and entry.requires_approval
 
+    def editor_ids(self, entry):
+        ids = set(entry.editors.values_list("user_id", flat=True))
+        if entry.created_by_id:
+            ids.add(entry.created_by_id)
+        return ids
+
     def approval_amount(self, entry):
         total = sum((line.debit for line in entry.lines.all()), Decimal("0"))
         return total, entry.entity.base_currency
