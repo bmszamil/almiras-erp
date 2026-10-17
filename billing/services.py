@@ -1053,18 +1053,33 @@ def _invoice_line_attrs(period, key, line_terms):
 
 
 def _supersede(adj, sys, actor):
-    """R46c: a pending correction is superseded; its draft note is deleted through invoicing (drafts only)."""
+    """R46c: a pending correction is superseded; its draft note is deleted through invoicing (drafts only).
+
+    The note row is locked first (``select_for_update``; invoicing locks the same row to submit or approve it), so
+    its status cannot change between this read and the delete. A note that is no longer ``draft`` or ``submitted``
+    (the CFO issued it after billing last read it back, review finding 3 / probe P7) is never superseded: the
+    correction takes the note's status (``issued`` / ``final``, or ``failed`` when rejected) and, if issued, keeps
+    counting in the billed position, so the pass that follows never credits or debits the same days twice.
+    Returns True when the correction was superseded."""
+    if adj.document_id is not None:
+        from invoicing.models import SalesDocument
+
+        stored = (SalesDocument.objects.select_for_update(of=("self",)).filter(pk=adj.document_id)
+                  .values_list("status", flat=True).first())
+        if stored is not None and stored not in ("draft", "submitted"):
+            _sync_adjustment(adj)
+            if adj.status not in BillingAdjustment.PENDING:
+                return False
+    else:
+        stored = None
     doc = adj.document
     adj.status, adj.document = AStatus.SUPERSEDED, None
     _save(adj)
-    if doc is not None:
-        from invoicing.models import SalesDocument
-
-        stored = SalesDocument.objects.filter(pk=doc.pk).values_list("status", flat=True).first()
-        if stored in ("draft", "submitted"):
-            invoicing_port.get_port().discard_adjustment_draft(doc, sys)
+    if doc is not None and stored in ("draft", "submitted"):
+        invoicing_port.get_port().discard_adjustment_draft(doc, sys)
     _event(adj.contract, Event.CORRECTION_SUPERSEDED, actor, adjustment=adj.pk, period=adj.billing_period_id,
            document=getattr(doc, "pk", None))
+    return True
 
 
 def _draft_note(adj, sys, actor):
@@ -1104,8 +1119,7 @@ def _correction_pass(contract, sys, *, trigger, version, affected, supersede, in
     if supersede:
         for adj in BillingAdjustment.objects.filter(contract=c, status__in=BillingAdjustment.PENDING).select_related(
                 "contract", "document"):
-            _supersede(adj, sys, sys)
-            superseded += 1
+            superseded += _supersede(adj, sys, sys)
     versions = _version_terms(c)
     end = _billable_end(c, versions)
     places = _places(c.currency)
