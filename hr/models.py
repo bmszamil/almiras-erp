@@ -447,6 +447,9 @@ class EmploymentContract(Tracked, ServiceGuarded):
     end_date = models.DateField(bi("End date", "تاريخ النهاية"), null=True, blank=True)
     calendar_basis = models.CharField(bi("Calendar basis", "التقويم المعتمد"), max_length=10,
                                       choices=CalendarBasis.choices, default=CalendarBasis.HIJRI)
+    # R58: the contract clause or work-regulations article that states Gregorian (e.g. unified contract cl. 14.6).
+    calendar_basis_ref = models.CharField(bi("Gregorian calendar reference", "مرجع اعتماد التقويم الميلادي"),
+                                          max_length=200, blank=True)
     # Probation (Art. 53-54, Regs Art. 19 [compliance 2026-10-17]): consecutive periods fixed at signing, total
     # within the parameter maximum.
     probation_periods = models.JSONField(bi("Probation periods (days)", "فترات التجربة (بالأيام)"), default=list,

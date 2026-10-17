@@ -99,7 +99,7 @@ def contract_fields(w, emp, **fields):
     values = dict(
         effective_date=emp.hire_date, start_date=emp.hire_date, contract_type="unlimited" if emp.is_saudi else "fixed",
         end_date=None if emp.is_saudi else date(emp.hire_date.year + 2, emp.hire_date.month, 1),
-        calendar_basis="gregorian", probation_periods=[90], job_title_en="Analyst", job_title_ar="محلل",
+        calendar_basis="gregorian", calendar_basis_ref="unified contract cl. 14.6", probation_periods=[90], job_title_en="Analyst", job_title_ar="محلل",
         weekly_hours="40", daily_hours="8", annual_leave_days=21, notice_days_employer=60, notice_days_employee=30,
         department=dept, grade=grade, qiwa_contract_ref="QIWA-TEST-1",
     )

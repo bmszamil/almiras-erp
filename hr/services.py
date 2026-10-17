@@ -28,6 +28,7 @@ from django.core.validators import validate_email
 from django.db import IntegrityError, transaction
 from django.db.models import Max, Q, Sum
 from django.utils import timezone
+from hijridate import Gregorian, Hijri
 
 from core import access
 from core.access import services as access_services
@@ -311,15 +312,44 @@ def _year_days(use, jurisdiction, basis, on):
     return int(value[basis])
 
 
-def _anniversary(start, years, basis, year_days):
-    """The date ``years`` service years after ``start`` (Gregorian: same calendar day; Hijri: years × the
-    parameter's year length in days, an approximation until a Hijri calendar library is chosen, OQ-9)."""
+def _hijri_add_years(start, years):
+    """The Gregorian date ``years`` Umm al-Qura years after ``start`` (Art. 10). The Hijri day is kept, or the last
+    day of the Hijri month when that month is shorter. Conversion by the open-source ``hijridate`` library (MIT),
+    whose Umm al-Qura month table covers 1343-1500 AH (1924-2077)."""
+    try:
+        h = Gregorian(start.year, start.month, start.day).to_hijri()
+        year = h.year + years
+        day = min(h.day, Hijri(year, h.month, 1).month_length())
+        g = Hijri(year, h.month, day).to_gregorian()
+    except (ValueError, OverflowError):
+        raise error(f"{start} plus {years} Hijri years is outside the Umm al-Qura calendar table (1924 to 2077).",
+                    f"التاريخ {start} مضافًا إليه {years} سنة هجرية خارج جدول تقويم أم القرى (1924 إلى 2077).",
+                    code="hijri_out_of_range") from None
+    return date(g.year, g.month, g.day)
+
+
+def _anniversary(start, years, basis, year_days=None):
+    """The date ``years`` service years after ``start`` in the contract's calendar (Art. 10): Gregorian = the same
+    calendar day; Hijri = the same Umm al-Qura day (R58)."""
     if basis == EmploymentContract.CalendarBasis.GREGORIAN:
         try:
             return start.replace(year=start.year + years)
         except ValueError:  # 29 February in a common year: the last day of February
             return start.replace(year=start.year + years, day=start.day - 1)
-    return start + timedelta(days=years * year_days)
+    return _hijri_add_years(start, years)
+
+
+def _years_between(start, end_exclusive, basis, year_days):
+    """Service years from ``start`` up to (not including) ``end_exclusive``. Gregorian: days / the parameter's
+    Gregorian divisor (AT-21). Hijri: completed Umm al-Qura years plus the remaining days / the parameter's Hijri
+    divisor (OQ-36 default: whole Hijri years + days/354)."""
+    days = (end_exclusive - start).days
+    if basis == EmploymentContract.CalendarBasis.GREGORIAN or days <= 0:
+        return Fraction(days, year_days)
+    n = 0
+    while _anniversary(start, n + 1, basis) <= end_exclusive:
+        n += 1
+    return Fraction(n) + Fraction((end_exclusive - _anniversary(start, n, basis)).days, year_days)
 
 
 def _holidays(use, jurisdiction, start, end):
@@ -805,7 +835,7 @@ def overtime_approver(employee, on, *, user):
 # =====================================================================================================
 
 CONTRACT_FIELDS = frozenset({
-    "effective_date", "contract_type", "start_date", "end_date", "calendar_basis", "probation_periods", "job_title_en",
+    "effective_date", "contract_type", "start_date", "end_date", "calendar_basis", "calendar_basis_ref", "probation_periods", "job_title_en",
     "job_title_ar", "occupation_code", "weekly_hours", "daily_hours", "annual_leave_days", "notice_days_employer",
     "notice_days_employee", "currency", "department", "grade", "qiwa_contract_ref",
 })
@@ -1012,6 +1042,14 @@ def _contract_problems(contract, *, statutory, use):
                             "يلزم للعقد محدد المدة تاريخ نهاية بعد تاريخ بدايته.")
     elif contract.end_date is not None:
         problems.append("An open-ended contract has no end date (R16). / لا تاريخ نهاية للعقد غير محدد المدة.")
+    if contract.calendar_basis not in EmploymentContract.CalendarBasis.values:
+        problems.append(f"Unknown calendar basis {contract.calendar_basis!r}. / التقويم {contract.calendar_basis!r} غير معروف.")
+    elif (basis == Basis.KSA_EMPLOYEE and contract.calendar_basis == EmploymentContract.CalendarBasis.GREGORIAN
+            and not (contract.calendar_basis_ref or "").strip()):
+        # R58 (Art. 10): Hijri unless the contract or work regulations state Gregorian.
+        problems.append("A Gregorian calendar basis needs the contract clause or work-regulations article that states "
+                        "it, e.g. unified contract cl. 14.6 (Art. 10, R58). / يلزم للتقويم الميلادي ذكر بند العقد أو مادة "
+                        "لائحة تنظيم العمل التي تنص عليه، مثل البند 14.6 من العقد الموحد (المادة 10).")
     comps = list(contract.components.select_related("component"))
     codes = [c.component.code for c in comps]
     currency = contract.currency
@@ -1150,6 +1188,17 @@ def _contract_end(contract):
     suspended = _suspended_days(use, "SA", emp, contract.calendar_basis, contract.start_date, contract.end_date,
                                 threshold)
     return contract.end_date + timedelta(days=len(suspended))
+
+
+def service_anniversary(employee, years, *, user, on=None):
+    """R58 (Art. 10): the date ``employee`` completes ``years`` service years, in the calendar of the contract in
+    force on ``on`` (default today): the same Umm al-Qura day for ``hijri``, the same Gregorian day for
+    ``gregorian``. Unpaid suspended days are not added here (R62 moves the anniversary of accrual tiers)."""
+    access.require(user, employee.entity, "hr.view")
+    terms = _terms_on(employee, on or _today()) or _approved_versions(employee).order_by("version_no").first()
+    if terms is None:
+        raise error("The employee has no approved contract.", "لا يوجد للموظف عقد معتمد.", code="no_terms")
+    return _anniversary(employee.hire_date, years, terms.calendar_basis)
 
 
 def contract_end_date(contract, *, user):
@@ -1372,15 +1421,20 @@ def _count_days(use, jurisdiction, req, rule, start, end):
 
 def _service_years(use, jurisdiction, emp, terms, on):
     year_days = _year_days(use, jurisdiction, terms.calendar_basis, on)
-    return Fraction((on - emp.hire_date).days + 1, year_days)
+    return _years_between(emp.hire_date, on + timedelta(days=1), terms.calendar_basis, year_days)
 
 
-def _sick_cycles(dates, year_days):
-    """Assign each sick day (sorted) to its sick-leave year: one year from the first sick day of the cycle (Art.
-    117 as read by the compliance review). Returns {date: (cycle_start, n_before_in_cycle)}."""
+def _sick_window_end(cycle_start, basis):
+    """Last day of the sick-leave year that starts on ``cycle_start`` (Art. 117; Gregorian or Umm al-Qura, R58)."""
+    return _anniversary(cycle_start, 1, basis) - timedelta(days=1)
+
+
+def _sick_cycles(dates, basis):
+    """Assign each sick day (sorted) to its sick-leave year: one year (in the contract's calendar) from the first
+    sick day of the cycle (Art. 117). Returns {date: (cycle_start, n_before_in_cycle)}."""
     result, start, n = {}, None, 0
     for d in sorted(dates):
-        if start is None or d > start + timedelta(days=year_days - 1):
+        if start is None or d > _sick_window_end(start, basis):
             start, n = d, 0
         result[d] = (start, n)
         n += 1
@@ -1389,11 +1443,11 @@ def _sick_cycles(dates, year_days):
 
 def _sick_plan(use, jurisdiction, req, terms):
     rule = use.get(jurisdiction, "leave.sick", req.start_date)
-    year_days = _year_days(use, jurisdiction, terms.calendar_basis, req.start_date)
+    _year_days(use, jurisdiction, terms.calendar_basis, req.start_date)  # the calendar basis is configured
     prior = set(SickLeaveDay.objects.filter(employee=req.employee, leave_request__status__in=(LR.APPROVED, LR.TAKEN))
                 .exclude(leave_request_id=req.pk).values_list("date", flat=True))
     new = list(_days(req.start_date, req.end_date))
-    cycles = _sick_cycles(prior | set(new), year_days)
+    cycles = _sick_cycles(prior | set(new), terms.calendar_basis)
     bounds, acc = [], 0
     for i, tier in enumerate(rule["tiers"], start=1):
         acc += int(tier["days"])
@@ -1950,7 +2004,7 @@ def _compute_eosb(employee, as_of, kind, use, additional_wage=ZERO):
     service_days = (as_of - start).days + 1
     excluded = len(_suspended_days(use, jurisdiction, emp, terms.calendar_basis, start, as_of,
                                    int(table["exclude_unpaid_days_beyond"])))
-    years = Fraction(service_days - excluded, year_days)
+    years = _years_between(start, as_of + timedelta(days=1 - excluded), terms.calendar_basis, year_days)
     components = {c.component.code: c.monthly_amount for c in terms.components.select_related("component")
                   if c.component.counts_for_eosb}
     wage = sum(components.values(), ZERO) + _decimal(additional_wage, "additional_wage")
