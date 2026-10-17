@@ -2,7 +2,7 @@
 
 Every business model has an ``entity`` FK (CLAUDE.md, R1). Business logic lives in ``billing.services``; the
 guards here only keep approved versions, generated periods and append-only rows from being changed outside
-those services (R7, R10, R38, R41). PostgreSQL triggers (migration 0002) repeat the guards for raw SQL.
+those services (R7, R10, R38, R41). PostgreSQL triggers (migrations 0002 to 0004) repeat the guards for raw SQL.
 
 Money is ``Decimal``: contract-currency amounts with up to 3 decimals, never more than the currency's own minor
 units (D11, R37, checked by ``billing.services``). Billing books nothing: invoicing posts the documents (§5).
@@ -263,9 +263,35 @@ class Contract(Tracked, Guarded):
                                    name="billing_contract_not_own_counterparty"),
         ]
 
+    # Fixed once the contract leaves draft (R7, R39 / OQ-23: customer and currency never change, a new contract is
+    # needed; number, start and the header terms that no version carries are fixed at approval). ``due_days`` is
+    # the version-1 value: later due days live on the versions and invoicing reads ``billed_version.due_days``.
+    # Migration 0003 repeats the guard in PostgreSQL (review finding 7).
+    FROZEN_AFTER_DRAFT = ("entity_id", "customer_id", "currency_id", "due_days", "bill_lead_days", "start_date",
+                          "counterparty_entity_id", "number")
+
     @property
     def is_intercompany(self):
         return self.counterparty_entity_id is not None
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self)._base_manager.filter(pk=self.pk).values("status", *self.FROZEN_AFTER_DRAFT).first()
+            if stored and stored["status"] != self.Status.DRAFT and any(
+                    stored[f] != getattr(self, f) for f in self.FROZEN_AFTER_DRAFT):
+                self._service_write = False
+                raise error("After approval the contract's customer, currency, number, start, due days and lead days "
+                            "never change; amend through a version or make a new contract (R7, R39).",
+                            "بعد الاعتماد لا يتغير عميل العقد ولا عملته ولا رقمه ولا بدايته ولا أيام الاستحقاق والفوترة "
+                            "المسبقة؛ عدّل بنسخة أو أنشئ عقدًا جديدًا.", code="contract_frozen")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        stored = type(self)._base_manager.filter(pk=self.pk).values_list("status", flat=True).first()
+        if stored is not None and stored != self.Status.DRAFT:
+            raise error("Approved contracts are never deleted; they end or are terminated.",
+                        "لا تُحذف العقود المعتمدة؛ بل تنتهي أو تُنهى.", code="contract_delete")
+        return super().delete(*args, **kwargs)
 
     def __str__(self):
         return self.number or f"{self.entity.code} contract draft {self.pk}"
@@ -517,7 +543,8 @@ class BillingPeriod(Guarded):
                 "status", "sales_document_id", *self.FROZEN_WHEN_GENERATED).first()
             if stored and stored["status"] == self.Status.GENERATED:
                 frozen_changed = any(stored[f] != getattr(self, f) for f in self.FROZEN_WHEN_GENERATED)
-                to_failed = self.status == self.Status.FAILED and self.sales_document_id is None
+                to_failed = (self.status == self.Status.FAILED and self.sales_document_id is None
+                             and self.needs_release)  # R12: only a ZATCA rejection, released by a person
                 same_doc = self.status == self.Status.GENERATED and stored["sales_document_id"] == self.sales_document_id
                 if frozen_changed or not (to_failed or same_doc):
                     self._service_write = False

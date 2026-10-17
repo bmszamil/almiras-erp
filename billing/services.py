@@ -476,6 +476,9 @@ CONTRACT_FIELDS = frozenset({
     "ejar_contract_no", "vehicle_ref",
 })
 TERM_FIELDS = ("end_date", "billing_frequency", "billing_timing", "period_anchor", "due_days")
+# Version terms mirrored on the contract row when a version is approved. ``due_days`` stays the version-1 value
+# (frozen after draft, ``Contract.FROZEN_AFTER_DRAFT``); the due days of an invoice are ``billed_version.due_days``.
+CONTRACT_MIRROR_FIELDS = ("end_date", "billing_frequency", "billing_timing", "period_anchor")
 
 
 def _contract_terms_to_version(c, v):
@@ -1119,7 +1122,7 @@ def approve_version(version, *, user):
             c.termination_reason_ar, c.termination_reason_en = v.reason_ar, v.reason_en
             action = Event.CANCELLED
         else:
-            for name in TERM_FIELDS:
+            for name in CONTRACT_MIRROR_FIELDS:
                 setattr(c, name, getattr(v, name))
             c.requires_purification = _purification(c, v)
             action = Event.AMENDED

@@ -71,7 +71,8 @@ class FakeInvoicing:
         contract = period.contract
         clerk = self.clerk(period.entity)
         issue_date = inv._riyadh_now().date()
-        due = {"due_date": issue_date + timedelta(days=contract.due_days)} if contract.due_days is not None else {}
+        due_days = period.billed_version.due_days  # the version's terms, not the (frozen) contract header
+        due = {"due_date": issue_date + timedelta(days=due_days)} if due_days is not None else {}
         with transaction.atomic():
             doc = inv.create_sales_document(
                 period.entity, user=clerk, customer=contract.customer, issue_date=issue_date,

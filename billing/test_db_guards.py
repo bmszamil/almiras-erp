@@ -65,6 +65,56 @@ def test_generated_period_never_changes_or_bills_again(w, billed):
         plain.save()
 
 
+def test_contract_header_frozen_after_draft(w, billed):
+    """R7, R39 (review finding 7): customer, currency, number, start, due days, lead days and counterparty never
+    change once approved; due days of later invoices come from the version."""
+    from billing.models import Contract
+
+    for name, value in (("customer", w.ic_customer), ("due_days", 45), ("bill_lead_days", 3),
+                        ("start_date", date(2026, 12, 1)), ("number", "ALM-CTR-2027-999999"),
+                        ("counterparty_entity", w.sub)):
+        stored = Contract.objects.get(pk=billed.pk)
+        setattr(stored, name, value)
+        stored._service_write = True
+        with pytest.raises(BillingError) as exc:
+            stored.save()
+        assert exc.value.code == "contract_frozen" and "نسخة" in str(exc.value)
+    stored = Contract.objects.get(pk=billed.pk)
+    stored._service_write = True
+    with pytest.raises(BillingError):
+        stored.delete()
+    stored = Contract.objects.get(pk=billed.pk)
+    stored.title_en = "Renamed"
+    stored._service_write = True
+    stored.save()  # header texts are not frozen
+
+
+def test_due_days_amended_by_version_reach_the_invoice_contract_header_unchanged(w):
+    c = approved(w, due_days=10)
+    run(w, date(2027, 1, 1))
+    w.clock.set(date(2027, 1, 20))
+    services.approve_version(version(w, c, effective=date(2027, 2, 1), due_days=30), user=w.c)
+    c.refresh_from_db()
+    assert c.due_days == 10 and c.current_version.due_days == 30
+    run(w, date(2027, 2, 1))
+    feb = period(c, date(2027, 2, 1))
+    assert feb.billed_version.due_days == 30 and feb.sales_document.due_date == date(2027, 3, 3)
+
+
+def test_generated_period_goes_to_failed_only_needing_release(w, billed):
+    """R12 (review finding 8): the model guard refuses an automatically retried failed for a generated period."""
+    p = period(billed, date(2027, 1, 1))
+    p.status, p.sales_document = "failed", None
+    p._service_write = True
+    with pytest.raises(BillingError):
+        p.save()
+    p = period(billed, date(2027, 1, 1))
+    p.status, p.sales_document, p.needs_release = "failed", None, True
+    p._service_write = True
+    p.save()
+    assert BillingPeriod.objects.get(pk=p.pk).status == "failed"
+
+
 def test_approved_lines_and_computed_corrections_are_read_only(w, billed):
     line = ContractLine.objects.filter(version__version_no=1, contract=billed).get()
     line._service_write = True
@@ -112,9 +162,36 @@ def test_triggers_refuse_raw_sql(w, billed):
         "rejected_reason_ar, created_by_id, created_at, updated_at, source, approved_by_id) VALUES "
         "(%s, %s, 99, 'amendment', '2027-01-01', 'monthly', 'advance', 'calendar', '', 'x', 'approved', '', '', %s, "
         "now(), now(), 'human', %s)", [w.alm.pk, billed.pk, w.s.pk, w.c.pk])
-    # the one allowed change of a generated period: to failed with no document (R12)
-    _raw("UPDATE billing_billingperiod SET status = 'failed', sales_document_id = NULL WHERE id = %s", [p.pk])
+    # a generated period never goes to an automatically retried failed (R12, review finding 8, migration 0004)
+    _refused("UPDATE billing_billingperiod SET status = 'failed', sales_document_id = NULL WHERE id = %s", [p.pk])
+    # the one allowed change of a generated period: to failed with no document, needing release (R12)
+    _raw("UPDATE billing_billingperiod SET status = 'failed', sales_document_id = NULL, needs_release = true "
+         "WHERE id = %s", [p.pk])
     assert BillingPeriod.objects.get(pk=p.pk).status == "failed"
+
+
+@postgres_only
+def test_contract_header_trigger_after_draft(w, billed):
+    """R7, R39 (review finding 7, migration 0003): raw SQL cannot change a non-draft contract's header or delete it."""
+    from billing.conftest import contract
+    from core.models import Currency
+
+    for sql, params in (
+        ("UPDATE billing_contract SET customer_id = %s WHERE id = %s", [w.ic_customer.pk, billed.pk]),
+        ("UPDATE billing_contract SET currency_id = 'USD' WHERE id = %s", [billed.pk]),
+        ("UPDATE billing_contract SET due_days = 99 WHERE id = %s", [billed.pk]),
+        ("UPDATE billing_contract SET bill_lead_days = 5 WHERE id = %s", [billed.pk]),
+        ("UPDATE billing_contract SET start_date = '2026-12-01' WHERE id = %s", [billed.pk]),
+        ("UPDATE billing_contract SET counterparty_entity_id = %s WHERE id = %s", [w.sub.pk, billed.pk]),
+        ("UPDATE billing_contract SET number = 'X-1' WHERE id = %s", [billed.pk]),
+        ("UPDATE billing_contract SET entity_id = %s WHERE id = %s", [w.sub.pk, billed.pk]),
+        ("DELETE FROM billing_contract WHERE id = %s", [billed.pk]),
+    ):
+        _refused(sql, params)
+    _raw("UPDATE billing_contract SET title_en = 'Renamed' WHERE id = %s", [billed.pk])  # not frozen
+    draft = contract(w)
+    _raw("UPDATE billing_contract SET currency_id = 'USD', due_days = 7 WHERE id = %s", [draft.pk])  # drafts change
+    assert Currency.objects.get(code="USD").code == draft.__class__._base_manager.get(pk=draft.pk).currency_id
 
 
 # --- PostgreSQL: advisory locks (AT-3, AT-27) --------------------------------------------------------------
