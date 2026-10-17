@@ -605,7 +605,8 @@ class Snapshot(models.Model):
 
 class SalesDocument(Tracked, Snapshot, Guarded):
     class DocType(models.TextChoices):
-        INVOICE = "invoice", bi("Tax invoice", "فاتورة ضريبية")
+        # The type, not the printed title (R47): an entity without a VAT number never issues a "Tax Invoice" (R94).
+        INVOICE = "invoice", bi("Invoice", "فاتورة")
         CREDIT_NOTE = "credit_note", bi("Credit note", "إشعار دائن")
         DEBIT_NOTE = "debit_note", bi("Debit note", "إشعار مدين")
 
@@ -747,15 +748,27 @@ class SalesDocument(Tracked, Snapshot, Guarded):
         return self.ZATCA_TYPE_CODES[self.doc_type]
 
     @property
+    def seller_vat_registered(self):
+        """R94: the seller has a VAT number (the frozen snapshot once issued, the entity's while a draft)."""
+        if self.status in (self.Status.ISSUED, self.Status.FINAL, self.Status.REJECTED):
+            return bool((self.seller_vat_number or "").strip())
+        return bool((self.entity.vat_number or "").strip())
+
+    @property
     def title_en(self):
-        """R47: printed title (rendering is not built in slice 1; the data is)."""
+        """R47: printed title (rendering is not built in slice 1; the data is). R94: an entity without a VAT number
+        is never titled "Tax Invoice"; its title waits for tax sign-off (OQ-59), so a neutral "Invoice" is shown."""
         if self.doc_type == self.DocType.INVOICE:
+            if not self.seller_vat_registered:
+                return "Invoice"
             return "Tax Invoice" if self.zatca_profile == self.Profile.STANDARD else "Simplified Tax Invoice"
         return "Credit Note" if self.doc_type == self.DocType.CREDIT_NOTE else "Debit Note"
 
     @property
     def title_ar(self):
         if self.doc_type == self.DocType.INVOICE:
+            if not self.seller_vat_registered:
+                return "فاتورة"
             return "فاتورة ضريبية" if self.zatca_profile == self.Profile.STANDARD else "فاتورة ضريبية مبسطة"
         return "إشعار دائن" if self.doc_type == self.DocType.CREDIT_NOTE else "إشعار مدين"
 

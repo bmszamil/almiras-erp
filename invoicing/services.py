@@ -578,6 +578,12 @@ def _sales_line_values(doc, line, *, income_type, quantity, unit_price, descript
     line.vat_category = vat_category or income_type.default_vat_category
     if line.vat_category not in VatCategory.values:
         raise error(f"Unknown VAT category {line.vat_category!r}.", "فئة ضريبة غير معروفة.", code="vat_category")
+    if line.vat_category == VatCategory.STANDARD and not (entity.vat_number or "").strip():
+        raise error(  # R11, R94: an entity without a VAT number charges no VAT
+            f"{entity.code} has no VAT number, so it charges no VAT: a standard-rated (S) line is not allowed; choose "
+            "category Z, E or O (R11, R94).",
+            f"ليس للكيان {entity.code} رقم ضريبي، فلا يفرض ضريبة القيمة المضافة: لا يُسمح ببند خاضع للنسبة الأساسية؛ "
+            "اختر الفئة Z أو E أو O.", code="no_vat_number")
     reason = vat_exemption_reason or income_type.default_exemption_reason
     if reason is not None and not isinstance(reason, VatExemptionReason):
         reason = _reference(VatExemptionReason, reason, "VAT exemption reason", "سبب الإعفاء")
@@ -1054,6 +1060,16 @@ def approve_sales_document(document, *, user):
         if doc.status != Status.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
         _refuse_stale_grant(grant, doc, seen_version)
+        if not (doc.entity.vat_number or "").strip():
+            # R94 / OQ-59 default: the title, type and posting path of an unregistered entity's documents (they are
+            # not tax invoices and never go to ZATCA) await tax sign-off; until then they are drafted only.
+            raise _problems_error([
+                f"{doc.entity.code} has no VAT number: its documents carry no VAT and are not tax invoices. Which "
+                "document title and type it issues, and how it posts, await tax sign-off (OQ-59), so it cannot be "
+                "issued yet; it stays submitted. / "
+                f"ليس للكيان {doc.entity.code} رقم ضريبي: مستنداته بلا ضريبة وليست فواتير ضريبية. ولا يزال عنوان "
+                "المستند ونوعه وطريقة ترحيله بانتظار اعتماد المستشار الضريبي، فلا يمكن إصداره بعد؛ ويبقى مقدَّمًا."
+            ], "entity_not_vat_registered")
         if doc.original_document_id:  # R18 cap: one note at a time per original (review item 4)
             doc.original_document = SalesDocument.objects.select_for_update(of=("self",)).get(
                 pk=doc.original_document_id)

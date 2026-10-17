@@ -499,15 +499,32 @@ def test_r16_export_invoice_carries_no_buyer_vat_number(w):
     assert (done.buyer_vat_number, done.buyer_other_id_scheme, done.buyer_other_id) == ("", "CRN", "1010999999")
 
 
-def test_at16_entity_without_vat_number_cannot_issue_s_lines(w):
-    Customer.objects.none()
+def test_at16_at100_entity_without_vat_number_charges_no_vat_and_is_not_issued(w, client):
+    """R11, R94 (D30b; OQ-59 default): S lines refused; Z/E lines drafted and submitted with VAT 0.00; approval
+    refused; never titled "Tax Invoice"; nothing handed to ZATCA."""
     w.alm.__class__.objects.filter(pk=w.alm.pk).update(vat_number="")
     w.alm.refresh_from_db()
-    with pytest.raises(InvoicingError) as exc:
+    with pytest.raises(InvoicingError) as exc:  # the S line
         invoice(w)
-    assert "vat_number" in messages(exc)
-    doc = invoice(w, [("rent_commercial", "1", "100", {"vat_category": "Z", "vat_exemption_reason": "VATEX-SA-33"})])
-    assert approve(w, doc).status == "issued"  # OQ-17: Z/E/O allowed
+    assert exc.value.code == "no_vat_number" and "VAT number" in messages(exc) and "رقم ضريبي" in messages(exc)
+    doc = invoice(w, [("rent_commercial", "1", "100", {"vat_category": "Z", "vat_exemption_reason": "VATEX-SA-33"}),
+                      ("rent_residential", "1", "200", {"vat_category": "E", "vat_exemption_reason": "VATEX-SA-30"})])
+    assert doc.status == "submitted"
+    assert [l.vat_amount for l in doc.lines.order_by("line_no")] == [D("0"), D("0")]
+    with pytest.raises(InvoicingError) as exc:
+        approve(w, doc)
+    assert exc.value.code == "entity_not_vat_registered" and "OQ-59" in messages(exc) and "فواتير ضريبية" in messages(exc)
+    doc = SalesDocument.objects.get(pk=doc.pk)
+    assert (doc.status, doc.number, doc.zatca_status) == ("submitted", "", "not_submitted") and not w.zatca.submitted
+    for rendered in (doc.title_en, doc.title_ar, str(doc), doc.get_doc_type_display()):
+        assert "Tax Invoice" not in rendered and "فاتورة ضريبية" not in rendered and "Tax invoice" not in rendered
+    assert (doc.title_en, doc.title_ar) == ("Invoice", "فاتورة")
+    w.viewer.is_staff = True
+    w.viewer.save()
+    client.force_login(w.viewer)
+    for url in (f"/admin/invoicing/salesdocument/{doc.pk}/change/", "/admin/invoicing/salesdocument/"):
+        body = client.get(url).content.decode()
+        assert "فاتورة ضريبية" not in body and "Tax Invoice" not in body and "Tax invoice" not in body, url
 
 
 def test_oq32_standard_rated_supply_before_vat_registration_rejected(w):
