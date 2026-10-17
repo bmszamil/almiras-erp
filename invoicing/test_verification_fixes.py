@@ -107,6 +107,31 @@ def test_item9_personal_data_right_cached_per_request_and_entity(w, client):
     assert calls == [w.alm.pk]
 
 
+def test_item9_the_cache_is_per_entity_and_lives_for_one_request(w, client):
+    """Two entities on one page: one check each. The next request checks again (a right just revoked counts)."""
+    from core.access.testing import member
+
+    member(w.viewer, w.sub, "viewer")
+    for entity, user in ((w.alm, w.clerk), (w.sub, w.sub_clerk)):
+        for n in range(3):
+            services.create_customer(entity, user=user, code=f"P{n}", name_ar=f"فرد {n}", customer_kind="individual",
+                                     **ADDRESS)
+    real_has = access.has
+    calls = []
+
+    def counting_has(user, entity, permission):
+        if permission == "invoicing.view_personal_data":
+            calls.append(entity.pk)
+        return real_has(user, entity, permission)
+
+    client.force_login(_staff(w.viewer))
+    with mock.patch.object(invoicing_admin.access, "has", side_effect=counting_has):
+        assert client.get("/admin/invoicing/customer/").status_code == 200
+        assert sorted(calls) == sorted([w.alm.pk, w.sub.pk])
+        assert client.get("/admin/invoicing/customer/").status_code == 200
+    assert sorted(calls) == sorted([w.alm.pk, w.sub.pk] * 2)
+
+
 # --- item 3: the purification flag of a posted bill (PostgreSQL trigger, migration 0008) -------------
 
 postgres_only = pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL triggers")
