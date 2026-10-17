@@ -1,6 +1,6 @@
 # Spec: `ledger` multi-currency extension (ledger-fx)
 
-Status: draft for review · Written: 2026-10-16 · Revised: 2026-10-16 (project-owner decision D5 on decimals; CLAUDE.md rule 7 amended) · Amended: 2026-10-16 (D6: build decisions, two-step revaluation, permission names) · Amended: 2026-10-16 (D7: R15, R18, R24, R28, R44, R45, R49, AT-34 to AT-38, OQ-18; code on branch `claude/funny-davinci-7yd88s`, commits aad0126..b690c12) · Author: spec-writer agent
+Status: draft for review · Written: 2026-10-16 · Revised: 2026-10-16 (project-owner decision D5 on decimals; CLAUDE.md rule 7 amended) · Amended: 2026-10-16 (D6: build decisions, two-step revaluation, permission names) · Amended: 2026-10-16 (D7: R15, R18, R24, R28, R44, R45, R49, AT-34 to AT-38, OQ-18; code on branch `claude/funny-davinci-7yd88s`, commits aad0126..b690c12) · Amended: 2026-10-16 (D8: 3.6, R50, AT-39, OQ-19; revaluation run status; commits b6ed6e1..497cb09) · Author: spec-writer agent
 Extends: `ledger` (models, services, tests). Touches: `core.Entity`, `ledger/coa_template.py`, `ledger/services_setup.py`. Unblocks the ledger side of `docs/specs/invoicing.md` OQ-6 (that spec is not changed here).
 **[CC-verify]** = standards, Sharia or rate-source statement written from memory; the compliance-checker must check it against the official text before module-builder starts.
 
@@ -19,6 +19,7 @@ Lets **every entity** in the group (Almiras, subsidiaries, and any entity added 
 | D5 | 2026-10-16 | Project owner | Decimals (resolves OQ-1): functional-currency (SAR) amounts are stored with 2 decimals; foreign transaction-currency amounts are stored with up to 3 decimals and validated against that currency's own minor units. CLAUDE.md rule 7 amended accordingly. The rule "functional currency must be a 2-decimal currency" (R4) stays. |
 | D6 | 2026-10-16 | Build decisions (caller brief; follows access A1 / OQ-5 default) | (a) Revaluation is two-step: `revalue_period` prepares a draft, `post_revaluation` posts it with a `ledger.post_entry` grant, so the preparer cannot approve; `discard_revaluation` drops a draft run (R23, R43 to R45). (b) Account 3400 is non-postable (report-only) pending accountant confirmation (OQ-6). (c) Permission names follow access §3.6: `fx_rate_maintain` → `ledger.maintain_entity_rate`, `fx_manual_rate` → `ledger.use_manual_rate`, `fx_revalue` → `ledger.revalue`. (d) Rate age default 5 calendar days, setting `FX_MAX_RATE_AGE_DAYS` (R12, OQ-3). (e) Not built: translation (R30, OQ-5) and automatic rate feeds (OQ-2); rates come from manual entry and CSV upload only. |
 | D7 | 2026-10-16 | Build decisions (code-reviewer hardening, caller brief); human approval at merge | (a) `post_revaluation` recomputes the revaluation and refuses if anything changed since the draft (R44). (b) A discarded run is kept for audit; its never-posted draft entry is deleted and no link is kept; a discarded run does not count toward R24 (OQ-18 default adopted, R45). (c) Revaluation drafts are posted only by `post_revaluation`, never `post_entry`, and are not edited (R49). (d) Global rates are written only against the top-level group parent (R28). (e) `rerate_entry` refuses settlement drafts (R15). (f) Settlements of one item are serialised; the final one leaves no functional residue (R18). |
+| D8 | 2026-10-16 | Build decision (verification review, caller brief); human approval at merge | A `RevaluationRun` changes status only through `post_revaluation` (draft → posted) and `discard_revaluation` (draft → discarded), each with its required audit fields; it is created as a draft (R50). |
 
 Nothing else is decided. Every other choice is in section 9; defaults used in the rules are marked "default (OQ-n)".
 
@@ -105,6 +106,7 @@ Checks needing the entity (functional currency) live in `validate_entry` (R6 to 
 | discarded_by, discarded_at | FK User, DateTime | N | *Added 2026-10-16.* |
 
 *Amended 2026-10-16 (D7):* runs are never deleted; `status` and the fields above change only through `ledger.services`.
+*Amended 2026-10-16 (D8):* DB check `revaluation_status_known` (status in draft/posted/discarded). Required fields per status (model `save`): `draft` has no `posted_by`/`posted_at`/`discarded_by`/`discarded_at`; `posted` has `posted_by`, `posted_at` and `reversal`, no discard fields; `discarded` has `discarded_by`, `discarded_at`, `entry` null, no post fields (R50).
 
 ## 4. Rules
 
@@ -193,6 +195,9 @@ Checks needing the entity (functional currency) live in `validate_entry` (R6 to 
 49. A revaluation draft is posted only by `post_revaluation` (with its reversal, after the R44 recheck): `post_entry` refuses it (`use_post_revaluation`). It is never edited: `update_draft` refuses it; the change is discard and re-run. **[svc `post_entry`, `_update_draft`; AT-34]**
 
 The other D7 changes are amendment notes on R15, R18, R24, R28, R44 and R45.
+
+### Revaluation run status (added 2026-10-16, D8)
+50. A `RevaluationRun` is created only as `draft` (`save`, `bulk_create`). Its status changes only draft → `posted` in `post_revaluation` and draft → `discarded` in `discard_revaluation`; a posted or discarded run never changes again, and no run is deleted. Setting `status` on the model and saving is refused, also with plausible audit fields; `QuerySet.update` and `delete` on runs are refused. The audit fields of 3.6 must match the status (a draft never carries a poster or discarder). Messages en/ar. **Known limitation:** these are model and queryset guards only; no database trigger guards `ledger_revaluationrun` on PostgreSQL or SQLite, so raw SQL or the base `django.db.models.QuerySet.update` can still change a run's status and fields (OQ-19; access.md R44 for the entry-level triggers). **[M `save`/queryset + DB check; svc; AT-39]**
 
 ## 5. Accounting
 
@@ -345,6 +350,7 @@ Fixtures: ALM (parent, SAR, Sharia enforced), LZM (child, SAR), EGY (child, EGP 
 | AT-36 | *Added 2026-10-16 (D7; R15).* USD draft with `settlement` and `realised_fx` lines; plain USD draft | `rerate_entry` on each | First refused (en/ar, `rerate_settlement`), draft unchanged; second re-rated |
 | AT-37 | *Added 2026-10-16 (D7; R18), PostgreSQL.* F1 open EUR 10,000.00 | Two sessions each post a settlement of EUR 10,000.00 at the same time; then partial receipts per F10 | Postings are serialised on the settled line's lock; together they never clear more than is open (the second is refused); after F10 both EUR and SAR balances of the 1200 item are exactly 0.00 |
 | AT-38 | *Added 2026-10-16 (D7; R28).* ALM top-level parent; LZM child; T2 is `group_treasury` on ALM | T2 creates a global rate with `group=LZM`; with `group=ALM`; with no `group` when exactly one top-level parent exists | First refused ("not the top-level group parent entity", en/ar); second and third allowed |
+| AT-39 | *Added 2026-10-16 (D8; R50).* Draft run X for ALM 2027-01 run by A | Set `status` to `posted` or `discarded` and save; set `posted`, `posted_by`, `posted_at` and save; set `discarded_by`/`discarded_at` on the draft and save; `QuerySet.update(status="posted")`; `delete()`; create or `bulk_create` a run as `posted` or `discarded`; `discard_revaluation(X, user=A)` | All direct writes refused (`LedgerError`, en/ar), X stays `draft`, no run created as non-draft; discard sets `discarded`, `discarded_by` = A, `discarded_at` within 10 s of now |
 
 ## 9. Open questions
 
@@ -370,6 +376,7 @@ Fixtures: ALM (parent, SAR, Sharia enforced), LZM (child, SAR), EGY (child, EGP 
 | OQ-16 | Migration of foreign open items from Daftra/SAP B1: original rate kept, or restated at cutover rate. | Accountant + migration-agent | Default: original currency, amount and rate; tie out per currency |
 | OQ-17 | Functional currency of each subsidiary (Egypt EGP?, China CNY?, UAE AED?) under IAS 21 indicators **[CC-verify]**. | Accountant / auditor | **BLOCKING** for setting up those entities, not for the build |
 | OQ-18 | *Added 2026-10-16 (D6).* Does a `discarded` revaluation run free the period for a new run (R24)? Who may discard a draft run (preparer, approver, both)? | Accountant + Dev | Default: discarded run kept for audit and does not count toward R24; `ledger.revalue` holders may discard. *Note 2026-10-16 (D7):* built with this default; the discarded run's draft entry is deleted (R45). Still for the accountant to confirm |
+| OQ-19 | *Added 2026-10-16 (D8).* Should `ledger_revaluationrun` get a PostgreSQL trigger (as journal entries have, access.md R43, R44) so raw SQL cannot change a run's status or audit fields? | Dev + code-reviewer | Default: model and queryset guards only, as built; DB role privileges (access.md OQ-10) |
 
 **Blocking:** OQ-2 (automatic import; not built, CSV only, D6), OQ-5 (translation; not built, D6), OQ-6 (FX postings; 3400 non-postable meanwhile, R46), OQ-17 (subsidiary setup). **Sharia board sign-off:** OQ-14 and any forward contract.
 
