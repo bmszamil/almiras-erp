@@ -7,7 +7,7 @@ from datetime import timedelta
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -174,6 +174,10 @@ def active_q(at, prefix=""):
     )
 
 
+# Roles of which at most one membership per entity is active at any time (R47: the group's chairman).
+# Also enforced on PostgreSQL by the trigger of migration core.0012.
+SINGLE_HOLDER_ROLES = frozenset({"chairman"})
+
 # How far a revocation's revoked_at may be from the clock when it is written (also the PostgreSQL trigger).
 REVOCATION_CLOCK_TOLERANCE = timedelta(seconds=10)
 
@@ -293,9 +297,14 @@ class Membership(models.Model):
         if errors:
             raise ValidationError(errors)
 
-    def overlapping(self):
-        """Other unrevoked memberships of the same (user, entity, role) whose dates overlap (R9)."""
-        qs = Membership.objects.filter(user_id=self.user_id, entity_id=self.entity_id, role_id=self.role_id).exclude(pk=self.pk)
+    def overlapping(self, *, any_user=False):
+        """Other unrevoked memberships of the same (user, entity, role) whose dates overlap (R9).
+
+        ``any_user=True``: of the same (entity, role) held by anyone (single-holder roles, R47).
+        """
+        qs = Membership.objects.filter(entity_id=self.entity_id, role_id=self.role_id).exclude(pk=self.pk)
+        if not any_user:
+            qs = qs.filter(user_id=self.user_id)
         qs = qs.filter(Q(revoked_at__isnull=True) | Q(revoked_at__gt=self.valid_from))
         qs = qs.filter(Q(valid_to__isnull=True) | Q(valid_to__gt=self.valid_from))
         if self.valid_to is not None:
@@ -329,6 +338,20 @@ class Membership(models.Model):
                     "An overlapping membership for this user, entity and role already exists. / "
                     "توجد عضوية متداخلة لهذا المستخدم والكيان والدور."
                 )
+            if self.role.code in SINGLE_HOLDER_ROLES:
+                with transaction.atomic():
+                    # Two grants at the same moment run one after the other (the PostgreSQL trigger does the same).
+                    Role.objects.select_for_update().filter(pk=self.role_id).exists()
+                    if self.overlapping(any_user=True).exists():
+                        raise ValidationError(  # R47
+                            f"{self.entity.code} already has an active {self.role.code}; only one person holds this "
+                            "role at a time. Revoke the current membership first. / "
+                            f"للكيان {self.entity.code} {self.role.name_ar} نشط بالفعل؛ لا يشغل هذا الدور إلا شخص واحد "
+                            "في الوقت نفسه. ألغِ العضوية الحالية أولًا.",
+                            code="single_holder",
+                        )
+                    super().save(*args, **kwargs)
+                return
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):

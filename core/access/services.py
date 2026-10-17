@@ -108,6 +108,10 @@ MESSAGES = {
         "يتطلب هذا الإجراء طلب رقابة مزدوجة معتمدًا وغير مستخدم لهذا التغيير بعينه.",
     ),
     "dual_control_expired": ("The four-eyes request has expired.", "انتهت صلاحية طلب الرقابة المزدوجة."),
+    "dual_control_wrong_role": (
+        "This step of the four-eyes approval for '{perm}' is taken only through the role {role}.",
+        "هذه المرحلة من الرقابة المزدوجة لصلاحية '{perm_ar}' لا تتم إلا من خلال دور {role_ar}.",
+    ),
     "grant_forged": (
         "This authorisation does not match the access log; ask for a new one.",
         "هذا التفويض لا يطابق سجل الوصول؛ اطلب تفويضًا جديدًا.",
@@ -756,14 +760,33 @@ def payload_hash(payload):
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
-def _require_dc_holder(user, entity, permission):
+def _require_dc_holder(user, entity, permission, step=None):
+    """Memberships through which ``user`` holds DC ``permission`` in ``entity`` (R19).
+
+    With ``step`` (``request``, ``decide`` or ``use``) and a permission whose steps are bound to roles
+    (catalogue.DUAL_CONTROL_STEPS, R48), only memberships of those roles count; holding the permission through
+    another role is refused (``dual_control_wrong_role``). No managing_partner fallback applies to a bound step.
+    """
     perm = catalogue.get(permission)
     if not perm.is_dual_control:
         raise AccessUsageError(f"{permission} is not a dual-control permission.")
     memberships, reason = _evaluate(user, entity, permission, now())
     if reason:
         _deny(user, entity, permission, reason)
-    return memberships
+    return _dc_step_memberships(user, entity, permission, memberships, step) if step else memberships
+
+
+def _dc_step_memberships(user, entity, permission, memberships, step):
+    roles = catalogue.dual_control_roles(permission, step)
+    if roles is None:
+        return memberships
+    allowed = [m for m in memberships if m.role.code in roles]
+    if not allowed:
+        names = list(Role.objects.filter(code__in=roles).order_by("code").values_list("name_en", "name_ar"))
+        _deny(user, entity, permission, "dual_control_wrong_role",
+              role=", ".join(en for en, _ in names) or ", ".join(sorted(roles)),
+              role_ar="، ".join(ar for _, ar in names) or ", ".join(sorted(roles)))
+    return allowed
 
 
 def _check_target(target):
@@ -774,7 +797,7 @@ def _check_target(target):
 def request_dual_control(user, entity, permission, target, payload):
     """Open a four-eyes request for a DC action on ``target`` with exactly ``payload`` (R19)."""
     _check_target(target)
-    _require_dc_holder(user, entity, permission)
+    memberships = _require_dc_holder(user, entity, permission, "request")
     at = now()
     with transaction.atomic():
         req = DualControlRequest.objects.create(
@@ -784,7 +807,8 @@ def request_dual_control(user, entity, permission, target, payload):
         )
         log(
             AccessLog.Event.DUAL_CONTROL_REQUESTED, actor=user, entity=entity, permission=permission,
-            details={"request": req.pk, "target": [req.target_type.model, req.target_id], "payload_hash": req.payload_hash},
+            details={"request": req.pk, "target": [req.target_type.model, req.target_id], "payload_hash": req.payload_hash,
+                     "roles": sorted({m.role.code for m in memberships})},
         )
     return req
 
@@ -792,9 +816,10 @@ def request_dual_control(user, entity, permission, target, payload):
 def decide_dual_control(user, request, approve, note=""):
     """Approve or reject a pending request; the decider must differ from the requester (R15, R19)."""
     entity, permission = request.entity, request.permission
-    _require_dc_holder(user, entity, permission)
+    memberships = _require_dc_holder(user, entity, permission)
     if request.requested_by_id == user.pk:
         _deny(user, entity, permission, "self_approval")
+    memberships = _dc_step_memberships(user, entity, permission, memberships, "decide")  # R48: e.g. chairman only
     at = now()
     if request.expires_at <= at:
         DualControlRequest.objects.filter(pk=request.pk, status=DualControlRequest.Status.PENDING)._transition(
@@ -810,7 +835,8 @@ def decide_dual_control(user, request, approve, note=""):
             _deny(user, entity, permission, "dual_control")
         log(
             AccessLog.Event.DUAL_CONTROL_DECIDED, actor=user, entity=entity, permission=permission,
-            details={"request": request.pk, "status": status, "note": note},
+            details={"request": request.pk, "status": status, "note": note,
+                     "roles": sorted({m.role.code for m in memberships})},
         )
     request.refresh_from_db()
     return request
@@ -822,7 +848,7 @@ def require_dual_control(user, entity, permission, request, payload, target):
     Returns a Grant; the request becomes ``used``.
     """
     _check_target(target)
-    memberships = _require_dc_holder(user, entity, permission)
+    memberships = _require_dc_holder(user, entity, permission, "use")
     request = DualControlRequest.objects.get(pk=request.pk)
     if (
         request.entity_id != entity.pk

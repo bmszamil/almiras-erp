@@ -162,6 +162,60 @@ def apply_entity_setup(entity, fields):
 # Changed only through change_entity_settings (base_currency: ledger.services.set_functional_currency).
 SENSITIVE_ENTITY_FIELDS = ("sharia_enforced", "consolidation", "parent", "is_active")
 ENTITY_SETTINGS_PERMISSION = "core.change_entity_settings"
+# R48 (A17): turning Sharia enforcement off is a two-step four-eyes action on the group parent:
+# managing_partner requests (first approval), chairman approves (second), managing_partner applies.
+SHARIA_OFF_PERMISSION = "core.disable_sharia_enforcement"
+
+
+def _reason_required(reason):
+    if not reason or not str(reason).strip():
+        raise ValidationError("A reason is required. / السبب مطلوب.")
+
+
+def sharia_off_payload(entity, reason):
+    """The change a Sharia switch-off request approves (R48): exactly this entity, off, for this reason."""
+    return {"entity": entity.code, "sharia_enforced": False, "reason": str(reason)}
+
+
+def new_entity_sharia_off_payload(code, parent, reason):
+    """The creation a Sharia-off request approves (R48): a new entity ``code`` under ``parent``, Sharia off."""
+    return {"create": True, "entity": code, "parent": parent.code, "sharia_enforced": False, "reason": str(reason)}
+
+
+def request_sharia_enforcement_off(entity, *, user, reason):
+    """Step 1 of R48: a managing partner of the group asks to turn Sharia enforcement off for ``entity``.
+
+    Opening the request is the managing partner's approval. It is recorded on the group parent (target = the
+    entity) and waits for the group's chairman (:func:`decide_sharia_enforcement_off`); then a managing partner
+    applies it with ``change_entity_settings(entity, sharia_enforced=False, dual_control_request=...)``.
+    """
+    from core.access import services as access
+
+    _reason_required(reason)
+    entity = Entity.objects.get(pk=entity.pk)
+    if not entity.sharia_enforced:
+        raise ValidationError(f"{entity.code} does not enforce Sharia. / الكيان {entity.code} لا يطبق الضوابط الشرعية.")
+    return access.request_dual_control(user, access.group_parent_of(entity), SHARIA_OFF_PERMISSION, entity,
+                                       sharia_off_payload(entity, reason))
+
+
+def request_new_entity_sharia_off(parent, code, *, user, reason):
+    """Step 1 of R48 for ``create_entity`` with ``sharia_enforced=False``: target = the parent entity."""
+    from core.access import services as access
+
+    _reason_required(reason)
+    parent = Entity.objects.get(pk=parent.pk)
+    return access.request_dual_control(user, access.group_parent_of(parent), SHARIA_OFF_PERMISSION, parent,
+                                       new_entity_sharia_off_payload(code, parent, reason))
+
+
+def decide_sharia_enforcement_off(request, *, user, approve, note=""):
+    """Step 2 of R48: the group's chairman approves or rejects the request (never its requester)."""
+    from core.access import services as access
+
+    if request.permission != SHARIA_OFF_PERMISSION:
+        raise ValidationError("Not a Sharia switch-off request. / ليس طلب إيقاف للضوابط الشرعية.")
+    return access.decide_dual_control(user, request, approve, note)
 
 
 def _setting_value(entity, name):
@@ -170,13 +224,18 @@ def _setting_value(entity, name):
     return getattr(entity, name)
 
 
-def change_entity_settings(entity, *, user, reason, **changes):
+def change_entity_settings(entity, *, user, reason, dual_control_request=None, **changes):
     """Change ``sharia_enforced``, ``consolidation``, ``parent`` or ``is_active`` of ``entity`` (R32).
 
     ``user`` needs ``core.change_entity_settings`` on the group parent of the
     entity (OQ-18 default: managing_partner only); moving the entity to
     another group needs it on that group too. Writes one
     ``entity_settings_changed`` AccessLog row with before and after values.
+
+    Turning Sharia enforcement **off** (R48) also needs ``dual_control_request``: a request opened by a
+    managing partner (:func:`request_sharia_enforcement_off`) and approved by the group's chairman, for exactly
+    this entity and ``reason``; it is used once, and the change must be alone in the call. Turning it **on**
+    stays a single step by the managing partner (R49).
     """
     from core.access import services as access
 
@@ -188,10 +247,28 @@ def change_entity_settings(entity, *, user, reason, **changes):
         )
     if unknown:
         raise ValidationError(f"Not an entity setting: {', '.join(sorted(unknown))}. / ليس من إعدادات الكيان.")
-    if not reason or not str(reason).strip():
-        raise ValidationError("A reason is required. / السبب مطلوب.")
+    _reason_required(reason)
     entity = Entity.objects.get(pk=entity.pk)
-    _require_settings_right(access, user, access.group_parent_of(entity), changes)
+    group = access.group_parent_of(entity)
+    _require_settings_right(access, user, group, changes)
+    switching_off = "sharia_enforced" in changes and not changes["sharia_enforced"] and entity.sharia_enforced
+    if switching_off and set(changes) != {"sharia_enforced"}:
+        raise ValidationError(
+            "Turning Sharia enforcement off is a change of its own; change the other settings separately (R48). / "
+            "إيقاف تطبيق الضوابط الشرعية تغيير مستقل؛ غيّر الإعدادات الأخرى بشكل منفصل.", code="sharia_off_alone",
+        )
+    if dual_control_request is not None and not switching_off:
+        raise ValidationError(
+            "A four-eyes request is used only to turn Sharia enforcement off. / "
+            "يُستخدم طلب الرقابة المزدوجة لإيقاف تطبيق الضوابط الشرعية فقط.", code="dual_control_not_needed",
+        )
+    if switching_off:
+        if dual_control_request is None:  # R48: MP request, chairman approval, then apply
+            access.deny(user, group, SHARIA_OFF_PERMISSION, "dual_control")
+        with transaction.atomic():  # the request is used only if the change is written
+            access.require_dual_control(user, group, SHARIA_OFF_PERMISSION, dual_control_request,
+                                        sharia_off_payload(entity, reason), target=entity)
+            return _change_entity_settings(entity, user, reason, changes, dual_control_request=dual_control_request)
     new_parent = changes.get("parent", entity.parent)
     if new_parent is None and changes.get("is_active", entity.is_active) is False:
         # Nobody could reactivate it: every right is checked on the group parent (access.md R6, R32).
@@ -257,7 +334,7 @@ def reactivate_entity_by_operator(entity, reason, os_user):
 
 
 @transaction.atomic
-def _change_entity_settings(entity, user, reason, changes):
+def _change_entity_settings(entity, user, reason, changes, dual_control_request=None):
     from core.access.models import AccessLog
     from core.access.services import log
 
@@ -276,18 +353,22 @@ def _change_entity_settings(entity, user, reason, changes):
         AccessLog.Event.ENTITY_SETTINGS_CHANGED, actor=user, entity=entity, permission=ENTITY_SETTINGS_PERMISSION,
         details={
             "before": {k: before[k] for k in changed}, "after": {k: after[k] for k in changed}, "reason": reason,
+            **({"dual_control_request": dual_control_request.pk} if dual_control_request is not None else {}),
         },
     )
     return entity
 
 
-def create_entity(entity, *, user, reason="Created in admin / أُنشئ من لوحة الإدارة"):
+def create_entity(entity, *, user, reason="Created in admin / أُنشئ من لوحة الإدارة", dual_control_request=None):
     """Create ``entity`` (an unsaved Entity) as a member of an existing group (access.md R32, A13).
 
     ``user`` needs ``core.change_entity_settings`` on the group parent of the
     chosen parent entity; that group parent must be active. A new top-level
     group (no parent) is set up by an operator, not here. Writes one
     ``entity_settings_changed`` row with the new entity's sensitive settings.
+
+    An entity created with ``sharia_enforced=False`` needs an approved R48 request
+    (:func:`request_new_entity_sharia_off`) naming its code, its parent and ``reason``.
     """
     from core.access import services as access
 
@@ -301,11 +382,24 @@ def create_entity(entity, *, user, reason="Created in admin / أُنشئ من ل
     access.require(user, group, ENTITY_SETTINGS_PERMISSION)
     if not group.is_active:
         access.deny(user, group, ENTITY_SETTINGS_PERMISSION, "inactive_entity_reactivate_only")
-    return _create_entity(entity, user, reason)
+    if entity.sharia_enforced:
+        if dual_control_request is not None:
+            raise ValidationError(
+                "A four-eyes request is used only to create an entity without Sharia enforcement. / "
+                "يُستخدم طلب الرقابة المزدوجة فقط لإنشاء كيان لا يطبق الضوابط الشرعية.", code="dual_control_not_needed",
+            )
+        return _create_entity(entity, user, reason)
+    if dual_control_request is None:  # R48: created with Sharia off only after MP request and chairman approval
+        access.deny(user, group, SHARIA_OFF_PERMISSION, "dual_control")
+    parent = Entity.objects.get(pk=entity.parent_id)
+    with transaction.atomic():
+        access.require_dual_control(user, group, SHARIA_OFF_PERMISSION, dual_control_request,
+                                    new_entity_sharia_off_payload(entity.code, parent, reason), target=parent)
+        return _create_entity(entity, user, reason, dual_control_request=dual_control_request)
 
 
 @transaction.atomic
-def _create_entity(entity, user, reason):
+def _create_entity(entity, user, reason, dual_control_request=None):
     from core.access.models import AccessLog
     from core.access.services import log
 
@@ -316,6 +410,6 @@ def _create_entity(entity, user, reason):
         details={"created": True, "before": None, "reason": reason, "after": {
             **{name: _setting_value(entity, name) for name in SENSITIVE_ENTITY_FIELDS},
             "base_currency": entity.base_currency_id,
-        }},
+        }, **({"dual_control_request": dual_control_request.pk} if dual_control_request is not None else {})},
     )
     return entity

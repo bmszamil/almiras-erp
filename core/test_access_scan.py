@@ -3,7 +3,8 @@ import ast
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-CHECKERS = {"require", "verify_grant", "require_dual_control", "_evaluate", "_deny", "deny"}
+CHECKERS = {"require", "verify_grant", "require_dual_control", "request_dual_control", "decide_dual_control", "_evaluate",
+            "_deny", "deny"}
 
 # Reviewed allow-list: function -> why it does not call require itself.
 ALLOW = {
@@ -11,6 +12,8 @@ ALLOW = {
     "core/services.py:load_setup_data": "reads a setup file; operator command only",
     "core/services.py:apply_entity_setup": "setup_almiras command only (operator, not a user action)",
     "core/services.py:reactivate_entity_by_operator": "reactivate_entity recovery command only (operator, logged, R32)",
+    "core/services.py:sharia_off_payload": "pure: the payload a Sharia switch-off request approves (R48)",
+    "core/services.py:new_entity_sharia_off_payload": "pure: the payload a Sharia-off creation request approves (R48)",
     "ledger/services.py:validate_entry": "pure validation, called inside post",
     "ledger/services.py:signed_purification": "pure sum over lines the caller has already read",
     "ledger/services.py:rates_visible_to": "the scope mechanism for rate rows (entities_for + global rows, ledger-fx R28)",

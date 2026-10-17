@@ -1,6 +1,6 @@
 """Seeded role catalogue (access.md 3.1, holders column of 3.6).
 
-``ROLE_SEED_V1`` is applied by migration ``core.0004_seed_access``. Seeded
+``ROLE_SEED_V1`` is applied by migration ``core.0004_seed_access``, V2 by ``core.0009``, V3 by ``core.0012``. Seeded
 roles' permission sets change only by migration: to change them, add a
 ``ROLE_SEED_V2`` (or a delta) and a new data migration; never edit V1 after
 it has been applied anywhere.
@@ -120,8 +120,21 @@ ROLE_SEED_V2 = {
         (*ROLE_SEED_V1["managing_partner"][5], "core.change_entity_settings", "core.manage_users"),
     ),
 }
+# V3 (migration core.0012, A17 / R47 / R48): the group-level ``chairman`` role, which holds only the second
+# approval of a Sharia switch-off; managing_partner requests (first approval) and applies it.
+ROLE_SEED_V3 = {
+    **ROLE_SEED_V2,
+    "managing_partner": (
+        *ROLE_SEED_V2["managing_partner"][:5],
+        (*ROLE_SEED_V2["managing_partner"][5], "core.disable_sharia_enforcement"),
+    ),
+    "chairman": (
+        "Chairman", "رئيس مجلس الإدارة", "group", "human", None,
+        ("core.disable_sharia_enforcement",),
+    ),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V2
+ROLE_SEED = ROLE_SEED_V3
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {

@@ -99,6 +99,10 @@ _PERMS = [
     _p("core.change_entity_settings", "Change sensitive entity settings", "تغيير إعدادات الكيان الحساسة", GROUP_ONLY,
        INACTIVE_OK),
     _p("core.manage_users", "Activate and deactivate user accounts", "تفعيل حسابات المستخدمين وإيقافها", GROUP_ONLY),
+    # R48 (A17): turning Sharia enforcement off is a two-step four-eyes action on the group parent: a managing
+    # partner requests it (first approval), the group's chairman approves it (second). Steps are role-bound below.
+    _p("core.disable_sharia_enforcement", "Turn Sharia enforcement off (two-step approval)",
+       "إيقاف تطبيق الضوابط الشرعية (اعتماد على مرحلتين)", GROUP_ONLY, DUAL_CONTROL, SEGREGATED),
     # invoicing
     _p("invoicing.manage_customer", "Manage customers", "إدارة العملاء"),
     _p("invoicing.manage_vendor", "Manage vendors", "إدارة الموردين"),
@@ -163,6 +167,28 @@ _PERMS = [
 
 CATALOGUE = {p.codename: p for p in _PERMS}
 assert len(CATALOGUE) == len(_PERMS), "duplicate codename in catalogue"
+
+# R19 as amended by A17 (R48): a DC permission may bind its steps to roles. ``request`` opens the request (and is
+# its first approval), ``decide`` approves or rejects it, ``use`` applies it. A step that is not listed may be
+# taken by any holder of the permission. No "or managing_partner" fallback applies to a bound step.
+DUAL_CONTROL_STEPS = {
+    "core.disable_sharia_enforcement": {
+        "request": frozenset({"managing_partner"}),
+        "decide": frozenset({"chairman"}),
+        "use": frozenset({"managing_partner"}),
+    },
+}
+DUAL_CONTROL_STEP_NAMES = ("request", "decide", "use")
+assert all(CATALOGUE[c].is_dual_control and set(steps) <= set(DUAL_CONTROL_STEP_NAMES)
+           for c, steps in DUAL_CONTROL_STEPS.items()), "role-bound steps are for DC permissions only"
+
+
+def dual_control_roles(codename, step):
+    """Role codes that may take ``step`` of DC permission ``codename``; None when any holder may (R19, R48)."""
+    if step not in DUAL_CONTROL_STEP_NAMES:
+        raise ValueError(f"Unknown dual-control step {step!r}")
+    return DUAL_CONTROL_STEPS.get(codename, {}).get(step)
+
 
 # Plain (non-Sys) permissions a system user may also hold (3.6 holders column, R13).
 SYSTEM_EXTRA = {

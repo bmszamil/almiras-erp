@@ -114,8 +114,16 @@ def test_managing_partner_holds_every_approval_permission():  # OQ-1 default
     assert approvals <= Role.objects.get(code="managing_partner").permission_codes
 
 
+# Named by the spec (access R48). It changes the entity's own setting through two approvals; the ledger's Sharia
+# check (ledger.services) reads Entity.sharia_enforced only and consults no permission (R7).
+SETTING_PERMISSIONS = frozenset({"core.disable_sharia_enforcement"})
+
+
 def test_no_permission_bypasses_ledger_rules():  # R7
     for codename, perm in catalogue.CATALOGUE.items():
+        if codename in SETTING_PERMISSIONS:
+            assert perm.is_dual_control and perm.is_segregated and perm.is_group_only and not perm.posts
+            continue
         assert not re.search(r"bypass|override|sharia|closed|unbalanced|any_entity|all_entities", codename), codename
 
 

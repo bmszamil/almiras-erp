@@ -100,12 +100,15 @@ def test_admin_creates_entities_through_the_service_and_logs_them(client, w):
     client.force_login(w.mp)
     page = client.get("/admin/core/entity/add/")
     assert set(page.context["adminform"].form.fields["parent"].queryset) == {w.alm, w.sub, w.min}
-    resp = client.post("/admin/core/entity/add/", data)
+    # R48: an entity created with Sharia enforcement off needs the MP + chairman request (not possible in admin).
+    assert client.post("/admin/core/entity/add/", data).status_code == 403  # the unticked box means "off"
+    assert not Entity.objects.filter(code="NEW").exists()
+    resp = client.post("/admin/core/entity/add/", {**data, "sharia_enforced": "on"})
     assert resp.status_code == 302, resp.content.decode()[:3000]
     new = Entity.objects.get(code="NEW")
     row = AccessLog.objects.get(event="entity_settings_changed", entity=new)
     assert row.actor == w.mp and row.permission == "core.change_entity_settings" and row.details["created"] is True
-    assert row.details["after"]["sharia_enforced"] is False and row.details["after"]["parent"] == "ALM"
+    assert row.details["after"]["sharia_enforced"] is True and row.details["after"]["parent"] == "ALM"
 
 
 def test_create_entity_needs_the_right_on_the_chosen_group(w):
@@ -128,11 +131,24 @@ def test_at31_entity_settings_service_needs_managing_partner_and_logs(w):
         core_services.change_entity_settings(w.sub, user=w.acc, reason="x", sharia_enforced=False)
     assert denied(w.acc, "core.change_entity_settings", w.alm)
     assert Entity.objects.get(pk=w.sub.pk).sharia_enforced is True
-    sub = core_services.change_entity_settings(w.sub, user=w.mp, reason="Board decision 12", sharia_enforced=False)
+    # Amended 2026-10-17 (A17, R48): the MP alone can no longer switch Sharia enforcement off.
+    with pytest.raises(services.AccessDenied) as exc:
+        core_services.change_entity_settings(w.sub, user=w.mp, reason="Board decision 12", sharia_enforced=False)
+    assert exc.value.code == "dual_control" and exc.value.message_ar
+    assert Entity.objects.get(pk=w.sub.pk).sharia_enforced is True
+    chairman = make_user("chair")
+    member(chairman, w.alm, "chairman")
+    req = core_services.request_sharia_enforcement_off(w.sub, user=w.mp, reason="Board decision 12")
+    core_services.decide_sharia_enforcement_off(req, user=chairman, approve=True)
+    sub = core_services.change_entity_settings(w.sub, user=w.mp, reason="Board decision 12", sharia_enforced=False,
+                                               dual_control_request=req)
     assert sub.sharia_enforced is False
     row = AccessLog.objects.get(event="entity_settings_changed", entity=w.sub)
     assert row.actor == w.mp and row.permission == "core.change_entity_settings"
-    assert row.details == {"before": {"sharia_enforced": True}, "after": {"sharia_enforced": False}, "reason": "Board decision 12"}
+    assert row.details == {"before": {"sharia_enforced": True}, "after": {"sharia_enforced": False},
+                           "reason": "Board decision 12", "dual_control_request": req.pk}
+    sub = core_services.change_entity_settings(w.sub, user=w.mp, reason="Back on", sharia_enforced=True)  # R49
+    assert sub.sharia_enforced is True
 
 
 def test_entity_settings_service_covers_equity_entities_and_checks_structure(w):
