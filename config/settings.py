@@ -42,11 +42,47 @@ INSTALLED_APPS = [
     "ledger",
     "invoicing",
     "hr",
+    "zatca",
 ]
 
-# ZATCA hand-off (invoicing.zatca_port): the default keeps sales documents pending until the zatca
-# module exists; it never clears anything, so nothing posts without a ZATCA result.
-INVOICING_ZATCA_PORT = "invoicing.zatca_port.PendingZatcaPort"
+# ZATCA hand-off (invoicing.zatca_port), implemented by the zatca app (docs/specs/zatca.md). An entity without a
+# ZATCA profile keeps the old behaviour: its documents stay pending and nothing posts without a ZATCA result.
+INVOICING_ZATCA_PORT = "zatca.port.ZatcaModulePort"
+
+# ZATCA (docs/specs/zatca.md). No real endpoint, URL, key or secret lives in the repository.
+# Secret store (D-3, D-12): OpenBao in KSA; the client is an interface until it is deployed (OQ-34), so every
+# key operation fails closed. Tests install zatca.keystore.LocalSecretStore.
+ZATCA_SECRET_STORE = os.environ.get("ZATCA_SECRET_STORE", "zatca.keystore.OpenBaoSecretStore")
+ZATCA_OPENBAO_ADDRESS = os.environ.get("ZATCA_OPENBAO_ADDRESS", "")
+ZATCA_OPENBAO_AUTH_ROLE = os.environ.get("ZATCA_OPENBAO_AUTH_ROLE", "")
+# API client (R-29). Base URLs and paths come from ZATCA's Swagger at deployment (OQ-30); empty placeholders.
+ZATCA_CLIENT = "zatca.client.HttpZatcaClient"
+ZATCA_API_BASE_URLS = {"sandbox": os.environ.get("ZATCA_SANDBOX_BASE_URL", ""),
+                       "simulation": os.environ.get("ZATCA_SIMULATION_BASE_URL", ""),
+                       "production": os.environ.get("ZATCA_PRODUCTION_BASE_URL", "")}
+ZATCA_API_PATHS = {"compliance_csid": "", "compliance_check": "", "production_csid": "", "renew_production_csid": "",
+                   "clearance": "", "reporting": ""}
+# R-29: production can be selected only where this is switched on explicitly (never in test or dev settings).
+ZATCA_PRODUCTION_ALLOWED = os.environ.get("ZATCA_PRODUCTION_ALLOWED", "0") == "1"
+# R-15 / R-37, pending a current ZATCA SDK or the sandbox (OQ-28 remainder, OQ-33): see zatca/qr.py.
+ZATCA_QR_TAGS_7_9_LAYOUT = "dtg_2023_pending_sdk_confirm"
+ZATCA_QR_TLV_LENGTH_FORM = "one_byte_max_127_pending_sdk_confirm"
+ZATCA_QR_MAX_CHARS = 700
+# R-14 X509IssuerName form (RFC 2253 with ", "; [SDK-confirm]).
+ZATCA_X509_ISSUER_NAME_STYLE = "rfc2253"
+# R-10 renewal lead time (OQ-9), R-23 alert lead time, R-24 retry policy (OQ-10), R-27 optional serialising.
+ZATCA_RENEWAL_DAYS = 30
+ZATCA_DEADLINE_ALERT_HOURS = 2
+ZATCA_RETRY_BASE_SECONDS = 60
+ZATCA_RETRY_CAP_SECONDS = 3600
+ZATCA_MAX_ATTEMPTS_STANDARD = 10
+ZATCA_SERIALISE_PER_EGS = False
+# R-16: ZATCA's size limit; optional UBL 2.1 XSD path for the local schema check (not shipped in the repo).
+ZATCA_MAX_XML_BYTES = 10 * 1024 * 1024
+ZATCA_UBL_INVOICE_XSD = os.environ.get("ZATCA_UBL_INVOICE_XSD", "")
+# R-35 failure-notification form; R-38 movable capital asset adjustment period in years (OQ-31: not set).
+ZATCA_FAILURE_NOTICE_URL = "https://zatca.gov.sa/en/E-Invoicing/FailureNotifications/Pages/VerifyTaxpayer.aspx"
+ZATCA_MOVABLE_ADJUSTMENT_YEARS = None
 
 # HR (docs/specs/hr.md). R7: in production every approval that used an unverified statutory parameter is
 # refused; only the test settings switch this off.
