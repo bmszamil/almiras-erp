@@ -171,3 +171,57 @@ def mutate(monkeypatch, **changes):
 
 def plus(td_hours):
     return NOW + timedelta(hours=td_hours)
+
+
+# --- shared by the review regression tests (zatca/test_review_*.py) -------------------------------------------------
+ADMINS1 = ["admin1", "admin1b"]  # the ZATCA admins of TST1 in the fixture world
+
+
+def no_entry(doc):
+    return not _journal_entries().filter(document_type="invoicing.salesdocument", document_id=doc.pk).exists()
+
+
+def alerts(kind, einv=None, entity=None):
+    qs = _alerts().filter(kind=kind)
+    if einv is not None:
+        qs = qs.filter(einvoice=einv)
+    if entity is not None:
+        qs = qs.filter(entity=entity)
+    return sorted(qs.values_list("recipient__username", flat=True))
+
+
+def held_codes(einv):
+    return set(einv.messages.values_list("code", flat=True))
+
+
+def xml_text(xml, xpath):
+    return _ubl().find_text(xml if isinstance(xml, bytes) else xml.encode(), xpath)
+
+
+def second_unit(zw, entity, admin, code, **kw):
+    egs = services.create_egs_unit(entity, user=admin, code=code, name_en=f"{entity.code} {code}", name_ar="وحدة",
+                                   serial_number=f"1-TestERP|2-1.0|3-{entity.code}-{code}", industry="Real estate",
+                                   supports_standard=kw.get("standard", True),
+                                   supports_simplified=kw.get("simplified", True))
+    services.generate_csr(egs, user=admin)
+    services.enter_otp(egs, "123457", user=admin)
+    services.run_compliance_checks(egs, user=admin)
+    return services.request_production_csid(egs, user=admin)
+
+
+def _journal_entries():
+    from ledger.models import JournalEntry
+
+    return JournalEntry.objects
+
+
+def _alerts():
+    from zatca.models import ZatcaAlert
+
+    return ZatcaAlert.objects
+
+
+def _ubl():
+    from zatca import ubl
+
+    return ubl

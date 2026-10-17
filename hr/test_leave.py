@@ -172,7 +172,11 @@ def test_at17_sick_tiers(w):
     req = _approved_leave(w, e, "SICK", date(2027, 3, 1), date(2027, 4, 9), document_ref="MED-2")  # 40 days
     days = list(SickLeaveDay.objects.filter(leave_request=req).order_by("date"))
     assert len(days) == 40
-    assert [d.pay_pct for d in days[:5]] == [D("100")] * 5 and {d.pay_pct for d in days[5:]} == {D("75")}
+    assert [d.pay_pct for d in days[:5]] == [D("100")] * 5
+    assert {d.pay_pct for d in days[5:] if not d.official_holiday} == {D("75")}
+    # Eid al-Fitr 1448 (2027-03-09 to 03-12) falls in the 75% tier: paid in full (Regs Art. 24).
+    assert [d.date for d in days if d.official_holiday] == [date(2027, 3, d) for d in (9, 10, 11, 12)]
+    assert {d.pay_pct for d in days if d.official_holiday} == {D("100")}
     assert {d.cycle_start for d in days} == {date(2027, 2, 1)}
     with pytest.raises(HrError) as exc:
         services.request_leave(e, "SICK", user=w.h, start_date=date(2027, 4, 20), end_date=date(2027, 7, 28),
@@ -493,10 +497,7 @@ def test_r62_five_year_anniversary_moves_later_by_suspended_days(w):
 # --- R64 / AT-17: official holidays inside sick leave are paid in full ----------------------------------------
 
 def test_at17_official_holiday_in_the_75_tier_is_paid_in_full(w):
-    holidays = services.param("SA", "calendar.official_holidays", date(2027, 1, 1))
-    holidays.value = {**holidays.value, "date_ranges": [["2027-03-09", "2027-03-11"]]}  # Eid al-Fitr (test dates)
-    holidays.save()
-    e = hired(w, hire_date=date(2025, 1, 1))
+    e = hired(w, hire_date=date(2025, 1, 1))  # Eid al-Fitr 1448 is seeded as 2027-03-09 to 03-12 (unverified)
     _approved_leave(w, e, "SICK", date(2027, 1, 1), date(2027, 1, 30), document_ref="MED-1")  # tier 1 used up
     _approved_leave(w, e, "SICK", date(2027, 2, 20), date(2027, 2, 24), document_ref="MED-2")
     _approved_leave(w, e, "SICK", date(2027, 3, 8), date(2027, 3, 12), document_ref="MED-3")
@@ -505,8 +506,8 @@ def test_at17_official_holiday_in_the_75_tier_is_paid_in_full(w):
     assert days[date(2027, 2, 21)] == (D("75.00"), 2, False)
     assert days[date(2027, 2, 22)] == (D("100.00"), 2, True)  # Founding Day (Regs Art. 24)
     assert days[date(2027, 3, 8)] == (D("75.00"), 2, False)
-    assert days[date(2027, 3, 9)] == days[date(2027, 3, 11)] == (D("100.00"), 2, True)  # Eid
-    assert SickLeaveDay.objects.filter(employee=e, official_holiday=True).count() == 4
+    assert days[date(2027, 3, 9)] == days[date(2027, 3, 12)] == (D("100.00"), 2, True)  # Eid
+    assert SickLeaveDay.objects.filter(employee=e, official_holiday=True).count() == 5
 
 
 # --- R33 / AT-35: maternity after a late birth --------------------------------------------------------------
@@ -571,3 +572,38 @@ def test_r33_exam_not_taken_reverses_the_pay(w):
     other = _approved_leave(w, e, "EXAM", date(2027, 8, 1), date(2027, 8, 1), document_ref="EXAM-2",
                             declarations={"employer_approved_study": True})
     assert services.record_exam_result(other, True, user=w.h).unpaid is False
+
+
+# --- Nit 12: Eid dates are seeded from the Umm al-Qura table; a missing year warns; spans read every row ---------
+
+def test_nit12_eid_dates_seeded_per_regs_art24(db):
+    value = services.param("SA", "calendar.official_holidays", date(2027, 1, 1)).value
+    # Regs Art. 24: Eid al-Fitr 4 days from the day after 29 Ramadan; Eid al-Adha 4 days from Arafah (Umm al-Qura).
+    assert value["eid_al_fitr"]["1448"] == ["2027-03-09", "2027-03-12"]
+    assert value["eid_al_adha"]["1448"] == ["2027-05-15", "2027-05-18"]
+    assert services.param("SA", "calendar.official_holidays", date(2027, 1, 1)).status == "unverified"
+
+
+def test_nit12_a_year_without_eid_dates_warns(w):
+    row = services.param("SA", "calendar.official_holidays", date(2027, 1, 1))
+    row.value = {**row.value, "eid_al_adha": {k: v for k, v in row.value["eid_al_adha"].items() if k != "1448"}}
+    row.save()
+    e = _with_opening(w, "21")
+    req = services.request_leave(e, "ANNUAL", user=w.h, start_date=date(2027, 5, 10), end_date=date(2027, 5, 20))
+    assert req.days == 11  # Eid al-Adha 1448 is not known: not deducted as a holiday ...
+    assert any("Eid al-Adha" in x and "1448" in x and "عيد الأضحى" in x for x in req.warnings)  # ... and said so
+    other = services.request_leave(e, "ANNUAL", user=w.h, start_date=date(2027, 3, 1), end_date=date(2027, 3, 15))
+    assert other.days == 11 and not other.warnings  # Eid al-Fitr 1448 known: 4 days not deducted
+
+
+def test_nit12_holidays_across_a_change_of_parameter_row(w):
+    row = services.param("SA", "calendar.official_holidays", date(2027, 1, 1))
+    services.supersede_statutory_parameter(row, user=w.h, value=row.value, source_url=row.source_url,
+                                           source_reference=row.source_reference)
+    services.add_statutory_parameter(user=w.h, jurisdiction="SA", code="calendar.official_holidays",
+                                     value={**row.value, "date_ranges": [["2027-07-05", "2027-07-05"]]},
+                                     valid_from=date(2027, 7, 1), source_url=row.source_url,
+                                     source_reference="test: an extra holiday from July")
+    e = _with_opening(w, "21")
+    req = services.request_leave(e, "ANNUAL", user=w.h, start_date=date(2027, 6, 28), end_date=date(2027, 7, 7))
+    assert req.days == 9  # the row valid from 1 July is read for the July days (was: only the row of 28 June)

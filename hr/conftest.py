@@ -20,6 +20,7 @@ D = Decimal
 TODAY = date(2027, 6, 1)
 _national = count(1000000101)
 _iqama = count(2000000101)
+_qiwa = count(1)  # nit 15: every contract version has its own Qiwa reference
 
 
 def make_entity(code, consolidation="full", parent=None, country="SA", currency="SAR"):
@@ -101,7 +102,7 @@ def contract_fields(w, emp, **fields):
         end_date=None if emp.is_saudi else date(emp.hire_date.year + 2, emp.hire_date.month, 1),
         calendar_basis="gregorian", calendar_basis_ref="unified contract cl. 14.6", probation_periods=[90], job_title_en="Analyst", job_title_ar="محلل",
         weekly_hours="40", daily_hours="8", annual_leave_days=21, notice_days_employer=60, notice_days_employee=30,
-        department=dept, grade=grade, qiwa_contract_ref="QIWA-TEST-1",
+        department=dept, grade=grade, qiwa_contract_ref=f"QIWA-TEST-{next(_qiwa)}",
     )
     if emp.employment_basis == "remuneration":
         values.update(contract_type="fixed", end_date=date(emp.hire_date.year + 1, 12, 31), probation_periods=[],

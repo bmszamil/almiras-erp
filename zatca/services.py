@@ -203,13 +203,23 @@ def _super_key_for(entity):
     return key
 
 
+def _require_super_key_holder(user, entity, super_key):
+    """R-50 b: creating or rotating an entity master key needs the group super key, i.e. its holder (the MP)."""
+    if super_key.holder_id != user.pk:
+        _refuse(user, entity, "zatca.grant_key_delegation", "not_super_key_holder",
+                "Only the holder of the group super key (the Managing Partner) creates or rotates an entity master "
+                "key (R-50 b).",
+                "لا ينشئ المفتاح الرئيسي للكيان أو يدوّره إلا حائز المفتاح الأعلى للمجموعة (الشريك المدير).")
+
+
 def create_entity_master_key(entity, *, user):
-    """R-50 b / AT-70: the entity's own master key under its group's super key; the MP only."""
+    """R-50 b / AT-70: the entity's own master key under its group's super key; the super-key holder only."""
     access.require(user, entity, "zatca.grant_key_delegation")
     if EntityMasterKey.objects.filter(entity=entity).exists():
         raise ZatcaError("This entity already has a master key; rotate it instead.", "للكيان مفتاح رئيسي بالفعل.",
                          code="exists")
     super_key = _super_key_for(entity)
+    _require_super_key_holder(user, entity, super_key)
     try:
         ref = keystore.get_store().create_master_key(keystore.master_key_path(entity.code), super_key.key_ref)
     except SecretStoreUnavailable as exc:
@@ -221,15 +231,24 @@ def create_entity_master_key(entity, *, user):
 
 
 def rotate_entity_master_key(entity, *, user):
-    """A new version of the entity master key (needs the super key: the MP only, AT-71)."""
+    """A new version of the entity master key (needs the super key: its holder only, AT-71). The store re-wraps
+    every EGS key and CSID secret of the entity under the new version in the same operation (OQ-34 d), so
+    signing, submission and renewal carry on with the references already stored."""
     access.require(user, entity, "zatca.grant_key_delegation")
-    mk = EntityMasterKey.objects.filter(entity=entity).first()
-    if mk is None:
-        raise ZatcaError("This entity has no master key.", "ليس للكيان مفتاح رئيسي.", code="no_master_key")
-    ref = keystore.get_store().rotate_master_key(keystore.parse_ref(mk.key_ref)[0], mk.protected_by.key_ref)
-    mk.key_ref, mk.key_version = ref, keystore.parse_ref(ref)[1]
-    _save(mk)
-    _event(entity, None, Action.MASTER_KEY_ROTATED, user, key_ref=ref)
+    with transaction.atomic():
+        mk = EntityMasterKey.objects.select_for_update().select_related("protected_by").filter(entity=entity).first()
+        if mk is None:
+            raise ZatcaError("This entity has no master key.", "ليس للكيان مفتاح رئيسي.", code="no_master_key")
+        _require_super_key_holder(user, entity, mk.protected_by)
+        try:
+            ref = keystore.get_store().rotate_master_key(keystore.parse_ref(mk.key_ref)[0], mk.protected_by.key_ref)
+        except SecretStoreUnavailable as exc:
+            raise ZatcaError(exc.en, exc.ar, code="secret_store_unavailable") from None
+        except SecretStoreRefused as exc:
+            raise ZatcaError(exc.en, exc.ar, code="secret_store_refused") from None
+        mk.key_ref, mk.key_version = ref, keystore.parse_ref(ref)[1]
+        _save(mk)
+        _event(entity, None, Action.MASTER_KEY_ROTATED, user, key_ref=ref)
     return mk
 
 

@@ -376,3 +376,11 @@ def test_r7_superseding_always_enters_a_replacement(w):
     with pytest.raises(access.AccessDenied):
         services.supersede_statutory_parameter(new, user=w.p, value={"days": "5"}, source_url=row.source_url,
                                                source_reference="x")
+
+
+def test_seed_rows_fit_their_columns():
+    """PostgreSQL enforces source_reference max_length (300); SQLite would not notice."""
+    rows = {code: statutory_seed.reference(code) for code in statutory_seed.SA_PARAMETERS}
+    rows.update({code: v[2] for code, v in {**statutory_seed.GOSI_PARAMETERS,
+                                            **statutory_seed.GOSI_MAP_PARAMETERS}.items()})
+    assert all(len(ref) <= StatutoryParameter._meta.get_field("source_reference").max_length for ref in rows.values())

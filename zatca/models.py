@@ -570,6 +570,17 @@ class KeyCustodianDelegation(Tracked, ServiceWritten):
         return self.revoked_at is None and (self.valid_until is None or self.valid_until > at) and self.granted_at <= at
 
 
+def _key_ref_guard(obj, stored):
+    """§3.10 / finding 16: entity fixed; a new reference only with a higher version, a new version only with a new
+    reference (the ERP never points an old version number at another key)."""
+    if stored is None:
+        return
+    ref_changed = stored["key_ref"] != obj.key_ref
+    version_changed = stored["key_version"] != obj.key_version
+    if stored["entity_id"] != obj.entity_id or obj.key_version < stored["key_version"] or ref_changed != version_changed:
+        raise _immutable()
+
+
 class GroupSuperKey(Tracked, ServiceWritten):
     entity = models.OneToOneField(Entity, on_delete=models.PROTECT, related_name="+",
                                   verbose_name=bi("Group parent", "الشركة الأم"))
@@ -580,6 +591,12 @@ class GroupSuperKey(Tracked, ServiceWritten):
     class Meta:
         verbose_name = bi("group super key (reference)", "المفتاح الأعلى للمجموعة (مرجع)")
         verbose_name_plural = bi("group super keys (references)", "المفاتيح العليا للمجموعات (مراجع)")
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            _key_ref_guard(self, type(self)._base_manager.filter(pk=self.pk).values(
+                "entity_id", "key_ref", "key_version").first())
+        super().save(*args, **kwargs)
 
 
 class EntityMasterKey(Tracked, ServiceWritten):
@@ -596,11 +613,12 @@ class EntityMasterKey(Tracked, ServiceWritten):
 
     def save(self, *args, **kwargs):
         if self.pk:
-            stored = type(self)._base_manager.filter(pk=self.pk).values("entity_id", "protected_by_id",
+            stored = type(self)._base_manager.filter(pk=self.pk).values("entity_id", "protected_by_id", "key_ref",
                                                                          "key_version").first()
-            if stored and (stored["entity_id"] != self.entity_id or stored["protected_by_id"] != self.protected_by_id
+            if stored and (stored["protected_by_id"] != self.protected_by_id
                            or self.key_version <= stored["key_version"]):
                 raise _immutable()  # only new versions
+            _key_ref_guard(self, stored)
         super().save(*args, **kwargs)
 
 

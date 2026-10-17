@@ -428,19 +428,56 @@ def _years_between(start, end_exclusive, basis, year_days):
     return Fraction(n) + Fraction((end_exclusive - _anniversary(start, n, basis)).days, year_days)
 
 
+EID_KEYS = (("eid_al_fitr", 9, 10, "Eid al-Fitr", "عيد الفطر"), ("eid_al_adha", 12, 12, "Eid al-Adha", "عيد الأضحى"))
+
+
+def _hijri_month_span(year, first_month, last_month):
+    """Gregorian first and last day of Hijri months ``first_month``..``last_month`` of ``year`` (None out of range)."""
+    try:
+        a = Hijri(year, first_month, 1).to_gregorian()
+        b = Hijri(year, last_month, 1)
+        b_end = Hijri(year, last_month, b.month_length()).to_gregorian()
+    except (ValueError, OverflowError):
+        return None
+    return date(a.year, a.month, a.day), date(b_end.year, b_end.month, b_end.day)
+
+
 def _holidays(use, jurisdiction, start, end):
-    """Official holidays between start and end (parameter ``calendar.official_holidays``)."""
-    value = use.get(jurisdiction, "calendar.official_holidays", start)
+    """Official holidays between start and end (parameter ``calendar.official_holidays``), each day taken from the
+    row valid on it (nit 12: every row overlapping the span is read). Founding Day and National Day by Gregorian
+    day; the Eids per Hijri year (``eid_al_fitr`` / ``eid_al_adha``); other ``date_ranges``. A Hijri year whose Eid
+    falls in the span but has no entry is a warning (en/ar) on the record, never a silent working day."""
     result = set()
-    for year in range(start.year, end.year + 1):
-        for md in value.get("fixed_month_days", []):
-            m, d = (int(x) for x in md.split("-"))
-            day = date(year, m, d)
-            if start <= day <= end:
+    for seg_start, seg_end, value in use.get_span(jurisdiction, "calendar.official_holidays", start, end):
+        for year in range(seg_start.year, seg_end.year + 1):
+            for md in value.get("fixed_month_days", []):
+                m, d = (int(x) for x in md.split("-"))
+                day = date(year, m, d)
+                if seg_start <= day <= seg_end:
+                    result.add(day)
+        ranges = list(value.get("date_ranges", []))
+        try:
+            first_h = Gregorian(seg_start.year, seg_start.month, seg_start.day).to_hijri().year
+            last_h = Gregorian(seg_end.year, seg_end.month, seg_end.day).to_hijri().year
+        except (ValueError, OverflowError):
+            first_h = last_h = None
+            use.warn(f"The Hijri calendar table does not cover {seg_start} to {seg_end}: Eid holidays are not counted "
+                     "(Regs Art. 24). / لا يغطي جدول التقويم الهجري الفترة من {seg_start} إلى {seg_end}: لا تُحتسب إجازة "
+                     "العيدين.".replace("{seg_start}", str(seg_start)).replace("{seg_end}", str(seg_end)))
+        for key, first_month, last_month, en, ar in EID_KEYS:
+            entries = value.get(key, {}) or {}
+            ranges += list(entries.values())
+            if first_h is None:
+                continue
+            for hy in range(first_h, last_h + 1):
+                window = _hijri_month_span(hy, first_month, last_month)
+                if window and window[0] <= seg_end and seg_start <= window[1] and str(hy) not in entries:
+                    use.warn(f"No {en} dates are entered for {hy} AH in calendar.official_holidays: those holiday "
+                             f"days are not counted (Regs Art. 19, 24). / لم تُدخل تواريخ {ar} لعام {hy} هـ في "
+                             "معيار العطل الرسمية: لا تُحتسب أيام هذه العطلة.")
+        for a, b in ranges:
+            for day in _days(max(seg_start, date.fromisoformat(a)), min(seg_end, date.fromisoformat(b))):
                 result.add(day)
-    for a, b in value.get("date_ranges", []):
-        for day in _days(max(start, date.fromisoformat(a)), min(end, date.fromisoformat(b))):
-            result.add(day)
     return result
 
 
@@ -1031,8 +1068,8 @@ def create_contract(employee, *, user, components=None, **fields):
             if last else None)
     if base is None:
         fields.setdefault("currency", emp.entity.base_currency_id)
-    else:  # an amendment starts from the latest approved terms
-        for name in CONTRACT_FIELDS - {"effective_date"}:
+    else:  # an amendment starts from the latest approved terms; it is documented on Qiwa itself (nit 15, R61)
+        for name in CONTRACT_FIELDS - {"effective_date", "qiwa_contract_ref"}:
             if name not in fields:
                 setattr(contract, name, getattr(base, name))
         if components is None:
@@ -1162,10 +1199,12 @@ def _statutory_contract_problems(contract, emp, use, jurisdiction):
     # R37 notice minimums for open-ended contracts (Art. 75).
     if contract.contract_type == EmploymentContract.ContractType.UNLIMITED:
         notice = use.get(jurisdiction, "notice.min_days", on)
-        if contract.notice_days_employer < int(notice["employer"]) or contract.notice_days_employee < int(notice["employee"]):
-            problems.append(f"Notice is at least {notice['employer']} days for the employer and {notice['employee']} "
-                            f"for the employee (Art. 75). / مدة الإشعار {notice['employer']} يومًا على الأقل لصاحب "
-                            f"العمل و{notice['employee']} يومًا للموظف.")
+        # Nit 13 (Art. 75): 60 / 30 days for monthly-paid workers; 30 days either side otherwise.
+        employer = int(notice["employer"] if contract.paid_monthly else notice["not_monthly"])
+        employee = int(notice["employee"] if contract.paid_monthly else notice["not_monthly"])
+        if contract.notice_days_employer < employer or contract.notice_days_employee < employee:
+            problems.append(f"Notice is at least {employer} days for the employer and {employee} for the employee "
+                            f"(Art. 75). / مدة الإشعار {employer} يومًا على الأقل لصاحب العمل و{employee} يومًا للموظف.")
     _year_days(use, jurisdiction, contract.calendar_basis, on)  # the calendar basis must be configured (Art. 10)
     return problems, warnings
 
@@ -1181,11 +1220,24 @@ def _statutory_annual_days(use, jurisdiction, emp, contract, on):
     return days
 
 
+def _qiwa_reused(contract, reference):
+    reference = (reference or "").strip()
+    return bool(reference) and EmploymentContract.objects.filter(employee=contract.employee).exclude(
+        pk=contract.pk).filter(qiwa_contract_ref=reference).exists()
+
+
+QIWA_REUSED = ("This Qiwa reference belongs to another version of the contract; every version (amendments too) is "
+               "documented on Qiwa with its own reference (R61, Regs Art. 18).",
+               "مرجع قوى هذا لنسخة أخرى من العقد؛ توثَّق كل نسخة (والتعديلات كذلك) في قوى بمرجعها الخاص.")
+
+
 def _contract_problems(contract, *, statutory, use):
     """All checks of a contract version. ``statutory=False`` skips the jurisdiction's statutory checks (submission
     of a local entity employee's contract: master data is kept, approval refuses, R5/R51)."""
     emp, entity = contract.employee, contract.entity
     problems, warnings = [], []
+    if _qiwa_reused(contract, contract.qiwa_contract_ref):
+        problems.append(f"{QIWA_REUSED[0]} / {QIWA_REUSED[1]}")
     basis = emp.employment_basis
     if not contract.job_title_ar or not contract.job_title_en:
         problems.append("The job title in English and Arabic is required. / المسمى الوظيفي بالإنجليزية والعربية مطلوب.")
@@ -1224,8 +1276,8 @@ def _contract_problems(contract, *, statutory, use):
         if contract.probation_days or contract.annual_leave_days:
             problems.append("Remuneration staff have no probation and no annual leave (R52). / "
                             "لا فترة تجربة ولا إجازة سنوية لأصحاب المكافأة الشهرية.")
-        if currency.minor_units not in (2, 3) or not currency.is_active:
-            problems.append(f"Currency {currency.code} is not supported (2 or 3 decimals, active). / "
+        if not 0 <= currency.minor_units <= 3 or not currency.is_active:  # nit 14: 0-decimal currencies too
+            problems.append(f"Currency {currency.code} is not supported (0 to 3 decimals, active). / "
                             f"العملة {currency.code} غير مدعومة.")
     else:
         # R18, R53: one BASIC, the entity's functional currency.
@@ -1290,7 +1342,7 @@ def approve_contract(contract, *, user):
     use.check_verified()
     use.mark_used()
     c.status, c.approved_by, c.approved_at = CStatus.APPROVED, user, timezone.now()
-    c.warnings, c.parameter_ids = warnings, use.ids
+    c.warnings, c.parameter_ids = warnings + use.warnings, use.ids
     _save(c)
     _activate_if_started(emp)
     return c
@@ -1416,6 +1468,8 @@ def record_qiwa_reference(contract, reference, *, user):
     if c.status in (CStatus.REJECTED, CStatus.WITHDRAWN) or (c.status == CStatus.APPROVED and c.qiwa_contract_ref):
         raise error("The Qiwa reference of this version is already recorded or the version is closed.",
                     "مرجع قوى لهذه النسخة مسجل مسبقًا أو النسخة مغلقة.", code="qiwa_reference")
+    if _qiwa_reused(c, reference):
+        raise error(*QIWA_REUSED, code="qiwa_reference")
     c.qiwa_contract_ref, c.modified_by, c.modified_at = reference, user, timezone.now()
     if c.status == CStatus.APPROVED:
         _save(c, update_fields=["qiwa_contract_ref"])  # the approval's own warnings stay as they were
@@ -2009,10 +2063,11 @@ def request_leave(employee, leave_type, *, user, start_date, end_date, event_dat
                        start_date=start_date, end_date=end_date, event_date=event_date, document_ref=document_ref,
                        reason_ar=reason_ar, reason_en=reason_en, declarations=declarations or {}, created_by=user,
                        source=_source(user))
-    problems = _leave_problems(req, ParamUse())
+    use = ParamUse()
+    problems = _leave_problems(req, use)
     if problems:
         raise _problems(problems, "leave_invalid")
-    req.status, req.submitted_by = LR.SUBMITTED, user
+    req.status, req.submitted_by, req.warnings = LR.SUBMITTED, user, list(use.warnings)
     return _save(req)
 
 

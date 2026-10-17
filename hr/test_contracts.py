@@ -246,7 +246,8 @@ def test_at28_functional_currency_for_ksa_and_local(w):
     with pytest.raises(HrError) as exc:
         services.submit_contract(usd, user=w.he)
     assert "EGP" in exc.value.messages[0] and "عملة" in exc.value.messages[0]
-    egp = services.create_contract(local, user=w.he, components={"BASIC": "9000.00"}, **{**fields, "currency": "EGP"})
+    egp = services.create_contract(local, user=w.he, components={"BASIC": "9000.00"},
+                                   **{**fields, "currency": "EGP", "qiwa_contract_ref": ""})
     assert services.submit_contract(egp, user=w.he).status == "submitted"
 
 
@@ -301,11 +302,12 @@ def test_at33_rehire_in_another_job_needs_the_written_agreement(w):
 def test_at33_probation_end_skips_founding_day_and_sick_days(w):
     emp = hired(w, hire_date=date(2027, 2, 1))  # probation 90 days
     c = emp.contracts.get(status="approved")
-    assert services.probation_end_date(c, user=w.h) == date(2027, 5, 2)  # Founding Day 2027-02-22 skipped
-    req = services.request_leave(emp, "SICK", user=w.h, start_date=date(2027, 3, 10), end_date=date(2027, 3, 12),
+    # Founding Day 2027-02-22 and Eid al-Fitr 1448 (2027-03-09 to 03-12, seeded from the Umm al-Qura table) skipped.
+    assert services.probation_end_date(c, user=w.h) == date(2027, 5, 6)
+    req = services.request_leave(emp, "SICK", user=w.h, start_date=date(2027, 3, 20), end_date=date(2027, 3, 22),
                                  document_ref="MED-1")
     services.approve_leave(req, user=w.h2)
-    assert services.probation_end_date(c, user=w.h) == date(2027, 5, 5)  # and the 3 sick days
+    assert services.probation_end_date(c, user=w.h) == date(2027, 5, 9)  # and the 3 sick days
 
 
 # --- R16(b), R63 / AT-10 (Art. 55) and R19 (Art. 99) ---------------------------------------------------------
@@ -340,3 +342,39 @@ def test_r19_nine_hour_days_only_with_an_art99_reference(w):
     assert c.status == "approved"
     with pytest.raises(HrError):
         _submit(w, employee(w), daily_hours="10", weekly_hours="45", extended_hours_ref="Ministerial decision (test)")
+
+
+# --- Nits 13 to 15 ---------------------------------------------------------------------------------------------
+
+def test_nit13_contract_notice_minimum_follows_paid_monthly(w):
+    with pytest.raises(HrError):  # monthly paid: 60 days for the employer
+        _submit(w, employee(w), notice_days_employer=30, notice_days_employee=30)
+    weekly = _submit(w, employee(w), paid_monthly=False, notice_days_employer=30, notice_days_employee=30)
+    assert weekly.status == "submitted"  # not monthly paid: 30 days either side (Art. 75)
+    with pytest.raises(HrError):
+        _submit(w, employee(w), paid_monthly=False, notice_days_employer=30, notice_days_employee=29)
+
+
+def test_nit14_zero_decimal_currency_for_remuneration(w):
+    jpy = contract(w, employee(w, basis="remuneration"), {"REMUNERATION": "600000"}, currency="JPY")
+    assert jpy.status == "approved"
+    with pytest.raises(HrError) as exc:
+        contract(w, employee(w, basis="remuneration"), {"REMUNERATION": "600000.5"}, currency="JPY", approve=False)
+    assert "JPY" in exc.value.messages[0]
+
+
+def test_nit15_an_amendment_needs_its_own_qiwa_reference(w):
+    emp = hired(w)
+    v1 = emp.contracts.get(status="approved")
+    v2 = services.create_contract(emp, user=w.h, effective_date=date(2027, 3, 1))
+    assert v2.qiwa_contract_ref == ""  # not copied from v1
+    services.update_contract(v2, user=w.h, qiwa_contract_ref=v1.qiwa_contract_ref)
+    with pytest.raises(HrError) as exc:
+        services.submit_contract(v2, user=w.h)
+    assert "Qiwa" in exc.value.messages[0] and "قوى" in exc.value.messages[0]
+    services.update_contract(v2, user=w.h, qiwa_contract_ref="")
+    v2 = services.approve_contract(services.submit_contract(v2, user=w.h), user=w.c)
+    assert any("Regs Art. 18" in x for x in v2.warnings)
+    with pytest.raises(HrError):
+        services.record_qiwa_reference(v2, v1.qiwa_contract_ref, user=w.h)
+    assert services.record_qiwa_reference(v2, "QIWA-AMEND-2", user=w.h).qiwa_contract_ref == "QIWA-AMEND-2"

@@ -14,6 +14,10 @@ are not verified).
 
 Values use Decimal strings (R6: no floats); fractions are exact rationals such as "1/3".
 """
+from datetime import date, timedelta
+
+from hijridate import Hijri
+
 LABOUR_LAW = "https://www.hrsd.gov.sa/en/policies/labor-law"
 REGULATIONS = "https://www.hrsd.gov.sa/en/policies/implementing-regulations-labor-law"
 VALID_FROM = "2000-01-01"
@@ -27,6 +31,28 @@ _RESIGNATION_BANDS = [  # Art. 85: <2 y 0; 2 to 5 y inclusive 1/3; >5 and <10 2/
 _FULL = [{"from": "0", "fraction": "1"}]
 _NONE = [{"from": "0", "fraction": "0"}]
 
+# Regs Art. 24 (1), (2) (HRSD Implementing Regulations, Arabic text downloaded 2026-10-17; model work regulations
+# Art. 39 says the same): Eid al-Fitr holiday "four days starting the day after the 29th of Ramadan per the Umm
+# al-Qura calendar"; Eid al-Adha holiday "four days starting on the day of standing at Arafah" (9 Dhu al-Hijjah).
+EID_HOLIDAY_DAYS = 4
+EID_FIRST_HIJRI_YEAR, EID_LAST_HIJRI_YEAR = 1440, 1462  # Gregorian 2019 to 2041
+
+
+def eid_ranges(first=EID_FIRST_HIJRI_YEAR, last=EID_LAST_HIJRI_YEAR):
+    """{"eid_al_fitr": {hijri year: [first, last]}, "eid_al_adha": {...}} computed from the Umm al-Qura table of
+    the open-source ``hijridate`` library. Seeded unverified: the announced dates (moon sighting for Arafah, the
+    Royal Court's holiday announcements) can differ by a day; the managing partner checks each year (R7)."""
+    fitr, adha = {}, {}
+    for year in range(first, last + 1):
+        g = Hijri(year, 9, 29).to_gregorian()
+        start = date(g.year, g.month, g.day) + timedelta(days=1)
+        fitr[str(year)] = [start.isoformat(), (start + timedelta(days=EID_HOLIDAY_DAYS - 1)).isoformat()]
+        g = Hijri(year, 12, 9).to_gregorian()
+        start = date(g.year, g.month, g.day)
+        adha[str(year)] = [start.isoformat(), (start + timedelta(days=EID_HOLIDAY_DAYS - 1)).isoformat()]
+    return {"eid_al_fitr": fitr, "eid_al_adha": adha}
+
+
 # code: (value, source_url, source_reference)
 SA_PARAMETERS = {
     # R9 [compliance: format not stated in any official source] — a warning, never a hard check.
@@ -36,10 +62,12 @@ SA_PARAMETERS = {
     "probation.max_days": ({"days": "180"}, LABOUR_LAW, "Labour Law Art. 53; Regs Art. 19"),
     # Art. 54: one probation per employer unless another job or 6+ months since the last employment ended.
     "probation.repeat": ({"months_since_last_employment": "6"}, LABOUR_LAW, "Labour Law Art. 54"),
-    # Official holidays not counted in probation and extending annual leave (Regs Art. 19, 24). Eid dates are
-    # Hijri and entered per year as date ranges by the parameter maintainer.
-    "calendar.official_holidays": ({"fixed_month_days": ["02-22", "09-23"], "date_ranges": []}, REGULATIONS,
-                                   "Regs Art. 19, 24 (Founding Day, National Day; Eid al-Fitr and Eid al-Adha per year)"),
+    # Official holidays not counted in probation and extending annual leave (Regs Art. 19, 24): Founding Day and
+    # National Day by Gregorian day; the Eids per Hijri year (generated above, unverified); ``date_ranges`` for any
+    # other dated holiday the maintainer enters. A year with no Eid entry gives a warning wherever it is used.
+    "calendar.official_holidays": ({"fixed_month_days": ["02-22", "09-23"], "date_ranges": [], **eid_ranges()},
+                                   REGULATIONS, "Regs Art. 19, 24 (Founding Day, National Day; Eids 1440-1462 AH from "
+                                   "the Umm al-Qura table via hijridate, check against announcements)"),
     # Art. 10: Hijri unless the contract states Gregorian. Divisor for pro-rata [CC-verify: 365 / 365.25 / 354].
     "calendar.year_days": ({"gregorian": "365", "hijri": "354"}, LABOUR_LAW, "Labour Law Art. 10 [CC-verify divisor]"),
     # R19.
@@ -188,3 +216,4 @@ def apply_rows(StatutoryParameter, rows, jurisdiction="SA", valid_from=VALID_FRO
         if (current.value, current.source_url, current.source_reference) != (value, url, ref):
             current.value, current.source_url, current.source_reference = value, url, ref
             current.save()
+

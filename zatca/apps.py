@@ -7,3 +7,6 @@ class ZatcaConfig(AppConfig):
     name = "zatca"
     verbose_name = "ZATCA e-invoicing / الفوترة الإلكترونية"
     default_auto_field = "django.db.models.BigAutoField"
+
+    def ready(self):
+        from . import checks  # noqa: F401  (registers zatca.E001)
