@@ -109,18 +109,43 @@ LOCAL = {
                    "مبلغ أحد البنود شاملًا الضريبة لا يساوي صافيه مضافًا إليه ضريبته."),
     "sar_vat": ("A document in a currency other than SAR needs its VAT total in SAR from invoicing (R-40).",
                 "يحتاج المستند بعملة غير الريال إلى إجمالي الضريبة بالريال من الفوترة."),
-    "third_decimal": ("Amounts with a third decimal other than 0 are not sent to ZATCA until 3-decimal amounts are "
-                      "confirmed (R-51, OQ-35).",
-                      "لا تُرسل المبالغ التي خانتها العشرية الثالثة ليست صفرًا إلى الهيئة حتى يتأكد قبول ثلاث خانات."),
+    "third_decimal": ("Amounts with a third decimal other than 0 are not sent to ZATCA: ZATCA XML amounts carry 2 "
+                      "decimals in every currency (R-51; SDK R3.4.8 rejects 3-decimal sums, BR-CO-14/-15).",
+                      "لا تُرسل إلى الهيئة المبالغ التي خانتها العشرية الثالثة ليست صفرًا: مبالغ فواتير الهيئة بخانتين "
+                      "عشريتين لكل العملات."),
     "exemption_reasons": ("One VAT category carries several exemption reasons; ZATCA allows one per category.",
                           "تحمل فئة ضريبية واحدة عدة أسباب إعفاء؛ تسمح الهيئة بسبب واحد لكل فئة."),
     "exemption_reason": ("A zero-rated, exempt or out-of-scope category needs its exemption reason code and text.",
                          "تحتاج الفئة الصفرية أو المعفاة أو خارج النطاق إلى سبب الإعفاء."),
     "movable_acquisition": ("A movable capital asset document needs its acquisition date (R-38).",
                             "يحتاج مستند الأصل الرأسمالي المنقول إلى تاريخ الاقتناء."),
-    "type_code": ("Only invoices (388), credit notes (381) and debit notes (383) are built; 386 waits for a current "
-                  "ZATCA SDK (R-39, OQ-29).",
-                  "تُنشأ الفواتير والإشعارات الدائنة والمدينة فقط؛ فاتورة الدفعة المقدمة تنتظر أداة الهيئة الحديثة."),
+    "type_code": ("Only invoices (388), credit notes (381) and debit notes (383) are built; prepayment invoices (386) "
+                  "wait for the invoicing prepayment flow (R-39).",
+                  "تُنشأ الفواتير والإشعارات الدائنة والمدينة فقط؛ فاتورة الدفعة المقدمة (386) تنتظر بناء الدفعات "
+                  "المقدمة في الفوترة."),
+    "prepayment_not_built": ("Documents that deduct prepayments are not built yet; they wait for the invoicing "
+                             "prepayment flow (R-39).",
+                             "لا تُنشأ بعد المستندات التي تخصم دفعات مقدمة؛ تنتظر بناء الدفعات المقدمة في الفوترة."),
+    "prepayment_reference": ("A prepaid amount needs a deduction line for each prepayment invoice with its number, issue "
+                             "date, issue time and type code (BR-KSA-73, R-39).",
+                             "يحتاج المبلغ المدفوع مقدمًا إلى بند خصم لكل فاتورة دفعة مقدمة برقمها وتاريخ ووقت إصدارها "
+                             "ورمز نوعها."),
+    "prepayment_type": ("A prepayment deduction line must reference a prepayment invoice, type code 386 (BR-KSA-74).",
+                        "يجب أن يشير بند خصم الدفعة المقدمة إلى فاتورة دفعة مقدمة برمز النوع 386."),
+    "prepayment_vat_fields": ("A prepayment deduction line needs the prepaid taxable amount, VAT amount, VAT category "
+                              "and rate (BR-KSA-75).",
+                              "يحتاج بند خصم الدفعة المقدمة إلى المبلغ الخاضع المدفوع مقدمًا وضريبته وفئة الضريبة "
+                              "ونسبتها."),
+    "prepayment_vat": ("The prepaid VAT of a deduction line differs from round(prepaid taxable amount x rate / 100, 2) "
+                       "(BR-KSA-79).",
+                       "ضريبة الدفعة المقدمة في بند الخصم لا تساوي المبلغ الخاضع مضروبًا في النسبة مقربًا إلى خانتين."),
+    "prepaid_amount": ("The prepaid amount differs from the sum of the prepaid taxable amounts and their VAT "
+                       "(BR-KSA-80).",
+                       "المبلغ المدفوع مقدمًا لا يساوي مجموع المبالغ الخاضعة المدفوعة مقدمًا وضرائبها."),
+    "prepayment_line_zero": ("A prepayment deduction line must have price, allowance, charge, net amount, line VAT and "
+                             "line amount with VAT of 0 (BR-KSA-82).",
+                             "يجب أن تكون قيم السعر والخصم والرسوم والصافي والضريبة والإجمالي في بند خصم الدفعة "
+                             "المقدمة صفرًا."),
     "xml_size": ("The signed XML is larger than ZATCA's 10 MB limit (R-16).",
                  "حجم الفاتورة الموقعة يتجاوز حد الهيئة البالغ 10 ميغابايت."),
     "seller_name_length": ("The seller name is longer than 1000 characters (BT-27, BR-KSA-F-06-C10).",

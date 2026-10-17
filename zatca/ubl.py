@@ -64,6 +64,29 @@ class TaxGroup:
 
 
 @dataclass
+class PrepaymentLine:
+    """One prepayment deduction line of a final 388 (R-39; SDK R3.4.8 findings §3.4). Validated by
+    ``zatca.rules.prepayment_problems`` only: not emitted until the invoicing prepayment flow exists (R-39)."""
+    number: str  # KSA-26: the 386's invoice number (BT-1)
+    uuid: str  # the 386's UUID (cbc:UUID in the line DocumentReference; every SDK sample carries it)
+    issue_date: str  # KSA-28, as emitted on the 386
+    issue_time: str  # KSA-29, as emitted on the 386
+    type_code: str  # KSA-30, must be 386 (BR-KSA-74)
+    taxable: Decimal | None  # KSA-31
+    vat: Decimal | None  # KSA-32 = round(KSA-31 x KSA-34 / 100, 2) (BR-KSA-79)
+    category: str  # KSA-33
+    rate: Decimal | None  # KSA-34
+    # BR-KSA-82: these line amounts are all 0 on a deduction line.
+    quantity: Decimal = Decimal("0")
+    price: Decimal = Decimal("0")
+    net: Decimal = Decimal("0")
+    allowance: Decimal = Decimal("0")
+    charge: Decimal = Decimal("0")
+    line_vat: Decimal = Decimal("0")
+    line_amount_with_vat: Decimal = Decimal("0")
+
+
+@dataclass
 class InvoiceData:
     number: str
     uuid: str
@@ -93,7 +116,8 @@ class InvoiceData:
     retention_class: str = "standard"
     acquisition_date: date | None = None
     attachments: list = field(default_factory=list)  # [(id, base64 text)] extra AdditionalDocumentReference
-    prepaid_amount: Decimal = Decimal("0")  # BT-113; 0 until prepayment deductions are built (R-39)
+    prepaid_amount: Decimal = Decimal("0")  # BT-113; non-zero only with prepayment lines (R-39, not built yet)
+    prepayments: list = field(default_factory=list)  # [PrepaymentLine] (R-39; validated, not emitted yet)
 
     @property
     def payable(self):
@@ -181,6 +205,8 @@ def _tax_scheme(parent):
 
 def build_unsigned(data: InvoiceData, icv: int, pih: str) -> bytes:
     """The unsigned UBL document with ICV and PIH; QR and signature are added by :func:`sign`."""
+    if data.prepayments:  # R-39: deduction lines are validated (rules.prepayment_problems) but not built yet
+        raise NotImplementedError("prepayment deduction lines are not built until invoicing prepayments exist (R-39)")
     root = etree.Element(f"{{{INV}}}Invoice", nsmap={None: INV, "cac": CAC, "cbc": CBC, "ext": EXT})
     cur = data.currency
     _sub(root, CBC, "ProfileID", "reporting:1.0")

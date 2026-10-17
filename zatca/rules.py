@@ -80,8 +80,8 @@ def _third_decimal(value):
 
 
 def document_problems(data):
-    """Local checks before any ICV is used (R-16, R-19, R-31, R-40, R-46, R-48, R-51, BT-27, BR-KSA-63/-67,
-    BR-CO-15).
+    """Local checks before any ICV is used (R-16, R-19, R-31, R-39, R-40, R-46, R-48, R-51, BT-27,
+    BR-KSA-63/-67, BR-CO-15).
 
     ``data`` is a :class:`zatca.ubl.InvoiceData`.
     """
@@ -174,8 +174,65 @@ def document_problems(data):
         amounts += [g.taxable, g.vat]
     if data.currency_places > 2 and any(_third_decimal(a) for a in amounts):
         problems.append(local("third_decimal"))
+    # R-39: prepayment deductions are checked, but not built until the invoicing prepayment flow exists.
+    if data.prepayments or Decimal(data.prepaid_amount or 0) != 0:
+        problems.append(local("prepayment_not_built"))
+        problems += prepayment_problems(data)
+        for p in data.prepayments:
+            amounts += [a for a in (p.taxable, p.vat) if a is not None]
+        amounts.append(data.prepaid_amount)
+        if data.currency_places > 2 and any(_third_decimal(a) for a in amounts):
+            problems.append(local("third_decimal"))
     if data.retention_class == "movable_capital_asset" and not data.acquisition_date:
         problems.append(local("movable_acquisition"))
+    seen, unique = set(), []
+    for p in problems:
+        if p[0] not in seen:
+            seen.add(p[0])
+            unique.append(p)
+    return unique
+
+
+def _round2(value):
+    return Decimal(value).quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def prepayment_problems(data):
+    """R-39: the prepayment deduction lines of a final 388 and its BT-113, per SDK R3.4.8's KSA rules
+    (findings §3.4). Validators only: the module does not build such documents yet.
+
+    BR-KSA-73 (BT-113 given -> deduction line(s) with KSA-26, -28, -29, -30), BR-KSA-74 (KSA-30 = 386),
+    BR-KSA-75 (KSA-31 to -34 present), BR-KSA-79 (KSA-32 = round(KSA-31 x KSA-34 / 100, 2); house rule: exact,
+    the SDK allows +-0.01 as a warning; 0 for Z/E/O), BR-KSA-80 (BT-113 = sum(KSA-31 + KSA-32); also no
+    deduction lines without BT-113), BR-KSA-82 (line price, allowance, charge, net, line VAT and line amount
+    with VAT all 0).
+    """
+    problems = []
+    prepaid = Decimal(data.prepaid_amount or 0)
+    lines = list(data.prepayments)
+    if prepaid != 0 and not lines:
+        problems.append(local("prepayment_reference"))
+    total = Decimal("0")
+    for p in lines:
+        if not all((str(v).strip() if v is not None else "") for v in (p.number, p.issue_date, p.issue_time,
+                                                                         p.type_code)):
+            problems.append(local("prepayment_reference"))  # BR-KSA-73
+        if (p.type_code or "").strip() != "386":
+            problems.append(local("prepayment_type"))  # BR-KSA-74
+        if p.taxable is None or p.vat is None or not (p.category or "").strip() or p.rate is None:
+            problems.append(local("prepayment_vat_fields"))  # BR-KSA-75
+            continue
+        rate = Decimal(p.rate) if p.category == "S" else Decimal("0")
+        if p.category != "S" and Decimal(p.rate) != 0:
+            problems.append(local("prepayment_vat"))
+        elif Decimal(p.vat) != _round2(Decimal(p.taxable) * rate / HUNDRED):
+            problems.append(local("prepayment_vat"))  # BR-KSA-79
+        total += Decimal(p.taxable) + Decimal(p.vat)
+        if any(Decimal(a) != 0 for a in (p.price, p.net, p.allowance, p.charge, p.line_vat,
+                                         p.line_amount_with_vat)):
+            problems.append(local("prepayment_line_zero"))  # BR-KSA-82
+    if lines and (prepaid == 0 or prepaid != total):
+        problems.append(local("prepaid_amount"))  # BR-KSA-80
     seen, unique = set(), []
     for p in problems:
         if p[0] not in seen:
