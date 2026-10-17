@@ -224,8 +224,16 @@ ROLE_SEED_V7 = {
     "managing_partner": _plus(ROLE_SEED_V6, "managing_partner", "banking.view", "banking.view_iban",
                               *_BANKING_APPROVALS, "banking.reopen_reconciliation"),
 }
+# V8 (migration core.0017, invoicing R54 amendment D31b): charity recipients of purification payouts. The accountant
+# adds (and deactivates) them; the Managing Partner approves them (A, S!: never the person who added them). The CFO
+# (approver) does not approve recipients: it approves the payouts to them (invoicing.approve_purification_payout).
+ROLE_SEED_V8 = {
+    **ROLE_SEED_V7,
+    "accountant": _plus(ROLE_SEED_V7, "accountant", "invoicing.manage_charity_recipient"),
+    "managing_partner": _plus(ROLE_SEED_V7, "managing_partner", "invoicing.approve_charity_recipient"),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V7
+ROLE_SEED = ROLE_SEED_V8
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {

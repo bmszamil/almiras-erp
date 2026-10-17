@@ -128,6 +128,12 @@ _PERMS = [
     _p("invoicing.manage_settings", "Manage invoicing settings", "إدارة إعدادات الفوترة"),
     _p("invoicing.post_purification_transfer", "Post purification transfers", "ترحيل تحويلات التطهير", POSTS),
     _p("invoicing.approve_purification_payout", "Approve purification payouts", "اعتماد صرف مبالغ التطهير", APPROVAL, POSTS),
+    # invoicing R54 amendment D31b: charity recipients of purification payouts, added by the accountant and approved
+    # by a Managing Partner who did not add them (S!: whatever roles the person holds).
+    _p("invoicing.manage_charity_recipient", "Add and deactivate charity recipients",
+       "إضافة الجهات الخيرية المستفيدة وإيقافها"),
+    _p("invoicing.approve_charity_recipient", "Approve charity recipients", "اعتماد الجهات الخيرية المستفيدة",
+       APPROVAL, SEGREGATED),
     _p("invoicing.view", "View invoicing", "عرض الفوترة", AGENT_OK),
     _p("invoicing.view_personal_data", "View personal data", "عرض البيانات الشخصية"),
     # billing
