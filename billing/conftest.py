@@ -34,9 +34,12 @@ def pytest_configure(config):
     config.addinivalue_line("markers", FAKE_CFO_APPROVAL)
 
 
-# Every clear() of an auto-issued invoice depends on the same fake approval; the tests marked are those whose
-# assertions are about that posting (journal entry, approved_by / posted_by of the invoice).
-fake_cfo_approval = pytest.mark.fake_cfo_approval
+def fake_cfo_approval(test):
+    """Mark ``test`` ``fake_cfo_approval``. Every clear() of an auto-issued invoice depends on the same fake approval;
+    the tests marked are those whose assertions are about that posting (journal entry, approved_by / posted_by of
+    the invoice). A function, so the mark is made when the test module is imported, after pytest_configure above
+    registered it."""
+    return pytest.mark.fake_cfo_approval(test)
 
 
 @pytest.fixture
