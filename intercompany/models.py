@@ -486,6 +486,33 @@ class ServiceAgreement(Sourced):
         return f"{self.number} {self.entity.code}->{self.counterparty.code}"
 
 
+class AgreementSuspension(Sourced):
+    """A period in which an agreement was suspended (re-review A). Suspended days are never billed;
+    an open suspension (no end date) runs until the agreement is resumed. Only the end date is ever set,
+    once, when an approval resumes the agreement."""
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
+    agreement = models.ForeignKey("ServiceAgreement", on_delete=models.PROTECT, related_name="suspensions")
+    start_date = models.DateField()
+    end_date = models.DateField(null=True, blank=True, help_text="Last suspended day; empty while suspended")
+    reason = models.CharField(max_length=300)
+
+    class Meta(Sourced.Meta):
+        ordering = ["agreement", "start_date", "id"]
+
+    def save(self, *args, **kwargs):
+        stored = self._stored()
+        if stored is not None:
+            changed = self._changed(stored)
+            if changed - {"end_date"} or stored.end_date is not None or not getattr(self, "_workflow", False):
+                raise locked_error("Suspension periods change only when the agreement is resumed.",
+                                   "تتغير فترات الإيقاف عند استئناف الاتفاقية فقط.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise locked_error("Suspension periods are kept for audit.", "تُحفظ فترات الإيقاف للتدقيق.")
+
+
 class AgreementRate(models.Model):
     """Optional per-role hourly rate (3.3). Pricing data: editable only while the agreement is a draft."""
 

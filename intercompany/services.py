@@ -38,7 +38,7 @@ from ledger import services as ledger
 from ledger.models import Account, FiscalPeriod, JournalEntry, JournalLine
 
 from .models import (
-    AgreementRate, AllocationDriver, BillableItem, BillingRun, CostPool, CostPoolPeriod, DraftEditor,
+    AgreementRate, AgreementSuspension, AllocationDriver, BillableItem, BillingRun, CostPool, CostPoolPeriod, DraftEditor,
     IntercompanyBill, IntercompanyBillLine, IntercompanyInvoice, InvoiceLine, NumberSequence, ServiceAgreement,
     Source, TimesheetEntry, VatRate, vatex_problem, workflow,
 )
@@ -340,8 +340,9 @@ def add_rate(user, agreement, *, role_en, role_ar, hourly_rate, valid_from, vali
 
 
 @transaction.atomic
-def suspend_agreement(user, agreement, reason, ctx=None):
-    """Stops billing. Resuming needs a new approval (submit the suspended agreement)."""
+def suspend_agreement(user, agreement, reason, from_date=None, ctx=None):
+    """Stops billing from `from_date` (default today): the suspension period is recorded and its days are
+    never billed (re-review A). Resuming needs a new approval (submit the suspended agreement)."""
     agreement = A.objects.select_for_update().get(pk=agreement.pk)
     _require(user, agreement.entity, "intercompany.agreement.manage")
     _require_human(user)
@@ -349,11 +350,49 @@ def suspend_agreement(user, agreement, reason, ctx=None):
         raise RuleError("reason_required", "A reason is required.", "السبب مطلوب.")
     if agreement.status != A.Status.ACTIVE:
         raise Conflict("not_active", "Only active agreements can be suspended.", "يمكن إيقاف الاتفاقيات النشطة فقط.")
+    from_date = from_date or today()
+    if from_date < agreement.start_date or (agreement.end_date and from_date > agreement.end_date):
+        raise RuleError("suspension_date_invalid", "The suspension must start within the agreement dates.",
+                        "يجب أن يبدأ الإيقاف ضمن مدة الاتفاقية.")
+    if agreement.invoices.filter(kind=INV.Kind.INVOICE, supply_date_to__gte=from_date) \
+            .exclude(status__in=INV.DEAD).exists():
+        raise RuleError("billed_after_suspension", "Invoices exist on or after this date; credit them first.",
+                        "توجد فواتير في هذا التاريخ أو بعده؛ أصدر إشعارات دائنة أولاً.")
     before = snapshot(agreement)
+    sp = AgreementSuspension.objects.create(entity=agreement.entity, agreement=agreement, start_date=from_date,
+                                            reason=reason[:300], created_by=user, **source_fields(user))
     _move(agreement, A.Status.SUSPENDED)
     _audit(user, "intercompany.agreement.suspend", agreement, before=before,
-           after=snapshot(agreement) | {"reason": reason}, ctx=ctx)
+           after=snapshot(agreement) | {"reason": reason, "from": from_date, "suspension": sp.pk}, ctx=ctx)
     return agreement
+
+
+def close_suspensions(agreement, resumed_on=None):
+    """On resume (final approval): the open suspension ends the day before the resume date."""
+    resumed_on = resumed_on or today()
+    for sp in AgreementSuspension.objects.select_for_update().filter(agreement=agreement, end_date__isnull=True):
+        sp.end_date = max(resumed_on - datetime.timedelta(days=1), sp.start_date - datetime.timedelta(days=1))
+        with workflow(sp):
+            sp.save()
+
+
+def suspended_ranges(agreement):
+    """[(first day, last day or None)] of the agreement's suspension periods (empty ranges dropped)."""
+    return [(sp.start_date, sp.end_date) for sp in agreement.suspensions.all()
+            if sp.end_date is None or sp.end_date >= sp.start_date]
+
+
+def suspended_days(agreement, start, end):
+    days = 0
+    for s_from, s_to in suspended_ranges(agreement):
+        lo, hi = max(start, s_from), min(end, s_to) if s_to else end
+        if hi >= lo:
+            days += (hi - lo).days + 1
+    return days
+
+
+def _is_suspended(ranges, day):
+    return any(s_from <= day and (s_to is None or day <= s_to) for s_from, s_to in ranges)
 
 
 @transaction.atomic
@@ -661,14 +700,15 @@ def supply_window(agreement, period):
         end = min(end, agreement.end_date)
     if end < start:
         return None
-    return key, start, end, ((end - start).days + 1, full_days)  # (active days, days in period), D14
+    active = (end - start).days + 1 - suspended_days(agreement, start, end)  # re-review A
+    return key, start, end, (active, full_days)  # (billable days, days in period), D14
 
 
 def _billable_status(agreement):
-    """Active agreements, and agreements ended by their end date (billed up to it). Suspended, draft,
-    pending and rejected (never activated) agreements are not billed (R3, review 2)."""
+    """Agreements that were approved: active, suspended or ended (billed up to the end date). Suspended
+    days are excluded by date (re-review A). Draft, pending and rejected (never activated) ones are not billed."""
     return agreement.status == A.Status.ACTIVE or (
-        agreement.status == A.Status.ENDED and agreement.activated_at is not None and agreement.end_date is not None)
+        agreement.status in (A.Status.SUSPENDED, A.Status.ENDED) and agreement.activated_at is not None)
 
 
 def _line(agreement, en, ar, quantity, unit_price, net, basis, **extra):
@@ -698,8 +738,13 @@ def _timesheet_lines(agreement, start, end, adjustment):
     qs = TS.objects.select_for_update().filter(agreement=agreement, status=TS.Status.APPROVED, invoice_line__isnull=True)
     qs = qs.filter(date__lt=start, date__gte=agreement.start_date) if adjustment else qs.filter(date__gte=start,
                                                                                                 date__lte=end)
+    if agreement.end_date:
+        qs = qs.filter(date__lte=agreement.end_date)
+    ranges = suspended_ranges(agreement)
     groups = OrderedDict()
     for e in qs.select_related("rate").order_by("date", "id"):
+        if _is_suspended(ranges, e.date):
+            continue  # hours in a suspension are never billed (re-review A)
         groups.setdefault((_month_key(e.date) if adjustment else "", e.rate_id), []).append(e)
     out = []
     desc_en, desc_ar = agreement.description_en, agreement.description_ar
@@ -741,8 +786,10 @@ def _pool_adjustments(agreement, period, notes):
                .distinct().select_related("period"))
     for cpp in earlier:
         lines = _live_lines().filter(agreement=agreement, cost_pool_period=cpp)
-        original = lines.filter(adjustment_period="").first()
-        if original is None or original.pool_share is None:
+        # Re-review B/C: only against an original on an issued invoice that is not fully credited.
+        original = lines.filter(adjustment_period="", invoice__status=INV.Status.ISSUED,
+                                invoice__kind=INV.Kind.INVOICE).first()
+        if original is None or original.pool_share is None or _line_remaining(original)[0] <= ZERO:
             continue
         billed_base = lines.aggregate(b=Sum("pool_amount"))["b"] or ZERO
         delta = pool_cost(agreement.cost_pool, cpp.period) - billed_base
@@ -797,11 +844,38 @@ def _build_lines(agreement, period, key, start, end, days, notes):
                             f"لا توجد تكاليف في المجمع {agreement.cost_pool.code} للفترة {period.name}.")
     items = BillableItem.objects.select_for_update().filter(
         agreement=agreement, status=BillableItem.Status.OPEN, period_end__lte=end).order_by("period_start", "id")
+    ranges = suspended_ranges(agreement)
     for item in items:
+        if _is_suspended(ranges, item.period_start):
+            continue  # stays open; never billed for a suspended period (re-review A)
         out.append((_line(agreement, item.description_en, item.description_ar, item.quantity, item.unit_price,
                           item.quantity * item.unit_price,
                           f"{item.quantity.normalize():f} x {item.unit_price.normalize():f}"), {"item": item}))
     return out
+
+
+def _late_lines(agreement, period, notes):
+    """Adjustment lines for an agreement that ended before `period` (re-review C)."""
+    after_end = agreement.end_date + datetime.timedelta(days=1)
+    out = []
+    if agreement.pricing_method == A.Pricing.TIMESHEET:
+        out += _timesheet_lines(agreement, after_end, after_end, adjustment=True)
+    elif agreement.pricing_method == A.Pricing.COST_PLUS:
+        out += _pool_adjustments(agreement, period, notes)
+    ranges = suspended_ranges(agreement)
+    items = BillableItem.objects.select_for_update().filter(
+        agreement=agreement, status=BillableItem.Status.OPEN, period_end__lte=agreement.end_date).order_by("period_start", "id")
+    for item in items:
+        if _is_suspended(ranges, item.period_start):
+            continue
+        out.append((_line(agreement, item.description_en, item.description_ar, item.quantity, item.unit_price,
+                          item.quantity * item.unit_price,
+                          f"{item.quantity.normalize():f} x {item.unit_price.normalize():f}"), {"item": item}))
+    if not out:
+        raise RuleError("no_late_adjustments", "Nothing late to bill.", "لا توجد تسويات متأخرة.")
+    starts = [datetime.date.fromisoformat(f"{d['adjustment_period']}-01") for d, _ in out if d.get("adjustment_period")]
+    starts += [links["item"].period_start for _, links in out if "item" in links]
+    return out, max(min(starts), agreement.start_date), agreement.end_date
 
 
 def _live_invoice(agreement, key):
@@ -816,14 +890,24 @@ def _draft_invoice(agreement, period, user, run=None, notes=None):
         raise RuleError("agreement_not_active", f"Agreement {agreement.number} is {agreement.status}.",
                         f"الاتفاقية {agreement.number} غير نشطة.")
     window = supply_window(agreement, period)
-    if window is None:
+    late_only = window is None and agreement.end_date is not None and agreement.end_date < period.start_date
+    if window is None and not late_only:
         raise RuleError("not_due", f"Not billed in {period.name} ({agreement.billing_frequency}).",
                         f"لا تُفوتر في {period.name}.")
-    key, start, end, days = window
+    key = window[0] if window else f"{period.end_date:%Y-%m}"
     if _live_invoice(agreement, key):
         raise Conflict("already_billed", f"{agreement.number} already billed for {key} (R4).",
                        f"تمت فوترة {agreement.number} للفترة {key}.")
-    lines = _build_lines(agreement, period, key, start, end, days, notes)
+    if late_only:
+        # Re-review C: an ended agreement still bills late hours, late pool costs and late items for months
+        # within its active dates, as adjustment lines.
+        lines, start, end = _late_lines(agreement, period, notes)
+    else:
+        _, start, end, days = window
+        if days[0] <= 0:
+            raise RuleError("suspended", f"{agreement.number} was suspended for the whole period.",
+                            f"كانت الاتفاقية {agreement.number} موقوفة طوال الفترة.")
+        lines = _build_lines(agreement, period, key, start, end, days, notes)
     if not lines:
         raise RuleError("nothing_to_bill", "Nothing to bill for the period.", "لا يوجد ما يُفوتر لهذه الفترة.")
     income = income_account_for(agreement)
@@ -927,11 +1011,9 @@ def _run(user, entity, period, ctx):
                                     **source_fields(user))
     log, created = [], 0
     agreements = (A.objects.select_for_update().filter(entity=entity, start_date__lte=period.end_date)
-                  .filter(Q(end_date__isnull=True) | Q(end_date__gte=_earliest_window_start(period)))
-                  .exclude(status=A.Status.DRAFT).order_by("number"))
+                  .exclude(status=A.Status.DRAFT).exclude(status=A.Status.ENDED, activated_at__isnull=True)
+                  .order_by("number"))
     for a in agreements:
-        if a.end_date and a.end_date < period.start_date and supply_window(a, period) is None:
-            continue
         row = {"agreement": a.number, "counterparty": a.counterparty.code}
         notes = []
         try:
@@ -942,6 +1024,8 @@ def _run(user, entity, period, ctx):
         except Conflict as exc:
             row.update(result="already billed" if exc.code == "already_billed" else "skipped", reason=exc.message_en)
         except RuleError as exc:
+            if exc.code == "no_late_adjustments":
+                continue  # ended agreement with nothing late: not worth a log line
             row.update(result="skipped", code=exc.code, reason=exc.message_en)
         if notes:
             row["notes"] = notes
@@ -953,11 +1037,6 @@ def _run(user, entity, period, ctx):
     _audit(user, "intercompany.billing.run", run, after={"period": period.name, "created": created, "log": log},
            ctx=ctx)
     return run
-
-
-def _earliest_window_start(period):
-    """Quarterly and annual windows start before the run month."""
-    return datetime.date(period.end_date.year, 1, 1)
 
 
 @transaction.atomic
@@ -1032,6 +1111,11 @@ def cancel_draft(user, invoice, reason="", ctx=None):
     if invoice.status != INV.Status.DRAFT:
         raise Conflict("not_draft", "Only drafts can be cancelled; pending requests must be cancelled first.",
                        "يمكن إلغاء المسودات فقط؛ ألغِ طلب الاعتماد أولاً.")
+    for line in invoice.lines.filter(adjustment_period="", cost_pool_period__isnull=False):
+        if _live_lines().filter(agreement=line.agreement, cost_pool_period=line.cost_pool_period) \
+                .exclude(adjustment_period="").exclude(invoice=invoice).exists():  # re-review B
+            raise Conflict("adjustments_exist", "Later adjustment lines refer to this pool month; cancel them first.",
+                           "توجد تسويات لاحقة لهذا الشهر؛ ألغها أولاً.")
     _release(invoice)
     _move(invoice, INV.Status.CANCELLED_DRAFT)
     _audit(user, "intercompany.invoice.cancel_draft", invoice, after={"status": invoice.status, "reason": reason},

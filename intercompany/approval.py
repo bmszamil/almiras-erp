@@ -79,6 +79,8 @@ class AgreementApproval(_Base):
     def on_approved(self, a, request, actor):
         services.validate_agreement(a)
         # Review 5: freeze the account codes on the agreement, so later service-type edits cannot move them.
+        if a.activated_at:  # resuming a suspended agreement closes its suspension period
+            services.close_suspensions(a)
         services._move(a, AS.ACTIVE, activated_at=a.activated_at or timezone.now(),
                        income_account_code=a.income_account_code or a.service_type.income_account_code,
                        expense_account_code=a.expense_account_code or a.service_type.expense_account_code)

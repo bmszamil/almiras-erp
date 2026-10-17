@@ -341,5 +341,10 @@ Backend build on branch `module/intercompany` (17 Oct 2026). Where the spec, D1â
 36. `end_agreement` refuses an end date before the supply end of an existing invoice.
 37. API: malformed bodies and unknown fields return 400, unknown lines 404; service types need intercompany view or create rights; timesheet rates and workers are looked up within the agreement and its entity.
 
+**Re-review (17 Oct 2026)**
+39. **Suspensions (A):** suspending records an `AgreementSuspension` from a date (default today; not before an invoiced supply end). Resuming through approval closes it on the day before the resume date. Suspended days are excluded from every billing window and pro-rated per D14 when they cover part of a month; timesheet hours and billable items dated in a suspension are never billed. Ending a suspended agreement, and `close_ended_agreements`, leave the suspension open, so those days stay unbillable.
+40. **Late pool costs (B):** adjustments are made only against an original line on an issued invoice, so a draft original that is cancelled and re-billed picks up the late cost once (1,200, not 1,400). As a safeguard, an original draft cannot be cancelled while live adjustment lines refer to its pool month.
+41. **Adjustment limits (C):** no adjustment for a month whose original line is fully credited. Agreements that have ended still bill late hours, late pool costs and late billable items for months within their active dates, as an adjustment-only invoice keyed to the run month (supply dates from the earliest adjusted month to the end date). Ended agreements with nothing late are skipped without a log line.
+
 **Not built (open questions)**
 38. Settlement (5.4, Q12), unrealised profit on associates (Q4), exports for off-ERP counterparties (Q13), IFRS 16 lease terms (Q15), secondment labour-law checks (Q17), late penalties (D11: none). Tests run on SQLite; PostgreSQL row locking is used but not exercised by the test suite.

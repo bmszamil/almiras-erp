@@ -172,7 +172,7 @@ def test_r3_only_active_agreements_covering_the_period_are_billed(make_agreement
     ended_before = make_agreement(end_date=datetime.date(2026, 10, 31))
     starts_mid = make_agreement(start_date=datetime.date(2026, 11, 15))  # D14: pro-rated, 16 of 30 days
     suspended = make_agreement()
-    services.suspend_agreement(accountant, suspended, "Paused")
+    services.suspend_agreement(accountant, suspended, "Paused", from_date=datetime.date(2026, 11, 1))
     later = make_agreement(start_date=datetime.date(2026, 12, 1))
     ok = make_agreement()
     run = services.run_billing(accountant, alm, nov)
@@ -182,7 +182,7 @@ def test_r3_only_active_agreements_covering_the_period_are_billed(make_agreement
     for a in (draft, ended_before, suspended, later):
         assert a.invoices.count() == 0
     results = {r["agreement"]: r for r in run.log}
-    assert results[suspended.number]["code"] == "agreement_not_active"
+    assert results[suspended.number]["code"] == "suspended"
     assert draft.number not in results and later.number not in results
 
 

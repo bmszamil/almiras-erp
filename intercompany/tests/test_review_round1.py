@@ -368,6 +368,7 @@ def test_review10_pool_decrease_is_noted_not_billed(make_agreement, accountant, 
     a = make_agreement("cost_plus", cost_pool=pool, allocation_basis="fixed_pct", allocation_pct=D("50"),
                        markup_pct=D("0"))
     services.run_billing(accountant, alm, nov)
+    issue(a.invoices.get(), accountant, mp)
     ledger.reverse_entry(entry, user=accountant, reason="Wrong pool", date=datetime.date(2026, 11, 30))
     post_cost(alm, datetime.date(2026, 12, 3), "5100", "200")
     monkeypatch.setattr(services, "today", lambda: datetime.date(2027, 1, 5))
