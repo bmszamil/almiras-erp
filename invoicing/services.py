@@ -101,6 +101,20 @@ def _problems_error(problems, code):
 
 # --- small helpers --------------------------------------------------------------------------------
 
+def _on_line(line_no, problem):
+    """Prefix a bilingual problem with its line number in both languages (nit 12)."""
+    en, sep, ar = problem.partition(" / ")
+    return f"Line {line_no}: {en} / البند {line_no}: {ar}" if sep else f"Line {line_no}: {problem}"
+
+
+def _reference(model, code, what_en, what_ar):
+    """A reference row by code; a bilingual error instead of DoesNotExist (nit 12)."""
+    obj = model.objects.filter(code=code).first()
+    if obj is None:
+        raise error(f"Unknown {what_en} {code!r}.", f"{what_ar} {code!r} غير معروف.", code="unknown_reference")
+    return obj
+
+
 def _round(amount):
     with localcontext() as ctx:
         ctx.prec = 60
@@ -430,7 +444,7 @@ def _apply_sales_header(doc, fields):
         if name == "document_discount":
             value = _money(value, "document discount")
         if name == "reason_code" and value is not None and not isinstance(value, NoteReason):
-            value = NoteReason.objects.get(code=value)
+            value = _reference(NoteReason, value, "note reason", "سبب الإشعار")
         setattr(doc, name, value)
     if "reason_code" in fields and doc.reason_code is not None:  # the pick list prefills the editable reason
         if "reason_ar" not in fields:
@@ -500,7 +514,7 @@ def _sales_line_values(doc, line, *, income_type, quantity, unit_price, descript
                        vat_exemption_reason, income_account, line_discount, unit_code):
     entity = doc.entity
     if not isinstance(income_type, IncomeType):
-        income_type = IncomeType.objects.get(code=income_type)
+        income_type = _reference(IncomeType, income_type, "income type", "نوع الإيراد")
     line.income_type = income_type
     line.quantity = _decimal(quantity, "quantity")
     if not fx.has_places(line.quantity, 3) or line.quantity <= ZERO:
@@ -518,7 +532,7 @@ def _sales_line_values(doc, line, *, income_type, quantity, unit_price, descript
         raise error(f"Unknown VAT category {line.vat_category!r}.", "فئة ضريبة غير معروفة.", code="vat_category")
     reason = vat_exemption_reason or income_type.default_exemption_reason
     if reason is not None and not isinstance(reason, VatExemptionReason):
-        reason = VatExemptionReason.objects.get(code=reason)
+        reason = _reference(VatExemptionReason, reason, "VAT exemption reason", "سبب الإعفاء")
     line.vat_exemption_reason = reason
     if income_account is None:
         intercompany = doc.customer.group_entity_id is not None
@@ -547,6 +561,9 @@ def _line_vat_problems(line, on):
     elif line.vat_exemption_reason is None:
         problems.append(f"A line in category {line.vat_category} needs an exemption reason (VATEX). / "
                         f"البند في الفئة {line.vat_category} يحتاج إلى سبب إعفاء.")
+    elif not line.vat_exemption_reason.is_active:  # nit 13: withdrawn codes are never used again
+        problems.append(f"Exemption reason {line.vat_exemption_reason.code} is no longer in use. / "
+                        f"سبب الإعفاء {line.vat_exemption_reason.code} لم يعد مستخدمًا.")
     elif line.vat_exemption_reason.category != line.vat_category:
         problems.append(f"Exemption reason {line.vat_exemption_reason.code} is not for category {line.vat_category}. / "
                         f"سبب الإعفاء {line.vat_exemption_reason.code} لا يخص الفئة {line.vat_category}.")
@@ -586,7 +603,10 @@ def add_sales_line(document, *, user, income_type, quantity, unit_price, descrip
 @transaction.atomic
 def delete_sales_line(line, *, user):
     doc = _draft_sales(line.document, user)
-    SalesDocumentLine.objects.get(pk=line.pk, document=doc).delete()
+    found = SalesDocumentLine.objects.filter(pk=line.pk, document=doc).first()
+    if found is None:
+        raise error("The line is not on this document.", "البند ليس في هذا المستند.", code="line_missing")
+    found.delete()
     _touch(doc, user)
     doc.save(update_fields=["modified_by", "modified_at", "updated_at"])
 
@@ -796,11 +816,11 @@ def _issue_problems(doc, *, check_period=True, user=None):
     except InvoicingError as exc:
         problems += exc.messages
     for line in lines:
-        problems += [f"Line {line.line_no}: {p}" for p in _account_problems(
+        problems += [_on_line(line.line_no, p) for p in _account_problems(
             entity, line.income_account, {Account.Type.INCOME}, "income")]
-        problems += [f"Line {line.line_no}: {p}" for p in _line_vat_problems(line, on)]
+        problems += [_on_line(line.line_no, p) for p in _line_vat_problems(line, on)]
         if not line.description_ar.strip():
-            problems.append(f"Line {line.line_no}: the Arabic description is required. / وصف البند بالعربية مطلوب.")
+            problems.append(_on_line(line.line_no, "the Arabic description is required. / وصف البند بالعربية مطلوب."))
     standard_rated = any(line.vat_category == VatCategory.STANDARD for line in lines)
     missing = entity_ready_to_issue(entity, standard_rated=standard_rated)
     if missing:  # R69, AT-48; R11 / AT-16 via standard_rated (vat_number required)
@@ -1075,12 +1095,17 @@ def _posting_as(user):
         _posting_user.reset(token)
 
 
-def _require_posting_context(document):
-    user = _posting_user.get()
-    if user is None:
+def _require_posting_context(document, status):
+    """A build_lines hook runs only inside an invoicing posting, for a document in the status that posting
+    gives it and not yet booked (nit 14)."""
+    if _posting_user.get() is None:
         raise error(f"{document._meta.label} posts only through invoicing.services.",
                     f"يُرحَّل المستند {document._meta.label} من خلال خدمات الفوترة فقط.", code="post_through_services")
-    return user
+    if document.status != status or document.journal_entry_id is not None:
+        raise error(f"{document._meta.label} {document.pk} is {document.status}; only a {status} document that is not "
+                    "yet booked builds its entry.",
+                    f"المستند {document.pk} حالته {document.status}؛ لا يبني قيده إلا مستند بحالة {status} لم يُرحَّل بعد.",
+                    code="post_wrong_status")
 
 
 def _control(party, receivable):
@@ -1172,8 +1197,11 @@ def _with_settlements(document, currency, plain, settlements):
 
 def _sales_document_lines(document):
     """Registered ``build_lines`` for SalesDocument: E1 to E4 from the stored document (R4, R9, R27, R37)."""
-    user = _require_posting_context(document)
-    entity, cur, functional = document.entity, document.currency_id, document.entity.base_currency_id
+    _require_posting_context(document, Status.ISSUED)
+    if document.zatca_status not in zatca_port.POSTING_STATUSES:  # R41: only once ZATCA cleared or reported it
+        raise error("A sales document is booked only once ZATCA cleared or reported it.",
+                    "لا يُرحَّل مستند المبيعات إلا بعد اعتماده من الهيئة أو الإبلاغ عنه.", code="not_cleared")
+    cur, functional = document.currency_id, document.entity.base_currency_id
     control, counterparty = _control(document.customer, receivable=True)
     credit_note = document.doc_type == SalesDocument.DocType.CREDIT_NOTE
     income_side, control_side = ("debit", "credit") if credit_note else ("credit", "debit")
@@ -1547,12 +1575,12 @@ def _purchase_problems(doc, check_period=True):
     except InvoicingError as exc:
         problems += exc.messages
     for line in lines:
-        problems += [f"Line {line.line_no}: {p}" for p in _account_problems(
+        problems += [_on_line(line.line_no, p) for p in _account_problems(
             entity, line.account, {Account.Type.EXPENSE, Account.Type.ASSET}, "expense or asset")]
         _price_line(line, doc.accounting_date)  # in memory: the rate effective on the accounting date (R10)
         if line.vat_rate is None:
-            problems.append(f"Line {line.line_no}: no VAT rate for category {line.vat_category} on {doc.accounting_date}. / "
-                            "لا توجد نسبة ضريبة لهذا البند.")
+            problems.append(_on_line(line.line_no, f"no VAT rate for category {line.vat_category} on {doc.accounting_date}. / "
+                                                   f"لا توجد نسبة ضريبة للفئة {line.vat_category} بتاريخ {doc.accounting_date}."))
     if problems:
         return problems
     _, net, charged, _, _, _, _ = _purchase_amounts(doc, lines) if lines else (None, ZERO, ZERO, None, None, None, None)
@@ -1660,8 +1688,8 @@ def approve_purchase_document(document, *, user):
 
 def _purchase_document_lines(document):
     """Registered ``build_lines`` for PurchaseDocument: E7 to E10 from the stored document (R4, R29, R30)."""
-    user = _require_posting_context(document)
-    entity, cur, functional = document.entity, document.currency_id, document.entity.base_currency_id
+    _require_posting_context(document, PStatus.POSTED)
+    cur, functional = document.currency_id, document.entity.base_currency_id
     control, counterparty = _control(document.vendor, receivable=False)
     note = document.doc_type == PurchaseDocument.DocType.VENDOR_CREDIT_NOTE
     cost_side, control_side = ("credit", "debit") if note else ("debit", "credit")
@@ -1856,8 +1884,8 @@ def post_receipt(receipt, *, user):
 
 def _receipt_lines(document):
     """Registered ``build_lines`` for CustomerReceipt: E5 / E6, settling foreign items at the carrying rate."""
-    user = _require_posting_context(document)
-    entity, cur, functional = document.entity, document.currency_id, document.entity.base_currency_id
+    _require_posting_context(document, CustomerReceipt.Status.POSTED)
+    cur, functional = document.currency_id, document.entity.base_currency_id
     control, counterparty = _control(document.customer, receivable=True)
     label = document.number
     if document.kind == CustomerReceipt.Kind.REFUND:  # E6
@@ -1956,8 +1984,8 @@ def approve_vendor_payment(payment, *, user):
 
 def _payment_lines(document):
     """Registered ``build_lines`` for VendorPayment: E11, settling foreign bills at the carrying rate."""
-    user = _require_posting_context(document)
-    entity, cur, functional = document.entity, document.currency_id, document.entity.base_currency_id
+    _require_posting_context(document, VendorPayment.Status.POSTED)
+    cur, functional = document.currency_id, document.entity.base_currency_id
     control, counterparty = _control(document.vendor, receivable=False)
     label = document.number
     if document.kind == VendorPayment.Kind.REFUND_RECEIVED:
@@ -2013,6 +2041,10 @@ def reverse_document(document, *, user, date=None, reason=""):
         document = model.objects.select_for_update(of=("self",)).select_related("entity").get(pk=document.pk)
         if document.status != "posted" or document.journal_entry_id is None:
             raise error("Only posted documents are reversed.", "تُعكس المستندات المرحّلة فقط.", code="not_posted")
+        if model is PurchaseDocument and PurchaseDocument.objects.filter(
+                original_document=document, status=PStatus.POSTED).exists():  # nit 17
+            raise error("A posted vendor credit note references this bill; reverse the credit note first.",
+                        "يشير إشعار دائن مرحّل من المورد إلى هذه الفاتورة؛ اعكس الإشعار أولًا.", code="has_credit_notes")
         own, others = _allocations_of(document)
         if any(not a.via_settlement for a in own) or others:
             raise error("The document has allocations; un-allocate them first (R25, R33).",

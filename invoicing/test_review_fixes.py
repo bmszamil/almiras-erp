@@ -1,6 +1,5 @@
 """Regression tests for the slice-1 code review (review items 1 to 17; reviewer probes probe4 p1 to p5)."""
 from datetime import date, time
-from decimal import Decimal
 from unittest import mock
 
 import pytest
@@ -318,3 +317,66 @@ def test_p5_reconcile_as_of_a_date_before_a_later_reversal_ties_out(w):
         rows = {row["account"]: row for row in services.reconcile_subledger(w.alm, as_of, user=w.accountant)}
         assert all(row["difference"] == D("0") for row in rows.values()), rows
         assert rows["2100"]["subledger"] == ap and rows["1200"]["subledger"] == ar
+
+
+# --- nits 12, 13, 14, 17 ---------------------------------------------------------------------------
+
+def test_nit12_unknown_reference_codes_and_line_prefixes_are_bilingual(w):
+    doc = services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10),
+                                         supply_date=date(2027, 1, 10))
+    for kwargs in ({"income_type": "no_such_type"}, {"income_type": "rent_commercial", "vat_category": "E",
+                                                     "vat_exemption_reason": "VATEX-SA-NOPE"}):
+        with pytest.raises(InvoicingError) as exc:
+            services.add_sales_line(doc, user=w.clerk, quantity="1", unit_price="10", description_ar="بند", **kwargs)
+        assert exc.value.code == "unknown_reference" and " / " in exc.value.messages[0]
+    with pytest.raises(InvoicingError) as exc:
+        services.update_sales_document(doc, user=w.clerk, reason_code="no_such_reason")
+    assert exc.value.code == "unknown_reference"
+    assert services._on_line(3, "Broken. / معطل.") == "Line 3: Broken. / البند 3: معطل."
+
+
+def test_nit13_inactive_exemption_reasons_are_refused(w):
+    from invoicing.models import VatExemptionReason
+
+    VatExemptionReason.objects.filter(code="VATEX-SA-29").update(is_active=False)
+    doc = services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10),
+                                         supply_date=date(2027, 1, 10))
+    with pytest.raises(InvoicingError) as exc:
+        services.add_sales_line(doc, user=w.clerk, income_type="other", income_account="4900", quantity="1",
+                                unit_price="10", description_ar="بند", vat_category="E",
+                                vat_exemption_reason="VATEX-SA-29")
+    assert "no longer in use" in str(exc.value.messages)
+
+
+def test_nit14_build_lines_hooks_refuse_documents_in_the_wrong_status(w):
+    from invoicing.models import CustomerReceipt
+
+    issued = approve(w, invoice(w))  # issued, ZATCA pending
+    draft_receipt = services.create_receipt(w.alm, user=w.clerk, customer=w.customer, date=date(2027, 1, 20),
+                                            amount="10")
+    with services._posting_as(w.cfo):
+        with pytest.raises(InvoicingError) as exc:
+            services._sales_document_lines(issued)
+        assert exc.value.code == "not_cleared"
+        with pytest.raises(InvoicingError) as exc:
+            services._receipt_lines(CustomerReceipt.objects.get(pk=draft_receipt.pk))
+        assert exc.value.code == "post_wrong_status"
+        posted = w.zatca.clear(SalesDocument.objects.get(pk=issued.pk))
+        with pytest.raises(InvoicingError) as exc:  # already booked
+            services._sales_document_lines(posted)
+        assert exc.value.code == "post_wrong_status"
+
+
+def test_nit17_bill_with_a_posted_vendor_credit_note_cannot_be_reversed(w):
+    b = services.approve_purchase_document(bill(w), user=w.cfo)
+    vcn = services.approve_purchase_document(
+        bill(w, [("5300", "1", "100.00")], number="VCN-1", doc_type="vendor_credit_note", original_document=b),
+        user=w.cfo)
+    from invoicing.models import PayableAllocation
+
+    services.unallocate(PayableAllocation.objects.get(vendor_credit_note=vcn), user=w.ap)  # no allocations left
+    with pytest.raises(InvoicingError) as exc:
+        services.reverse_document(b, user=w.accountant)
+    assert exc.value.code == "has_credit_notes"
+    services.reverse_document(vcn, user=w.accountant)
+    assert services.reverse_document(b, user=w.accountant).status == "reversed"
