@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import date as date_type
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
+from zoneinfo import ZoneInfo
 
 from django.db import transaction
 from django.db.models import Sum
@@ -76,6 +77,17 @@ PStatus = PurchaseDocument.Status
 SEQUENCE_CODES = {
     "invoice": "INV", "credit_note": "CN", "debit_note": "DN", "bill": "BILL", "vendor_credit_note": "VCN",
 }
+
+RIYADH = ZoneInfo("Asia/Riyadh")
+
+
+def _riyadh_now():
+    """Current time in Asia/Riyadh: the issue date and time of a sales document (BR-KSA-04, TIR §4.2.3).
+
+    A function so tests can move the approval day (invoicing.testing.approval_day).
+    """
+    return timezone.now().astimezone(RIYADH)
+
 
 # The person whose ledger.view right is used while a document's lines are built (fx_settlement_lines, R18).
 _posting_user = ContextVar("invoicing_posting_user", default=None)
@@ -854,6 +866,14 @@ def _note_warnings(doc):
     return []
 
 
+def _issue_date_warnings(doc):
+    """6b: the draft asked for another date; the document is issued on the approval day instead (warning only)."""
+    if doc.requested_issue_date and doc.requested_issue_date != doc.issue_date:
+        return [f"Issued on {doc.issue_date} (the day of approval); the draft asked for {doc.requested_issue_date}. / "
+                f"صدر بتاريخ {doc.issue_date} (يوم الاعتماد)؛ وكانت المسودة تطلب {doc.requested_issue_date}."]
+    return []
+
+
 def approve_sales_document(document, *, user):
     """CFO approval issues a submitted document (R57): number, snapshots and totals in one transaction, then the
     ZATCA hand-off after commit (R40). The approver is never the creator, submitter or last modifier: approvals
@@ -867,6 +887,12 @@ def approve_sales_document(document, *, user):
         doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity", "customer").get(pk=doc.pk)
         if doc.status != Status.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
+        # 6b / BR-KSA-04: the issue date is the day of issue (approval) in Riyadh, never the draft's date and
+        # never a future one; the draft's date is kept as the date requested. Time and date come from one clock.
+        now = _riyadh_now()
+        doc.requested_issue_date = doc.issue_date
+        doc.issue_date = now.date()
+        doc.issue_time = now.time().replace(microsecond=0)
         problems = _issue_problems(doc, user=user)
         if problems:
             raise _problems_error(problems, "document_invalid")
@@ -905,7 +931,6 @@ def approve_sales_document(document, *, user):
         doc.retention_until = _retention_until(entity, doc)
         doc.due_date = doc.due_date or doc.issue_date  # OQ-3 default: prefilled with the document date
         doc.number = _next_number(entity, doc.doc_type, doc.issue_date.year)
-        doc.issue_time = timezone.localtime().time().replace(microsecond=0)
         doc.status = Status.ISSUED
         doc.approved_by, doc.approved_at = user, timezone.now()
         doc._service_write = True
@@ -913,7 +938,7 @@ def approve_sales_document(document, *, user):
         access.use_grant(grant, target=doc)  # a used, current approval: the clearance posting checks it (access R42)
         port = zatca_port.get_port()
         transaction.on_commit(lambda: port.submit_document(SalesDocument.objects.get(pk=doc.pk), user))
-    doc.warnings = _note_warnings(doc)
+    doc.warnings = _issue_date_warnings(doc) + _note_warnings(doc)
     return doc
 
 
@@ -1658,7 +1683,8 @@ def create_receipt(entity, *, user, customer, date, amount, currency=None, bank_
     return receipt
 
 
-def _application_problems(source, target, amount, receivable):
+def _application_problems(source, target, amount, receivable, planned=ZERO):
+    """R34: ``amount`` plus what is already ``planned`` for ``target`` on the same receipt or payment fits its open amount."""
     problems = []
     party_ok = (target.customer_id == source.customer_id) if receivable else (target.vendor_id == source.vendor_id)
     if target.entity_id != source.entity_id or not party_ok:
@@ -1674,9 +1700,15 @@ def _application_problems(source, target, amount, receivable):
     if target.currency_id != source.currency_id:
         problems.append("A settlement is in the document's currency (cross-currency settlement is not built). / "
                         "تكون التسوية بعملة المستند.")
-    if amount > open_:
-        problems.append(f"{amount} is more than the open amount {open_}. / {amount} أكبر من المبلغ المفتوح {open_}.")
+    if planned + amount > open_:
+        problems.append(f"{planned + amount} planned for {target.number} is more than its open amount {open_}. / "
+                        f"{planned + amount} المخطط للمستند {target.number} أكبر من المبلغ المفتوح {open_}.")
     return problems
+
+
+def _planned_for(movement, target):
+    """What a draft receipt or payment already plans to settle on ``target`` (R34: summed per target)."""
+    return _sum(movement.applications.filter(target_id=target.pk))
 
 
 @transaction.atomic
@@ -1687,7 +1719,8 @@ def add_receipt_application(receipt, target, amount, *, user):
     if receipt.status != "draft" or receipt.kind != CustomerReceipt.Kind.RECEIPT:
         raise error("Only draft receipts get applications.", "تُضاف التخصيصات إلى مسودات سندات القبض فقط.", code="not_draft")
     amount = _money(amount, "amount", positive=True)
-    problems = _application_problems(receipt, target, amount, receivable=True)
+    target = SalesDocument.objects.select_for_update(of=("self",)).get(pk=target.pk)
+    problems = _application_problems(receipt, target, amount, receivable=True, planned=_planned_for(receipt, target))
     planned = _sum(receipt.applications.all())
     if planned + amount > receipt.amount:
         problems.append("Applications exceed the receipt amount. / التخصيصات تتجاوز مبلغ السند.")
@@ -1713,9 +1746,11 @@ def _post_money(movement, *, user, grant, receivable):
                     code="wrong_status")
     apps = list(movement.applications.select_related("target").order_by("pk"))
     targets = {t.pk: t for t in target_model.objects.select_for_update(of=("self",)).filter(pk__in=[a.target_id for a in apps])}
-    problems = []
+    problems, per_target = [], {}
     for app in apps:
-        problems += _application_problems(movement, targets[app.target_id], app.amount, receivable)
+        per_target[app.target_id] = per_target.get(app.target_id, ZERO) + app.amount
+    for target_id, amount in per_target.items():  # R34: every application of one target together
+        problems += _application_problems(movement, targets[target_id], amount, receivable)
     if sum((a.amount for a in apps), ZERO) > movement.amount:
         problems.append("Applications exceed the amount. / التخصيصات تتجاوز المبلغ.")
     period = _open_period(entity, movement.date)
@@ -1818,7 +1853,8 @@ def add_payment_application(payment, target, amount, *, user):
     if payment.status != "draft" or payment.kind != VendorPayment.Kind.PAYMENT:
         raise error("Only draft payments get applications.", "تُضاف التخصيصات إلى مسودات سندات الصرف فقط.", code="not_draft")
     amount = _money(amount, "amount", positive=True)
-    problems = _application_problems(payment, target, amount, receivable=False)
+    target = PurchaseDocument.objects.select_for_update(of=("self",)).get(pk=target.pk)
+    problems = _application_problems(payment, target, amount, receivable=False, planned=_planned_for(payment, target))
     if _sum(payment.applications.all()) + amount > payment.amount:
         problems.append("Applications exceed the payment amount. / التخصيصات تتجاوز مبلغ السند.")
     if problems:

@@ -3,6 +3,7 @@
 Never used outside tests; nothing here calls an external service.
 """
 from contextlib import contextmanager
+from datetime import datetime, time
 from itertools import count
 
 from core import access
@@ -49,3 +50,15 @@ def fake_zatca():
         yield port
     finally:
         zatca_port._override = previous
+
+
+@contextmanager
+def approval_day(day, at=time(10, 0)):
+    """Run approvals as if it were ``day`` (``at`` o'clock) in Riyadh: the issue date is the approval day (6b)."""
+    moment = datetime.combine(day, at, tzinfo=services.RIYADH)
+    previous = services._riyadh_now
+    services._riyadh_now = lambda: moment
+    try:
+        yield moment
+    finally:
+        services._riyadh_now = previous

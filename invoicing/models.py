@@ -623,6 +623,11 @@ class SalesDocument(Tracked, Snapshot, Guarded):
         verbose_name=bi("Customer", "العميل"))
     issue_date = models.DateField(bi("Issue date", "تاريخ الإصدار"))
     issue_time = models.TimeField(bi("Issue time", "وقت الإصدار"), null=True, blank=True)
+    requested_issue_date = models.DateField(
+        bi("Document date requested", "تاريخ المستند المطلوب"), null=True, blank=True,
+        help_text=bi("The date on the draft; at approval the issue date becomes the approval day in Riyadh (BR-KSA-04)",
+                     "التاريخ في المسودة؛ عند الاعتماد يصبح تاريخ الإصدار يوم الاعتماد بتوقيت الرياض"),
+    )
     supply_date = models.DateField(bi("Supply date", "تاريخ التوريد"), null=True, blank=True)
     supply_end_date = models.DateField(bi("Supply end date", "تاريخ نهاية التوريد"), null=True, blank=True)
     due_date = models.DateField(bi("Due date", "تاريخ الاستحقاق"), null=True, blank=True)

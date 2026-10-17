@@ -20,7 +20,7 @@ def test_at6_concurrent_approvals_get_consecutive_numbers():
     from invoicing import reference_seed, services
     from invoicing.conftest import ADDRESS, invoice
     from invoicing.models import SalesDocument
-    from invoicing.testing import fake_zatca
+    from invoicing.testing import approval_day, fake_zatca
 
     apply_seed(Role, RolePermission)
     apply_currency_seed(Currency)
@@ -38,7 +38,7 @@ def test_at6_concurrent_approvals_get_consecutive_numbers():
     member(cfo2, alm, "approver")
     customer = services.create_customer(alm, user=clerk, code="C1", name_ar="عميل", is_vat_registered=True,
                                         vat_number="310000000000003", **ADDRESS)
-    with fake_zatca():
+    with fake_zatca(), approval_day(date(2027, 1, 10)):
         w = SimpleNamespace(alm=alm, clerk=clerk, customer=customer)
         first, second = invoice(w), invoice(w)
         result = {}

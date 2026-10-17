@@ -92,14 +92,16 @@ def approve(w, doc, user=None, django_capture_on_commit_callbacks=None):
     """CFO approval; the ZATCA hand-off runs after commit (R40)."""
     from django.db import connection
 
+    from invoicing.models import SalesDocument
+    from invoicing.testing import approval_day
+
     user = user or w.cfo
     callbacks_before = len(connection.run_on_commit)
-    result = services.approve_sales_document(doc, user=user)
+    with approval_day(SalesDocument.objects.get(pk=doc.pk).issue_date):  # approved on the day the draft asks for
+        result = services.approve_sales_document(doc, user=user)
     for _, callback, _ in connection.run_on_commit[callbacks_before:]:  # what commit would run
         callback()
     del connection.run_on_commit[callbacks_before:]
-    from invoicing.models import SalesDocument
-
     stored = SalesDocument.objects.get(pk=result.pk)
     stored.warnings = result.warnings
     return stored
