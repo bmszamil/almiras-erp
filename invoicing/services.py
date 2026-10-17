@@ -316,6 +316,9 @@ def party_problems(party):
         problems.append(f"{party.country!r} is not an ISO country code. / {party.country!r} ليس رمز دولة صالحًا.")
     if party.country == "SA" and party.postal_code and not (len(party.postal_code) == 5 and party.postal_code.isdigit()):
         problems.append("A Saudi postal code has 5 digits. / الرمز البريدي السعودي من 5 أرقام.")
+    if isinstance(party, Vendor) and party.vendor_kind not in Vendor.Kind.values:  # D24 / R91: required
+        problems.append("The vendor kind (business, individual or government) is required. / "
+                        "نوع المورد (منشأة أو فرد أو جهة حكومية) مطلوب.")
     if isinstance(party, Vendor) and not party.is_resident:
         try:
             validate_country_code(party.residence_country)
@@ -333,7 +336,7 @@ PARTY_FIELDS = {
     "city_ar", "postal_code", "country",
 }
 CUSTOMER_FIELDS = PARTY_FIELDS | {"customer_kind"}
-VENDOR_FIELDS = PARTY_FIELDS - {"payment_terms_days"} | {"is_resident", "residence_country", "bank_iban"}
+VENDOR_FIELDS = PARTY_FIELDS - {"payment_terms_days"} | {"vendor_kind", "is_resident", "residence_country", "bank_iban"}
 
 
 def _save_party(party, user, fields, allowed):
@@ -348,7 +351,7 @@ def _save_party(party, user, fields, allowed):
         party.currency_id = party.entity.base_currency_id
     problems = party_problems(party)
     try:
-        party.full_clean(exclude=["name_ar"])
+        party.full_clean(exclude=["name_ar", "vendor_kind"])
     except Exception as exc:  # noqa: BLE001 - field validators carry bilingual messages
         problems += [m for m in getattr(exc, "messages", [str(exc)]) if m not in problems]
     if problems:
@@ -389,7 +392,7 @@ def add_customer_identifier(customer, scheme, value, *, user):
 
 @transaction.atomic
 def create_vendor(entity, *, user, **fields):
-    """Create a vendor in ``entity`` (``invoicing.manage_vendor``)."""
+    """Create a vendor in ``entity`` (``invoicing.manage_vendor``). ``vendor_kind`` is required (D24, R91)."""
     access.require(user, entity, "invoicing.manage_vendor")
     return _save_party(Vendor(entity=entity, created_by=user, source=_source(user)), user, fields, VENDOR_FIELDS)
 
@@ -1550,6 +1553,18 @@ def _draft_purchase(document, user):
     return doc
 
 
+def _unregistered_vendor(doc):
+    """D24 / R92: a resident vendor whose document carries no VAT number is not registered for VAT and charges
+    no VAT. Non-resident vendors have no KSA VAT number by nature and keep reverse charge (R30)."""
+    return doc.vendor.is_resident and not (doc.vendor_vat_number or "").strip()
+
+
+def _vat_free_category(doc, line):
+    """R92 / OQ-60 default: lines of a bill from an unregistered resident vendor record category O, VAT 0.00."""
+    if _unregistered_vendor(doc):
+        line.vat_category = VatCategory.OUT_OF_SCOPE
+
+
 PURCHASE_HEADER_FIELDS = {"vendor_document_date", "accounting_date", "due_date", "vendor_total_vat",
                           "vendor_total_gross", "vendor_vat_number"}
 
@@ -1588,6 +1603,7 @@ def add_purchase_line(document, *, user, account, quantity, unit_price, vat_cate
     line.unit_code = unit_code or "C62"
     line.description_ar, line.description_en = (description_ar or "").strip(), (description_en or "").strip()
     line.vat_category, line.vat_attribution, line.supply_kind = vat_category, vat_attribution, supply_kind or ""
+    _vat_free_category(doc, line)
     problems = _account_problems(entity, line.account, {Account.Type.EXPENSE, Account.Type.ASSET}, "expense or asset")
     if not (line.description_ar or line.description_en):
         problems.append("A line needs a description. / يحتاج البند إلى وصف.")
@@ -1617,8 +1633,17 @@ def _purchase_amounts(doc, lines):
     number, otherwise it is added to the line's cost (``exempt``; ``mixed`` fully to cost until OQ-9 is signed off).
     Non-resident vendor: no VAT charged; standard-rated services are reverse charged (Dr 1310 or cost / Cr 2200);
     goods are not (import VAT at customs, OQ-29).
+    Resident vendor without a VAT number on the document (D24, R92, E8a): not registered for VAT, so no VAT at
+    all: every line VAT 0.00, nothing to 1310 and nothing added to cost; lines record category O (OQ-60 default).
     """
     resident = doc.vendor.is_resident
+    if _unregistered_vendor(doc):
+        for line in lines:
+            line.vat_amount = ZERO
+        net = sum((l.net_amount for l in lines), ZERO)
+        breakdown = [{"category": VatCategory.OUT_OF_SCOPE.value, "rate": "0.00", "taxable": str(net), "vat": "0.00",
+                      "reverse_charge": False, "unregistered_vendor": True}] if lines else []
+        return breakdown, net, ZERO, ZERO, {l.line_no: l.net_amount for l in lines}, ZERO, set()
     recoverable_ok = bool(doc.vendor_vat_number) or not resident  # R30 overrides the VAT-number condition
     groups = {}
     for line in lines:
@@ -1669,6 +1694,7 @@ def _purchase_problems(doc, check_period=True):
     for line in lines:
         problems += [_on_line(line.line_no, p) for p in _account_problems(
             entity, line.account, {Account.Type.EXPENSE, Account.Type.ASSET}, "expense or asset")]
+        _vat_free_category(doc, line)  # R92: the VAT number may have been removed after the line was added
         _price_line(line, doc.accounting_date)  # in memory: the rate effective on the accounting date (R10)
         if line.vat_rate is None:
             problems.append(_on_line(line.line_no, f"no VAT rate for category {line.vat_category} on {doc.accounting_date}. / "
@@ -1676,7 +1702,13 @@ def _purchase_problems(doc, check_period=True):
     if problems:
         return problems
     _, net, charged, _, _, _, _ = _purchase_amounts(doc, lines) if lines else (None, ZERO, ZERO, None, None, None, None)
-    if lines and (doc.vendor_total_vat != charged or doc.vendor_total_gross != net + charged):  # OQ-11: exact match
+    if _unregistered_vendor(doc) and doc.vendor_total_vat != ZERO:  # R92, OQ-60 default: refused, never booked
+        problems.append(f"The vendor has no VAT number, so it is not registered for VAT and cannot charge VAT; the "
+                        f"vendor document shows VAT {doc.vendor_total_vat}. Ask the vendor for a corrected document, "
+                        f"or enter its VAT number if it is registered (R92). / المورد ليس له رقم ضريبي، فهو غير مسجل "
+                        f"في ضريبة القيمة المضافة ولا يجوز له تحصيلها؛ ومستند المورد يُظهر ضريبة {doc.vendor_total_vat}. "
+                        "اطلب من المورد مستندًا مصححًا، أو أدخل رقمه الضريبي إن كان مسجلًا.")
+    elif lines and (doc.vendor_total_vat != charged or doc.vendor_total_gross != net + charged):  # OQ-11: exact match
         problems.append(f"Totals differ from the vendor document: computed VAT {charged}, total {net + charged}; "
                         f"vendor document VAT {doc.vendor_total_vat}, total {doc.vendor_total_gross}. / "
                         "الإجماليات تختلف عن مستند المورد.")
@@ -1744,6 +1776,7 @@ def approve_purchase_document(document, *, user):
         entity = doc.entity
         lines = list(doc.lines.select_related("account", "vat_rate"))
         for line in lines:
+            _vat_free_category(doc, line)  # R92: stored as category O when the vendor is not registered
             _price_line(line, doc.accounting_date)
         breakdown, net, charged, rc_vat, costs, recoverable, recoverable_lines = _purchase_amounts(doc, lines)
         for line in lines:

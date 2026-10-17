@@ -123,3 +123,82 @@ def test_access_at53_zatca_admin_is_an_add_on_membership_checked_on_its_own_role
     with pytest.raises(access.AccessDenied) as exc:  # R14 applies to the person, whatever roles they hold
         services.approve_sales_document(own, user=c)
     assert exc.value.code == "self_approval"
+
+
+# --- D24 / R91: vendor kind and masked individual vendors (AT-93, AT-94) ------------------------------------
+
+VENDOR_NAMES = ("Test Supplier Person", "مورد فرد")
+
+
+def _individual_vendor(w, entity=None, user=None):
+    return services.create_vendor(entity or w.alm, user=user or w.ap, vendor_kind="individual", code="IV1",
+                                  name_en="Test Supplier Person", name_ar="مورد فرد")
+
+
+def test_at93_vendor_kind_is_required_in_every_entity(w):
+    from core.access.testing import member as m
+
+    for entity, user in ((w.alm, w.ap), (w.sub, make_user("sub_ap"))):
+        if entity is w.sub:
+            m(user, w.sub, "payables_clerk")
+        with pytest.raises(InvoicingError) as exc:  # no vendor_kind
+            services.create_vendor(entity, user=user, code="NK", name_ar="مورد بلا نوع")
+        assert "vendor kind" in " ".join(exc.value.messages) and "نوع المورد" in " ".join(exc.value.messages)
+        with pytest.raises(InvoicingError):
+            services.create_vendor(entity, user=user, vendor_kind="company", code="NK", name_ar="مورد")
+        saved = _individual_vendor(w, entity, user)
+        assert (saved.vendor_kind, saved.entity) == ("individual", entity)
+
+
+def test_at94_individual_vendor_names_are_masked_without_the_right(w, client):
+    from invoicing.test_verification_fixes import _page
+
+    person = _individual_vendor(w)
+    assert str(person) == "IV1" and person.display_name(personal=True) == "IV1 — مورد فرد"
+    assert str(w.vendor) == "V001 — المورد التجريبي"  # a business vendor is not personal data
+    doc = services.approve_purchase_document(bill(w, vendor=person, vat="0", gross="1000.00"), user=w.cfo)
+    urls = (f"/admin/invoicing/vendor/{person.pk}/change/", f"/admin/invoicing/vendor/{person.pk}/history/",
+            "/admin/invoicing/vendor/", f"/admin/invoicing/purchasedocument/{doc.pk}/change/",
+            f"/admin/invoicing/purchasedocument/{doc.pk}/history/", "/admin/invoicing/purchasedocument/")
+    assert not access.has(w.viewer, w.alm, "invoicing.view_personal_data")
+    for url in urls:
+        body = _page(client, w.viewer, url)
+        assert not any(name in body for name in VENDOR_NAMES), url
+    assert "V001" in _page(client, w.viewer, "/admin/invoicing/vendor/")  # business names stay visible
+    assert "المورد التجريبي" in _page(client, w.viewer, "/admin/invoicing/vendor/")
+    assert access.has(w.ap, w.alm, "invoicing.view_personal_data")
+    for url in (f"/admin/invoicing/vendor/{person.pk}/change/", "/admin/invoicing/vendor/",
+                "/admin/invoicing/purchasedocument/"):
+        assert "مورد فرد" in _page(client, w.ap, url), url
+    client.force_login(w.viewer)  # search by an individual's name finds nothing without the right
+    assert "IV1" not in client.get("/admin/invoicing/vendor/", {"q": "مورد فرد"}).content.decode()
+    assert "IV1" in client.get("/admin/invoicing/vendor/", {"q": "IV1"}).content.decode()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_at93_migration_makes_existing_vendors_business():
+    from django.db import connection
+    from django.db.migrations.executor import MigrationExecutor
+
+    from core.currency_seed import apply_currency_seed
+
+    def migrate(targets):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(targets)
+        return MigrationExecutor(connection).loader.project_state(targets).apps
+
+    leaf = MigrationExecutor(connection).loader.graph.leaf_nodes()
+    old = migrate([("invoicing", "0010_approved_version")])
+    try:
+        apply_currency_seed(old.get_model("core", "Currency"))
+        Entity = old.get_model("core", "Entity")
+        User = old.get_model("auth", "User")
+        alm = Entity.objects.create(code="ALM", name_en="ALM", name_ar="كيان", consolidation="parent",
+                                    base_currency_id="SAR")
+        user = User.objects.create(username="migration.user")
+        old.get_model("invoicing", "Vendor").objects.create(entity=alm, code="OLD", name_ar="مورد قديم",
+                                                            currency_id="SAR", created_by=user)
+    finally:
+        new = migrate(leaf)
+    assert new.get_model("invoicing", "Vendor").objects.get(code="OLD").vendor_kind == "business"

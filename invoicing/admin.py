@@ -2,7 +2,7 @@
 
 Every change goes through ``invoicing.services``, which check rights and rules;
 the admin only shows records, scoped to the entities where the user holds
-``invoicing.view``. Personal data of individual customers (names, address, IDs,
+``invoicing.view``. Personal data of individual customers and vendors (D24; names, address, IDs,
 VAT number, also as the buyer snapshot on documents and in list columns) and
 vendor IBANs are hidden or masked unless the user holds
 ``invoicing.view_personal_data`` in that entity (R51, PDPL; review item 11).
@@ -71,29 +71,41 @@ def _may_see_personal(request, entity):
     return cache[key]
 
 
+def _is_individual(party):
+    """A customer or vendor of kind ``individual`` (personal data, R49, R91)."""
+    kind = party.customer_kind if isinstance(party, Customer) else party.vendor_kind
+    return kind == Customer.Kind.INDIVIDUAL
+
+
 def _masked_customer(request, customer):
-    """True when ``customer`` is an individual whose personal data the user may not see (R51)."""
-    return customer.customer_kind == Customer.Kind.INDIVIDUAL and not _may_see_personal(request, customer.entity)
+    """True when the party (customer or vendor) is an individual whose personal data the user may not see (R51)."""
+    return _is_individual(customer) and not _may_see_personal(request, customer.entity)
+
+
+_masked_party = _masked_customer
 
 
 def _customer_column(request, path, field, label):
-    """A list column showing ``field`` of the customer at ``path`` (""=the object), masked for individuals."""
+    """A list column showing ``field`` of the party at ``path`` (""=the object), masked for individuals."""
     def column(obj):
-        customer = getattr(obj, path) if path else obj
-        if _masked_customer(request, customer):
+        party = getattr(obj, path) if path else obj
+        if _masked_party(request, party):
             return MASK
         if field:
-            return getattr(customer, field)
-        return customer.display_name(personal=customer.customer_kind != Customer.Kind.INDIVIDUAL
-                                     or _may_see_personal(request, customer.entity))
+            return getattr(party, field)
+        return party.display_name(personal=not _is_individual(party) or _may_see_personal(request, party.entity))
     column.short_description = label
     return column
 
 
-class PersonalSearchMixin:
-    """Search by name finds individual customers only in entities where the user may see personal data."""
+_party_column = _customer_column
 
-    customer_path = ""  # "" for Customer itself, "customer" for documents and receipts
+
+class PersonalSearchMixin:
+    """Search by name finds individual parties only in entities where the user may see personal data."""
+
+    customer_path = ""  # "" for the party itself, "customer" / "vendor" for documents, receipts and payments
+    kind_field = "customer_kind"  # "vendor_kind" for vendors and their documents
     code_lookups = ("code",)
 
     def get_search_results(self, request, queryset, search_term):
@@ -104,7 +116,7 @@ class PersonalSearchMixin:
             by_code = Q()
             for lookup in self.code_lookups:
                 by_code |= Q(**{f"{lookup}__icontains": search_term})
-            qs = qs.exclude(Q(**{f"{prefix}customer_kind": Customer.Kind.INDIVIDUAL})
+            qs = qs.exclude(Q(**{f"{prefix}{self.kind_field}": Customer.Kind.INDIVIDUAL})
                             & ~Q(**{f"{prefix}entity__in": allowed}) & ~by_code)
         return qs, duplicates
 
@@ -124,11 +136,24 @@ class CustomerAdmin(PersonalSearchMixin, ReadOnlyScopedAdmin):
         return ()
 
 
-class VendorAdmin(ReadOnlyScopedAdmin):
-    list_display = ["code", "name_ar", "name_en", "entity", "is_resident", "is_vat_registered", "is_active"]
+PERSONAL_VENDOR_FIELDS = PERSONAL_CUSTOMER_FIELDS + ("bank_iban",)
+
+
+class VendorAdmin(PersonalSearchMixin, ReadOnlyScopedAdmin):
+    """Individual vendors are personal data like individual customers (D24, R91, R86)."""
+
+    list_filter = ["vendor_kind", "is_resident", "is_active"]
     search_fields = ["code", "name_en", "name_ar"]
+    kind_field = "vendor_kind"
+
+    def get_list_display(self, request):
+        return ["code", _party_column(request, "", "name_ar", "Name (Arabic) / الاسم (بالعربية)"),
+                _party_column(request, "", "name_en", "Name (English) / الاسم (بالإنجليزية)"), "entity",
+                "vendor_kind", "is_resident", "is_vat_registered", "is_active"]
 
     def get_exclude(self, request, obj=None):
+        if obj is not None and _masked_party(request, obj):
+            return PERSONAL_VENDOR_FIELDS
         if obj is None or not _may_see_personal(request, obj.entity):
             return ("bank_iban",)
         return ()
@@ -168,12 +193,22 @@ class PurchaseLineInline(SalesLineInline):
     model = PurchaseDocumentLine
 
 
-class PurchaseDocumentAdmin(ReadOnlyScopedAdmin):
-    list_display = ["number", "doc_type", "entity", "vendor", "vendor_document_number", "accounting_date", "currency",
-                    "total_gross", "status"]
+class PurchaseDocumentAdmin(PersonalSearchMixin, ReadOnlyScopedAdmin):
     list_filter = ["doc_type", "status"]
-    search_fields = ["number", "vendor_document_number", "vendor__name_ar", "vendor__name_en"]
+    search_fields = ["number", "vendor_document_number", "vendor__code", "vendor__name_ar", "vendor__name_en"]
+    customer_path = "vendor"
+    kind_field = "vendor_kind"
+    code_lookups = ("number", "vendor_document_number", "vendor__code")
     inlines = [PurchaseLineInline]
+
+    def get_list_display(self, request):
+        return ["number", "doc_type", "entity", _party_column(request, "vendor", "", "Vendor / المورد"),
+                "vendor_document_number", "accounting_date", "currency", "total_gross", "status"]
+
+    def get_exclude(self, request, obj=None):  # R91: an individual vendor's bill snapshot is personal data
+        if obj is not None and _masked_party(request, obj.vendor):
+            return ("vendor", "vendor_vat_number")
+        return ()
 
 
 class ReceiptAdmin(ReadOnlyScopedAdmin):
@@ -186,7 +221,12 @@ class ReceiptAdmin(ReadOnlyScopedAdmin):
 
 
 class VendorPaymentAdmin(ReadOnlyScopedAdmin):
-    list_display = ["number", "kind", "entity", "vendor", "date", "amount", "currency", "status"]
+    def get_list_display(self, request):
+        return ["number", "kind", "entity", _party_column(request, "vendor", "", "Vendor / المورد"), "date",
+                "amount", "currency", "status"]
+
+    def get_exclude(self, request, obj=None):
+        return ("vendor",) if obj is not None and _masked_party(request, obj.vendor) else ()
 
 
 class AllocationAdmin(ReadOnlyScopedAdmin):

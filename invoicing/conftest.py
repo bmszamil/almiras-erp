@@ -67,7 +67,7 @@ def w(db, zatca):
         city_ar="جدة", postal_code="23456", country="SA",
     )
     ns.vendor = services.create_vendor(
-        alm, user=ns.ap, code="V001", name_en="Test Supplier", name_ar="المورد التجريبي", is_vat_registered=True,
+        alm, user=ns.ap, vendor_kind="business", code="V001", name_en="Test Supplier", name_ar="المورد التجريبي", is_vat_registered=True,
         vat_number="320000000000003",
     )
     return ns

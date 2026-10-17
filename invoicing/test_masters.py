@@ -79,7 +79,7 @@ def test_party_rules(w):
     with pytest.raises(InvoicingError):  # Saudi postal code has 5 digits
         services.create_customer(w.alm, user=w.clerk, code="X5", name_ar="عميل", postal_code="123")
     with pytest.raises(InvoicingError):
-        services.create_vendor(w.alm, user=w.ap, code="NR", name_ar="مورد", is_resident=False)
+        services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="NR", name_ar="مورد", is_resident=False)
     with pytest.raises(InvoicingError):  # entity's own code once per entity
         services.create_customer(w.alm, user=w.clerk, code="C001", name_ar="مكرر")
     customer = Customer(entity=w.alm, code="X6", name_ar="", currency_id="SAR", created_by=w.clerk)
@@ -91,7 +91,7 @@ def test_party_rights_follow_roles(w):
     with pytest.raises(access.AccessDenied):  # payables clerk does not manage customers
         services.create_customer(w.alm, user=w.ap, code="X7", name_ar="عميل")
     with pytest.raises(access.AccessDenied):
-        services.create_vendor(w.alm, user=w.clerk, code="X8", name_ar="مورد")
+        services.create_vendor(w.alm, user=w.clerk, vendor_kind="business", code="X8", name_ar="مورد")
     with pytest.raises(access.AccessDenied):  # no right in SUB
         services.create_customer(w.sub, user=w.clerk, code="X9", name_ar="عميل")
     with pytest.raises(InvoicingError):

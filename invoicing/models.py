@@ -354,11 +354,18 @@ class CustomerIdentifier(models.Model):
 
 
 class Vendor(Tracked, Address):
+    Kind = Customer.Kind  # D24 / R91: the same kinds as customers
+
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="vendors",
         verbose_name=bi("Entity", "الكيان"))
     code = models.CharField(bi("Code", "الرمز"), max_length=20)
     name_en = models.CharField(bi("Name (English)", "الاسم (بالإنجليزية)"), max_length=200, blank=True)
     name_ar = models.CharField(bi("Name (Arabic)", "الاسم (بالعربية)"), max_length=200)
+    vendor_kind = models.CharField(
+        bi("Vendor kind", "نوع المورد"), max_length=12, choices=Customer.Kind.choices,
+        help_text=bi("Individuals are personal data: names masked without the right (R91, R86)",
+                     "الأفراد بيانات شخصية: تُخفى أسماؤهم دون الصلاحية"),
+    )
     is_vat_registered = models.BooleanField(bi("VAT registered", "مسجل في ضريبة القيمة المضافة"), default=False)
     vat_number = models.CharField(bi("VAT number", "الرقم الضريبي"), max_length=15, blank=True,
                                   validators=[validate_vat_number])
@@ -384,8 +391,16 @@ class Vendor(Tracked, Address):
         if problems:
             raise ValidationError(problems)
 
-    def __str__(self):
+    def display_name(self, *, personal=False):
+        """Code and name; an individual vendor's name only with ``personal=True`` after the caller checked
+        ``invoicing.view_personal_data`` in the vendor's entity (R51, R91)."""
+        if self.vendor_kind == self.Kind.INDIVIDUAL and not personal:
+            return self.code
         return f"{self.code} — {self.name_ar or self.name_en}"
+
+    def __str__(self):
+        """Never an individual vendor's name (R86, R91): admin titles, choices and history show the code."""
+        return self.display_name()
 
 
 # --- guarded documents -------------------------------------------------------------------------------

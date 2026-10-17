@@ -250,7 +250,7 @@ def gbp_rate(w, rate, on):
 
 def test_f5_foreign_bill_paid_later_books_a_realised_loss(w):
     gbp_rate(w, "4.70", date(2027, 1, 15))
-    nr = services.create_vendor(w.alm, user=w.ap, code="UK1", name_ar="مورد يفوتر بالجنيه", currency="GBP")
+    nr = services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="UK1", name_ar="مورد يفوتر بالجنيه", currency="GBP")
     posted_bill = services.approve_purchase_document(
         bill(w, [("5300", "1", "2000.00", {"vat_category": "O"})], vendor=nr, number="UK-1"), user=w.cfo)
     assert posted_bill.journal_entry.lines.get(account__code="2100").credit == D("9400.00")
@@ -280,7 +280,7 @@ def test_r18_partial_then_final_settlement_leaves_no_residue(w):
 
 
 def test_d14_no_payment_to_a_non_resident_vendor_until_wht_is_built(w):
-    nr = services.create_vendor(w.alm, user=w.ap, code="NR9", name_ar="مورد أجنبي", is_resident=False,
+    nr = services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="NR9", name_ar="مورد أجنبي", is_resident=False,
                                 residence_country="GB")
     with pytest.raises(InvoicingError) as exc:
         services.create_vendor_payment(w.alm, user=w.ap, vendor=nr, date=date(2027, 1, 25), amount="100.00")

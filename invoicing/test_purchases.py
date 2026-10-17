@@ -1,4 +1,4 @@
-"""Purchase documents (invoicing.md R22 to R30, R32, R58; AT-12, AT-22 to AT-26, AT-39, AT-40, AT-52, AT-69)."""
+"""Purchase documents (invoicing.md R22 to R30, R32, R58, R92; AT-12, AT-22 to AT-24, AT-26, AT-95, AT-96, AT-39, AT-40, AT-52, AT-69)."""
 from datetime import date, timedelta
 
 import pytest
@@ -76,10 +76,44 @@ def test_r58_ledger_refusal_rolls_back_number(w, monkeypatch):
     assert not DocumentSequence.objects.filter(doc_type="BILL").exclude(last_number=0).exists()
 
 
-def test_at25_resident_vendor_without_vat_number_vat_to_cost(w):
-    plain = services.create_vendor(w.alm, user=w.ap, code="V2", name_ar="مورد غير مسجل")
-    posted = services.approve_purchase_document(bill(w, vendor=plain), user=w.cfo)
-    assert je(posted) == [("2100", D("0"), D("1150.00")), ("5300", D("1150.00"), D("0"))]
+def test_at95_resident_vendor_without_vat_number_carries_no_vat(w):
+    """D24 / R92, E8a (replaces AT-25): no input VAT, nothing to 1310 and nothing added to cost."""
+    plain = services.create_vendor(w.alm, user=w.ap, vendor_kind="individual", code="V2", name_ar="مورد غير مسجل")
+    doc = bill(w, vendor=plain, vat="0.00", gross="1000.00")
+    posted = services.approve_purchase_document(doc, user=w.cfo)
+    assert je(posted) == [("2100", D("0"), D("1000.00")), ("5300", D("1000.00"), D("0"))]
+    assert (posted.total_vat, posted.total_gross, posted.reverse_charge_vat) == (D("0"), D("1000.00"), D("0"))
+    line = posted.lines.get()
+    assert (line.vat_category, line.vat_amount, line.vat_recoverable) == ("O", D("0"), False)
+    assert posted.vat_breakdown[0]["category"] == "O" and posted.vat_breakdown[0]["vat"] == "0.00"
+    assert not getattr(posted, "warnings", [])
+
+
+def test_at96_unregistered_vendor_vat_refused_and_non_resident_still_reverse_charged(w):
+    plain = services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="V2", name_ar="مورد غير مسجل")
+    with pytest.raises(InvoicingError) as exc:  # vendor total VAT 150.00 on a bill without a VAT number
+        bill(w, vendor=plain, vat="150.00", gross="1150.00")
+    text = " ".join(exc.value.messages)
+    assert "cannot charge VAT" in text and "غير مسجل" in text
+    draft = PurchaseDocument.objects.get(vendor=plain)
+    assert draft.status == "draft"
+    services.update_purchase_document(draft, user=w.ap, vendor_total_vat="0", vendor_total_gross="1000.00")
+    assert services.submit_purchase_document(draft, user=w.ap).status == "submitted"
+    nr = foreign_vendor(w)  # no KSA VAT number by nature: E9 reverse charge stays
+    posted = services.approve_purchase_document(
+        bill(w, [("5300", "1", "1000", {"supply_kind": "services"})], vendor=nr, number="NR-2"), user=w.cfo)
+    assert je(posted) == [("1310", D("150.00"), D("0")), ("2100", D("0"), D("1000.00")), ("2200", D("0"), D("150.00")),
+                          ("5300", D("1000.00"), D("0"))]
+
+
+def test_r92_vat_number_removed_from_the_document_makes_it_vat_free(w):
+    doc = bill(w, submit=False)  # registered vendor: line S 15%
+    assert doc.lines.get().vat_category == "S"
+    services.update_purchase_document(doc, user=w.ap, vendor_vat_number="", vendor_total_vat="0",
+                                      vendor_total_gross="1000.00")
+    posted = services.approve_purchase_document(services.submit_purchase_document(doc, user=w.ap), user=w.cfo)
+    assert je(posted) == [("2100", D("0"), D("1000.00")), ("5300", D("1000.00"), D("0"))]
+    assert posted.lines.get().vat_category == "O"
 
 
 def test_at39_attribution_taxable_exempt_mixed(w):
@@ -92,7 +126,7 @@ def test_at39_attribution_taxable_exempt_mixed(w):
 
 
 def foreign_vendor(w):
-    return services.create_vendor(w.alm, user=w.ap, code="NR1", name_ar="مورد أجنبي", name_en="Foreign Co",
+    return services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="NR1", name_ar="مورد أجنبي", name_en="Foreign Co",
                                    is_resident=False, residence_country="GB")
 
 
@@ -127,7 +161,7 @@ def test_at12_sharia_prohibited_bill_line(w):
     ap, cfo = make_user("free_ap"), make_user("free_cfo")
     member(ap, free, "payables_clerk")
     member(cfo, free, "approver")
-    vendor = services.create_vendor(free, user=ap, code="B1", name_ar="بنك تقليدي")
+    vendor = services.create_vendor(free, user=ap, vendor_kind="business", code="B1", name_ar="بنك تقليدي")
     doc = services.create_purchase_document(free, user=ap, vendor=vendor, vendor_document_number="I-1",
                                             vendor_document_date=date(2027, 1, 15), accounting_date=date(2027, 1, 15))
     services.add_purchase_line(doc, user=ap, account="5610", quantity="1", unit_price="100", description_ar="فوائد",
@@ -148,7 +182,8 @@ def test_at23_duplicate_vendor_document_number(w):
     with pytest.raises(InvoicingError) as exc:
         bill(w)
     assert exc.value.code == "duplicate_vendor_document"
-    other_vendor = services.create_vendor(w.alm, user=w.ap, code="V3", name_ar="مورد آخر")
+    other_vendor = services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="V3", name_ar="مورد آخر",
+                                          is_vat_registered=True, vat_number="330000000000003")
     assert bill(w, vendor=other_vendor, vat="150.00", gross="1150.00").status == "submitted"  # another vendor may
     services.reverse_document(first, user=w.accountant)
     assert bill(w).status == "submitted"  # allowed after the first is reversed
@@ -241,7 +276,7 @@ def test_r46_purchase_documents_never_go_to_zatca(w):
 
 
 def test_intercompany_bill_uses_2110(w):
-    group_vendor = services.create_vendor(w.alm, user=w.ap, code="G-SUB", name_ar="التابعة", group_entity=w.sub,
+    group_vendor = services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="G-SUB", name_ar="التابعة", group_entity=w.sub,
                                           is_vat_registered=True, vat_number="311111111100003")
     posted = services.approve_purchase_document(bill(w, vendor=group_vendor), user=w.cfo)
     line = posted.journal_entry.lines.get(account__code="2110")

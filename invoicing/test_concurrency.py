@@ -92,7 +92,7 @@ def _seeded_world():
     member(w.queue, alm, "system_zatca_queue")
     w.customer = services.create_customer(alm, user=w.clerk, code="C1", name_ar="عميل", is_vat_registered=True,
                                           vat_number="310000000000003", **ADDRESS)
-    w.vendor = services.create_vendor(alm, user=w.ap, code="V1", name_ar="مورد", is_vat_registered=True,
+    w.vendor = services.create_vendor(alm, user=w.ap, vendor_kind="business", code="V1", name_ar="مورد", is_vat_registered=True,
                                       vat_number="320000000000003")
     return w
 
