@@ -119,6 +119,18 @@ LOCAL = {
     "not_live": ("This entity is not live on ZATCA Phase 2 yet (no go-live date, or a future one); the document is "
                  "not submitted (R-28).",
                  "لم يبدأ هذا الكيان المرحلة الثانية مع الهيئة بعد؛ لا يُرسل المستند."),
+    "cleared_xml_missing": ("ZATCA answered HTTP 200 without a cleared XML that can be read; the document is not "
+                            "issued or posted and needs attention (R-22).",
+                            "ردت الهيئة بالرمز 200 دون فاتورة معتمدة يمكن قراءتها؛ لم يصدر المستند ولم يُرحَّل ويحتاج إلى "
+                            "متابعة."),
+    "cleared_xml_uuid": ("The cleared XML returned by ZATCA carries another UUID than the document sent; it is not "
+                         "issued or posted and needs attention (R-22).",
+                         "تحمل الفاتورة المعتمدة التي أعادتها الهيئة معرّفًا فريدًا غير معرّف المستند المرسل؛ لم يصدر ولم "
+                         "يُرحَّل ويحتاج إلى متابعة."),
+    "cleared_xml_hash": ("The invoice hash of the cleared XML returned by ZATCA differs from the hash of the document "
+                         "sent; it is not issued or posted and needs attention (R-22).",
+                         "تختلف تجزئة الفاتورة المعتمدة التي أعادتها الهيئة عن تجزئة المستند المرسل؛ لم يصدر ولم يُرحَّل "
+                         "ويحتاج إلى متابعة."),
     "no_egs": ("No active EGS unit of this entity can sign this category of document.",
                "لا توجد وحدة فوترة نشطة لهذا الكيان توقّع هذه الفئة من المستندات."),
 }

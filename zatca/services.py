@@ -609,8 +609,19 @@ def _body_sha256(body):
 
 
 def _errors(response):
-    results = (response.body or {}).get("validationResults") or {}
-    return list(results.get("errorMessages") or []), list(results.get("warningMessages") or [])
+    """ZATCA's error and warning items; a body of an unexpected shape yields no items (never raises)."""
+    body = response.body if isinstance(response.body, dict) else {}
+    results = body.get("validationResults")
+    if not isinstance(results, dict):
+        return [], []
+
+    def items(key):
+        value = results.get(key)
+        if not isinstance(value, list):
+            return []
+        return [item if isinstance(item, dict) else {"message": str(item)[:1000]} for item in value]
+
+    return items("errorMessages"), items("warningMessages")
 
 
 def run_compliance_checks(egs, *, user):
@@ -1191,50 +1202,122 @@ def _send(einv, user, now):
         if einv.status != Status.QUEUED:
             return einv
         _transition(einv, Status.SUBMITTING)
+        einv.submitting_since = now
         _save(einv)
     einv = _post(einv, user, now, einv.api)
     _sync_invoicing(einv)
     return einv
 
 
+def _alert_once(einv, kind, en, ar):
+    """One alert of ``kind`` per e-invoice to the entity's ZATCA admins (repeated failures do not flood them)."""
+    if not ZatcaAlert.objects.filter(einvoice=einv, kind=kind).exists():
+        _alert(einv.entity, _zatca_admins(einv.entity), kind, en, ar, einvoice=einv)
+
+
+def _response_json(response):
+    body = response.body if isinstance(response.body, dict) else ({"value": str(response.body)[:2000]}
+                                                                     if response.body else {})
+    if response.error:
+        body = {**body, "error": response.error} if body else {"error": response.error}
+    return body or None
+
+
+def _cleared_result(einv, response):
+    """R-22 / finding 5: the cleared XML of an HTTP 200/202 clearance must decode, parse and be the document that
+    was sent (same UUID, same invoice hash). Returns ``(xml_text, "")`` or ``("", local message code)``."""
+    body = response.body if isinstance(response.body, dict) else {}
+    raw = body.get("clearedInvoice")
+    if not isinstance(raw, str) or not raw.strip():
+        return "", "cleared_xml_missing"
+    try:
+        xml = base64.b64decode(raw, validate=True)
+        text = xml.decode("utf-8")
+        returned_uuid = ubl.find_text(xml, "/*/cbc:UUID").strip()
+        returned_hash = crypto.invoice_hash(xml)
+    except (ValueError, UnicodeDecodeError, etree.XMLSyntaxError):  # binascii.Error is a ValueError
+        return "", "cleared_xml_missing"
+    if returned_uuid != str(einv.uuid):
+        return "", "cleared_xml_uuid"
+    if returned_hash != einv.invoice_hash:
+        return "", "cleared_xml_hash"
+    return text, ""
+
+
 def _post(einv, user, now, api):
+    """One call to ZATCA and its result (R-21 to R-26, R-44). Never leaves the row in ``submitting`` because of
+    an error here: any failure of the client call or of reading the response is a transient attempt (R-24)."""
+    O = SubmissionAttempt.Outcome
     profile = ZatcaProfile.objects.get(entity=einv.entity)
     body = _request_body(einv.invoice_hash, einv.uuid, einv.signed_xml.encode("utf-8"))
     started = _now()
     credential = _active_credential(einv.egs_unit, EgsCredential.Kind.PRODUCTION)
+    crashed = False
     try:
         if credential is None:
             raise SecretStoreRefused("No active production credential.", "لا توجد شهادة إنتاج نشطة.")
+        if credential.environment != profile.environment:  # R-36
+            raise SecretStoreRefused(f"The credential was issued in {credential.environment}, the profile is "
+                                     f"{profile.environment}.", "صدرت الشهادة في بيئة غير بيئة الملف.")
         auth = _auth(credential, _master_ref(einv.entity))
         method = zatca_client.get_client().clearance if api == EInvoice.Api.CLEARANCE \
             else zatca_client.get_client().reporting
         response = method(profile.environment, auth, body)
+        if not isinstance(response, zatca_client.ApiResponse):
+            raise TypeError("the ZATCA client returned no ApiResponse")
     except SecretStoreUnavailable as exc:  # R-47: a transient failure under R-24
         _secret_store_down(einv.entity, exc)
         response = zatca_client.ApiResponse(None, {}, "secret_store_unavailable")
     except (SecretStoreRefused, ZatcaError) as exc:
         response = zatca_client.ApiResponse(None, {}, f"credential_unavailable: {getattr(exc, 'en', exc)}")
+    except Exception as exc:  # noqa: BLE001 - finding 2: a crash of the client is a transient attempt
+        log.warning("zatca: %s call for e-invoice %s failed: %s", api, einv.pk, type(exc).__name__)
+        response = zatca_client.ApiResponse(None, {}, f"client_error: {type(exc).__name__}")
+        crashed = True
     else:
         _secret_store_up(einv.entity)
-    outcome = _classify(api, response)
+    cleared_text, cleared_problem = "", ""
+    try:
+        outcome = _classify(api, response)
+        if outcome in (O.ACCEPTED, O.ACCEPTED_WITH_WARNINGS) and api == EInvoice.Api.CLEARANCE \
+                and not einv.clearance_disabled:
+            cleared_text, cleared_problem = _cleared_result(einv, response)
+            if cleared_problem:
+                outcome = O.PERMANENT_ERROR
+    except Exception as exc:  # noqa: BLE001 - an unreadable response is a transient attempt (finding 2)
+        log.warning("zatca: %s response for e-invoice %s unreadable: %s", api, einv.pk, type(exc).__name__)
+        response = zatca_client.ApiResponse(response.status, response.body if isinstance(response.body, dict) else {},
+                                            f"response_error: {type(exc).__name__}")
+        outcome, crashed = O.TRANSIENT_ERROR, True
+    # A resubmission after an attempt whose result is unknown may get a "duplicate" answer. Its shape is not in
+    # the downloaded documents: TODO(zatca OQ-30, sandbox check): map ZATCA's duplicate-submission code here.
+    # Until then such an unexplained answer (not 200/202, 303, 400 or transient) is retried and alerted, never
+    # failed_final.
+    unclear_resubmission = outcome == O.PERMANENT_ERROR and not cleared_problem and \
+        einv.attempts.filter(outcome=O.TRANSIENT_ERROR).exists()
     with transaction.atomic():
-        einv = EInvoice.objects.select_for_update().select_related("entity").get(pk=einv.pk)
+        einv = EInvoice.objects.select_for_update().select_related("entity", "source_document").get(pk=einv.pk)
         attempt = SubmissionAttempt.objects.create(
             entity=einv.entity, einvoice=einv, attempt_no=einv.attempts.count() + 1, api=api,
             environment=profile.environment, request_sha256=_body_sha256(body), http_status=response.status,
-            response_json=response.body or ({"error": response.error} if response.error else None),
-            outcome=outcome, started_at=started, finished_at=_now(), created_by=user)
+            response_json=_response_json(response), outcome=O.TRANSIENT_ERROR if unclear_resubmission else outcome,
+            started_at=started, finished_at=_now(), created_by=user)
+        number = einv.source_document.number
+        if einv.status != Status.SUBMITTING:  # e.g. moved on by the stuck-submission sweep meanwhile
+            _alert_once(einv, "late_response",
+                        f"A late ZATCA answer for {number} (attempt {attempt.attempt_no}, {attempt.outcome}) arrived "
+                        f"after the document had moved to {einv.status}; check it in the attempt log.",
+                        f"وصل رد متأخر من الهيئة للمستند {number} بعد انتقاله إلى حالة {einv.status}؛ راجعه في سجل "
+                        "المحاولات.")
+            return einv
         _zatca_messages(einv, attempt, response)
-        O = SubmissionAttempt.Outcome
         if outcome in (O.ACCEPTED, O.ACCEPTED_WITH_WARNINGS):
             warned = outcome == O.ACCEPTED_WITH_WARNINGS
             if einv.clearance_disabled:
                 _transition(einv, Status.REPORTED_CLEARANCE_DISABLED)
             elif api == EInvoice.Api.CLEARANCE:
-                cleared = (response.body or {}).get("clearedInvoice") or ""
-                einv.cleared_xml = base64.b64decode(cleared).decode("utf-8") if cleared else ""
-                if einv.cleared_xml:
-                    einv.qr_tlv = einv.qr_tlv or ubl.qr_from_xml(einv.cleared_xml.encode("utf-8"))
+                einv.cleared_xml = cleared_text
+                einv.qr_tlv = einv.qr_tlv or ubl.qr_from_xml(cleared_text.encode("utf-8"))
                 _transition(einv, Status.CLEARED_WITH_WARNINGS if warned else Status.CLEARED)
             else:
                 _transition(einv, Status.REPORTED_WITH_WARNINGS if warned else Status.REPORTED)
@@ -1242,33 +1325,97 @@ def _post(einv, user, now, api):
             einv.clearance_disabled, einv.api = True, EInvoice.Api.REPORTING
             _save(einv)
             _alert(einv.entity, _zatca_admins(einv.entity), "clearance_disabled",
-                   f"ZATCA disabled clearance (HTTP 303): {einv.source_document.number} is sent to reporting. It is not "
+                   f"ZATCA disabled clearance (HTTP 303): {number} is sent to reporting. It is not "
                    "issued to the buyer or posted until the tax adviser signs off OQ-7.",
-                   f"عطّلت الهيئة الاعتماد (HTTP 303): يُرسل المستند {einv.source_document.number} للإبلاغ. لا يُسلَّم "
+                   f"عطّلت الهيئة الاعتماد (HTTP 303): يُرسل المستند {number} للإبلاغ. لا يُسلَّم "
                    "للمشتري ولا يُرحَّل حتى يعتمد المستشار الضريبي ذلك.", einvoice=einv)
         elif outcome == O.REJECTED:
             _transition(einv, Status.REJECTED)
-        elif outcome == O.TRANSIENT_ERROR:
-            einv.transient_failures += 1
-            limit = int(_setting("ZATCA_MAX_ATTEMPTS_STANDARD", 10))
-            if einv.zatca_category == EInvoice.Category.STANDARD and einv.transient_failures >= limit:
-                _transition(einv, Status.FAILED_FINAL)
-                _alert(einv.entity, _zatca_admins(einv.entity), "failed_final",
-                       f"{einv.source_document.number} could not be cleared after {limit} attempts; it is not issued.",
-                       f"تعذر اعتماد المستند {einv.source_document.number} بعد {limit} محاولات؛ لم يصدر.", einvoice=einv)
-            else:  # simplified: never failed_final for transient errors; keep retrying at the cap (R-24)
-                _transition(einv, Status.FAILED_RETRYABLE)
-                einv.next_attempt_at = now + _backoff(einv.transient_failures)
+        elif outcome == O.TRANSIENT_ERROR or unclear_resubmission:
+            if crashed:
+                _alert_once(einv, "submission_error",
+                            f"Submitting {number} to ZATCA failed unexpectedly ({response.error}); it is retried.",
+                            f"تعذر إرسال المستند {number} إلى الهيئة بسبب خطأ غير متوقع؛ ستُعاد المحاولة.")
+            if unclear_resubmission:
+                _alert_once(einv, "resubmission_unclear",
+                            f"ZATCA answered the resubmission of {number} with HTTP {response.status}, which the "
+                            "module cannot read as cleared, reported or rejected (perhaps a duplicate). It is "
+                            "retried; check the attempt log and ZATCA's portal.",
+                            f"ردت الهيئة على إعادة إرسال المستند {number} بالرمز {response.status} الذي لا يُفهم منه "
+                            "اعتماد أو إبلاغ أو رفض (ربما تكرار). ستُعاد المحاولة؛ راجع سجل المحاولات وبوابة الهيئة.")
+            _transient(einv, now)
         else:
+            if cleared_problem:
+                _messages(einv, [local(cleared_problem)], origin=ValidationMessage.Origin.LOCAL_RULES, attempt=attempt)
             _transition(einv, Status.FAILED_FINAL)
             _alert(einv.entity, _zatca_admins(einv.entity), "failed_final",
-                   f"ZATCA refused {einv.source_document.number} (HTTP {response.status}); it needs attention.",
-                   f"رفضت الهيئة المستند {einv.source_document.number} (HTTP {response.status})؛ يحتاج إلى متابعة.",
-                   einvoice=einv)
+                   f"ZATCA's answer for {number} (HTTP {response.status}) cannot be used; it is not issued or posted "
+                   "and needs attention.",
+                   f"لا يمكن استخدام رد الهيئة على المستند {number} (HTTP {response.status})؛ لم يصدر ولم يُرحَّل "
+                   "ويحتاج إلى متابعة.", einvoice=einv)
         _save(einv)
     if outcome == SubmissionAttempt.Outcome.CLEARANCE_DISABLED:  # R-44: the same signed XML to reporting, now
         return _post(einv, user, now, EInvoice.Api.REPORTING)
     return einv
+
+
+def _transient(einv, now):
+    """R-24 for a locked row in ``submitting``: standard documents end ``failed_final`` after the maximum number of
+    attempts; simplified ones keep retrying at the cap interval."""
+    einv.transient_failures += 1
+    limit = int(_setting("ZATCA_MAX_ATTEMPTS_STANDARD", 10))
+    number = einv.source_document.number
+    if einv.zatca_category == EInvoice.Category.STANDARD and einv.transient_failures >= limit:
+        _transition(einv, Status.FAILED_FINAL)
+        _alert(einv.entity, _zatca_admins(einv.entity), "failed_final",
+               f"{number} could not be cleared after {limit} attempts; it is not issued.",
+               f"تعذر اعتماد المستند {number} بعد {limit} محاولات؛ لم يصدر.", einvoice=einv)
+    else:  # simplified: never failed_final for transient errors; keep retrying at the cap (R-24)
+        _transition(einv, Status.FAILED_RETRYABLE)
+        einv.next_attempt_at = now + _backoff(einv.transient_failures)
+
+
+def sweep_stuck_submissions(*, user, now=None):
+    """Finding 2 (scheduled; also run by :func:`process_queue`): a row left in ``submitting`` for longer than
+    ``ZATCA_SUBMITTING_STALE_MINUTES`` (default 15; the client times out after 30 s) by a crashed worker gets a
+    transient attempt and goes to ``failed_retryable`` (R-20), so the same signed XML is resent (R-24)."""
+    _require_system(user)
+    now = now or _now()
+    moved = []
+    for entity in access.entities_for(user, PROCESS):
+        access.require(user, entity, PROCESS)
+        moved += _sweep_stuck(entity, user, now)
+    return moved
+
+
+def _sweep_stuck(entity, user, now):
+    stale = now - timedelta(minutes=float(_setting("ZATCA_SUBMITTING_STALE_MINUTES", 15)))
+    moved = []
+    for pk in EInvoice.objects.filter(Q(submitting_since__lte=stale) | Q(submitting_since__isnull=True),
+                                      entity=entity, status=Status.SUBMITTING).values_list("pk", flat=True):
+        with transaction.atomic():
+            einv = EInvoice.objects.select_for_update().select_related("entity", "source_document").get(pk=pk)
+            if einv.status != Status.SUBMITTING or (einv.submitting_since and einv.submitting_since > stale):
+                continue
+            body = _request_body(einv.invoice_hash, einv.uuid, einv.signed_xml.encode("utf-8"))
+            SubmissionAttempt.objects.create(
+                entity=einv.entity, einvoice=einv, attempt_no=einv.attempts.count() + 1, api=einv.api,
+                environment=ZatcaProfile.objects.get(entity=entity).environment, request_sha256=_body_sha256(body),
+                http_status=None, response_json={"error": "stuck_in_submitting"},
+                outcome=SubmissionAttempt.Outcome.TRANSIENT_ERROR, started_at=einv.submitting_since or now,
+                finished_at=now, created_by=user)
+            number = einv.source_document.number
+            _alert_once(einv, "stuck_submitting",
+                        f"{number} stayed in 'submitting' (the worker stopped mid-call); it is retried. ZATCA may "
+                        "already have it, so a duplicate answer is possible.",
+                        f"بقي المستند {number} في حالة الإرسال (توقف المعالج أثناء الاتصال)؛ ستُعاد المحاولة. قد "
+                        "تكون الهيئة استلمته، فقد يرد رد بالتكرار.")
+            einv.transient_failures += 1
+            _transition(einv, Status.FAILED_RETRYABLE)
+            einv.next_attempt_at = now + _backoff(einv.transient_failures)
+            _save(einv)
+            moved.append(einv)
+    return moved
 
 
 # --- results back to invoicing (§5, R-22, R-23) --------------------------------------------------------------
@@ -1347,36 +1494,56 @@ def _require_system(user):
 
 
 def process_queue(*, user, now=None):
-    """One worker run (ZATCA queue system user): stamp pending documents, requeue due retries, submit queued
-    documents (not held back by earlier ICVs unless serialised, R-27), resend results to invoicing, and run
-    the deadline checks. Returns counts."""
+    """One worker run (ZATCA queue system user): move stuck submissions on, stamp pending documents, requeue due
+    retries, submit queued documents (not held back by earlier ICVs unless serialised, R-27), resend results to
+    invoicing, and run the deadline checks. An unexpected error in one document or one entity is logged and the
+    run carries on with the others (finding 2). Returns counts."""
     _require_system(user)
     now = now or _now()
-    counts = {"stamped": 0, "sent": 0}
+    counts = {"stamped": 0, "sent": 0, "errors": 0}
     for entity in access.entities_for(user, PROCESS):
         access.require(user, entity, PROCESS)
-        _probe_store(entity)
-        due = Q(next_attempt_at__isnull=True) | Q(next_attempt_at__lte=now)
-        for einv in EInvoice.objects.filter(due, entity=entity, status=Status.PENDING,
-                                            hold_reason__in=RETRIED_HOLDS).order_by("created_at", "pk"):
-            if _stamp(einv, user, now).status == Status.QUEUED:
-                counts["stamped"] += 1
-        for einv in EInvoice.objects.filter(due, entity=entity, status=Status.FAILED_RETRYABLE).order_by("icv"):
-            with transaction.atomic():
-                einv = EInvoice.objects.select_for_update().get(pk=einv.pk)
-                if einv.status == Status.FAILED_RETRYABLE:
-                    _transition(einv, Status.QUEUED)
-                    _save(einv)
-        for einv in EInvoice.objects.filter(entity=entity, status=Status.QUEUED).order_by("egs_unit", "icv"):
-            if _blocked_by_earlier(einv):
-                continue
-            _send(einv, user, now)
-            counts["sent"] += 1
-        for einv in EInvoice.objects.filter(entity=entity, source_document__status="issued").exclude(
-                status=Status.PENDING, hold_reason=""):
-            _sync_invoicing(einv)
-        _deadline_checks(entity, now)
+        try:
+            _process_entity(entity, user, now, counts)
+        except Exception as exc:  # noqa: BLE001 - one entity never stops the others
+            counts["errors"] += 1
+            log.warning("zatca: queue run for entity %s failed: %s", entity.code, type(exc).__name__)
     return counts
+
+
+def _guarded(counts, what, einv, fn, *args):
+    try:
+        return fn(*args)
+    except Exception as exc:  # noqa: BLE001 - one document never stops the run
+        counts["errors"] += 1
+        log.warning("zatca: %s of e-invoice %s failed: %s", what, einv.pk, type(exc).__name__)
+        return None
+
+
+def _process_entity(entity, user, now, counts):
+    _probe_store(entity)
+    _sweep_stuck(entity, user, now)
+    due = Q(next_attempt_at__isnull=True) | Q(next_attempt_at__lte=now)
+    for einv in EInvoice.objects.filter(due, entity=entity, status=Status.PENDING,
+                                        hold_reason__in=RETRIED_HOLDS).order_by("created_at", "pk"):
+        stamped = _guarded(counts, "stamping", einv, _stamp, einv, user, now)
+        if stamped is not None and stamped.status == Status.QUEUED:
+            counts["stamped"] += 1
+    for einv in EInvoice.objects.filter(due, entity=entity, status=Status.FAILED_RETRYABLE).order_by("icv"):
+        with transaction.atomic():
+            einv = EInvoice.objects.select_for_update().get(pk=einv.pk)
+            if einv.status == Status.FAILED_RETRYABLE:
+                _transition(einv, Status.QUEUED)
+                _save(einv)
+    for einv in EInvoice.objects.filter(entity=entity, status=Status.QUEUED).order_by("egs_unit", "icv"):
+        if _blocked_by_earlier(einv):
+            continue
+        if _guarded(counts, "submission", einv, _send, einv, user, now) is not None:
+            counts["sent"] += 1
+    for einv in EInvoice.objects.filter(entity=entity, source_document__status="issued").exclude(
+            status=Status.PENDING, hold_reason=""):
+        _sync_invoicing(einv)
+    _deadline_checks(entity, now)
 
 
 def run_deadline_checks(*, user, now=None):

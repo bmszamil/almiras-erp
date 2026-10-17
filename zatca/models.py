@@ -299,6 +299,9 @@ class EInvoice(Tracked, ServiceWritten):
     acquisition_date = models.DateField(bi("Acquisition date", "تاريخ الاقتناء"), null=True, blank=True)
     transient_failures = models.PositiveIntegerField(default=0, editable=False)
     next_attempt_at = models.DateTimeField(null=True, blank=True, editable=False)
+    submitting_since = models.DateTimeField(
+        null=True, blank=True, editable=False,
+        help_text="when the row last entered submitting (the stuck-submission sweep, ZATCA_SUBMITTING_STALE_MINUTES)")
     invoicing_synced = models.CharField(max_length=30, blank=True, editable=False,
                                         help_text="status last reported to invoicing (on_zatca_result)")
 

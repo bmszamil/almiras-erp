@@ -1,4 +1,5 @@
-"""Run the ZATCA queue once as the ZATCA queue system user (stamp, submit, retry, results, deadlines)."""
+"""Run the ZATCA queue once as the ZATCA queue system user (stuck-submission sweep, stamp, submit, retry, results,
+deadlines)."""
 from django.core.management.base import BaseCommand
 
 from core import access
@@ -10,4 +11,4 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         counts = services.process_queue(user=access.system_user("zatca_queue"))
-        self.stdout.write(f"stamped={counts['stamped']} sent={counts['sent']}")
+        self.stdout.write(f"stamped={counts['stamped']} sent={counts['sent']} errors={counts['errors']}")
