@@ -342,7 +342,7 @@ def test_t17_agent_drafts_but_cannot_approve_or_issue(make_agreement, make_user,
     assert inv.source == "agent" and inv.source_agent == "billing-bot" and inv.status == "draft"
     with pytest.raises(AccessDenied):
         services.run_billing(bot, alm, nov)
-    with pytest.raises(AccessDenied, match="D15"):
+    with pytest.raises(AccessDenied, match="D15|D20"):  # engine-level D20 check fires first
         approvals.submit(inv, bot)  # D15: agents cannot submit, also not through the engine
     with pytest.raises(AccessDenied, match="D15"):
         services.submit_for_approval(bot, inv)

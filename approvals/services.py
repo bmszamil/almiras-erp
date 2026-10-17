@@ -211,7 +211,8 @@ def _eligible_others(request, step, exclude_id):
 
 
 def _mp_sole_approver(request, step, principal):
-    """The D10 situation: the MP created, submitted or edited the document and nobody else is eligible."""
+    """The D10 situation: the MP created, submitted or edited the document and nobody else is eligible.
+    D22: this includes an MP who submitted an AI agent's or integration's draft (the submitter is involved)."""
     return (
         principal.pk in _involved(request)
         and principal.is_human
@@ -433,13 +434,21 @@ def submit_by_code(code, object_id, user, ctx=None):
     entity = adapter.entity(doc)
     if not user.is_active:
         raise AccessDenied("inactive", "Your user is inactive.", "المستخدم غير نشط.")
+    if not user.is_human:
+        # D20: AI agents and integrations create drafts only; a human must submit them.
+        raise AccessDenied("service_user_cannot_submit",
+                           "AI agents and integrations cannot submit for approval; a person must submit the draft (D20).",
+                           "لا يمكن للوكلاء والتكاملات تقديم طلبات الموافقة؛ يجب أن يقدّم شخص المسودة (D20).")
     # R1/R2/T2: permission in the document's own entity only.
     access.require_perm(user, entity, "approvals.request.submit")
     if adapter.submit_permission:
         access.require_perm(user, entity, adapter.submit_permission)
     creator = adapter.created_by(doc)
-    if creator is None or creator.pk != user.pk:
+    agent_draft = creator is not None and not creator.is_human
+    if creator is None or (creator.pk != user.pk and not agent_draft):
         # Conservative build choice: users submit their own drafts only (spec §7.1 "own drafts").
+        # D20: drafts made by an AI agent or integration are submitted by a person holding the
+        # submit rights in the document's entity (that person then cannot approve it, R8).
         raise AccessDenied("not_own_draft", "You can only submit drafts you created.",
                            "يمكنك تقديم المسودات التي أنشأتها فقط.")
     if not adapter.is_submittable(doc):
@@ -469,7 +478,7 @@ def submit_by_code(code, object_id, user, ctx=None):
         raise Conflict("already_pending", "This document already has a pending approval request.",
                        "يوجد طلب موافقة معلق لهذا المستند.")
     editors = set(adapter.editor_ids(doc)) | {creator.pk}
-    request.document_editors.set(User.objects.filter(pk__in=editors))
+    request.document_editors.add(*User.objects.filter(pk__in=editors))  # append-only through table
     request._involved_ids = None
     ApprovalAction.objects.create(request=request, actor=user, action=A.SUBMIT, at=at, channel=_channel(ctx))
     adapter.on_submitted(doc, request)

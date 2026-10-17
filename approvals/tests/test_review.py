@@ -110,9 +110,13 @@ def test_d17_integration_cannot_act_cancel_others_or_get_powerful_roles(alm, mp,
         access.grant_access(mp, integration, alm, "chairman")
 
 
-def test_d17_integration_submits_own_draft_with_import_source(alm, integration, make_bill):
-    r = services.submit(make_bill(integration, alm), integration)
-    assert r.source == "import"
+def test_d20_integration_cannot_submit_human_submits_with_import_source(alm, integration, accountant, make_bill):
+    bill = make_bill(integration, alm)
+    with pytest.raises(AccessDenied) as e:
+        services.submit(bill, integration)
+    assert e.value.code == "service_user_cannot_submit"
+    r = services.submit(bill, accountant)
+    assert r.source == "import" and r.submitted_by == accountant
 
 
 # ---------------------------------------------------------------- 9. any posting exception

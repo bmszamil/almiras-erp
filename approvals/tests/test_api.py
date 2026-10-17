@@ -110,14 +110,20 @@ def test_t16_agent_approve_via_api_403(alm, agent, accountant, make_payment, api
     assert r.status == "pending"
 
 
-def test_t16_agent_submits_own_draft_via_api_but_cannot_approve_it(alm, agent, make_bill, api):
+def test_d20_agent_cannot_submit_via_api_human_submits_and_agent_cannot_approve(alm, agent, accountant, make_bill,
+                                                                                  api):
     bill = make_bill(agent, alm)
     c = api(agent)
     resp = c.post("/api/v1/approvals/requests", {"document_type": "payables.bill", "object_id": bill.pk}, format="json")
+    assert resp.status_code == 403 and resp.json()["code"] == "service_user_cannot_submit"
+    assert resp.json()["message_ar"] and not ApprovalRequest.objects.exists()
+    resp = api(accountant).post("/api/v1/approvals/requests", {"document_type": "payables.bill", "object_id": bill.pk},
+                                format="json")
     assert resp.status_code == 201 and resp.json()["source"] == "agent:invoice-reader"
     r = ApprovalRequest.objects.get(pk=resp.json()["id"])
-    assert post_action(c, r, "approve", {"document_version": r.document_version}).status_code == 403
-    assert ApprovalRequest.objects.get(pk=r.pk).actions.filter(channel="agent_gateway").exists()
+    assert r.submitted_by == accountant and r.document_created_by == agent
+    assert post_action(c, r, "approve", {"document_version": r.document_version}).status_code in (403, 404)
+    assert ApprovalRequest.objects.get(pk=r.pk).status == "pending"
 
 
 def test_t19_language_persists_and_messages_bilingual(alm, make_user, api):

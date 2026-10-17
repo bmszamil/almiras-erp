@@ -48,4 +48,6 @@ class IsTwoFactorAuthenticated(permissions.BasePermission):
             return not user.is_human
         if not user.is_human:
             return False  # service users never use sessions
+        if user.totp_enrolment_required:
+            return False  # D21: must set own password and enrol a device first
         return identity().is_second_factor_verified(request._request, user)

@@ -37,8 +37,9 @@ def sub(alm):
 
 @pytest.fixture
 def make_user(db):
-    def make(username, *roles, user_type="human", language="en", email=None, agent_name=""):
-        """roles: (entity, role_code) pairs."""
+    def make(username, *roles, user_type="human", language="en", email=None, agent_name="", enrolled=True):
+        """roles: (entity, role_code) pairs. enrolled=True: the user has since set his own password and
+        enrolled his device (D21), as an established user would; False keeps the post-grant state."""
         u = User.objects.create(
             username=username, full_name_en=username.title(), full_name_ar=f"م {username}",
             email=f"{username}@example.test" if email is None else email,
@@ -46,6 +47,9 @@ def make_user(db):
         )
         for entity, role in roles:
             access.grant_access(None, u, entity, role, valid_from=datetime.date(2026, 1, 1))
+        if enrolled:
+            User.objects.filter(pk=u.pk).update(totp_enrolment_required=False, password_set_by_others=False)
+            u.refresh_from_db()
         return u
 
     return make

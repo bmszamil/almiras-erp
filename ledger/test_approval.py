@@ -152,13 +152,15 @@ def test_rejected_entry_is_locked_and_never_posts(alm, mp, accountant):
         e.save()
 
 
-def test_d8_agent_entry_is_draft_with_agent_source_and_agent_cannot_post(alm, agent, mp):
+def test_d8_agent_entry_is_draft_with_agent_source_and_agent_cannot_post(alm, agent, mp, accountant):
     e = services.create_entry(alm, date(2027, 1, 3), "Drafted by agent",
                               [{"account": "5200", "debit": 10}, {"account": "2300", "credit": 10}], user=agent)
     assert e.source == "agent:invoice-reader" and e.requires_approval
     with pytest.raises(LedgerError):
         services.post_entry(e, user=agent)
-    r = approvals.submit(e, agent)
+    with pytest.raises(AccessDenied):
+        approvals.submit(e, agent)  # D20: a person submits
+    r = approvals.submit(e, accountant)
     assert r.source == "agent:invoice-reader"
     with pytest.raises(AccessDenied):
         approve(r, agent)

@@ -50,4 +50,7 @@ class LockoutModelBackend(ModelBackend):
         ip = client_ip(request) if request is not None else ""
         if username and is_locked_out(username, ip):
             raise PermissionDenied("Too many failed sign-ins. Try again later.")  # stops all backends
-        return super().authenticate(request, username=username, password=password, **kwargs)
+        user = super().authenticate(request, username=username, password=password)
+        if user is not None and user.totp_enrolment_required and not kwargs.get("enrolment"):
+            return None  # D21: sign-in refused until he set his own password and enrolled (/access/enrol-2fa/)
+        return user

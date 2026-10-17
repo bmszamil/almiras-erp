@@ -204,7 +204,7 @@ class ApprovalRequest(models.Model):
     submitted_by = models.ForeignKey(USER, on_delete=models.PROTECT, related_name="+")
     document_created_by = models.ForeignKey(USER, on_delete=models.PROTECT, related_name="+")
     document_editors = models.ManyToManyField(
-        USER, blank=True, related_name="+",
+        USER, blank=True, related_name="+", through="RequestEditor",
         help_text="Everyone who edited the draft before submission; treated like the creator under R8/D10",
     )
     source = models.CharField(max_length=60, default="human")
@@ -242,6 +242,18 @@ class ApprovalRequest(models.Model):
 
     def __str__(self):
         return f"{self.document_type.code}#{self.object_id} ({self.status})"
+
+
+class RequestEditor(AppendOnlyModel):
+    """Through table of ApprovalRequest.document_editors; append-only (follow-up 2b). Keeps the table
+    Django created for the former automatic many-to-many."""
+
+    approvalrequest = models.ForeignKey(ApprovalRequest, on_delete=models.PROTECT, related_name="+")
+    user = models.ForeignKey(USER, on_delete=models.PROTECT, related_name="+")
+
+    class Meta:
+        db_table = "approvals_approvalrequest_document_editors"
+        constraints = [models.UniqueConstraint(fields=["approvalrequest", "user"], name="unique_request_editor")]
 
 
 class ApprovalAction(AppendOnlyModel):

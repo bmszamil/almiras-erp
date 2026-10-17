@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Enrol authenticator app / تسجيل تطبيق المصادقة</title></head>
+<body>
+<h1>Enrol authenticator app <span lang="ar" dir="rtl">/ تسجيل تطبيق المصادقة</span></h1>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+{% if done %}
+  <p>Your authenticator app is enrolled. Sign in with your password and a code.
+  <span lang="ar" dir="rtl">تم تسجيل تطبيق المصادقة. سجّل الدخول بكلمة المرور والرمز.</span></p>
+  <p><a href="/admin/login/">Sign in / تسجيل الدخول</a></p>
+{% elif set_password %}
+  <p>Choose your own password first. Nobody else may know it.
+  <span lang="ar" dir="rtl">اختر كلمة مرورك أولاً، ولا يجوز أن يعرفها غيرك.</span></p>
+  <form method="post">{% csrf_token %}
+    <label for="np1">New password / كلمة المرور الجديدة</label>
+    <input id="np1" name="new_password1" type="password" autocomplete="new-password" required>
+    <label for="np2">Repeat / أعد الإدخال</label>
+    <input id="np2" name="new_password2" type="password" autocomplete="new-password" required>
+    <button type="submit">Save / حفظ</button>
+  </form>
+{% elif device %}
+  <p>Add this account to your authenticator app, then enter the code it shows. This secret is shown only to you.
+  <span lang="ar" dir="rtl">أضف هذا الحساب إلى تطبيق المصادقة ثم أدخل الرمز. يظهر هذا السر لك وحدك.</span></p>
+  <p><label>Set-up link / رابط الإعداد<br><code dir="ltr">{{ device.config_url }}</code></label></p>
+  <form method="post">{% csrf_token %}
+    <label for="token">Code / الرمز</label>
+    <input id="token" name="token" inputmode="numeric" autocomplete="one-time-code" required>
+    <button type="submit">Confirm / تأكيد</button>
+  </form>
+{% else %}
+  <p>For accounts whose authenticator app was reset or that were given the Managing Partner or Chairman role. <span lang="ar" dir="rtl">للحسابات التي أُعيد تعيين تطبيق المصادقة لها أو مُنحت دور الشريك المدير أو رئيس مجلس الإدارة.</span></p>
+  <form method="post">{% csrf_token %}
+    <label for="username">Username / اسم المستخدم</label> <input id="username" name="username" autocomplete="username" required>
+    <label for="password">Password / كلمة المرور</label> <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <label for="code">One-time enrolment code, if you were given one / رمز التسجيل لمرة واحدة إن أُعطي لك</label>
+    <input id="code" name="code" autocomplete="off">
+    <button type="submit">Continue / متابعة</button>
+  </form>
+{% endif %}
+</body>
+</html>

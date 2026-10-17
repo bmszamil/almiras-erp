@@ -20,10 +20,15 @@ Tick every item before the ERP serves real users. Data stays in a Saudi cloud re
 - [ ] **HSTS preload decision:** `SECURE_HSTS_PRELOAD` is off. Turning it on and submitting the domain to browser preload lists is hard to undo. Needs an explicit decision (all subdomains must serve HTTPS forever).
 
 ## Accounts and access
-- [ ] Every human user has an authenticator app enrolled (`manage.py setup_totp <user>`), and the enrolment shows in the audit log.
+- [ ] Every human user has an authenticator app enrolled (`manage.py setup_totp <user>`), and the enrolment shows in the audit log. Managing Partners and Chairmen cannot be enrolled by anyone else: after the role grant they set their own password and enrol at `/access/enrol-2fa/` (D21).
 - [ ] Service tokens are issued with `manage.py issue_service_token <user> --days N`; expiry dates are recorded and rotated.
 - [ ] Initial grants are made (`manage.py grant_access`), then reviewed with `manage.py access_review --as <reviewer>`. The review is repeated quarterly.
-- [ ] Cron: `run_escalations` every 15 minutes; `send_notifications` (email retry) every 15 minutes.
+- [ ] Cron: `run_escalations` every 15 minutes; `send_notifications` (email retry) every 15 minutes; `expire_chairman_changes` (D21 dual-control requests) hourly.
+- [ ] `ERP_CHAIRMAN_CHANGE_EXPIRY_DAYS` is set if the default of 7 days is not wanted (D21).
+- [ ] `/access/enrol-2fa/` (2FA self-enrolment after a dual-controlled reset, D21) is reachable only over HTTPS and is not cached by any proxy (the page sends `Cache-Control: no-store`).
+
+## Development databases
+- [ ] **Rebuild dev databases created before 17 Oct 2026 migration renumbering.** On `fix/approvals-followups` the access migrations were renumbered after main's intercompany migrations (`0008_user_manager_guards_system_user`, `0009_d20_agents_do_not_submit`, then `0010`, `0011`). A local database that applied the old `0006_user_manager_guards_system_user` / `0007_d20_agents_do_not_submit` has a migration history that no longer matches: delete it (`db.sqlite3` or the scratch PostgreSQL database) and run `python manage.py migrate` again. No production database exists yet.
 
 ## Pending (not built yet)
 - [ ] **Database-level guards.** PostgreSQL triggers must block UPDATE/DELETE of posted journal entries and lines and of approval requests' final states. A database role without UPDATE/DELETE on `access_auditlog` and `approvals_approvalaction` is needed. An exclusion constraint for overlapping approval policies is also needed. Until then the guards are application-level only.

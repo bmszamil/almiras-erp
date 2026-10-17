@@ -8,7 +8,7 @@ Rules (spec docs/specs/approvals-and-web-ui.md):
 """
 import uuid
 
-from django.contrib.auth.models import AbstractUser
+from django.contrib.auth.models import AbstractUser, UserManager as BaseUserManager
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
@@ -16,6 +16,49 @@ from django.utils import timezone
 from core.models import Entity
 
 from .errors import BilingualError
+
+
+SYSTEM_USERNAME = "system"
+
+
+def _refuse_system(message_en, message_ar):
+    raise BilingualError("system_user", message_en, message_ar)
+
+
+class UserQuerySet(models.QuerySet):
+    """Bulk changes skip User.save/delete, so they are refused when the rows include the reserved
+    ERP system user (follow-up 2a). bulk_update goes through update()."""
+
+    def update(self, **kwargs):
+        if self.filter(username=SYSTEM_USERNAME).exists():
+            _refuse_system("The ERP system user cannot be changed.", "لا يمكن تعديل مستخدم النظام.")
+        if kwargs.get("username") == SYSTEM_USERNAME:
+            _refuse_system("The username 'system' is reserved.", "اسم المستخدم 'system' محجوز.")
+        return super().update(**kwargs)
+
+    update.alters_data = True
+
+    def delete(self):
+        if self.filter(username=SYSTEM_USERNAME).exists():
+            _refuse_system("The ERP system user cannot be deleted.", "لا يمكن حذف مستخدم النظام.")
+        return super().delete()
+
+    delete.alters_data = True
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        # Checked before Django opens its atomic block, so a refusal does not break the caller's transaction.
+        objs = list(objs)
+        if "username" in fields and any(o.username == SYSTEM_USERNAME for o in objs):
+            _refuse_system("The username 'system' is reserved.", "اسم المستخدم 'system' محجوز.")
+        if self.model._default_manager.filter(pk__in=[o.pk for o in objs], username=SYSTEM_USERNAME).exists():
+            _refuse_system("The ERP system user cannot be changed.", "لا يمكن تعديل مستخدم النظام.")
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+    bulk_update.alters_data = True
+
+
+class UserManager(BaseUserManager.from_queryset(UserQuerySet)):
+    pass
 
 
 class User(AbstractUser):
@@ -42,8 +85,22 @@ class User(AbstractUser):
     user_type = models.CharField(max_length=20, choices=UserType.choices, default=UserType.HUMAN)
     agent_name = models.SlugField(max_length=60, blank=True, help_text="Required for service agents")
     default_entity = models.ForeignKey(Entity, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    totp_enrolment_required = models.BooleanField(
+        default=False, help_text="Set by a dual-controlled 2FA reset (D21): the user enrols a new device himself "
+                                 "at next sign-in (password + one-time enrolment).")
+    enrolment_code_required = models.BooleanField(
+        default=False, help_text="D21 split knowledge: enrolment needs the initial password (known to the requester) "
+                                 "and a one-time code (shown only to the approver who applied it).")
+    enrolment_code_hash = models.CharField(max_length=128, blank=True, help_text="Hash only; never the code")
+    enrolment_code_expires_at = models.DateTimeField(null=True, blank=True)
+    password_set_by_others = models.BooleanField(
+        default=True, help_text="The current password was set by someone other than the user (account creation, "
+                                "admin, commands, D21 dual control). Cleared only when the user changes it himself. "
+                                "While set, no 2FA reset or self-enrolment is allowed.")
 
     REQUIRED_FIELDS = ["email", "full_name_en", "full_name_ar"]
+
+    objects = UserManager()
 
     class Meta:
         constraints = [
@@ -73,6 +130,23 @@ class User(AbstractUser):
             return "import"
         return "human"
 
+    def set_password(self, raw_password):
+        """Every password set through here counts as set by others (D21); the self-service paths clear the
+        flag afterwards (access.services.password_changed_by_self)."""
+        super().set_password(raw_password)
+        self.password_set_by_others = True
+
+    def check_password(self, raw_password):
+        from django.contrib.auth.base_user import AbstractBaseUser
+        from django.contrib.auth.hashers import check_password
+
+        def setter(raw):
+            AbstractBaseUser.set_password(self, raw)  # hash upgrade only: not a new password
+            self._password = None
+            self.save(update_fields=["password"])
+
+        return check_password(raw_password, self.password, setter)
+
     def get_full_name(self):
         return self.full_name_ar if self.language == self.Language.AR else self.full_name_en
 
@@ -84,7 +158,22 @@ class User(AbstractUser):
         if self.user_type == self.UserType.SERVICE_AGENT and not self.agent_name:
             raise ValidationError({"agent_name": "Service agents need an agent name."})
 
+    def save(self, *args, **kwargs):
+        # Follow-up 2a: the reserved ERP system user is never renamed or otherwise changed, and no
+        # other account can take its name.
+        if not self._state.adding and self.pk:
+            stored = User.objects.filter(pk=self.pk).values_list("username", flat=True).first()
+            if stored == SYSTEM_USERNAME and getattr(self, "_allow_system_save", False) is not True:
+                raise BilingualError("system_user", "The ERP system user cannot be changed.",
+                                     "لا يمكن تعديل مستخدم النظام.")
+            if stored != SYSTEM_USERNAME and self.username == SYSTEM_USERNAME:
+                raise BilingualError("system_user", "The username 'system' is reserved.",
+                                     "اسم المستخدم 'system' محجوز.")
+        super().save(*args, **kwargs)
+
     def delete(self, *args, **kwargs):
+        if self.pk and User.objects.filter(pk=self.pk, username=SYSTEM_USERNAME).exists():
+            _refuse_system("The ERP system user cannot be deleted.", "لا يمكن حذف مستخدم النظام.")
         about_me = models.Q(object_type="access.user", object_id=str(self.pk))
         if AuditLog.objects.filter(models.Q(actor=self) | models.Q(on_behalf_of=self) | about_me).exists():
             raise BilingualError(
@@ -165,6 +254,9 @@ class AppendOnlyQuerySet(models.QuerySet):
     def delete(self):
         raise BilingualError("append_only", "Audit records cannot be deleted.", "لا يمكن حذف سجلات التدقيق.")
 
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise BilingualError("append_only", "Audit records cannot be changed.", "لا يمكن تعديل سجلات التدقيق.")
+
 
 class AppendOnlyModel(models.Model):
     objects = AppendOnlyQuerySet.as_manager()
@@ -228,3 +320,92 @@ class ServiceToken(models.Model):
 
     def __str__(self):
         return f"token {self.label or self.pk} for {self.user}"
+
+
+class ChairmanChangeQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise BilingualError("dual_control", "Dual-control changes move only through their service.",
+                             "لا تتغير طلبات الرقابة المزدوجة إلا عبر خدمتها.")
+
+    def delete(self):
+        raise BilingualError("dual_control", "Dual-control changes cannot be deleted.",
+                             "لا يمكن حذف طلبات الرقابة المزدوجة.")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self.update()
+
+
+class ChairmanChange(models.Model):
+    """D21 dual control: a proposed change to the account of a user holding the Chairman role (or to a
+    role a Chairman holds). Applies only after a CFO and a Managing Partner of the group root entity,
+    two distinct people and neither of them an affected Chairman, have both approved. The requester's
+    request counts as their approval. Created and moved only through access.dual_control."""
+
+    class Action(models.TextChoices):
+        PASSWORD = "password", "Set password"
+        TOTP_RESET = "totp_reset", "Reset authenticator app (Chairman re-enrols himself)"
+        DEACTIVATE = "deactivate", "Deactivate"
+        UNLOCK = "unlock", "Clear sign-in lockout"
+        UPDATE = "update", "Change account fields"
+        GRANT = "grant", "Grant role"
+        REVOKE = "revoke", "Revoke role"
+        ROLE_PERMISSIONS = "role_permissions", "Change role permissions"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPLIED = "applied", "Applied"
+        REJECTED = "rejected", "Rejected"
+        EXPIRED = "expired", "Expired"
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+",
+                               help_text="The group root entity whose CFO and MP approve")
+    target = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+                               help_text="The Chairman whose account changes (empty for role edits)")
+    role = models.ForeignKey(Role, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+                             help_text="The role whose permissions change (role edits only)")
+    action = models.CharField(max_length=20, choices=Action.choices)
+    payload = models.JSONField(default=dict, blank=True, help_text="Proposed change; passwords only as a hash")
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name="+")
+    requested_at = models.DateTimeField(default=timezone.now)
+    expires_at = models.DateTimeField()
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    reason = models.TextField(blank=True)
+
+    objects = ChairmanChangeQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["-requested_at", "-id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(target__isnull=False) | models.Q(role__isnull=False),
+                name="chairman_change_has_subject",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding and getattr(self, "_allow_save", False) is not True:
+            raise BilingualError("dual_control", "Dual-control changes move only through their service.",
+                                 "لا تتغير طلبات الرقابة المزدوجة إلا عبر خدمتها.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise BilingualError("dual_control", "Dual-control changes cannot be deleted.",
+                             "لا يمكن حذف طلبات الرقابة المزدوجة.")
+
+    def __str__(self):
+        subject = self.target or self.role
+        return f"{self.get_action_display()} for {subject} ({self.status})"
+
+
+class ChairmanChangeApproval(AppendOnlyModel):
+    """One approval of a ChairmanChange (append-only). The request itself is the requester's approval."""
+
+    change = models.ForeignKey(ChairmanChange, on_delete=models.PROTECT, related_name="approvals")
+    approver = models.ForeignKey(User, on_delete=models.PROTECT, related_name="+")
+    roles = models.JSONField(default=list, help_text="Dual-control roles the approver held when approving")
+    at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["change", "approver"], name="unique_chairman_change_approver")]

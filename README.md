@@ -18,11 +18,12 @@ In-house ERP for the Almiras group. Python / Django / PostgreSQL, all open sourc
 ```bash
 pip install -r requirements.txt
 export DJANGO_DEBUG=1                 # local only; otherwise DJANGO_SECRET_KEY is required
-python manage.py migrate
+python manage.py migrate   # dev DBs made before the 17 Oct 2026 access migration renumbering: delete and re-run
 python manage.py setup_almiras        # Almiras entity, 55 accounts, 2027 periods
 python manage.py createsuperuser      # setup only: run admin with ERP_ADMIN_SETUP_MODE=1
-python manage.py grant_access <user> ALM managing_partner
-python manage.py setup_totp <user>    # authenticator app; admin and API need password + code
+python manage.py grant_access <user> ALM managing_partner   # MP/Chairman grant clears password and 2FA (D21)
+python manage.py changepassword <user>  # initial password; the user then sets his own and enrols at /access/enrol-2fa/
+python manage.py setup_totp <user>    # other users: authenticator app; admin and API need password + code
 python manage.py runserver            # admin at /admin, API at /api/v1/
 python -m pytest -q
 ```

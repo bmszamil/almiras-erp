@@ -443,11 +443,45 @@ def test_actions_are_append_only(alm, accountant, make_payment):
         a.delete()
 
 
-def test_t15_agent_drafts_and_submits_bill_with_agent_source(alm, mp, agent, make_bill):
+def test_t15_agent_drafts_bill_cannot_submit_human_submits_with_agent_source(alm, mp, agent, accountant, make_bill):
+    """T15 as amended by D20: the agent creates the draft; only a person can submit it."""
     bill = make_bill(agent, alm)
-    r = submit(bill, agent)
-    assert bill.source == "agent:invoice-reader" and r.source == "agent:invoice-reader"
+    assert bill.source == "agent:invoice-reader"
+    with pytest.raises(AccessDenied) as e:
+        submit(bill, agent)
+    assert e.value.code == "service_user_cannot_submit"
+    assert not ApprovalRequest.objects.exists() and not AuditLog.objects.filter(action="approval.submit").exists()
+    r = submit(bill, accountant)
+    assert r.source == "agent:invoice-reader" and r.submitted_by == accountant
     assert AuditLog.objects.get(action="approval.submit", object_id=str(r.pk)).source == "agent:invoice-reader"
+    assert approve(r, mp).status == "approved"
+
+
+def test_d20_agent_cannot_submit_even_with_a_role_granting_submit(alm, agent, make_bill):
+    from access.models import EntityAccess, Permission
+
+    role = Role.objects.get(code="agent_drafter")
+    assert not role.permissions.filter(code="approvals.request.submit").exists()  # migration 0007
+    EntityAccess.objects.create(user=agent, entity=alm, role=Role.objects.get(code="accountant"),
+                                valid_from=datetime.date(2026, 1, 1))
+    assert not access.has_perm(agent, alm, "approvals.request.submit")
+    assert Permission.objects.filter(code="approvals.request.submit").exists()
+    with pytest.raises(AccessDenied):
+        submit(make_bill(agent, alm), agent)
+
+
+def test_d20_person_cannot_submit_another_persons_draft(alm, accountant, make_user, make_bill):
+    """The D20 exception covers drafts of service users only; human drafts stay own-drafts-only."""
+    other = make_user("acc2", (alm, "accountant"))
+    with pytest.raises(AccessDenied) as e:
+        submit(make_bill(other, alm), accountant)
+    assert e.value.code == "not_own_draft"
+
+
+def test_d20_person_needs_submit_rights_to_submit_agent_draft(alm, agent, make_user, make_bill):
+    viewer = make_user("v", (alm, "viewer"))
+    with pytest.raises(AccessDenied):
+        submit(make_bill(agent, alm), viewer)
 
 
 def test_t16_agent_cannot_approve_regardless_of_roles(alm, mp, agent, accountant, make_payment):
