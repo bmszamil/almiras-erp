@@ -866,6 +866,16 @@ def _note_warnings(doc):
     return []
 
 
+def _refuse_stale_grant(grant, doc):
+    """Review item 3 (access R14, R42): an approval checked before the locked document last changed does not count.
+
+    The grant is taken before the row lock; a return to draft, edit or resubmission in between makes it stale.
+    """
+    changed = [t for t in (doc.modified_at, getattr(doc, "submitted_at", None)) if t is not None]
+    if any(t > grant.checked_at for t in changed):
+        access.deny(grant.user, doc.entity, grant.permission, "grant_document_changed")
+
+
 def _issue_date_warnings(doc):
     """6b: the draft asked for another date; the document is issued on the approval day instead (warning only)."""
     if doc.requested_issue_date and doc.requested_issue_date != doc.issue_date:
@@ -887,6 +897,7 @@ def approve_sales_document(document, *, user):
         doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity", "customer").get(pk=doc.pk)
         if doc.status != Status.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
+        _refuse_stale_grant(grant, doc)
         # 6b / BR-KSA-04: the issue date is the day of issue (approval) in Riyadh, never the draft's date and
         # never a future one; the draft's date is kept as the date requested. Time and date come from one clock.
         now = _riyadh_now()
@@ -1555,6 +1566,7 @@ def approve_purchase_document(document, *, user):
         doc = PurchaseDocument.objects.select_for_update(of=("self",)).select_related("entity", "vendor").get(pk=doc.pk)
         if doc.status != PStatus.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
+        _refuse_stale_grant(grant, doc)
         problems = _purchase_problems(doc)
         if problems:
             raise _problems_error(problems, "document_invalid")
@@ -1744,6 +1756,7 @@ def _post_money(movement, *, user, grant, receivable):
     if movement.status != expected:
         raise error(f"Only {expected} documents are posted here.", "لا يُرحَّل هذا المستند في حالته الحالية.",
                     code="wrong_status")
+    _refuse_stale_grant(grant, movement)
     apps = list(movement.applications.select_related("target").order_by("pk"))
     targets = {t.pk: t for t in target_model.objects.select_for_update(of=("self",)).filter(pk__in=[a.target_id for a in apps])}
     problems, per_target = [], {}

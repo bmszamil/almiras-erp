@@ -133,3 +133,71 @@ def test_6b_issue_time_follows_the_riyadh_clock(w):
     with mock.patch("invoicing.services.timezone.now", return_value=moment):
         now = services._riyadh_now()
     assert (now.date(), now.time()) == (date(2027, 1, 11), time(0, 30))
+
+
+# --- 3. stale approvals: a grant checked before the document last changed is refused ---------------
+
+def _race(permission, action):
+    """Patch access.require so ``action`` runs right after the ``permission`` grant is taken (before the lock)."""
+    real = access.require
+
+    def require_then_race(user, entity, perm, **kw):
+        grant = real(user, entity, perm, **kw)
+        if perm == permission:
+            action()
+        return grant
+
+    return mock.patch.object(services.access, "require", side_effect=require_then_race)
+
+
+def test_p2_approval_refused_when_the_document_changed_after_the_grant(w):
+    doc = invoice(w)
+
+    def edit():
+        services.return_to_draft(doc, user=w.clerk2)
+        services.update_sales_document(doc, user=w.clerk2, notes_en="changed", notes_ar="تغير")
+        services.submit_sales_document(doc, user=w.clerk2)
+
+    with _race("invoicing.approve_sales_document", edit), pytest.raises(access.AccessDenied) as exc:
+        approve(w, doc)
+    assert exc.value.code == "grant_document_changed"
+    doc.refresh_from_db()
+    assert (doc.status, doc.number) == ("submitted", "")
+    posted = final(w, doc)  # a fresh approval after the change issues it and clearance posts it
+    assert posted.status == "final" and posted.journal_entry.status == "posted"
+
+
+def test_p2_receipt_posting_refused_when_an_application_was_added_after_the_grant(w):
+    inv = final(w, invoice(w))
+    r = services.create_receipt(w.alm, user=w.clerk, customer=w.customer, date=date(2027, 1, 20), amount="1150.00")
+
+    def add():
+        services.add_receipt_application(r, inv, "1150.00", user=w.clerk)
+
+    with _race("invoicing.post_receipt", add), pytest.raises(access.AccessDenied) as exc:
+        services.post_receipt(r, user=w.clerk2)
+    assert exc.value.code == "grant_document_changed"
+    assert services.post_receipt(r, user=w.clerk2).status == "posted"
+
+
+@pytest.mark.parametrize("kind", ["bill", "payment"])
+def test_p2_bill_and_payment_approval_refused_when_changed_after_the_grant(w, kind):
+    from django.db import models
+    from django.utils import timezone
+
+    if kind == "bill":
+        doc, permission = bill(w), "invoicing.approve_bill"
+        approve_ = services.approve_purchase_document
+    else:
+        doc = services.create_vendor_payment(w.alm, user=w.ap, vendor=w.vendor, date=date(2027, 1, 25), amount="100")
+        doc = services.submit_vendor_payment(doc, user=w.ap)
+        permission, approve_ = "invoicing.approve_vendor_payment", services.approve_vendor_payment
+
+    def change():  # a write that bypasses the services, after the grant
+        models.QuerySet.update(type(doc)._base_manager.filter(pk=doc.pk), modified_at=timezone.now())
+
+    with _race(permission, change), pytest.raises(access.AccessDenied) as exc:
+        approve_(doc, user=w.cfo)
+    assert exc.value.code == "grant_document_changed"
+    doc.refresh_from_db()
+    assert (doc.status, doc.number) == ("submitted", "")
