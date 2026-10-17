@@ -1,6 +1,6 @@
 # Banking: bank accounts, statement import and reconciliation (Track D)
 
-Django app: `banking`. Status: **draft spec**. Written 2026-10-17 by the spec-writer agent.
+Django app: `banking`. Status: **draft spec**. Written 2026-10-17 by the spec-writer agent. Amended 2026-10-17 (B11, project owner / CFO decision pack: receipts without bank charges, statement formats later, approved FX accounts and revaluation policy, control accounts, retention, legacy system Falcon; notes on B7, B10, R32, R42, §5, §6, OQ-1, OQ-15, OQ-17, new OQ-27).
 Depends on: `core` (`Entity`, `Currency`), `core.access` (`docs/specs/access.md`: `require`, `scope`, segregation R14/R35, document registry R34 to R36, masking R29), `ledger.services` (`create_entry(post=True, grant, document)`, `reverse_entry`, `close_period` + `pending_documents`, `trial_balance(by_currency=True)`, `fx_settlement_lines`, R20 currency exchange), `docs/specs/ledger-fx.md` (rates, decimals, realised FX), `docs/specs/invoicing.md` (`CustomerReceipt`, `VendorPayment`, D26/R46), `docs/specs/payroll.md` (`PayrollPayment`, `WpsFile`).
 **[CC-verify]** = format or regulatory statement written from memory; the compliance-checker verifies it before the module-builder relies on it.
 
@@ -18,10 +18,11 @@ The banking module keeps a register of each entity's bank accounts, imports bank
 | B4 | Multi-currency is built: per-line transaction currency/amount/rate, rate table, realised FX on settlement, spot currency exchange (no FX at the exchange itself), period-end revaluation. 3-decimal currencies are used. | Project owner (ledger-fx D1, D5, D9) | 2026-10-16 / 2026-10-17 |
 | B5 | Hosting in KSA. | Project owner (caller brief) | 2026-10-17 |
 | B6 | Open source only. Bank APIs, SWIFT and host-to-host links are reached only through the integration layer, never as a dependency of this module. | CLAUDE.md; project owner (caller brief) | in repo / 2026-10-17 |
-| B7 | A customer receipt may be posted by its recorder only when it has no bank charge; otherwise a second person posts. Every other document keeps creator ≠ poster. | Project owner (invoicing D26, access A16, R46; narrowed as built in `invoicing/services.py` `_receipt_creator_may_post`) | 2026-10-17 |
+| B7 | A customer receipt may be posted by its recorder only when it has no bank charge; otherwise a second person posts. Every other document keeps creator ≠ poster. *Confirmed 2026-10-17 by the project owner (B11(a)): no bank charge of any size.* | Project owner (invoicing D26, access A16, R46; narrowed as built in `invoicing/services.py` `_receipt_creator_may_post`) | 2026-10-17 |
 | B8 | Bank charges are booked gross to 5700, no VAT split. Bank account on receipts/payments: 1100 or a selectable asset account. Bank payment files are not in invoicing's scope. | Project owner (invoicing D19: OQ-20, OQ-21, OQ-23) | 2026-10-16 |
 | B9 | The five banks' WPS/salary file formats will be shared later. | Project owner (payroll P18) | 2026-10-17 |
-| B10 | Proposed account codes stay proposed until the accountant/CFO review (Word document). Applies to FX accounts used here (4700, 5750, 5770). | Project owner (ledger-fx D10, invoicing D29) | 2026-10-17 |
+| B10 | Proposed account codes stay proposed until the accountant/CFO review (Word document). Applies to FX accounts used here (4700, 5750, 5770). *Resolved 2026-10-17 by B11(b): approved.* | Project owner (ledger-fx D10, invoicing D29) | 2026-10-17 |
+| B11 | **Project owner / CFO decision pack** (`docs/approvals/owner-cfo-decision-pack-2026-10-17-answered.docx`). (a) A9: a clerk may post their own receipt only with no bank charge; small charges (e.g. up to SAR 50) are **not** allowed: "No bank charge allowed" (confirms B7). (b) CFO: 4700, 4710, 5750, 5760, 5770 approved; policy C: monetary accounts, cash included, revalued at month end (R42); policy A: 1200, 2100, 1210, 2110, 2310, 2320 "can only be posted by the invoicing module, never by manual journal" (R32 note, OQ-27). 1140 (purification account, R7 amendment) was not in the pack and stays proposed. (c) B4: bank statement formats (MT940 / camt.053 / CSV samples) "Will be shared later" (OQ-1). (d) Tax 12 + legal E7: keep records indefinitely; personal data over 10 years nominated for burning (OQ-15). (e) A10: Almiras's legacy system is Falcon, not Daftra (§6, OQ-17). | Project owner (Part A, B), CFO (Part C), CFO / tax adviser (Part D), legal adviser (Part E) | 2026-10-17 |
 
 Nothing else is decided. Every other choice is a default marked "(OQ-n)" and listed in §9.
 
@@ -228,6 +229,7 @@ Enforcement: **S** = `banking/services.py`; **M** = model `save`/`delete`/`clean
 30. `own_transfer`, same currency: Dr `to_bank_account` GL / Cr `bank_account` GL (direction `out`), or the mirror when created from the receiving line. Both accounts in the same entity; a transfer to another entity's account is an `intercompany_transfer`. One document only: the other account's statement line is matched (M1/M2) to the same entry's other line; no second document. **[S; AT-21]**
 31. `own_transfer`, different currencies: one entry, both legs on the same date, priced exactly as ledger-fx R20 (`record_currency_exchange`): the foreign leg carries the actual bank rate (`rate_source=manual`, reason "Actual bank rate / سعر البنك الفعلي"); when neither leg is functional, the sold leg is at the day's table rate and the bought leg at the implied rate; no FX gain/loss at the exchange itself (ledger-fx R20, R35). Legs on two dates are refused (spot only). The difference against the foreign account's carrying value is picked up by revaluation (ledger-fx R21). Builder note: `build_lines` reuses the R20 pricing as a pure helper, not by calling `record_currency_exchange` (which creates a manual draft). Default (OQ-20). **[S + L; AT-18]**
 32. `intercompany_transfer`: one line on `intercompany_account` (1210, 1220 or 2110) with `counterparty_entity` set; the counterparty is another active entity of the same group (`counterparty_choices`), never the entity itself. It books only in the entity that owns the bank account; the counterparty records its side with its own document from its own statement (no automatic mirror, by analogy with invoicing D23; OQ-25). Mirror positions are checked with `intercompany_balances(by_currency=True)`. **[S + L rule 6; AT-20]**
+    *Note 2026-10-17 (B11(b)):* policy A makes 1210 and 2110 control accounts "posted only by the invoicing module". This rule posts a banking document on them. Until the CFO answers OQ-27 (= invoicing OQ-66), `BankTransaction(kind=intercompany_transfer)` is on the registry allow-list for 1210 / 2110 (invoicing R97); 1220 is not a control account. Manual journals stay refused on both.
 33. Foreign-currency transfers that settle an open intercompany item (`settles_line` set) clear it at its carrying rate and book the difference to 4700 / 5750 as a `realised_fx` line (ledger-fx R18, `_settlement_for_document` inside `build_lines`). Without `settles_line`, the intercompany line is at the spot table rate of the date (no FX line). **[L + S; AT-19]**
 34. Foreign lines without a rate on the document date make approval fail; nothing posts, the grant stays unused, the document stays `submitted` (ledger-fx R14). The rate row used is pinned on the document at approval. Approval into a closed or missing period fails the same way (ledger R4). **[L + S; AT-18, AT-26]**
 35. A posted `BankTransaction` is corrected only by `reverse_entry` with a `banking.reverse_bank_transaction` grant (status → `reversed`) and, if needed, a new document. Reversal is refused while its bank line is in a `confirmed` match (undo the match first) and always once that match is locked; then the correction is a new document in an open period. A draft may be discarded (kept for audit, status `discarded`). **[S + L; AT-27]**
@@ -242,6 +244,7 @@ Enforcement: **S** = `banking/services.py`; **M** = model `save`/`delete`/`clean
 
 **FX and currency**
 42. Statement amounts, match parts and reconciliation figures are in the bank account's currency; reconciliations also show functional figures. Amount decimals follow the currency (e.g. KWD 3, JPY 0); float input refused (ledger-fx R8). Revaluation of foreign bank accounts is ledger-fx `revalue_period` (1100 sub-accounts are `is_monetary`); banking does not revalue. **[S + L; AT-18]**
+    *Confirmed 2026-10-17 (B11(b), policy C):* month-end revaluation of foreign-currency cash balances is approved. No change.
 
 **Agents, system users, audit, language**
 43. Agent users (gateway only) may hold `banking.view` (masked), `banking.suggest_match` (creates `proposed` matches only) and `banking.create_bank_transaction` (drafts, `source="agent:<name>"`). They cannot import, confirm/reject/undo matches, submit, approve, reverse, prepare or approve reconciliations, change bank accounts or settings, or unmask IBANs (access R12). Every agent action writes a `BankingEvent`. **[S + access catalogue; AT-25]**
@@ -306,7 +309,7 @@ In SUB (SUB's own document from SUB's statement): Dr Bank GL (SUB) 100,000.00 / 
 | 2110 Due to group entities | USD | 10,000.00 | 3.7500 (carrying) | settlement | 37,500.00 | | SUB |
 | 5750 FX loss – realised (proposed) | SAR | 100.00 | 1 | realised_fx | 100.00 | | |
 | Bank GL (USD) | USD | 10,000.00 | 3.7600 (table) | normal | | 37,600.00 | |
-A gain goes to 4700 (proposed). Rounding differences, if any, to 5770 (ledger-fx R17).
+A gain goes to 4700 (proposed). Rounding differences, if any, to 5770 (ledger-fx R17). *(2026-10-17, B11(b): 4700, 5750, 5770 approved.)*
 
 **B9. Reversal** of any of the above: `reverse_entry` mirrors every line (ledger F11); the document becomes `reversed`.
 
@@ -325,7 +328,7 @@ None automated in this spec. All external links, when added, go through the inte
 | `payroll` | Read | `PayrollPayment` id/number, amount, `bank_reference` (M1); WPS bank-processed files are not used for matching (OQ-26) | When payroll is built |
 | `ledger` | Out (posting) / Read | `BankTransaction` postings via the registry; GL lines on bank GL accounts; rates | Built |
 | ZATCA, GOSI, Mudad, SAP B1 | — | None | n/a |
-| Daftra / SAP B1 migration | In (one-off) | Opening bank balances and outstanding items at cutover | migration-agent (OQ-17) |
+| Legacy system (Falcon) or another source system (migration) | In (one-off) | Opening bank balances and outstanding items at cutover | migration-agent (OQ-17). *Amended 2026-10-17 (B11(e)):* Almiras's source is Falcon |
 
 ## 7. Permissions
 
@@ -396,7 +399,7 @@ Fixtures (anonymised): ALM (group parent, SAR, Sharia enforced), SUB (`full`, SA
 
 | # | Question | Who | Blocks? | Default |
 |---|---|---|---|---|
-| OQ-1 | Statement formats per bank (Riyad, SNB, Al Rajhi, AlJazira, Alinma): which of MT940 / camt.053 / CSV each provides to corporate clients, field mapping (references, transaction codes, Arabic narratives), encoding, balances in CSV, statement ids. Sample anonymised files needed. | Project owner + each bank | **B** for each bank-specific parser; generic MT940 and camt.053 parsers can be built on standard fixtures | No bank parser marked supported until its sample passes |
+| OQ-1 | Statement formats per bank (Riyad, SNB, Al Rajhi, AlJazira, Alinma): which of MT940 / camt.053 / CSV each provides to corporate clients, field mapping (references, transaction codes, Arabic narratives), encoding, balances in CSV, statement ids. Sample anonymised files needed. | Project owner + each bank | **B** for each bank-specific parser; generic MT940 and camt.053 parsers can be built on standard fixtures | No bank parser marked supported until its sample passes. *Note 2026-10-17 (B11(c)):* the owner will share the formats and samples later; unchanged |
 | OQ-2 | Are payments ever initiated from the ERP (payment files, bulk transfers, WPS upload to bank)? | Managing Partner | **B** for any payment file or initiation | No: the ERP records payments made in the bank portal |
 | OQ-3 | Automatic connections: bank APIs, SWIFT (MT940 via SWIFT service bureau), host-to-host SFTP, SAMA open banking (account information) **[CC-verify: framework scope and availability]**; a `system_bank_import` user if built. | Managing Partner + Dev | D | Manual upload only; any link via the integration layer |
 | OQ-4 | IBAN rules: confirm SA IBAN structure (24 chars, bank code in positions 5–6) and the five banks' codes and BICs **[CC-verify]**; foreign accounts in non-IBAN countries (China, USA, Egypt status **[CC-verify]**): which identifiers to store. | Accountant + compliance-checker | **GL** for bank-code check | ISO 13616 mod-97 always; SA bank-code check uses seeded `unverified` codes and warns until verified |
@@ -410,9 +413,9 @@ Fixtures (anonymised): ALM (group parent, SAR, Sharia enforced), SUB (`full`, SA
 | OQ-12 | Should `close_period` require approved bank reconciliations of all active accounts? | Accountant / CFO | D | No; only submitted bank documents block (R41) |
 | OQ-13 | VAT on bank charges where the bank issues a tax invoice: recover input VAT? **[CC-verify]** | Accountant / tax adviser | D | Gross to 5700, no VAT split (B8) |
 | OQ-14 | Is a per-entity treasury role needed, or do accountants and group treasury prepare? | Managing Partner | D | `accountant` + `group_treasury` |
-| OQ-15 | Retention of statement files and line data containing personal data (PDPL); retention period **[CC-verify: 10-year accounting records]**. | Managing Partner + legal | **GL** | Keep encrypted in KSA for 10 years; masked in lists |
+| OQ-15 | Retention of statement files and line data containing personal data (PDPL); retention period **[CC-verify: 10-year accounting records]**. | Managing Partner + legal | **GL** | Keep encrypted in KSA for 10 years; masked in lists. **Retention resolved by B11(d) (2026-10-17):** statement files and lines are kept indefinitely (encrypted, KSA); after 10 years counterparty personal data in statement lines is nominated for a human "burn" decision (invoicing R108); statement lines themselves are immutable (R15), so a burn masks the counterparty fields only (to build; nomination start point invoicing OQ-67). PDPL lawful basis stays open (GL) |
 | OQ-16 | Islamic deposits (murabaha, wakala) at banks: may a `BankAccount` point to 1300, and how is deposit profit accrued vs received? | Accountant | D | No; 1100 children only; profit when credited (B3) |
-| OQ-17 | Cutover: opening bank balances per account and outstanding items at go-live from Daftra; must tie to the opening TB. | Accountant + migration-agent | **GL** | `opening_statement_balance` per account; outstanding items loaded as migration book items |
+| OQ-17 | Cutover: opening bank balances per account and outstanding items at go-live from the legacy system (Falcon for Almiras, B11(e); was "Daftra"); must tie to the opening TB. | Accountant + migration-agent | **GL** | `opening_statement_balance` per account; outstanding items loaded as migration book items |
 | OQ-18 | Should a system user draft `BankTransaction`s automatically from bank transaction codes (e.g. every "CHG" line)? | Accountant | D | No; user or agent drafts only (R24) |
 | OQ-19 | Who may reverse a posted `BankTransaction`? | CFO | D | Approver |
 | OQ-20 | Cross-currency own transfers: keep the ledger-fx R20 actual-rate method (no realised FX; difference via revaluation), or realise FX against the foreign account's carrying rate? | Accountant | D | R20 method (R31) |
@@ -422,8 +425,9 @@ Fixtures (anonymised): ALM (group parent, SAR, Sharia enforced), SUB (`full`, SA
 | OQ-24 | CSV exports without opening/closing balances: may the importer enter them, and who checks them? | Accountant | D | Importer enters both; R11/R12 apply |
 | OQ-25 | Intercompany transfers: should the receiving entity get a draft mirror document automatically? | Managing Partner | D | No (as invoicing D23); each entity drafts its own side |
 | OQ-26 | Should payroll's bank-processed WPS file (per-employee results) be used to match or flag failed salary transfers? | Payroll + accountant | D | No; match on the payment amount and reference only |
+| OQ-27 | *Added 2026-10-17 (B11(b)).* Policy A: may a banking `intercompany_transfer` post to the control accounts 1210 / 2110, or must intercompany cash go through an invoicing document? Same question as invoicing OQ-66. | CFO | D | Allowed (registry allow-list, R32 note); manual journals refused |
 
-**Blocking:** OQ-1 (each bank-specific parser), OQ-2 (any payment initiation or payment file), OQ-7 (booking conventional interest debits in Sharia-enforcing entities). **Go-live:** OQ-4 (verified SA bank codes), OQ-15 (retention/PDPL), OQ-17 (cutover balances). **Sharia board sign-off:** OQ-6, OQ-7.
+**Blocking:** OQ-1 (each bank-specific parser), OQ-2 (any payment initiation or payment file), OQ-7 (booking conventional interest debits in Sharia-enforcing entities). **Go-live:** OQ-4 (verified SA bank codes), OQ-15 (retention/PDPL; *2026-10-17: retention resolved by B11(d), PDPL lawful basis remains*), OQ-17 (cutover balances). **Sharia board sign-off:** OQ-6, OQ-7.
 
 ## Appendix: existing code that must change (for the module-builder)
 
