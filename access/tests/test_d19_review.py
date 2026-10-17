@@ -357,3 +357,104 @@ def test_d20_service_users_cannot_be_given_submitting_roles(alm, agent, mp):
     with pytest.raises(RuleError):
         access.grant_access(mp, agent, alm, "pa_drafter")
     access.grant_access(mp, agent, alm, "agent_drafter")  # drafts-only role is still allowed
+
+
+# ---------------------------------------------------------------- D21: Chairman accounts protected like MP accounts
+
+
+PASSWORD = {"password1": "N3w-long-passphrase!", "password2": "N3w-long-passphrase!", "usable_password": "true"}
+
+
+@pytest.fixture
+def chairman2(make_user, alm):
+    return make_user("chairman2", (alm, "chairman"))
+
+
+@pytest.mark.parametrize("who", ["mp", "user_manager"])
+def test_d21_mp_or_user_manager_cannot_take_over_chairman(request, alm, chairman, admin_for, who):
+    actor = request.getfixturevalue(who)
+    assert access.can_manage_user(actor, chairman) is False
+    old_hash = User.objects.get(pk=chairman.pk).password
+    c = admin_for(actor)
+    assert c.post(f"/admin/access/user/{chairman.pk}/password/", PASSWORD).status_code == 403
+    assert c.post(change_url(chairman), form_data(chairman, is_active=None)).status_code == 403
+    for call in (lambda: access.enroll_totp(actor, chairman),
+                 lambda: access.deactivate_user(actor, chairman),
+                 lambda: access.unlock_user(actor, chairman),
+                 lambda: access.grant_access(actor, chairman, alm, "viewer"),
+                 lambda: access.revoke_access(actor, EntityAccess.objects.get(user=chairman, role__code="chairman"))):
+        with pytest.raises(AccessDenied) as e:
+            call()
+        assert e.value.code in ("chairman_protected", "chairman_role_protected") and e.value.message_ar
+    chairman.refresh_from_db()
+    assert chairman.is_active and chairman.password == old_hash
+    from django_otp.plugins.otp_totp.models import TOTPDevice
+
+    assert not TOTPDevice.objects.filter(user=chairman).exists()
+    assert not AuditLog.objects.filter(object_id=str(chairman.pk), actor=actor).exists()
+
+
+def test_d21_mp_who_is_also_chairman_cannot_manage_a_chairman(alm, mp, chairman):
+    access.grant_access(chairman, mp, alm, "chairman")
+    assert access.has_role(mp, alm, "chairman")
+    assert access.can_manage_user(mp, chairman) is False
+    with pytest.raises(AccessDenied):
+        access.enroll_totp(mp, chairman)
+
+
+def test_d21_another_chairman_of_same_entities_may_manage_chairman(alm, chairman, chairman2, admin_for):
+    c = admin_for(chairman2)
+    assert f"/admin/access/user/{chairman.pk}/change/" in c.get("/admin/access/user/").content.decode()
+    assert c.post(f"/admin/access/user/{chairman.pk}/password/", PASSWORD).status_code == 302
+    assert AuditLog.objects.filter(action="access.user.password_change", actor=chairman2,
+                                   object_id=str(chairman.pk)).exists()
+    device = access.enroll_totp(chairman2, chairman)
+    assert device.user == chairman
+    access.unlock_user(chairman2, chairman)
+    access.deactivate_user(chairman2, chairman)
+    assert User.objects.get(pk=chairman.pk).is_active is False
+    actions = set(AuditLog.objects.filter(actor=chairman2, object_id=str(chairman.pk)).values_list("action", flat=True))
+    assert {"access.totp.enroll", "access.unlock", "access.user.deactivate"} <= actions
+
+
+def test_d21_chairman_needed_in_every_entity_where_target_is_chairman(alm, sub, chairman, chairman2):
+    access.grant_access(None, chairman, sub, "chairman")
+    assert access.can_manage_user(chairman2, chairman) is False
+    with pytest.raises(AccessDenied):
+        access.enroll_totp(chairman2, chairman)
+    access.grant_access(None, chairman2, sub, "chairman")
+    assert access.can_manage_user(chairman2, chairman) is True
+
+
+def test_d21_setup_mode_and_operator_commands_may_manage_chairman(alm, mp, chairman, admin_for):
+    access.enroll_totp(None, chairman)  # `setup_totp` command
+    access.unlock_user(None, chairman)  # `unlock_user` command
+    access.enroll_totp(mp, chairman, name="Second device", setup=True)
+    with override_settings(ERP_ADMIN_SETUP_MODE=True):
+        mp.is_superuser = True
+        mp.save()
+        c = admin_for(mp)
+        assert c.post(f"/admin/access/user/{chairman.pk}/password/", PASSWORD).status_code == 302
+    assert AuditLog.objects.filter(action="access.user.password_change", actor=mp, object_id=str(chairman.pk)).exists()
+
+
+def test_d21_nobody_manages_themselves_but_may_enrol_own_device(alm, chairman):
+    assert access.can_manage_user(chairman, chairman) is False
+    with pytest.raises(AccessDenied):
+        access.deactivate_user(chairman, chairman)
+    device = access.enroll_totp(chairman, chairman)  # own device: the secret goes only to the user
+    assert device.user == chairman
+
+
+def test_d21_chairman_role_edits_need_another_chairman(alm, chairman, make_user, user_admin_role):
+    role_admin = site._registry[Role]
+    chair_role = Role.objects.get(code="chairman")
+    ua = make_user("ua2", (alm, "user_admin_test"))
+    assert role_admin.has_change_permission(req(ua), chair_role) is False
+    chair2 = make_user("chair2ua", (alm, "user_admin_test"), (alm, "chairman"))
+    # Editing the chairman role changes the editor's own privileges too, so it is setup-only in practice.
+    assert role_admin.has_change_permission(req(chair2), chair_role) is False
+    with override_settings(ERP_ADMIN_SETUP_MODE=True):
+        ua.is_superuser = True
+        ua.save()
+        assert role_admin.has_change_permission(req(ua), chair_role) is True

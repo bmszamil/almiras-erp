@@ -62,14 +62,16 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
 
     def scope_queryset(self, request, qs):
         """Users holding a grant in an entity the viewer manages, plus users with no grant yet.
-        D19: a Chairman also sees the Managing Partners of the entities where he is Chairman."""
+        D19/D21: a Chairman also sees the Managing Partners and other Chairmen of the entities where he
+        is Chairman."""
         managed = self.erp_entities(request)
         chaired = _chaired_entities(request)
         q = Q(pk__in=[])
         if managed.exists():
             q |= Q(entity_access__entity__in=managed) | Q(entity_access__isnull=True)
         if chaired:
-            q |= Q(entity_access__entity__in=chaired, entity_access__role__code=access.MP_ROLE_CODE,
+            q |= Q(entity_access__entity__in=chaired,
+                   entity_access__role__code__in=[access.MP_ROLE_CODE, access.CHAIRMAN_ROLE_CODE],
                    entity_access__revoked_at__isnull=True)
         return qs.filter(q).distinct()
 

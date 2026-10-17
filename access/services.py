@@ -290,7 +290,8 @@ def _require_grant_rights(actor, user, entity, role, setup):
     - Nobody grants or revokes their own roles, in any mode (closes self-promotion to Chairman).
     - D19: only a holder of the Chairman role in that entity grants or revokes the Chairman role, so
       nobody can create a Chairman to get around the Managing Partner protection. Setup mode excepted.
-    - D19: roles of a Managing Partner change only through a Chairman in all of their MP entities.
+    - D19/D21: roles of a Managing Partner or Chairman change only through a Chairman of all of their
+      MP and Chairman entities (can_manage_user).
     - Otherwise access.entity_access.manage in the entity.
     """
     if actor.pk == user.pk:
@@ -303,8 +304,8 @@ def _require_grant_rights(actor, user, entity, role, setup):
                 f"Only a Chairman of {entity.code} can grant or revoke the Chairman role (D19).",
                 f"لا يحق إلا لرئيس مجلس الإدارة في {entity.code} منح دور رئيس مجلس الإدارة أو سحبه (D19).",
             )
-    if is_protected_mp(user):
-        require_manage_user(actor, user, setup=setup)  # D19
+    if is_protected(user):
+        require_manage_user(actor, user, setup=setup)  # D19, D21
     elif role.code != CHAIRMAN_ROLE_CODE or setup:
         require_perm(actor, entity, "access.entity_access.manage")
 
@@ -332,12 +333,30 @@ def is_protected_mp(user):
     return bool(mp_entities(user))
 
 
+def chairman_entities(user):
+    """Entities where `user` holds the Chairman role (any non-revoked grant, even future or expired)."""
+    return set(EntityAccess.objects.filter(user=user, role__code=CHAIRMAN_ROLE_CODE, revoked_at__isnull=True)
+               .values_list("entity_id", flat=True))
+
+
+def is_protected_chairman(user):
+    return bool(chairman_entities(user))
+
+
+def is_protected(user):
+    """D19/D21: Managing Partner and Chairman accounts are managed only by a Chairman."""
+    return is_protected_mp(user) or is_protected_chairman(user)
+
+
 def can_manage_user(actor, target, setup=False):
     """Who may change `target`'s privileges, active status, password, roles, tokens, TOTP or lockout.
 
     - Nobody manages themselves; the ERP system user is never managed (2a).
     - D19: a Managing Partner is managed only by a user holding the Chairman role (an active grant)
       in every entity where the target is MP. Other MPs and user managers cannot. Setup mode excepted.
+    - D21: a Chairman is protected the same way: managed only by another Chairman holding an active
+      grant in every entity where the target is Chairman (and, if the target is also MP, in every MP
+      entity). A Managing Partner never manages a Chairman, even one who also holds the Chairman role.
     - Everyone else (review B): access.user.manage in every entity where the target holds a grant.
     - Superusers are managed only in setup mode.
     """
@@ -349,7 +368,10 @@ def can_manage_user(actor, target, setup=False):
         return True
     if target.is_superuser:
         return False
-    protected = mp_entities(target)
+    mp_of, chair_of = mp_entities(target), chairman_entities(target)
+    if chair_of and is_protected_mp(actor):
+        return False  # D21: an MP can never manage a Chairman
+    protected = mp_of | chair_of
     if protected:
         chair = set(active_grants(actor).filter(role__code=CHAIRMAN_ROLE_CODE).values_list("entity_id", flat=True))
         return protected <= chair
@@ -363,20 +385,20 @@ def can_manage_user(actor, target, setup=False):
 
 
 def mp_holders(role):
-    """Managing Partners holding `role` (any non-revoked grant)."""
+    """Managing Partners and Chairmen (D21) holding `role` (any non-revoked grant)."""
     holders = User.objects.filter(entity_access__role=role, entity_access__revoked_at__isnull=True).distinct()
-    return [u for u in holders if is_protected_mp(u)]
+    return [u for u in holders if is_protected(u)]
 
 
 def can_edit_role(actor, role, setup=False):
     """D19 for role edits: changing a role held by a Managing Partner changes that MP's privileges, so
-    the editor must be able to manage every MP holding it (Chairman in each of their MP entities,
-    see can_manage_user). The managing_partner role itself always needs a Chairman. The normal
+    the editor must be able to manage every MP or Chairman (D21) holding it (see can_manage_user). The
+    managing_partner and chairman roles themselves always need a Chairman. The normal
     role-edit right is checked separately (admin). Setup mode excepted."""
     if setup:
         return True
     holders = mp_holders(role)
-    if role.code != MP_ROLE_CODE and not holders:
+    if role.code not in (MP_ROLE_CODE, CHAIRMAN_ROLE_CODE) and not holders:
         return True
     if actor is None or not active_grants(actor).filter(role__code=CHAIRMAN_ROLE_CODE).exists():
         return False
@@ -385,12 +407,19 @@ def can_edit_role(actor, role, setup=False):
 
 def require_manage_user(actor, target, setup=False):
     if not can_manage_user(actor, target, setup=setup):
-        if is_protected_mp(target) and actor is not None and actor.pk != target.pk:
-            raise AccessDenied(
-                "mp_protected",
-                "Only the Chairman can change, lock or disable a Managing Partner (D19).",
-                "لا يحق إلا لرئيس مجلس الإدارة تعديل الشريك المدير أو قفله أو تعطيله (D19).",
-            )
+        if actor is not None and actor.pk != target.pk and not is_system_user(target):
+            if is_protected_mp(target):
+                raise AccessDenied(
+                    "mp_protected",
+                    "Only the Chairman can change, lock or disable a Managing Partner (D19).",
+                    "لا يحق إلا لرئيس مجلس الإدارة تعديل الشريك المدير أو قفله أو تعطيله (D19).",
+                )
+            if is_protected_chairman(target):
+                raise AccessDenied(
+                    "chairman_protected",
+                    "Only another Chairman can change, lock or disable a Chairman (D21).",
+                    "لا يحق إلا لرئيس مجلس إدارة آخر تعديل رئيس مجلس الإدارة أو قفله أو تعطيله (D21).",
+                )
         raise AccessDenied(
             "cannot_manage_user",
             "You cannot change this user: you need user-management rights in every entity they belong to, "
