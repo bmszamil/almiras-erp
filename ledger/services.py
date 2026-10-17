@@ -28,7 +28,7 @@ from core.access.services import kind_of
 from core.access.services import log as access_log
 from core.models import Currency, Entity
 
-from . import documents, fx
+from . import documents, fx, restricted
 from .fx import ONE, error
 from .models import (
     Account,
@@ -128,7 +128,49 @@ def validate_entry(entry):
     if entry.reversal_of_id is not None:  # the Sharia and rate checks above trust a reversal: prove it is one
         problems += _reversal_problems(entry, lines)
     problems += _currency_problems(entry, lines)
+    problems += _restricted_problems(entry, lines)
     return problems
+
+
+def _restricted_codes(lines):
+    return sorted({line.account.code for line in lines} & restricted.codes())
+
+
+def _restricted_problems(entry, lines):
+    """Restricted accounts (ledger.restricted; invoicing R54 D31b): a line on one is posted only when a registered
+    allowance accepts the entry (a reversal: the entry it reverses), and then only if the account's own check
+    passes (e.g. the purification account never below zero)."""
+    problems = []
+    for code in _restricted_codes(lines):
+        if not restricted.allowed(code, entry):
+            problems.append(restricted.refusal(code))
+            continue
+        spec = restricted.get(code)
+        if spec.check is not None:
+            problems += [str(p) for p in (spec.check(entry, lines) or [])]
+    return problems
+
+
+def _lock_restricted(entry):
+    """The restricted accounts' own locks (e.g. the purification lock), taken after the entry row and before the
+    period lock and validation, so two postings on the account in one entity never pass its check together."""
+    codes = _restricted_codes(JournalLine.objects.filter(entry=entry).select_related("account"))
+    for code in codes:
+        spec = restricted.get(code)
+        if spec.lock is not None:
+            spec.lock(entry.entity)
+
+
+def _refuse_restricted_draft(entity, lines, source):
+    """A manual draft never carries a line on a restricted account (only documents post to it); an import draft
+    may (a migration opening entry, checked again when posted)."""
+    if source == JournalEntry.Source.IMPORT:
+        return
+    codes = _restricted_codes(lines)
+    if codes:
+        exc = LedgerError([restricted.refusal(code) for code in codes])
+        exc.code = "restricted_account"
+        raise exc
 
 
 def _mirrors(rev, orig):
@@ -539,6 +581,25 @@ def purification_amount(entity, *, user, as_of=None, date_from=None):
     return signed_purification(qs.only("debit", "credit", "requires_purification"))
 
 
+def _booked_balance_floor(entity, code, on):
+    """The smallest booked balance (debits less credits, functional amounts) of account ``code`` of ``entity`` on
+    ``on`` and on every later booking date, as ``(amount, date)``: the room a credit dated ``on`` has without
+    taking the account below zero then or later. Posted and reversed entries count; drafts do not. Internal
+    helper for module checks (no access check): callers check their own rights first."""
+    deltas = {}
+    rows = (JournalLine.objects.filter(entry__entity=entity, entry__status__in=BOOKED, account__code=code)
+            .values("entry__date").annotate(d=Sum("debit"), c=Sum("credit")))
+    for row in rows:
+        deltas[row["entry__date"]] = (row["d"] or ZERO) - (row["c"] or ZERO)
+    deltas.setdefault(on, ZERO)
+    balance, room, at = ZERO, None, None
+    for day in sorted(deltas):
+        balance += deltas[day]
+        if day >= on and (room is None or balance < room):
+            room, at = balance, day
+    return room.quantize(Decimal("0.01")), at  # SQLite sums lose the scale
+
+
 def _lock_for_posting(entry):
     """Locks taken before an entry is validated and posted (rules 1 and 4, R11, R18).
 
@@ -569,10 +630,14 @@ def _post(entry, posted_by):
     entry = JournalEntry.objects.select_for_update(of=("self",)).select_related("entity").get(pk=entry.pk)
     if entry.status != JournalEntry.Status.DRAFT:
         raise error("Only draft entries can be posted.", "يمكن ترحيل المسودات فقط.")
+    _lock_restricted(entry)
     period = _lock_for_posting(entry)
     problems = validate_entry(entry)
     if problems:
-        raise LedgerError(problems)
+        exc = LedgerError(problems)
+        if {restricted.refusal(code) for code in restricted.codes()} & set(problems):
+            exc.code = "restricted_account"
+        raise exc
     entry.period = period
     lines = list(entry.lines.select_related("account"))
     flagged = set(_purification_flags(entry, lines))
@@ -821,6 +886,8 @@ def _document_lines(doc_type, document, lines):
 def _create(entity, date, description, lines, user, reference, post, posted_by, source=JournalEntry.Source.HUMAN,
             document_ref=None, check_lines=None):
     built = _build_lines(entity, date, lines, user)
+    if document_ref is None:
+        _refuse_restricted_draft(entity, built, source)
     if check_lines is not None:  # the document type's own rule for its lines, before any write
         check_lines(built)
     entry = JournalEntry(
@@ -887,6 +954,8 @@ def _update_draft(entry, user, date, description, reference, lines):
             setattr(entry, name, value)
     if lines is not None:
         built = _build_lines(entry.entity, entry.date, lines, user)
+        if entry.document_ref is None and entry.reversal_of_id is None:
+            _refuse_restricted_draft(entry.entity, built, entry.source)
         entry.lines.all().delete()
         for line in built:
             line.entry = entry
