@@ -477,6 +477,10 @@ class EmploymentContract(Tracked, ServiceGuarded):
     rejected_reason_en = models.TextField(bi("Rejection reason (English)", "سبب الرفض (بالإنجليزية)"), blank=True)
     rejected_reason_ar = models.TextField(bi("Rejection reason (Arabic)", "سبب الرفض (بالعربية)"), blank=True)
     qiwa_contract_ref = models.CharField(bi("Qiwa contract reference", "مرجع العقد في قوى"), max_length=40, blank=True)
+    # R62 (Regs Art. 25): a written agreement that suspended unpaid days do not extend the fixed term.
+    suspension_agreement_ref = models.CharField(
+        bi("Written agreement: term not extended by suspension", "اتفاق مكتوب: عدم تمديد المدة بأيام الإيقاف"),
+        max_length=200, blank=True)
     warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
     parameter_ids = models.JSONField(bi("Parameters used", "المعايير المستخدمة"), default=list, blank=True)
     # Set by an approved termination (R38), cleared by its withdrawal (R41): the only change to an approved row.

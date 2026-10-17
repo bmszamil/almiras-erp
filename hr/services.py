@@ -837,7 +837,7 @@ def overtime_approver(employee, on, *, user):
 CONTRACT_FIELDS = frozenset({
     "effective_date", "contract_type", "start_date", "end_date", "calendar_basis", "calendar_basis_ref", "probation_periods", "job_title_en",
     "job_title_ar", "occupation_code", "weekly_hours", "daily_hours", "annual_leave_days", "notice_days_employer",
-    "notice_days_employee", "currency", "department", "grade", "qiwa_contract_ref",
+    "notice_days_employee", "currency", "department", "grade", "qiwa_contract_ref", "suspension_agreement_ref",
 })
 
 
@@ -1017,11 +1017,11 @@ def _statutory_contract_problems(contract, emp, use, jurisdiction):
 
 def _statutory_annual_days(use, jurisdiction, emp, contract, on):
     value = use.get(jurisdiction, "leave.annual", on)
-    year_days = _year_days(use, jurisdiction, contract.calendar_basis, on)
+    _year_days(use, jurisdiction, contract.calendar_basis, on)  # the calendar basis is configured
     days = 0
     for tier in value["tiers"]:
         years = int(Decimal(tier["from_years"]))
-        if years == 0 or on > _anniversary(emp.hire_date, years, contract.calendar_basis, year_days):
+        if years == 0 or on > _service_anniversary(use, jurisdiction, emp, years, contract.calendar_basis):
             days = max(days, int(Decimal(tier["days"])))
     return days
 
@@ -1176,17 +1176,16 @@ def terms_on(employee, day, *, user):
 
 
 def _contract_end(contract):
-    """Last day of a version: its termination end, else its end date extended by the suspended days (unpaid leave
-    beyond 20 days in a work year suspends the contract and extends a fixed term, Art. 116, Regs Art. 25)."""
+    """Last day of a version: its termination end, else its end date extended by the suspended days (R62: unpaid
+    leave beyond ``leave.unpaid.suspension_after_days`` suspends the contract and extends a fixed term, Art. 116,
+    Regs Art. 25), unless ``suspension_agreement_ref`` records a written agreement that the term is not extended."""
     if contract.ended_on or contract.end_date is None:
         return contract.ended_on
     emp = contract.employee
-    if emp.employment_basis != Basis.KSA_EMPLOYEE:
+    if emp.employment_basis != Basis.KSA_EMPLOYEE or (contract.suspension_agreement_ref or "").strip():
         return contract.end_date
-    use = ParamUse()
-    threshold = int(use.get("SA", "leave.annual", contract.start_date)["unpaid_suspends_after_days"])
-    suspended = _suspended_days(use, "SA", emp, contract.calendar_basis, contract.start_date, contract.end_date,
-                                threshold)
+    suspended = _suspended_days(ParamUse(), "SA", emp, contract.calendar_basis, contract.start_date,
+                                contract.end_date)
     return contract.end_date + timedelta(days=len(suspended))
 
 
@@ -1747,13 +1746,19 @@ def approve_leave_adjustment(adjustment, *, user):
     return adj
 
 
+def _unpaid_days_of(r, start, end):
+    """The unpaid days of one approved request between start and end."""
+    if r.unpaid or r.leave_type.paid_rule == LeaveType.PaidRule.UNPAID:
+        return set(_days(max(r.start_date, start), min(r.end_date, end)))
+    return set()
+
+
 def _unpaid_days(emp, start, end):
     """Approved unpaid leave days of ``emp`` between start and end (R34)."""
     result = set()
     for r in LeaveRequest.objects.filter(employee=emp, status__in=(LR.APPROVED, LR.TAKEN), start_date__lte=end,
                                          end_date__gte=start).select_related("leave_type"):
-        if r.unpaid or r.leave_type.paid_rule == LeaveType.PaidRule.UNPAID:
-            result |= {d for d in _days(max(r.start_date, start), min(r.end_date, end))}
+        result |= _unpaid_days_of(r, start, end)
     return result
 
 
@@ -1763,14 +1768,28 @@ def unpaid_leave_days(employee, start, end, *, user):
     return len(_unpaid_days(employee, start, end))
 
 
-def _suspended_days(use, jurisdiction, emp, terms_basis, start, end, threshold):
-    """Unpaid days beyond ``threshold`` in each work year (from hire), within start..end (Art. 2, 116)."""
-    year_days = _year_days(use, jurisdiction, terms_basis, start)
+def _suspension_rule(use, jurisdiction, on):
+    """R62 parameter ``leave.unpaid.suspension_after_days``: (threshold days, aggregation ``work_year`` (Art. 2,
+    default) or ``per_leave`` (Art. 116); OQ-37)."""
+    value = use.get(jurisdiction, "leave.unpaid.suspension_after_days", on)
+    return int(value["days"]), value.get("aggregation", "work_year")
+
+
+def _suspended_days(use, jurisdiction, emp, terms_basis, start, end):
+    """R62: unpaid days within start..end beyond the threshold, counted per work year from the hire date (Art. 2)
+    or per unpaid leave (Art. 116), as the parameter says (OQ-37). These days give no accrual and no EOSB service."""
+    threshold, aggregation = _suspension_rule(use, jurisdiction, start)
     result = set()
+    if aggregation == "per_leave":
+        for r in LeaveRequest.objects.filter(employee=emp, status__in=(LR.APPROVED, LR.TAKEN), start_date__lte=end,
+                                             end_date__gte=start).select_related("leave_type"):
+            days = sorted(_unpaid_days_of(r, r.start_date, r.end_date))
+            result |= {d for d in days[threshold:] if start <= d <= end}
+        return result
     n = 0
     while True:
-        ys = _anniversary(emp.hire_date, n, terms_basis, year_days)
-        ye = _anniversary(emp.hire_date, n + 1, terms_basis, year_days) - timedelta(days=1)
+        ys = _anniversary(emp.hire_date, n, terms_basis)
+        ye = _anniversary(emp.hire_date, n + 1, terms_basis) - timedelta(days=1)
         if ys > end:
             break
         if ye >= start:
@@ -1778,6 +1797,20 @@ def _suspended_days(use, jurisdiction, emp, terms_basis, start, end, threshold):
             result |= {d for d in unpaid[threshold:] if start <= d <= end}
         n += 1
     return result
+
+
+def _service_anniversary(use, jurisdiction, emp, years, basis):
+    """The ``years`` anniversary of the hire date moved later by the suspended days before it (R30, R62:
+    "completed five consecutive years" of service)."""
+    plain = _anniversary(emp.hire_date, years, basis)
+    shifted = plain
+    for _ in range(10):
+        moved = plain + timedelta(days=len(_suspended_days(use, jurisdiction, emp, basis, emp.hire_date,
+                                                           shifted - timedelta(days=1))))
+        if moved == shifted:
+            break
+        shifted = moved
+    return shifted
 
 
 def _month_accrual(emp, month_start, month_end, use, jurisdiction):
@@ -1796,12 +1829,11 @@ def _month_accrual(emp, month_start, month_end, use, jurisdiction):
     if start > end:
         return None
     value = use.get(jurisdiction, "leave.annual", month_start)
-    threshold = int(value["unpaid_suspends_after_days"])
     basis = (_terms_on(emp, end) or first).calendar_basis
-    suspended = _suspended_days(use, jurisdiction, emp, basis, start, end, threshold)
-    year_days = _year_days(use, jurisdiction, basis, month_start)
+    suspended = _suspended_days(use, jurisdiction, emp, basis, start, end)
+    _year_days(use, jurisdiction, basis, month_start)  # the calendar basis is configured
     tiers = [(int(Decimal(t["from_years"])), int(Decimal(t["days"]))) for t in value["tiers"]]
-    anniversaries = {years: _anniversary(emp.hire_date, years, basis, year_days) for years, _ in tiers}
+    anniversaries = {years: _service_anniversary(use, jurisdiction, emp, years, basis) for years, _ in tiers}
     total = 0
     for d in _days(start, end):
         if d in suspended:
@@ -2002,8 +2034,7 @@ def _compute_eosb(employee, as_of, kind, use, additional_wage=ZERO):
     year_days = _year_days(use, jurisdiction, terms.calendar_basis, as_of)
     start = emp.hire_date
     service_days = (as_of - start).days + 1
-    excluded = len(_suspended_days(use, jurisdiction, emp, terms.calendar_basis, start, as_of,
-                                   int(table["exclude_unpaid_days_beyond"])))
+    excluded = len(_suspended_days(use, jurisdiction, emp, terms.calendar_basis, start, as_of))
     years = _years_between(start, as_of + timedelta(days=1 - excluded), terms.calendar_basis, year_days)
     components = {c.component.code: c.monthly_amount for c in terms.components.select_related("component")
                   if c.component.counts_for_eosb}

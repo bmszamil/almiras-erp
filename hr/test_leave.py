@@ -285,3 +285,56 @@ def test_art116_unpaid_leave_beyond_twenty_days_extends_a_fixed_term(w):
     assert services.contract_end_date(c, user=w.h) == date(2029, 1, 1)
     _approved_leave(w, e, "UNPAID", date(2027, 2, 1), date(2027, 2, 28), reason_ar="ظرف خاص")
     assert services.contract_end_date(c, user=w.h) == date(2029, 1, 9)  # 8 suspended days
+
+
+# --- R62 / AT-40: contract suspension ---------------------------------------------------------------------
+
+def test_r62_threshold_is_its_own_parameter(db):
+    row = services.param("SA", "leave.unpaid.suspension_after_days", date(2027, 1, 1))
+    assert row.value == {"days": "20", "aggregation": "work_year"} and row.status == "unverified"
+    assert row.verified_by_id is None
+    assert "unpaid_suspends_after_days" not in services.param("SA", "leave.annual", date(2027, 1, 1)).value
+    assert "exclude_unpaid_days_beyond" not in services.param("SA", "eosb.award_table", date(2027, 1, 1)).value
+
+
+def test_at40_suspended_days_give_no_accrual_no_service_and_extend_the_term(w):
+    e = hired(w, saudi=False, contract_kwargs={"end_date": date(2027, 12, 31)})
+    c = e.contracts.get(status="approved")
+    _approved_leave(w, e, "UNPAID", date(2027, 3, 1), date(2027, 3, 30), reason_ar="ظرف خاص")
+    assert services.contract_end_date(c, user=w.h) == date(2028, 1, 10)  # 10 days beyond the 20
+    services.accrue_leave(2027, 3)
+    assert _accrual(e, "2027-03") == D("1.19")  # 21 × 21 / (12 × 31): 10 suspended days accrue nothing
+    eosb = services.calculate_eosb(e, date(2027, 5, 31), "end_of_fixed_term", user=w.h)
+    assert eosb.excluded_days == 10 and eosb.service_days == 151
+
+
+def test_r62_written_agreement_keeps_the_fixed_term(w):
+    e = hired(w, saudi=False, contract_kwargs={"end_date": date(2027, 12, 31),
+                                               "suspension_agreement_ref": "Agreement 2027/4, cl. 2"})
+    c = e.contracts.get(status="approved")
+    _approved_leave(w, e, "UNPAID", date(2027, 3, 1), date(2027, 3, 30), reason_ar="ظرف خاص")
+    assert services.contract_end_date(c, user=w.h) == date(2027, 12, 31)
+    services.accrue_leave(2027, 3)
+    assert _accrual(e, "2027-03") == D("1.19")  # the agreement only keeps the term; suspension still applies
+
+
+def test_r62_aggregation_per_leave_or_per_work_year(w):
+    e = hired(w, saudi=False, contract_kwargs={"end_date": date(2027, 12, 31)})
+    c = e.contracts.get(status="approved")
+    _approved_leave(w, e, "UNPAID", date(2027, 3, 1), date(2027, 3, 15), reason_ar="ظرف خاص")
+    _approved_leave(w, e, "UNPAID", date(2027, 4, 1), date(2027, 4, 15), reason_ar="ظرف خاص")
+    assert services.contract_end_date(c, user=w.h) == date(2028, 1, 10)  # work year: 30 - 20
+    row = services.param("SA", "leave.unpaid.suspension_after_days", date(2027, 1, 1))
+    services.supersede_statutory_parameter(row, user=w.h)  # used by approvals: corrected by a new row (R7)
+    services.add_statutory_parameter(user=w.h, jurisdiction="SA", code=row.code,
+                                     value={"days": "20", "aggregation": "per_leave"}, valid_from=row.valid_from
+                                     + timedelta(days=1), source_url=row.source_url, source_reference="OQ-37 variant")
+    assert services.contract_end_date(c, user=w.h) == date(2027, 12, 31)  # no single leave beyond 20 days
+
+
+def test_r62_five_year_anniversary_moves_later_by_suspended_days(w):
+    e = hired(w, hire_date=date(2022, 1, 1))
+    _approved_leave(w, e, "UNPAID", date(2026, 3, 1), date(2026, 3, 30), reason_ar="ظرف خاص")
+    services.accrue_leave(2027, 1)
+    # 10 suspended days: the 30-day rate starts on 2027-01-12 instead of 2027-01-02: (21×11 + 30×20) / (12×31).
+    assert _accrual(e, "2027-01") == D("2.23")

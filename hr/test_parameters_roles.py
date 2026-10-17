@@ -200,3 +200,68 @@ def test_payroll_officer_cannot_approve_contracts_or_edit(w):
         services.approve_contract(c, user=w.p)
     with pytest.raises(access.AccessDenied):
         services.update_employee(emp, user=w.p, phone="0500000001")
+
+
+# --- seed loader and the R62 data migration ----------------------------------------------------------------
+
+def test_r7_seed_never_verifies_and_records_the_compliance_check(db):
+    rows = {r.code: r for r in StatutoryParameter.objects.filter(jurisdiction="SA")}
+    assert all(r.verified_by_id is None and r.verified_at is None for r in rows.values())
+    assert "Checked 2026-10-17 against the HRSD text" in rows["probation.max_days"].source_reference
+    assert "MP verification pending" in rows["probation.max_days"].source_reference
+    assert "Checked 2026-10-17" not in rows["id.format"].source_reference  # [CC-verify]: no official format
+    assert "Checked 2026-10-17" not in rows["calendar.year_days"].source_reference  # OQ-36 legal sign-off
+
+
+def test_r7_seed_reload_leaves_verified_and_used_rows_alone(w):
+    verified = StatutoryParameter.objects.get(jurisdiction="SA", code="leave.marriage")
+    services.verify_statutory_parameter(verified, user=w.mp)
+    unverified = StatutoryParameter.objects.get(jurisdiction="SA", code="leave.hajj")
+    unverified.value = {"min_days": "1"}
+    unverified.save()
+    verified = StatutoryParameter.objects.get(pk=verified.pk)
+    verified.source_reference = "edited by MP"
+    verified.save()
+    statutory_seed.apply(StatutoryParameter)
+    verified.refresh_from_db()
+    unverified.refresh_from_db()
+    assert verified.source_reference == "edited by MP" and verified.status == "verified"
+    assert verified.verified_by == w.mp
+    assert unverified.value == statutory_seed.SA_PARAMETERS["leave.hajj"][0] and unverified.verified_by_id is None
+
+
+def _migration_0005():
+    import importlib
+
+    return importlib.import_module("hr.migrations.0005_unpaid_suspension_parameter")
+
+
+def test_r62_data_migration_moves_the_threshold_and_keeps_its_verification(w):
+    from django.apps import apps
+
+    when = timezone.now()
+    verified = StatutoryParameter.objects.create(
+        jurisdiction="AE", code="leave.annual", value={"tiers": [], "unpaid_suspends_after_days": "20"},
+        valid_from=date(2020, 1, 1), source_url="https://example.test", source_reference="test",
+        status="verified", entered_by=w.h, verified_by=w.mp, verified_at=when)
+    unverified = StatutoryParameter.objects.create(
+        jurisdiction="QA", code="eosb.award_table", value={"tiers": [], "exclude_unpaid_days_beyond": "15"},
+        valid_from=date(2020, 1, 1), source_url="https://example.test", source_reference="test")
+    used = StatutoryParameter.objects.create(
+        jurisdiction="BH", code="leave.annual", value={"tiers": [], "unpaid_suspends_after_days": "20"},
+        valid_from=date(2020, 1, 1), source_url="https://example.test", source_reference="test", used_at=when)
+    _migration_0005().forward(apps, None)
+    moved = StatutoryParameter.objects.get(jurisdiction="AE", code="leave.unpaid.suspension_after_days")
+    assert moved.value == {"days": "20", "aggregation": "work_year"} and moved.valid_from == date(2020, 1, 1)
+    assert (moved.status, moved.verified_by, moved.verified_at, moved.entered_by) == ("verified", w.mp, when, w.h)
+    qa = StatutoryParameter.objects.get(jurisdiction="QA", code="leave.unpaid.suspension_after_days")
+    assert qa.status == "unverified" and qa.verified_by_id is None and qa.value["days"] == "15"
+    verified.refresh_from_db()
+    unverified.refresh_from_db()
+    used.refresh_from_db()
+    assert "unpaid_suspends_after_days" not in verified.value
+    assert "exclude_unpaid_days_beyond" not in unverified.value
+    assert used.value["unpaid_suspends_after_days"] == "20"  # a used row is never edited (R7)
+    assert StatutoryParameter.objects.filter(jurisdiction="BH", code="leave.unpaid.suspension_after_days").exists()
+    _migration_0005().forward(apps, None)  # idempotent
+    assert StatutoryParameter.objects.filter(code="leave.unpaid.suspension_after_days", jurisdiction="AE").count() == 1
