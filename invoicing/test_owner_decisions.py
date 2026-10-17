@@ -72,3 +72,54 @@ def test_at73_recording_needs_allocate_and_post_receipt_then_the_recorder_posts(
     with pytest.raises(InvoicingError) as exc:
         receipt(w, purpose="advance")
     assert exc.value.code == "purpose"
+
+
+# --- D28 / access A19, R50: zatca_admin as an add-on membership (access AT-53) ------------------------------
+
+def _failed_hand_offs(w, count):
+    """``count`` issued documents whose after-commit hand-off raised (still ``not_submitted``)."""
+    from unittest import mock
+
+    from invoicing.conftest import approve
+    from invoicing.models import SalesDocument
+
+    docs = []
+    for _ in range(count):
+        with mock.patch.object(w.zatca, "submit_document", side_effect=RuntimeError("connection reset")):
+            with pytest.raises(RuntimeError):
+                approve(w, invoice(w))
+        docs.append(SalesDocument.objects.filter(status="issued").order_by("-pk").first())
+    assert all(d.zatca_status == "not_submitted" for d in docs)
+    return docs
+
+
+def test_access_at53_zatca_admin_is_an_add_on_membership_checked_on_its_own_role(w):
+    from django.utils import timezone
+
+    from core.access import services as access_services
+    from core.access.models import Membership, Role
+    from invoicing.test_review_fixes import resubmit
+
+    mp = make_user("mp")
+    member(mp, w.alm, "managing_partner")
+    a, c = make_user("a_acc"), make_user("c_cfo")
+    now = timezone.now()
+    for user, roles in ((a, ("accountant", "zatca_admin")), (c, ("approver", "zatca_admin", "receivables_clerk"))):
+        for code in roles:  # granted by the MP as separate memberships in the same entity (R9 allows it)
+            access_services.grant_membership(mp, user, w.alm, Role.objects.get(code=code), now, reason=f"{code} role")
+    assert set(Membership.objects.active().filter(user=a, entity=w.alm).values_list("role__code", flat=True)) == {
+        "accountant", "zatca_admin"}
+    first, second, third = _failed_hand_offs(w, 3)
+    assert resubmit(first, a).zatca_status == "pending"
+    assert resubmit(second, c).zatca_status == "pending"
+    for user in (a, c):
+        assert AccessLog.objects.filter(actor=user, details__action="zatca_resubmit").count() == 1
+    access_services.revoke_membership(mp, Membership.objects.get(user=a, role__code="zatca_admin"), "Duty ended")
+    with pytest.raises(access.AccessDenied) as exc:  # still an accountant (who holds zatca.retry_failed): refused
+        services.resubmit_to_zatca(third, user=a)
+    assert exc.value.code == "no_membership"
+    assert access.has(a, w.alm, "zatca.retry_failed")  # OQ-27 default: accountants keep the catalogue right
+    own = invoice(w, user=c)  # C created and submitted it
+    with pytest.raises(access.AccessDenied) as exc:  # R14 applies to the person, whatever roles they hold
+        services.approve_sales_document(own, user=c)
+    assert exc.value.code == "self_approval"
