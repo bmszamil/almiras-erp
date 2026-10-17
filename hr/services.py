@@ -293,14 +293,36 @@ def verify_statutory_parameter(row, *, user):
 
 
 @transaction.atomic
-def supersede_statutory_parameter(row, *, user):
-    """R7: a used row is corrected by superseding it and entering a replacement."""
+def supersede_statutory_parameter(row, *, user, value, source_url, source_reference, valid_from=None, valid_to=None):
+    """R7: a verified or used row is corrected by superseding it **and** entering its replacement in the same
+    transaction (a superseded row without a replacement would leave the dates without a figure). The replacement
+    starts on ``valid_from`` (default: the superseded row's own ``valid_from``), is entered by ``user`` and starts
+    ``unverified``. Returns ``(superseded, replacement)``."""
     group = _group_parent(user, "hr.maintain_statutory_parameter")
     access.require(user, group, "hr.maintain_statutory_parameter")
-    row = StatutoryParameter.objects.select_for_update().get(pk=row.pk)
-    row.status = StatutoryParameter.Status.SUPERSEDED
-    row.save()
-    return row
+    old = StatutoryParameter.objects.select_for_update().get(pk=row.pk)
+    if old.status == StatutoryParameter.Status.SUPERSEDED:
+        raise error("This parameter row is already superseded.", "صف المعيار هذا مستبدل مسبقًا.", code="parameter_status")
+    start = valid_from or old.valid_from
+    if start < old.valid_from:
+        raise error("The replacement starts on or after the superseded row's valid-from date.",
+                    "يبدأ الصف البديل في تاريخ سريان الصف المستبدل أو بعده.", code="parameter_invalid")
+    old.status = StatutoryParameter.Status.SUPERSEDED
+    old.save(update_fields=["status"])
+    new = StatutoryParameter(jurisdiction=old.jurisdiction, code=old.code, value=value, valid_from=start,
+                             valid_to=valid_to, source_url=source_url, source_reference=source_reference,
+                             entered_by=user)
+    try:
+        new.full_clean(validate_constraints=False)
+    except ValidationError as exc:
+        raise HrError(exc.messages, code="parameter_invalid") from None
+    try:
+        with transaction.atomic():
+            new.save()
+    except IntegrityError:
+        raise error(f"Another current row of {old.code} already starts on {start}.",
+                    f"يوجد صف ساري آخر للمعيار {old.code} يبدأ في {start}.", code="parameter_invalid") from None
+    return old, new
 
 
 # =====================================================================================================

@@ -1,6 +1,6 @@
 """hr R6, R7 (AT-4), R13 (AT-8), R57 (AT-32), R48: statutory parameters, roles, agents, rights."""
 import ast
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -111,9 +111,12 @@ def test_at4_unverified_parameters_block_approval_until_verified(w, settings):
     assert exc.value.code == "parameter_used"
     with pytest.raises(HrError):
         used.delete()
-    # A correction is a superseding row; the used row keeps its value.
-    services.supersede_statutory_parameter(used, user=w.h)
+    # A correction is a superseding row entered with it; the used row keeps its value.
+    old, new = services.supersede_statutory_parameter(used, user=w.h, value=used.value, source_url=used.source_url,
+                                                      source_reference="corrected")
     assert StatutoryParameter.objects.get(pk=used.pk).status == "superseded"
+    assert new.status == "unverified" and new.valid_from == used.valid_from and new.entered_by == w.h
+    assert services.param("SA", "eosb.award_table", date(2027, 1, 1)).pk == new.pk
 
 
 def test_r7_contract_approval_also_refused_on_unverified(w, settings):
@@ -221,11 +224,21 @@ def test_r7_seed_reload_leaves_verified_and_used_rows_alone(w):
     unverified.save()
     verified = StatutoryParameter.objects.get(pk=verified.pk)
     verified.source_reference = "edited by MP"
-    verified.save()
+    with pytest.raises(HrError) as exc:  # R7: a verified row is never edited
+        verified.save()
+    assert exc.value.code == "parameter_used"
+    seed_exam = StatutoryParameter.objects.get(jurisdiction="SA", code="leave.exam")
+    _, entered = services.supersede_statutory_parameter(seed_exam, user=w.h, value={"request_lead_days": "16"},
+                                                        source_url="https://example.test",
+                                                        source_reference="entered by H")
     statutory_seed.apply(StatutoryParameter)
     verified.refresh_from_db()
     unverified.refresh_from_db()
-    assert verified.source_reference == "edited by MP" and verified.status == "verified"
+    entered.refresh_from_db()
+    assert verified.source_reference != "edited by MP" and verified.status == "verified"
+    # Nit 21: a row a person entered (entered_by set) is never refreshed by the loader, even unverified and unused.
+    assert entered.value == {"request_lead_days": "16"} and entered.status == "unverified"
+    assert StatutoryParameter.objects.filter(jurisdiction="SA", code="leave.exam").count() == 2
     assert verified.verified_by == w.mp
     assert unverified.value == statutory_seed.SA_PARAMETERS["leave.hajj"][0] and unverified.verified_by_id is None
 
@@ -236,32 +249,130 @@ def _migration_0005():
     return importlib.import_module("hr.migrations.0005_unpaid_suspension_parameter")
 
 
-def test_r62_data_migration_moves_the_threshold_and_keeps_its_verification(w):
+def test_r62_data_migration_moves_the_threshold_and_never_copies_verification(w):
+    """Nit 20: 0005 creates the new rows unverified (no verification state copied) and imports no live seed."""
     from django.apps import apps
 
     when = timezone.now()
-    verified = StatutoryParameter.objects.create(
-        jurisdiction="AE", code="leave.annual", value={"tiers": [], "unpaid_suspends_after_days": "20"},
-        valid_from=date(2020, 1, 1), source_url="https://example.test", source_reference="test",
-        status="verified", entered_by=w.h, verified_by=w.mp, verified_at=when)
+    verified = services.add_statutory_parameter(
+        user=w.h, jurisdiction="AE", code="leave.annual", value={"tiers": [], "unpaid_suspends_after_days": "20"},
+        valid_from=date(2020, 1, 1), source_url="https://example.test", source_reference="test")
+    services.verify_statutory_parameter(verified, user=w.mp)
     unverified = StatutoryParameter.objects.create(
         jurisdiction="QA", code="eosb.award_table", value={"tiers": [], "exclude_unpaid_days_beyond": "15"},
         valid_from=date(2020, 1, 1), source_url="https://example.test", source_reference="test")
     used = StatutoryParameter.objects.create(
         jurisdiction="BH", code="leave.annual", value={"tiers": [], "unpaid_suspends_after_days": "20"},
-        valid_from=date(2020, 1, 1), source_url="https://example.test", source_reference="test", used_at=when)
+        valid_from=date(2020, 1, 1), source_url="https://example.test", source_reference="test")
+    used.used_at = when
+    used.save()
     _migration_0005().forward(apps, None)
     moved = StatutoryParameter.objects.get(jurisdiction="AE", code="leave.unpaid.suspension_after_days")
     assert moved.value == {"days": "20", "aggregation": "work_year"} and moved.valid_from == date(2020, 1, 1)
-    assert (moved.status, moved.verified_by, moved.verified_at, moved.entered_by) == ("verified", w.mp, when, w.h)
+    assert (moved.status, moved.verified_by, moved.verified_at, moved.entered_by) == ("unverified", None, None, None)
     qa = StatutoryParameter.objects.get(jurisdiction="QA", code="leave.unpaid.suspension_after_days")
     assert qa.status == "unverified" and qa.verified_by_id is None and qa.value["days"] == "15"
     verified.refresh_from_db()
     unverified.refresh_from_db()
     used.refresh_from_db()
-    assert "unpaid_suspends_after_days" not in verified.value
+    assert verified.value["unpaid_suspends_after_days"] == "20"  # a verified row is never edited (R7)
     assert "exclude_unpaid_days_beyond" not in unverified.value
     assert used.value["unpaid_suspends_after_days"] == "20"  # a used row is never edited (R7)
     assert StatutoryParameter.objects.filter(jurisdiction="BH", code="leave.unpaid.suspension_after_days").exists()
     _migration_0005().forward(apps, None)  # idempotent
     assert StatutoryParameter.objects.filter(code="leave.unpaid.suspension_after_days", jurisdiction="AE").count() == 1
+    source = Path(_migration_0005().__file__).read_text(encoding="utf-8")
+    assert "statutory_seed" not in source.split('"""', 2)[2]  # no import of the live seed module
+
+
+# --- R7: parameter immutability (review probes P4, P4b) ------------------------------------------------------
+
+def _seed_row(code="eosb.award_table"):
+    return services.param("SA", code, date(2027, 1, 1))
+
+
+def test_r7_used_at_is_set_once_and_never_cleared(db):
+    row = _seed_row()
+    row.used_at = timezone.now()
+    row.save()
+    row = StatutoryParameter.objects.get(pk=row.pk)
+    row.used_at = None
+    with pytest.raises(HrError) as exc:
+        row.save()
+    assert exc.value.code == "parameter_used"
+    row = StatutoryParameter.objects.get(pk=row.pk)
+    row.used_at = timezone.now()
+    with pytest.raises(HrError):
+        row.save()
+    row = StatutoryParameter.objects.get(pk=row.pk)
+    row.value = {"tiers": [{"up_to_years": None, "months_per_year": "5"}]}
+    with pytest.raises(HrError):
+        row.save()
+
+
+def test_r7_verified_row_value_and_source_never_change(w):
+    row = services.add_statutory_parameter(user=w.h, jurisdiction="SA", code="leave.marriage", value={"days": "5"},
+                                           valid_from=date(2027, 7, 1), source_url="https://example.test",
+                                           source_reference="Art. 113")
+    services.verify_statutory_parameter(row, user=w.mp)
+    for field, value in (("value", {"days": "50"}), ("source_reference", "x"), ("source_url", "https://o.test"),
+                         ("valid_from", date(2027, 8, 1)), ("valid_to", date(2028, 1, 1)), ("code", "leave.other")):
+        r = StatutoryParameter.objects.get(pk=row.pk)
+        setattr(r, field, value)
+        with pytest.raises(HrError):
+            r.save()
+    r = StatutoryParameter.objects.get(pk=row.pk)
+    assert r.value == {"days": "5"} and r.status == "verified" and r.verified_by == w.mp
+
+
+def test_r7_status_moves_forward_only_and_verifier_is_set_once(w):
+    row = services.add_statutory_parameter(user=w.h, jurisdiction="SA", code="test.status", value={"x": "1"},
+                                           valid_from=date(2027, 1, 1), source_url="https://example.test",
+                                           source_reference="t")
+    r = StatutoryParameter.objects.get(pk=row.pk)
+    r.status = "verified"  # no verifier
+    with pytest.raises(HrError):
+        r.save()
+    r = StatutoryParameter.objects.get(pk=row.pk)
+    r.status, r.verified_by, r.verified_at = "verified", w.h, timezone.now()  # the enterer verifies
+    with pytest.raises(HrError):
+        r.save()
+    services.verify_statutory_parameter(row, user=w.mp)
+    r = StatutoryParameter.objects.get(pk=row.pk)
+    r.status, r.verified_by, r.verified_at = "unverified", None, None
+    with pytest.raises(HrError):
+        r.save()
+    r = StatutoryParameter.objects.get(pk=row.pk)
+    r.verified_by = w.c
+    with pytest.raises(HrError):
+        r.save()
+    with pytest.raises(HrError):  # inserted already verified
+        StatutoryParameter.objects.create(jurisdiction="SA", code="test.new", value={}, valid_from=date(2027, 1, 1),
+                                          source_url="https://example.test", source_reference="t", status="verified",
+                                          verified_by=w.mp, verified_at=timezone.now())
+    old, new = services.supersede_statutory_parameter(row, user=w.h, value={"x": "2"},
+                                                      source_url="https://example.test", source_reference="fix")
+    r = StatutoryParameter.objects.get(pk=old.pk)
+    r.status = "verified"
+    with pytest.raises(HrError):
+        r.save()
+
+
+def test_r7_superseding_always_enters_a_replacement(w):
+    row = _seed_row("leave.marriage")
+    with pytest.raises(TypeError):
+        services.supersede_statutory_parameter(row, user=w.h)  # no replacement given
+    assert StatutoryParameter.objects.get(pk=row.pk).status == "unverified"
+    with pytest.raises(HrError):  # a replacement never starts before the row it replaces
+        services.supersede_statutory_parameter(row, user=w.h, value={"days": "5"}, source_url=row.source_url,
+                                               source_reference="x", valid_from=row.valid_from - timedelta(days=1))
+    assert StatutoryParameter.objects.get(pk=row.pk).status == "unverified"
+    old, new = services.supersede_statutory_parameter(row, user=w.h, value={"days": "5"}, source_url=row.source_url,
+                                                      source_reference="Art. 113 (re-entered)")
+    assert old.status == "superseded" and services.param("SA", "leave.marriage", date(2027, 1, 1)).pk == new.pk
+    with pytest.raises(HrError):
+        services.supersede_statutory_parameter(old, user=w.h, value={"days": "5"}, source_url=row.source_url,
+                                               source_reference="again")
+    with pytest.raises(access.AccessDenied):
+        services.supersede_statutory_parameter(new, user=w.p, value={"days": "5"}, source_url=row.source_url,
+                                               source_reference="x")

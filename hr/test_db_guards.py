@@ -64,7 +64,8 @@ def test_used_parameter_and_events(w):
     _refused("UPDATE hr_statutoryparameter SET value = '{}' WHERE id = %s", [used.pk])
     _refused("DELETE FROM hr_statutoryparameter WHERE id = %s", [used.pk])
     with connection.cursor() as cur:  # verification stays possible
-        cur.execute("UPDATE hr_statutoryparameter SET status = 'verified' WHERE id = %s", [used.pk])
+        cur.execute("UPDATE hr_statutoryparameter SET status = 'verified', verified_by_id = %s, verified_at = now() "
+                    "WHERE id = %s", [w.mp.pk, used.pk])
     emp = hired(w)
     a = services.create_assignment(emp, user=w.h, kind="secondment", receiving_entity=w.sub, role_title_en="A",
                                    role_title_ar="أ", start_date=date(2027, 2, 1))
@@ -74,3 +75,31 @@ def test_used_parameter_and_events(w):
     _refused("DELETE FROM hr_assignmentevent WHERE id = %s", [ev.pk])
     services.deliver_assignment_events()
     _refused("UPDATE hr_assignmentevent SET attempts = 9 WHERE id = %s", [ev.pk])  # delivered: final
+
+
+@pg
+def test_r7_parameter_trigger_refuses_unlocking_and_self_verification(w):
+    """Review probe PG1: clearing used_at, editing after it, verifier = enterer, status back, verified insert."""
+    row = services.param("SA", "eosb.award_table", date(2027, 1, 1))
+    with connection.cursor() as cur:
+        cur.execute("UPDATE hr_statutoryparameter SET used_at = now() WHERE id = %s", [row.pk])
+    _refused("UPDATE hr_statutoryparameter SET value = '{}'::jsonb WHERE id = %s", [row.pk])
+    _refused("UPDATE hr_statutoryparameter SET used_at = NULL WHERE id = %s", [row.pk])
+    _refused("UPDATE hr_statutoryparameter SET used_at = now() - interval '1 day' WHERE id = %s", [row.pk])
+    _refused("UPDATE hr_statutoryparameter SET status = 'verified' WHERE id = %s", [row.pk])  # CHECK: no verifier
+    entered = services.add_statutory_parameter(user=w.h, jurisdiction="SA", code="test.pg", value={"x": "1"},
+                                               valid_from=date(2027, 1, 1), source_url="https://example.test",
+                                               source_reference="t")
+    _refused("UPDATE hr_statutoryparameter SET status = 'verified', verified_by_id = entered_by_id, verified_at = now() "
+             "WHERE id = %s", [entered.pk])
+    services.verify_statutory_parameter(entered, user=w.mp)
+    _refused("UPDATE hr_statutoryparameter SET source_reference = 'x' WHERE id = %s", [entered.pk])
+    _refused("UPDATE hr_statutoryparameter SET verified_by_id = %s WHERE id = %s", [w.c.pk, entered.pk])
+    _refused("UPDATE hr_statutoryparameter SET status = 'unverified', verified_by_id = NULL, verified_at = NULL "
+             "WHERE id = %s", [entered.pk])
+    _refused("INSERT INTO hr_statutoryparameter (jurisdiction, code, value, valid_from, source_url, source_reference, "
+             "status, verified_by_id, verified_at, created_at) VALUES ('SA', 'test.ins', '{}'::jsonb, '2027-01-01', "
+             "'https://x.test', 't', 'verified', %s, now(), now())", [w.mp.pk])
+    with connection.cursor() as cur:  # forward: verified -> superseded stays possible
+        cur.execute("UPDATE hr_statutoryparameter SET status = 'superseded' WHERE id = %s", [entered.pk])
+    _refused("UPDATE hr_statutoryparameter SET status = 'verified' WHERE id = %s", [entered.pk])

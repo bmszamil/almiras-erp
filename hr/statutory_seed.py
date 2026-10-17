@@ -133,13 +133,26 @@ def apply(StatutoryParameter):
     """Create the SA rows that do not exist yet and bring the seeded rows nobody has verified or used up to date
     (idempotent; takes the model so a migration can pass its own). Never verifies a row and never touches a
     verified, superseded or used row: a change to one of those is a new row entered and verified by people (R7)."""
-    for code, (value, url, _ref) in SA_PARAMETERS.items():
-        row, created = StatutoryParameter.objects.get_or_create(
-            jurisdiction="SA", code=code, valid_from=VALID_FROM,
-            defaults=dict(value=value, source_url=url, source_reference=reference(code), status="unverified"),
-        )
-        if created or row.status != "unverified" or row.used_at is not None or row.verified_by_id is not None:
+    return apply_rows(StatutoryParameter, {code: (value, url, reference(code))
+                                           for code, (value, url, _ref) in SA_PARAMETERS.items()})
+
+
+def apply_rows(StatutoryParameter, rows, jurisdiction="SA", valid_from=VALID_FROM):
+    """Create missing seed rows; refresh a seed row only while it is still a pristine loader row: unverified,
+    unused, never verified and entered by nobody (``entered_by`` empty: a row a person entered is theirs, R7).
+    A superseded row is history: its current replacement (if any) is the row looked at."""
+    for code, (value, url, ref) in rows.items():
+        current = (StatutoryParameter.objects.filter(jurisdiction=jurisdiction, code=code, valid_from=valid_from)
+                   .exclude(status="superseded").first())
+        if current is None:
+            if StatutoryParameter.objects.filter(jurisdiction=jurisdiction, code=code, valid_from=valid_from).exists():
+                continue  # superseded with no same-day replacement: people decided; the loader does not re-add it
+            StatutoryParameter.objects.create(jurisdiction=jurisdiction, code=code, valid_from=valid_from, value=value,
+                                              source_url=url, source_reference=ref, status="unverified")
             continue
-        if (row.value, row.source_url, row.source_reference) != (value, url, reference(code)):
-            row.value, row.source_url, row.source_reference = value, url, reference(code)
-            row.save()
+        if (current.status != "unverified" or current.used_at is not None or current.verified_by_id is not None
+                or current.entered_by_id is not None):
+            continue
+        if (current.value, current.source_url, current.source_reference) != (value, url, ref):
+            current.value, current.source_url, current.source_reference = value, url, ref
+            current.save()

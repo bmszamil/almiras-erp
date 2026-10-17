@@ -201,14 +201,31 @@ class StatutoryParameter(models.Model):
 
     objects = ServiceOnlyQuerySet.as_manager()
 
-    # Once used by an approved record only these may change (R7): verification and supersession.
-    USED_MUTABLE = ("status", "verified_by_id", "verified_at", "used_at")
+    # R7: the figure and its source. They change only while the row is unverified, unused and has no verifier;
+    # afterwards a correction is a superseding row (hr.services.supersede_statutory_parameter).
+    DATA_FIELDS = ("jurisdiction", "code", "value", "valid_from", "valid_to", "source_url", "source_reference",
+                   "entered_by_id")
+    # R7: status only moves forward.
+    TRANSITIONS = frozenset({("unverified", "verified"), ("verified", "superseded"), ("unverified", "superseded")})
 
     class Meta:
         verbose_name = bi("statutory parameter", "معيار نظامي")
         verbose_name_plural = bi("statutory parameters", "المعايير النظامية")
         ordering = ["jurisdiction", "code", "valid_from"]
-        constraints = [models.UniqueConstraint(fields=["jurisdiction", "code", "valid_from"], name="hr_param_once")]
+        constraints = [
+            # A superseded row keeps its dates; its replacement may start on the same day (R7).
+            models.UniqueConstraint(fields=["jurisdiction", "code", "valid_from"], condition=~Q(status="superseded"),
+                                    name="hr_param_once"),
+            # R7: the verifier is never the person who entered the row.
+            models.CheckConstraint(condition=Q(verified_by__isnull=True) | Q(entered_by__isnull=True)
+                                   | ~Q(verified_by=models.F("entered_by")), name="hr_param_verifier_not_enterer"),
+            models.CheckConstraint(condition=~Q(status="verified") | (Q(verified_by__isnull=False)
+                                                                      & Q(verified_at__isnull=False)),
+                                   name="hr_param_verified_has_verifier"),
+            models.CheckConstraint(condition=~Q(status="unverified") | (Q(verified_by__isnull=True)
+                                                                        & Q(verified_at__isnull=True)),
+                                   name="hr_param_unverified_has_no_verifier"),
+        ]
 
     def _floats(self, value):
         if isinstance(value, float):
@@ -219,21 +236,50 @@ class StatutoryParameter(models.Model):
             return any(self._floats(v) for v in value)
         return False
 
+    @property
+    def locked(self):
+        """R7: verified, superseded or used by an approval: the figure and its source never change."""
+        return self.status != self.Status.UNVERIFIED or self.used_at is not None or self.verified_by_id is not None
+
+    def _refuse(self, en, ar):
+        raise error(en, ar, code="parameter_used")
+
     def save(self, *args, **kwargs):
         if self._floats(self.value):
             raise error("Statutory parameter values use Decimal strings, never floats.",
                         "تستخدم قيم المعايير النظامية أرقامًا عشرية نصية، لا أعدادًا عشرية ثنائية.", code="float_rejected")
-        if self.pk:
-            stored = type(self)._base_manager.filter(pk=self.pk).first()
-            if stored and stored.used_at is not None:
-                changed = [f.attname for f in self._meta.concrete_fields
-                           if getattr(stored, f.attname) != getattr(self, f.attname)]
-                if set(changed) - set(self.USED_MUTABLE):
-                    raise error(
-                        f"Parameter {self.code} from {self.valid_from} was used by an approved record and is never "
-                        "edited; add a new row with a later valid-from date or supersede it.",
-                        f"استُخدم المعيار {self.code} الساري من {self.valid_from} في سجل معتمد ولا يُعدَّل أبدًا؛ أضف صفًا "
-                        "جديدًا بتاريخ سريان لاحق أو استبدله.", code="parameter_used")
+        stored = type(self)._base_manager.filter(pk=self.pk).first() if self.pk else None
+        name = f"{self.jurisdiction} {self.code} ({self.valid_from})"
+        if stored is None:
+            if (self.status != self.Status.UNVERIFIED or self.verified_by_id is not None or self.verified_at is not None
+                    or self.used_at is not None):
+                self._refuse(f"Parameter {name} is entered unverified and unused; it is verified afterwards by "
+                             "someone else (R7).",
+                             f"يُدخل المعيار {name} غير متحقق منه وغير مستخدم؛ ثم يتحقق منه شخص آخر.")
+        else:
+            changed = {f.attname for f in self._meta.concrete_fields
+                       if getattr(stored, f.attname) != getattr(self, f.attname)}
+            if "used_at" in changed and stored.used_at is not None:
+                self._refuse(f"Parameter {name}: the first use is recorded once and never cleared (R7).",
+                             f"المعيار {name}: يُسجَّل أول استخدام مرة واحدة ولا يُمحى.")
+            if "status" in changed and (stored.status, self.status) not in self.TRANSITIONS:
+                self._refuse(f"Parameter {name}: status {stored.status} cannot become {self.status} (R7).",
+                             f"المعيار {name}: لا تتحول الحالة {stored.status} إلى {self.status}.")
+            if changed & {"verified_by_id", "verified_at"} and (stored.verified_by_id is not None
+                                                                or stored.verified_at is not None):
+                self._refuse(f"Parameter {name} is verified once; the verifier never changes (R7).",
+                             f"يُتحقق من المعيار {name} مرة واحدة؛ ولا يتغير المتحقق.")
+            if changed & set(self.DATA_FIELDS) and stored.locked:
+                self._refuse(
+                    f"Parameter {name} is verified, superseded or was used by an approved record and is never "
+                    "edited; supersede it with a corrected row (R7).",
+                    f"المعيار {name} متحقق منه أو مستبدل أو استُخدم في سجل معتمد ولا يُعدَّل أبدًا؛ استبدله بصف مصحَّح.")
+        if self.verified_by_id is not None and self.verified_by_id == self.entered_by_id:
+            self._refuse(f"Parameter {name} is verified by someone other than the person who entered it (R7).",
+                         f"يتحقق من المعيار {name} شخص غير الذي أدخله.")
+        if self.status == self.Status.VERIFIED and (self.verified_by_id is None or self.verified_at is None):
+            self._refuse(f"A verified parameter names its verifier and the time ({name}, R7).",
+                         f"يذكر المعيار المتحقق منه اسم المتحقق ووقت التحقق ({name}).")
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):

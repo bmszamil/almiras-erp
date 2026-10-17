@@ -325,10 +325,9 @@ def test_r62_aggregation_per_leave_or_per_work_year(w):
     _approved_leave(w, e, "UNPAID", date(2027, 4, 1), date(2027, 4, 15), reason_ar="ظرف خاص")
     assert services.contract_end_date(c, user=w.h) == date(2028, 1, 10)  # work year: 30 - 20
     row = services.param("SA", "leave.unpaid.suspension_after_days", date(2027, 1, 1))
-    services.supersede_statutory_parameter(row, user=w.h)  # used by approvals: corrected by a new row (R7)
-    services.add_statutory_parameter(user=w.h, jurisdiction="SA", code=row.code,
-                                     value={"days": "20", "aggregation": "per_leave"}, valid_from=row.valid_from
-                                     + timedelta(days=1), source_url=row.source_url, source_reference="OQ-37 variant")
+    # Used by approvals: corrected by a superseding row from the same day (R7).
+    services.supersede_statutory_parameter(row, user=w.h, value={"days": "20", "aggregation": "per_leave"},
+                                           source_url=row.source_url, source_reference="OQ-37 variant")
     assert services.contract_end_date(c, user=w.h) == date(2027, 12, 31)  # no single leave beyond 20 days
 
 
