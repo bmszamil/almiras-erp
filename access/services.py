@@ -823,7 +823,7 @@ def _lock_pending(change):
     from .errors import Conflict
     from .models import ChairmanChange as CC
 
-    locked = CC.objects.select_for_update().select_related("entity", "target", "role").get(pk=change.pk)
+    locked = CC.objects.select_for_update(of=("self",)).select_related("entity", "target", "role").get(pk=change.pk)
     if locked.status != CC.Status.PENDING:
         raise Conflict("dual_control_decided", f"This request is already {locked.status}.",
                        "تم البت في هذا الطلب.")
