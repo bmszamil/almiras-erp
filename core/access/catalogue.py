@@ -163,6 +163,30 @@ _PERMS = [
     _p("ledger.view_rates", "View exchange rates", "عرض أسعار الصرف", AGENT_OK),
     _p("ledger.view_translation", "View currency translation", "عرض ترجمة العملات", AGENT_OK),
     _p("ledger.change_functional_currency", "Change functional currency", "تغيير العملة الوظيفية", GROUP_ONLY),
+    # hr (hr.md §7; A21). No HR permission is Ag (hr R13). hr.maintain_statutory_parameter is not G: the spec's
+    # holder is the group parent's hr_officer (an entity role); hr.services checks it on the group parent entity.
+    _p("hr.view", "View HR records (personal data masked)", "عرض سجلات الموارد البشرية (البيانات الشخصية مخفية)"),
+    _p("hr.view_personal_data", "View employees' personal data", "عرض البيانات الشخصية للموظفين"),
+    _p("hr.manage_employee", "Create and edit employees and their documents", "إنشاء الموظفين ومستنداتهم وتعديلها"),
+    _p("hr.edit_contract_draft", "Edit draft employment contracts", "تعديل مسودات عقود العمل"),
+    _p("hr.submit_contract", "Submit employment contracts", "تقديم عقود العمل"),
+    _p("hr.approve_contract", "Approve employment contracts", "اعتماد عقود العمل", APPROVAL),
+    _p("hr.manage_assignment", "Draft assignments and secondments", "إعداد التكليفات والإعارات"),
+    _p("hr.approve_assignment", "Approve assignments and secondments", "اعتماد التكليفات والإعارات", APPROVAL),
+    _p("hr.end_assignment", "End or cancel assignments and secondments", "إنهاء التكليفات والإعارات أو إلغاؤها"),
+    _p("hr.request_leave", "Record leave requests and balance corrections", "تسجيل طلبات الإجازات وتصحيحات الأرصدة"),
+    _p("hr.approve_leave", "Approve leave requests", "اعتماد طلبات الإجازات", APPROVAL),
+    _p("hr.adjust_leave_balance", "Approve leave balance adjustments", "اعتماد تسويات أرصدة الإجازات", APPROVAL),
+    _p("hr.record_termination", "Record terminations", "تسجيل إنهاء الخدمة"),
+    _p("hr.approve_termination", "Approve terminations", "اعتماد إنهاء الخدمة", APPROVAL),
+    _p("hr.calculate_eosb", "Preview end-of-service calculations", "معاينة حساب مكافأة نهاية الخدمة"),
+    _p("hr.export_personal_data", "Export an employee's personal data", "تصدير البيانات الشخصية للموظف", SEGREGATED),
+    _p("hr.maintain_statutory_parameter", "Enter statutory parameters", "إدخال المعايير النظامية"),
+    _p("hr.verify_statutory_parameter", "Verify statutory parameters", "التحقق من المعايير النظامية", GROUP_ONLY,
+       APPROVAL),
+    _p("hr.receive_alerts", "Receive HR alerts", "استلام تنبيهات الموارد البشرية"),
+    _p("hr.manage_org", "Manage departments and grades", "إدارة الأقسام والدرجات الوظيفية"),
+    _p("hr.set_overtime_route", "Change the overtime approval route", "تغيير مسار اعتماد العمل الإضافي"),
 ]
 
 CATALOGUE = {p.codename: p for p in _PERMS}

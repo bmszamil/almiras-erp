@@ -26,8 +26,9 @@ GRANT_MAX_AGE = timedelta(minutes=15)
 GRANT_EVENTS = ("permission_granted", "dual_control_used")
 DELEGATION_START_TOLERANCE = timedelta(minutes=1)
 
-# OQ-2 default: an access_admin grants every entity role except these.
-ACCESS_ADMIN_CANNOT_GRANT = frozenset({"access_admin", "approver", "zatca_admin"})
+# OQ-2 default: an access_admin grants every entity role except these. hr_officer and payroll_officer: granted by
+# the managing partner only (A21, R52).
+ACCESS_ADMIN_CANNOT_GRANT = frozenset({"access_admin", "approver", "zatca_admin", "hr_officer", "payroll_officer"})
 
 
 def now():

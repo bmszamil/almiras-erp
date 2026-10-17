@@ -133,8 +133,46 @@ ROLE_SEED_V3 = {
         ("core.disable_sharia_enforcement",),
     ),
 }
+# V4 (migration core.0013, A21 / hr.md §7): roles ``hr_officer`` and ``payroll_officer`` (granted by the managing
+# partner only, R52) and the HR permissions on existing roles. accountant and viewer get the masked ``hr.view``
+# (hr AT-6: they open an employee and see masked values). payroll.* rights come with the payroll module.
+_HR_APPROVALS = ("hr.approve_contract", "hr.approve_assignment", "hr.approve_leave", "hr.adjust_leave_balance",
+                 "hr.approve_termination")
+
+
+def _plus(seed, code, *perms):
+    return (*seed[code][:5], (*seed[code][5], *perms))
+
+
+ROLE_SEED_V4 = {
+    **ROLE_SEED_V3,
+    "accountant": _plus(ROLE_SEED_V3, "accountant", "hr.view"),
+    "viewer": _plus(ROLE_SEED_V3, "viewer", "hr.view"),
+    "approver": _plus(
+        ROLE_SEED_V3, "approver", "hr.view", "hr.approve_contract", "hr.approve_assignment", "hr.end_assignment",
+        "hr.adjust_leave_balance", "hr.approve_termination", "hr.calculate_eosb",
+    ),
+    "managing_partner": _plus(
+        ROLE_SEED_V3, "managing_partner", "hr.view", *_HR_APPROVALS, "hr.verify_statutory_parameter",
+        "hr.set_overtime_route",
+    ),
+    "hr_officer": (
+        "HR officer", "مسؤول الموارد البشرية", "entity", "human", None,
+        (
+            "hr.view", "hr.view_personal_data", "hr.manage_employee", "hr.edit_contract_draft", "hr.submit_contract",
+            "hr.manage_assignment", "hr.end_assignment", "hr.request_leave", "hr.approve_leave",
+            "hr.record_termination", "hr.calculate_eosb", "hr.export_personal_data",
+            "hr.maintain_statutory_parameter", "hr.receive_alerts", "hr.manage_org", *_LEDGER_VIEW,
+        ),
+    ),
+    "payroll_officer": (
+        "Payroll officer", "مسؤول الرواتب", "entity", "human", None,
+        # hr.view_personal_data: bank, IBAN and ID only (hr §7); hr.services limits the fields for this role.
+        ("hr.view", "hr.view_personal_data", "hr.calculate_eosb", *_LEDGER_VIEW),
+    ),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V3
+ROLE_SEED = ROLE_SEED_V4
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
