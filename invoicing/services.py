@@ -2598,6 +2598,7 @@ PURIFICATION_PERMISSION = {
 
 
 def _posted_purification(entity, kind, as_of=None, exclude_pk=None):
+    """Posted (not reversed) transfers or payouts of ``kind`` up to ``as_of``; reversed rows never count (R54)."""
     qs = PurificationTransfer.objects.filter(entity=entity, kind=kind, status=PurificationTransfer.Status.POSTED)
     if as_of is not None:
         qs = qs.filter(date__lte=as_of)
@@ -2606,10 +2607,41 @@ def _posted_purification(entity, kind, as_of=None, exclude_pk=None):
     return qs.aggregate(t=Sum("amount"))["t"] or ZERO
 
 
+def _purification_room(entity, kind, on, exclude_pk=None):
+    """R6, R54: the room left for a ``kind`` row dated ``on``, as (amount, date): the smallest of flagged less
+    transferred (a transfer) or transferred less paid out (a payout) on ``on`` **and on every later date** on
+    which a flagged line or a posted row is booked, so the last one is the all-time position. A backdated row can
+    therefore never push a later date over its limit (review finding 1). Reversed rows do not count.
+    """
+    deltas = {}
+    flagged = (JournalLine.objects.filter(entry__entity=entity, entry__status__in=ledger.BOOKED,
+                                          requires_purification=True)
+               .values("entry__date").annotate(c=Sum("credit"), d=Sum("debit")))
+    for row in flagged:
+        deltas.setdefault(row["entry__date"], [ZERO, ZERO, ZERO])[0] += (row["c"] or ZERO) - (row["d"] or ZERO)
+    rows = (PurificationTransfer.objects.filter(entity=entity, status=PurificationTransfer.Status.POSTED)
+            .exclude(pk=exclude_pk).values("date", "kind").annotate(t=Sum("amount")))
+    for row in rows:
+        i = 1 if row["kind"] == PurificationTransfer.Kind.TRANSFER else 2
+        deltas.setdefault(row["date"], [ZERO, ZERO, ZERO])[i] += row["t"] or ZERO
+    deltas.setdefault(on, [ZERO, ZERO, ZERO])
+    flagged_sum = transferred = paid = ZERO
+    room = at = None
+    for day in sorted(deltas):
+        f, t, p = deltas[day]
+        flagged_sum, transferred, paid = flagged_sum + f, transferred + t, paid + p
+        if day < on:
+            continue
+        left = flagged_sum - transferred if kind == PurificationTransfer.Kind.TRANSFER else transferred - paid
+        if room is None or left < room:
+            room, at = left, day
+    return _round(room, 2), at  # SQLite sums lose the scale; amounts are SAR with 2 decimals
+
+
 def purification_position(entity, *, user, as_of=None):
     """R6, R54 / AT-45, AT-71: non-compliant income flagged in the ledger (``ledger.purification_amount``), what was
     transferred to 2600 (E14) and paid out (E15), and what is left to transfer and to pay. ``invoicing.view`` and
-    ``ledger.view``."""
+    ``ledger.view``. Reversed transfers and payouts do not count."""
     access.require(user, entity, "invoicing.view")
     flagged = ledger.purification_amount(entity, user=user, as_of=as_of)
     transferred = _posted_purification(entity, PurificationTransfer.Kind.TRANSFER, as_of)
@@ -2622,18 +2654,18 @@ def _purification_problems(doc, user, exclude_self=True):
     problems = []
     entity = doc.entity
     pk = doc.pk if exclude_self else None
+    access.require(user, entity, "ledger.view")  # the limits come from the ledger's flagged lines
+    left, at = _purification_room(entity, doc.kind, doc.date, exclude_pk=pk)
     if doc.kind == PurificationTransfer.Kind.TRANSFER:
-        flagged = ledger.purification_amount(entity, user=user, as_of=doc.date)
-        left = flagged - _posted_purification(entity, doc.kind, doc.date, exclude_pk=pk)
         if doc.amount > left:
-            problems.append(f"Only {left} of non-compliant income is left to purify on {doc.date} (R6, R54). / "
-                            f"المتبقي من الإيرادات غير المتوافقة للتطهير {left} فقط بتاريخ {doc.date}.")
+            problems.append(f"Only {left} of non-compliant income is left to purify on {at} (R6, R54; checked on "
+                            f"{doc.date} and every later date). / المتبقي من الإيرادات غير المتوافقة للتطهير {left} "
+                            f"فقط بتاريخ {at} (يُتحقق في {doc.date} وفي كل تاريخ لاحق).")
     else:
-        payable = (_posted_purification(entity, PurificationTransfer.Kind.TRANSFER, doc.date)
-                   - _posted_purification(entity, doc.kind, doc.date, exclude_pk=pk))
-        if doc.amount > payable:
-            problems.append(f"Only {payable} is on the charity payable (2600) on {doc.date}; transfer first (E14). / "
-                            f"رصيد مستحقات التطهير {payable} فقط بتاريخ {doc.date}؛ حوّل أولًا.")
+        if doc.amount > left:
+            problems.append(f"Only {left} is on the charity payable (2600) on {at}; transfer first (E14; checked on "
+                            f"{doc.date} and every later date). / رصيد مستحقات التطهير {left} فقط بتاريخ {at}؛ "
+                            f"حوّل أولًا (يُتحقق في {doc.date} وفي كل تاريخ لاحق).")
         if not doc.recipient_ar.strip():
             problems.append("The recipient charity is named in Arabic (OQ-30). / اسم الجهة الخيرية المستفيدة بالعربية مطلوب.")
         if doc.bank_account_id is None:
@@ -2642,6 +2674,13 @@ def _purification_problems(doc, user, exclude_self=True):
     if period:
         problems.append(period)
     return problems
+
+
+def _lock_purification(entity):
+    """R54: posting and reversing purification rows of one entity run one at a time, so two concurrent posts can
+    never both pass the limits (``FOR NO KEY UPDATE`` on the entity row: inserts that reference the entity are
+    not blocked; a no-op on SQLite)."""
+    Entity.objects.select_for_update(no_key=True).filter(pk=entity.pk).values_list("pk", flat=True).first()
 
 
 def create_purification_transfer(entity, *, user, kind, date, amount, bank_account=None, recipient_ar="",
@@ -2680,6 +2719,7 @@ def post_purification_transfer(transfer, *, user):
     grant = access.require(user, doc.entity, permission, document=doc)
     seen_version = doc.version
     with transaction.atomic():
+        _lock_purification(doc.entity)
         doc = PurificationTransfer.objects.select_for_update(of=("self",)).select_related("entity").get(pk=doc.pk)
         if doc.status != PurificationTransfer.Status.DRAFT:
             raise error("Only recorded drafts are posted.", "تُرحَّل المسودات المسجلة فقط.", code="not_draft")

@@ -108,3 +108,82 @@ def test_r54_closed_period_refused_and_posted_rows_are_locked(w):
         t.delete()
     with pytest.raises(InvoicingError):
         PurificationTransfer.objects.filter(pk=t.pk).update(amount=D("1.00"))
+
+
+# --- review finding 1: limits hold on the document date and on every later date --------------------------------
+
+def test_r54_backdated_transfer_cannot_exceed_what_was_flagged(w):
+    """Reviewer probe: a transfer dated before an existing one passed the as-of-date check, so 2,000.00 was
+    transferred for 1,000.00 flagged. The limit now also holds on every later date (all-time)."""
+    flagged_invoice(w, "1000.00")
+    late = services.create_purification_transfer(w.alm, user=w.accountant, kind="transfer", date=date(2027, 2, 20),
+                                                 amount="1000.00")
+    services.post_purification_transfer(late, user=w.cfo)
+    with pytest.raises(InvoicingError) as exc:
+        services.create_purification_transfer(w.alm, user=w.accountant, kind="transfer", date=date(2027, 1, 31),
+                                              amount="1000.00")
+    assert exc.value.code == "purification_invalid" and "2027-02-20" in str(exc.value)
+    pos = services.purification_position(w.alm, user=w.accountant)
+    assert (pos["transferred"], pos["to_transfer"]) == (D("1000.00"), D("0.00"))
+    assert balance(w, "4900") == D("0.00")
+
+
+def test_r54_backdated_transfer_drafted_earlier_is_refused_at_posting(w):
+    flagged_invoice(w, "1000.00")
+    early = services.create_purification_transfer(w.alm, user=w.accountant, kind="transfer", date=date(2027, 1, 31),
+                                                  amount="1000.00")
+    late = services.create_purification_transfer(w.alm, user=w.accountant, kind="transfer", date=date(2027, 2, 20),
+                                                 amount="1000.00")
+    services.post_purification_transfer(late, user=w.cfo)
+    with pytest.raises(InvoicingError) as exc:
+        services.post_purification_transfer(early, user=w.cfo)
+    assert exc.value.code == "purification_invalid"
+    assert PurificationTransfer.objects.get(pk=early.pk).status == "draft"
+
+
+def test_r54_backdated_payout_cannot_exceed_what_was_transferred(w):
+    """Reviewer probe: two payouts of 1,000.00 for one 1,000.00 transfer (the earlier-dated one passed its date)."""
+    flagged_invoice(w, "1000.00")
+    t = services.create_purification_transfer(w.alm, user=w.accountant, kind="transfer", date=date(2027, 1, 31),
+                                              amount="1000.00")
+    services.post_purification_transfer(t, user=w.cfo)
+    late = services.create_purification_transfer(w.alm, user=w.accountant, kind="payout", date=date(2027, 2, 20),
+                                                 amount="1000.00", bank_account="1100", recipient_ar="جمعية")
+    services.post_purification_transfer(late, user=w.cfo)
+    with pytest.raises(InvoicingError) as exc:
+        services.create_purification_transfer(w.alm, user=w.accountant, kind="payout", date=date(2027, 2, 1),
+                                              amount="1000.00", bank_account="1100", recipient_ar="جمعية")
+    assert exc.value.code == "purification_invalid" and "2600" in str(exc.value)
+    pos = services.purification_position(w.alm, user=w.accountant)
+    assert (pos["paid_out"], pos["payable"]) == (D("1000.00"), D("0.00"))
+    assert balance(w, "2600") == D("0.00")
+
+
+def test_r54_a_payout_before_its_transfer_is_refused_even_if_paid_later(w):
+    flagged_invoice(w, "1000.00")
+    t = services.create_purification_transfer(w.alm, user=w.accountant, kind="transfer", date=date(2027, 2, 10),
+                                              amount="1000.00")
+    services.post_purification_transfer(t, user=w.cfo)
+    with pytest.raises(InvoicingError):  # on 2027-02-01 nothing was on 2600 yet
+        services.create_purification_transfer(w.alm, user=w.accountant, kind="payout", date=date(2027, 2, 1),
+                                              amount="1.00", bank_account="1100", recipient_ar="جمعية")
+    ok = services.create_purification_transfer(w.alm, user=w.accountant, kind="payout", date=date(2027, 2, 10),
+                                               amount="400.00", bank_account="1100", recipient_ar="جمعية")
+    assert services.post_purification_transfer(ok, user=w.cfo).status == "posted"
+
+
+def test_r54_posting_locks_the_entity_row(w):
+    """Concurrent posts serialise on the entity row (FOR NO KEY UPDATE on PostgreSQL)."""
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    flagged_invoice(w, "1000.00")
+    t = services.create_purification_transfer(w.alm, user=w.accountant, kind="transfer", date=date(2027, 1, 31),
+                                              amount="100.00")
+    with CaptureQueriesContext(connection) as queries:
+        services.post_purification_transfer(t, user=w.cfo)
+    entity_reads = [q["sql"] for q in queries.captured_queries if 'FROM "core_entity"' in q["sql"]]
+    if connection.vendor == "postgresql":
+        assert any("FOR NO KEY UPDATE" in sql for sql in entity_reads)
+    else:
+        assert entity_reads  # the lock read runs (SQLite has no row locks)
