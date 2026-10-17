@@ -24,6 +24,20 @@ from invoicing.testing import fake_zatca
 D = Decimal
 RIYADH = services.RIYADH
 
+FAKE_CFO_APPROVAL = ("fake_cfo_approval: posting assertions on auto-issued invoices that hold only because "
+                     "billing.testing.FakeInvoicing approves them as the CFO; the real hook must not (port contract "
+                     "item 2), so with the real hooks they hold only once billing.md R53 is built. Deselect with "
+                     "-m 'not fake_cfo_approval' when running against the real invoicing hooks.")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", FAKE_CFO_APPROVAL)
+
+
+# Every clear() of an auto-issued invoice depends on the same fake approval; the tests marked are those whose
+# assertions are about that posting (journal entry, approved_by / posted_by of the invoice).
+fake_cfo_approval = pytest.mark.fake_cfo_approval
+
 
 @pytest.fixture
 def clock(monkeypatch):

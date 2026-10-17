@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 
 from billing import reports, services
-from billing.conftest import approve_note, approved, clear, period, run, version
+from billing.conftest import approve_note, approved, clear, fake_cfo_approval, period, run, version
 from billing.models import BillingAdjustment
 from core import access
 from core.access.testing import make_user, member
@@ -29,6 +29,7 @@ def _nothing_in_sub(w):
     assert not PurchaseDocument.objects.filter(entity=w.sub).exists()
 
 
+@fake_cfo_approval
 def test_at11_intercompany_invoice_carries_the_counterparty(w):
     c = approved(w, customer=w.ic_customer, lines=(("rent_commercial", "5000.00"),))
     assert c.counterparty_entity == w.sub and c.lines.get().income_account.code == "4110"
@@ -55,6 +56,7 @@ def test_at32_retroactive_intercompany_cancellation_credits_1210(w):
     _nothing_in_sub(w)
 
 
+@fake_cfo_approval
 def test_at50_intercompany_ip_licence_on_4310(w):
     c = approved(w, customer=w.ic_customer, contract_type="service", lease_use="", property_ref="", unit_ref="",
                  lines=(("ip_licence", "20000.00"),))
@@ -95,6 +97,7 @@ def ic_books(w):
     return sar, usd
 
 
+@fake_cfo_approval
 def test_at44_reconciliation_by_pair_and_currency(w, ic_books):
     member(w.c, w.alm, "group_viewer")  # the CFO also sees the group (ledger.view on SUB through the group role)
     rows = services.intercompany_reconciliation(date(2027, 3, 31), user=w.c, group=w.alm)

@@ -7,7 +7,7 @@ import pytest
 from django.db import IntegrityError, transaction
 
 from billing import hooks, services
-from billing.conftest import LEASE, approved, clear, contract, period, run, submitted
+from billing.conftest import LEASE, approved, clear, contract, fake_cfo_approval, period, run, submitted
 from billing.models import BillingError, BillingPeriod, Contract, ContractEvent, ContractLine, ContractVersion
 from core import access
 from core.access.testing import make_user, member
@@ -157,6 +157,7 @@ def test_at16_deposit_is_memo_only(w, django_capture_on_commit_callbacks):
 
 # --- R24, R25, R27, R29 (AT-12, AT-13, AT-50) ------------------------------------------------------------------------
 
+@fake_cfo_approval
 def test_at12_residential_lease_is_exempt_commercial_is_standard(w):
     res = contract(w, lease_use="residential", lines=())
     with pytest.raises(BillingError):

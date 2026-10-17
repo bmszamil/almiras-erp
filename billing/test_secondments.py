@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from billing import services
-from billing.conftest import approve_note, clear, period, run, submitted
+from billing.conftest import approve_note, clear, fake_cfo_approval, period, run, submitted
 from billing.hr_port import BillingHrPort
 from billing.models import BillingAdjustment, BillingError
 from core import access
@@ -77,6 +77,7 @@ def _adjs(c):
 
 # --- AT-7, AT-51, R19, R65 --------------------------------------------------------------------------------
 
+@fake_cfo_approval
 def test_at7_at51_unlinked_end_prorates_march_cancels_after(w):
     c, a = secondment_contract(w)
     for m in (2, 3):

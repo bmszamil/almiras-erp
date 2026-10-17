@@ -8,14 +8,17 @@ validation, ZATCA hand-off and posting on clearance are the real ones:
 
 - the draft is created and submitted by a stand-in human clerk of the entity (as built, invoicing has no
   system-created draft yet; the real hook will record ``source="system:billing"`` and the billing system user);
-- with ``auto_issue_from_approved_contract`` the invoice is approved by the CFO who approved ``billed_version``
-  (R53), on the invoicing clock (the run date in tests), so its clearance posting is accepted by the ledger as
-  built; otherwise it stays ``submitted`` for the CFO (R35, invoicing R60);
+- with ``auto_issue_from_approved_contract`` the invoice is approved **as** the CFO who approved
+  ``billed_version`` (R53), on the invoicing clock (the run date in tests), so its clearance posting is accepted
+  by the ledger as built. This is fake-only: the real hook must not act as the CFO (port contract item 2), and
+  tests whose posting assertions depend on it are marked ``fake_cfo_approval``; otherwise it stays ``submitted``
+  for the CFO (R35, invoicing R60);
 - correction notes are left as **drafts** (R44), with their lines from the adjustment.
 
 All-or-nothing like the real hook (R52): a refusal raises an ``InvoicingError`` with a code (R54) and leaves
-nothing behind. ``fail(code)`` makes the next calls raise that code; the third-decimal refusal is reported with
-code ``third_decimal_pending`` (the code billing.md R54 asks invoicing to add).
+nothing behind. ``fail(code)`` makes the next calls raise that code; the third-decimal refusal is raised by the
+fake itself with code ``third_decimal_pending`` (the code billing.md R54 asks invoicing to add), never inferred
+from a message. What the real hooks must do instead is the contract in ``billing.invoicing_port``.
 """
 from contextlib import contextmanager
 from datetime import timedelta
@@ -86,16 +89,14 @@ class FakeInvoicing:
                     vat_category=row["vat_category"], vat_exemption_reason=row["vat_exemption_reason"] or None,
                     income_account=row["income_account"], unit_code=row["unit_code"],
                 )
+            _refuse_third_decimal(doc)  # before submit: invoicing checks the amounts at submit already
             doc = inv.submit_sales_document(doc, user=clerk)
             settings, _ = InvoicingSettings.objects.get_or_create(entity=period.entity)
             warnings = []
             if settings.auto_issue_from_approved_contract:
-                try:
-                    doc = inv.approve_sales_document(doc, user=period.billed_version.approved_by)
-                except InvoicingError as exc:
-                    if any("OQ-62" in m or "third decimal" in m for m in exc.messages):
-                        raise InvoicingError(exc.messages, code="third_decimal_pending") from None
-                    raise
+                # FAKE ONLY: approves as the CFO who approved billed_version. The real hook must not (port contract
+                # item 2); posting on clearance then needs R53. Tests relying on it are marked fake_cfo_approval.
+                doc = inv.approve_sales_document(doc, user=period.billed_version.approved_by)
                 warnings = list(getattr(doc, "warnings", []))
         self.by_period[period.pk] = doc.pk
         doc.warnings = warnings
@@ -137,6 +138,20 @@ class FakeInvoicing:
             doc = inv.return_to_draft(doc, user=clerk)
         inv.delete_sales_draft(doc, user=clerk)
         self.discarded.append(document.pk)
+
+
+def _refuse_third_decimal(doc):
+    """Port contract item 5: the third-decimal refusal (OQ-62) comes with its own code, ``third_decimal_pending``.
+    Invoicing as built reports it only inside a generic issue refusal, so the fake checks the amounts itself (line
+    nets and VAT, document totals, 3-decimal currencies) and raises the coded error; billing never reads messages."""
+    if doc.currency.minor_units != 3:
+        return
+    lines = list(doc.lines.all())
+    amounts = [line.net_amount for line in lines] + [line.vat_amount for line in lines]
+    amounts += [sum(amounts[:len(lines)], Decimal("0")), sum(amounts[len(lines):], Decimal("0"))]
+    if any(a is not None and a != a.quantize(Decimal("0.01")) for a in amounts):
+        raise InvoicingError("Fake invoicing: 3-decimal amounts await ZATCA confirmation (OQ-62). / "
+                             "رفض تجريبي: المبالغ بثلاث خانات بانتظار تأكيد الهيئة.", code="third_decimal_pending")
 
 
 @contextmanager

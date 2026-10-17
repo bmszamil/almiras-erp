@@ -8,7 +8,8 @@ import pytest
 from django.core.management import CommandError, call_command
 
 from billing import services
-from billing.conftest import approved, clear, contract, period, run, set_auto_issue, submitted, version
+from billing.conftest import (approved, clear, contract, fake_cfo_approval, period, run, set_auto_issue, submitted,
+                              version)
 from billing.models import BillingNotification, BillingPeriod, BillingRun
 from core import access
 from core.access.testing import make_user, member
@@ -57,6 +58,7 @@ def test_at2_rerun_never_bills_twice(w):
     assert w.fake.invoice_calls == [period(c, date(2027, 3, 1)).pk]  # invoicing was not even asked again
 
 
+@fake_cfo_approval
 def test_at4_at39_invoice_from_contract_issued_without_per_invoice_approval(w):
     c = approved(w, start=date(2027, 3, 1))
     run(w, date(2027, 3, 1))
@@ -64,7 +66,7 @@ def test_at4_at39_invoice_from_contract_issued_without_per_invoice_approval(w):
     doc = SalesDocument.objects.get(pk=p.sales_document_id)
     assert (doc.status, doc.issue_date, doc.supply_date, doc.supply_end_date) == (
         "issued", date(2027, 3, 1), date(2027, 3, 1), date(2027, 3, 31))
-    assert doc.approved_by == w.c  # the contract approver (R53), no per-invoice approval (D8)
+    assert doc.approved_by == w.c  # the contract approver (R53), no per-invoice approval (D8); fake-only today
     assert doc.retention_class == "capital_asset_real_estate"  # R28: rent on real estate
     assert p.billed_version == c.current_version and p.invoice_lines[0]["net"] == "10000.00"
     line = doc.lines.get()
@@ -72,7 +74,7 @@ def test_at4_at39_invoice_from_contract_issued_without_per_invoice_approval(w):
     assert "2027-03-01 to 2027-03-31" in line.description_en and "من 2027-03-01" in line.description_ar
     final = clear(w, doc)
     entry = final.journal_entry
-    assert entry.posted_by == w.c
+    assert entry.posted_by == w.c  # fake-only until R53: the fake approved as the CFO
     assert sorted((ln.account.code, ln.debit, ln.credit) for ln in entry.lines.all()) == [  # B1
         ("1200", D("11500.00"), D("0.00")), ("2200", D("0.00"), D("1500.00")), ("4100", D("0.00"), D("10000.00"))]
     assert run(w, date(2027, 3, 1)).generated_count == 0
@@ -277,6 +279,7 @@ def test_at18_price_steps(w):
     assert period(b, date(2027, 8, 1)).sales_document.total_net == D("11000.00")
 
 
+@fake_cfo_approval
 def test_at19_foreign_currency_rate_on_issue_date_or_failed(w):
     _rate(w, "USD", "3.75", date(2027, 3, 1))
     usd = approved(w, start=date(2027, 3, 1), currency="USD", lines=(("rent_commercial", "1000.00"),))
@@ -312,6 +315,28 @@ def test_at45_kwd_third_decimal_held_round_amounts_issued(w):
     run(w, date(2027, 2, 2))
     assert period(c, date(2027, 1, 15)).status == "held"  # held again, no number used
     assert _numbers_used(w.alm) == used + 1
+
+
+def test_r54_third_decimal_refusal_mapped_by_code_only(w, monkeypatch):
+    """The fake raises ``third_decimal_pending`` itself (VAT 150.1515 -> 150.152 here, the net ends in 0); a refusal
+    whose message talks about third decimals but has another code is a plain failure (review finding 5)."""
+    _rate(w, "KWD", "12.2", date(2027, 3, 1))
+    c = approved(w, start=date(2027, 3, 1), currency="KWD", lines=(("rent_commercial", "1001.010"),))
+    used = _numbers_used(w.alm)
+    run(w, date(2027, 3, 1))
+    p = period(c, date(2027, 3, 1))
+    assert (p.status, p.error_code, p.sales_document) == ("held", "third_decimal_pending", None)
+    assert "OQ-62" in p.hold_reason_en and _numbers_used(w.alm) == used
+    other = approved(w, start=date(2027, 3, 1))
+
+    def refuse(period, user):
+        raise InvoicingError("Amounts with a third decimal other than 0 (OQ-62). / خانة عشرية ثالثة.",
+                             code="document_invalid")
+
+    monkeypatch.setattr(w.fake, "create_from_billing", refuse)
+    run(w, date(2027, 3, 2))
+    q = period(other, date(2027, 3, 1))
+    assert (q.status, q.error_code) == ("failed", "document_invalid")  # not held: the code decides
 
 
 # --- AT-46, R66, R67: command, manual runs ---------------------------------------------------------------------
