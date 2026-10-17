@@ -60,6 +60,7 @@ from .models import (
     VatRate,
     TreatyCertificate,
     Vendor,
+    validate_treaty_document,
     VendorPayment,
     WhtCategory,
     WhtDeduction,
@@ -2463,7 +2464,7 @@ def _wht_plan(payment, on):
                                 f"فئة الاستقطاع {code} لا تنشأ في كيان يطبق الضوابط الشرعية.")
                 continue
             cert = _treaty_certificate(vendor, code, on)
-            rate = cert.treaty_rate if cert else row.rate
+            rate = min(cert.treaty_rate, row.rate) if cert else row.rate  # a treaty never raises the rate
             r = rate / HUNDRED
             with localcontext() as ctx:
                 ctx.prec = 60
@@ -2516,33 +2517,109 @@ def wht_preview(payment, *, user):
     }
 
 
-def add_treaty_certificate(vendor, *, user, country, treaty_rate, valid_from, valid_to, received_on,
-                           wht_category=None, document=None):
-    """Enter a treaty certificate for a non-resident vendor (``invoicing.enter_wht_data``; R62). It counts only
-    once a second person verifies it (:func:`verify_treaty_certificate`)."""
-    vendor = Vendor.objects.select_related("entity").get(pk=vendor.pk)
-    access.require(user, vendor.entity, "invoicing.enter_wht_data")
+def _treaty_rate_cap(cert):
+    """The statutory rate a treaty certificate may not exceed (review finding 6): its category's
+    ``WhtCategory.rate`` effective on ``valid_from``; for a certificate for all categories, the lowest of them
+    (Sharia-prohibited categories left out where Sharia is enforced). None if no rate is effective then."""
+    on = cert.valid_from
+    if cert.wht_category_id:
+        rows = [_wht_rate_row(cert.wht_category.code, on)]
+    else:
+        rows = [_wht_rate_row(code, on) for code in
+                WhtCategory.objects.order_by().values_list("code", flat=True).distinct()]
+        rows = [r for r in rows if r is not None and not (r.sharia_prohibited and cert.entity.sharia_enforced)]
+    rows = [r for r in rows if r is not None]
+    return min(r.rate for r in rows) if rows else None
+
+
+def _check_treaty_certificate(cert, vendor):
+    """R62 (review findings 4, 6): what a certificate must satisfy when entered, changed and verified."""
     if vendor.is_resident:
         raise error("Treaty certificates are for non-resident vendors.", "شهادات الاتفاقيات للموردين غير المقيمين.",
                     code="vendor_resident")
-    rate = _decimal(treaty_rate, "treaty rate")
-    if not fx.has_places(rate, 2) or not (ZERO <= rate < HUNDRED):
-        raise error("The treaty rate is a percentage from 0 to below 100 with 2 decimals.",
-                    "نسبة الاتفاقية نسبة مئوية من 0 إلى أقل من 100 بخانتين عشريتين.", code="treaty_rate")
-    if valid_to < valid_from:
-        raise error("The certificate ends before it starts.", "تنتهي الشهادة قبل أن تبدأ.", code="treaty_dates")
-    if wht_category is not None and not isinstance(wht_category, WhtCategory):
-        wht_category = _wht_category(wht_category)
-    cert = TreatyCertificate(entity=vendor.entity, vendor=vendor, country=str(country).upper(), treaty_rate=rate,
-                             wht_category=wht_category, valid_from=valid_from, valid_to=valid_to,
-                             received_on=received_on, created_by=user)
+    cert.country = str(cert.country or "").upper()
     try:
         validate_country_code(cert.country)
     except Exception:  # noqa: BLE001
-        raise error(f"{country!r} is not an ISO country code.", f"{country!r} ليس رمز دولة صالحًا.",
+        raise error(f"{cert.country!r} is not an ISO country code.", f"{cert.country!r} ليس رمز دولة صالحًا.",
                     code="country") from None
+    residence = (vendor.residence_country or "").upper()
+    if cert.country != residence:
+        raise error(f"The treaty country {cert.country} is not the vendor's country of residence "
+                    f"({residence or 'not set'}); treaty relief follows residence (R62).",
+                    f"دولة الاتفاقية {cert.country} ليست دولة إقامة المورد ({residence or 'غير محددة'})؛ "
+                    f"الإعفاء بموجب الاتفاقية يتبع الإقامة.", code="treaty_country_mismatch")
+    rate = cert.treaty_rate
+    if not isinstance(rate, Decimal) or not fx.has_places(rate, 2) or not (ZERO <= rate < HUNDRED):
+        raise error("The treaty rate is a percentage from 0 to below 100 with 2 decimals.",
+                    "نسبة الاتفاقية نسبة مئوية من 0 إلى أقل من 100 بخانتين عشريتين.", code="treaty_rate")
+    if cert.valid_to < cert.valid_from:
+        raise error("The certificate ends before it starts.", "تنتهي الشهادة قبل أن تبدأ.", code="treaty_dates")
+    cap = _treaty_rate_cap(cert)
+    if cap is None:
+        raise error(f"No statutory withholding tax rate is effective on {cert.valid_from} to compare the treaty "
+                    "rate with.", f"لا توجد نسبة استقطاع نظامية سارية بتاريخ {cert.valid_from} لمقارنة نسبة الاتفاقية بها.",
+                    code="treaty_rate_above_statutory")
+    if rate > cap:
+        what = cert.wht_category.code if cert.wht_category_id else "the lowest category rate"
+        what_ar = cert.wht_category.code if cert.wht_category_id else "أدنى نسبة بين الفئات"
+        raise error(f"The treaty rate {rate}% is above the statutory rate {cap}% ({what}); a treaty only reduces "
+                    "the tax (R62).",
+                    f"نسبة الاتفاقية {rate}% أعلى من النسبة النظامية {cap}% ({what_ar})؛ الاتفاقية تخفض الضريبة فقط.",
+                    code="treaty_rate_above_statutory")
+    if cert.document:
+        validate_treaty_document(cert.document)
+
+
+TREATY_FIELDS = {"country", "treaty_rate", "wht_category", "valid_from", "valid_to", "received_on", "document"}
+
+
+def _treaty_values(cert, fields):
+    for name, value in fields.items():
+        if name == "treaty_rate":
+            value = _decimal(value, "treaty rate")
+        elif name == "wht_category" and value is not None and not isinstance(value, WhtCategory):
+            value = _wht_category(value)
+        setattr(cert, name, value)
+
+
+def add_treaty_certificate(vendor, *, user, country, treaty_rate, valid_from, valid_to, received_on,
+                           wht_category=None, document=None):
+    """Enter a treaty certificate for a non-resident vendor (``invoicing.enter_wht_data``; R62). It counts only
+    once a second person verifies it (:func:`verify_treaty_certificate`). The country is the vendor's country of
+    residence; the rate is not above the statutory rate (review finding 6); the scan is a PDF, PNG or JPG of at
+    most 10 MB (finding 4)."""
+    vendor = Vendor.objects.select_related("entity").get(pk=vendor.pk)
+    access.require(user, vendor.entity, "invoicing.enter_wht_data")
+    cert = TreatyCertificate(entity=vendor.entity, vendor=vendor, created_by=user)
+    _treaty_values(cert, {"country": country, "treaty_rate": treaty_rate, "valid_from": valid_from,
+                          "valid_to": valid_to, "received_on": received_on, "wht_category": wht_category})
     if document is not None:
         cert.document = document
+    _check_treaty_certificate(cert, vendor)
+    cert._service_write = True
+    cert.save()
+    return cert
+
+
+@transaction.atomic
+def update_treaty_certificate(certificate, *, user, **fields):
+    """Change an unverified treaty certificate (``invoicing.enter_wht_data``); records who changed it, and that
+    person cannot verify it either (review finding 4). A verified certificate is never changed."""
+    cert = TreatyCertificate.objects.select_for_update(of=("self",)).select_related(
+        "entity", "vendor", "wht_category").get(pk=certificate.pk)
+    access.require(user, cert.entity, "invoicing.enter_wht_data")
+    if cert.verified_at is not None:
+        raise error("A verified treaty certificate is never edited; enter a new one.",
+                    "لا تُعدَّل شهادة الاتفاقية بعد التحقق منها؛ أدخل شهادة جديدة.", code="certificate_verified")
+    unknown = set(fields) - TREATY_FIELDS
+    if unknown:
+        raise error(f"These fields are not changed here: {', '.join(sorted(unknown))}.",
+                    f"لا تُعدَّل هذه الحقول هنا: {', '.join(sorted(unknown))}.", code="field_not_editable")
+    _treaty_values(cert, fields)
+    _check_treaty_certificate(cert, cert.vendor)
+    cert.modified_by, cert.modified_at = user, timezone.now()
+    cert._service_write = True
     cert.save()
     return cert
 
@@ -2550,14 +2627,18 @@ def add_treaty_certificate(vendor, *, user, country, treaty_rate, valid_from, va
 @transaction.atomic
 def verify_treaty_certificate(certificate, *, user):
     """A second person verifies a treaty certificate (``invoicing.verify_wht_data``; never the one who entered
-    it). From then on it is never edited (3.2)."""
-    cert = TreatyCertificate.objects.select_for_update(of=("self",)).select_related("entity").get(pk=certificate.pk)
+    or last changed it). The R62 checks run again (the vendor's residence may have changed). From then on it is
+    never edited (3.2)."""
+    cert = TreatyCertificate.objects.select_for_update(of=("self",)).select_related(
+        "entity", "vendor", "wht_category").get(pk=certificate.pk)
     access.require(user, cert.entity, "invoicing.verify_wht_data")
-    if cert.created_by_id == user.pk:
+    if user.pk in (cert.created_by_id, cert.modified_by_id):
         access.deny(user, cert.entity, "invoicing.verify_wht_data", "self_approval")
     if cert.verified_at is not None:
         raise error("The certificate is already verified.", "تم التحقق من الشهادة مسبقًا.", code="certificate_verified")
+    _check_treaty_certificate(cert, Vendor.objects.get(pk=cert.vendor_id))
     cert.verified_by, cert.verified_at = user, timezone.now()
+    cert._service_write = True
     cert.save()
     return cert
 

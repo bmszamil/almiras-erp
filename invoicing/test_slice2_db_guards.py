@@ -71,3 +71,18 @@ def test_purification_reversal_only_with_its_own_reversal_entry(w):
     _refused("UPDATE invoicing_purificationtransfer SET reversal_reason = 'x' WHERE id = %s", [r.pk])
     _refused("UPDATE invoicing_purificationtransfer SET status = 'posted' WHERE id = %s", [r.pk])
     _refused("DELETE FROM invoicing_purificationtransfer WHERE id = %s", [r.pk])
+
+
+def test_unverified_certificate_edits_record_the_modifier_and_a_third_person_verifies(w):
+    nr = nr_vendor(w)
+    cert = services.add_treaty_certificate(nr, user=w.ap, country="GB", treaty_rate="5.00", valid_from=date(2027, 1, 1),
+                                           valid_to=date(2027, 12, 31), received_on=date(2027, 1, 1))
+    _refused("UPDATE invoicing_treatycertificate SET treaty_rate = 0 WHERE id = %s", [cert.pk])  # no modifier
+    _refused("UPDATE invoicing_treatycertificate SET verified_by_id = created_by_id, verified_at = now() "
+             "WHERE id = %s", [cert.pk])  # the creator never verifies
+    _refused("UPDATE invoicing_treatycertificate SET vendor_id = %s, modified_by_id = %s, modified_at = now() "
+             "WHERE id = %s", [w.vendor.pk, w.accountant.pk, cert.pk])
+    services.update_treaty_certificate(cert, user=w.accountant, treaty_rate="1.00")
+    _refused("UPDATE invoicing_treatycertificate SET verified_by_id = %s, verified_at = now() WHERE id = %s",
+             [w.accountant.pk, cert.pk])  # nor the last modifier
+    _refused("DELETE FROM invoicing_treatycertificate WHERE id = %s", [cert.pk])

@@ -1167,9 +1167,55 @@ class VendorPayment(MoneyMovement):
         return f"{self.number or 'DRAFT'} {self.amount} {self.currency_id} ({self.status})"
 
 
+TREATY_DOCUMENT_TYPES = {".pdf": (b"%PDF-",), ".png": (b"\x89PNG\r\n\x1a\n",), ".jpg": (b"\xff\xd8\xff",),
+                         ".jpeg": (b"\xff\xd8\xff",)}
+TREATY_DOCUMENT_MAX_BYTES = 10 * 1024 * 1024
+
+
+def validate_treaty_document(upload):
+    """Review finding 4: a treaty certificate scan is a PDF, PNG or JPEG of at most 10 MB, by name and content."""
+    if not upload:
+        return
+    import os
+
+    ext = os.path.splitext(getattr(upload, "name", "") or "")[1].lower()
+    if ext not in TREATY_DOCUMENT_TYPES:
+        raise error("The certificate is uploaded as a PDF, PNG or JPG file.",
+                    "تُرفع الشهادة بصيغة PDF أو PNG أو JPG.", code="certificate_file_type")
+    size = getattr(upload, "size", None)
+    if size is None or size > TREATY_DOCUMENT_MAX_BYTES:
+        raise error("The certificate file is at most 10 MB.", "حجم ملف الشهادة 10 ميغابايت كحد أقصى.",
+                    code="certificate_file_size")
+    position = upload.tell() if hasattr(upload, "tell") else None
+    upload.seek(0)
+    head = upload.read(8)
+    if position is not None:
+        upload.seek(position)
+    if not any(head.startswith(magic) for magic in TREATY_DOCUMENT_TYPES[ext]):
+        raise error("The certificate file content is not the PDF, PNG or JPG its name says.",
+                    "محتوى ملف الشهادة لا يطابق صيغة PDF أو PNG أو JPG المذكورة في اسمه.",
+                    code="certificate_file_type")
+
+
+class TreatyCertificateQuerySet(models.QuerySet):
+    """Bulk writes skip save(): certificates change only through invoicing.services (review finding 4)."""
+
+    def update(self, **kwargs):
+        raise error("Treaty certificates are changed only through invoicing.services; a verified one never.",
+                    "تُعدَّل شهادات الاتفاقيات من خلال خدمات الفوترة فقط، ولا تُعدَّل بعد التحقق منها.",
+                    code="service_only")
+
+    def delete(self):
+        raise error("Treaty certificates are never deleted.", "لا تُحذف شهادات الاتفاقيات.", code="certificate_kept")
+
+
 class TreatyCertificate(models.Model):
-    """Treaty relief evidence for a non-resident vendor (R62; 3.2). Never edited after verification; a new
-    certificate replaces it. ``treaty_rate`` 0.00 = exempt; ``wht_category`` null = all categories."""
+    """Treaty relief evidence for a non-resident vendor (R62; 3.2). Written only by invoicing.services, which
+    records who entered and who last changed it; a second person (neither of them) verifies it, and from then on
+    it is never edited (a new certificate replaces it). ``treaty_rate`` 0.00 = exempt; ``wht_category`` null = all
+    categories."""
+
+    objects = TreatyCertificateQuerySet.as_manager()
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     vendor = models.ForeignKey(Vendor, on_delete=models.PROTECT, related_name="treaty_certificates",
@@ -1181,11 +1227,16 @@ class TreatyCertificate(models.Model):
                                      verbose_name=bi("Category (blank = all)", "الفئة (فارغ = الكل)"))
     valid_from = models.DateField(bi("Valid from", "ساري من"))
     valid_to = models.DateField(bi("Valid to", "ساري حتى"))
-    document = models.FileField(bi("Certificate", "الشهادة"), upload_to="invoicing/treaty/%Y/", blank=True)
+    document = models.FileField(bi("Certificate", "الشهادة"), upload_to="invoicing/treaty/%Y/", blank=True,
+                                validators=[validate_treaty_document],
+                                help_text=bi("PDF, PNG or JPG, at most 10 MB", "PDF أو PNG أو JPG، بحد أقصى 10 ميغابايت"))
     received_on = models.DateField(bi("Received on", "تاريخ الاستلام"))
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
                                    verbose_name=bi("Entered by", "أدخله"))
     created_at = models.DateTimeField(bi("Entered at", "تاريخ الإدخال"), auto_now_add=True)
+    modified_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="+", verbose_name=bi("Last changed by", "آخر من عدّله"))
+    modified_at = models.DateTimeField(bi("Last changed at", "تاريخ آخر تعديل"), null=True, blank=True)
     verified_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                     related_name="+", verbose_name=bi("Verified by", "تحقق منه"))
     verified_at = models.DateTimeField(bi("Verified at", "تاريخ التحقق"), null=True, blank=True)
@@ -1200,11 +1251,15 @@ class TreatyCertificate(models.Model):
         ]
 
     def save(self, *args, **kwargs):
+        allowed, self._service_write = getattr(self, "_service_write", False), False
         if self.pk:
             stored = type(self)._base_manager.filter(pk=self.pk).values("verified_at").first()
             if stored and stored["verified_at"] is not None:
                 raise error("A verified treaty certificate is never edited; enter a new one.",
                             "لا تُعدَّل شهادة الاتفاقية بعد التحقق منها؛ أدخل شهادة جديدة.", code="certificate_verified")
+        if not allowed:  # review finding 4: an edit always records who made it (update_treaty_certificate)
+            raise error("Treaty certificates are entered and changed only through invoicing.services.",
+                        "تُدخل شهادات الاتفاقيات وتُعدَّل من خلال خدمات الفوترة فقط.", code="service_only")
         if self.entity_id != self.vendor.entity_id:
             raise error("A certificate belongs to its vendor's entity.", "تتبع الشهادة كيان المورد.",
                         code="entity_mismatch")
