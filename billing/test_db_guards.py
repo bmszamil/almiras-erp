@@ -158,9 +158,15 @@ def test_at3_concurrent_runs_bill_once(monkeypatch):
     from billing import invoicing_port
     from billing.conftest import contract
 
+    from datetime import datetime, time as clock_time
+
+    from invoicing import services as inv
+
     w = _seeded_world()
     monkeypatch.setattr(invoicing_port, "_override", w.fake)
     monkeypatch.setattr(services, "_today", lambda: date(2027, 1, 1))
+    monkeypatch.setattr(inv, "_riyadh_now", lambda: datetime.combine(date(2027, 1, 1), clock_time(10),
+                                                                    tzinfo=services.RIYADH))
     c = services.approve_contract(contract(w), user=w.c)
     results, errors = [], []
 
@@ -178,7 +184,7 @@ def test_at3_concurrent_runs_bill_once(monkeypatch):
     for t in threads:
         t.join(timeout=60)
     assert not errors, errors
-    assert sorted(r.generated_count for r in results) == [0, 1]
+    assert sorted((r.generated_count, r.failed_count) for r in results) == [(0, 0), (1, 0)]
     assert SalesDocument.objects.filter(entity=w.alm, doc_type="invoice").count() == 1
     assert BillingPeriod.objects.get(contract=c, period_start=date(2027, 1, 1)).status == "generated"
 
