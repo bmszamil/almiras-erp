@@ -4,6 +4,7 @@ DEBUG stays off (production-like); a throwaway secret key is set before the base
 """
 import os
 
+os.environ.pop("DJANGO_DEBUG", None)  # tests always run production-like, whatever the shell exports
 os.environ.setdefault("DJANGO_SECRET_KEY", "test-only-not-secret")
 
 from .settings import *  # noqa: E402,F401,F403
