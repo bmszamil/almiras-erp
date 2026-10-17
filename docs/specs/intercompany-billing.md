@@ -20,8 +20,12 @@ All by Badr Alzamil, Managing Partner, 16 Oct 2026.
 | D8 | Subsidiaries join the same ERP later. When both entities are in the ERP, the receiving entity's bill is created automatically as a draft mirroring the invoice. When the counterparty is not on the ERP yet, only Almiras's side is booked. |
 | D9 | The rental assets module (leases, vehicles with fuel/mileage logs) is a later wave. Billing agreements must be able to take lines from rental leases later. |
 | D10 | Records created by future AI agents carry a `source` field (human / import / agent) and are drafts only. |
-| D12 | (16 Oct 2026, answers to Q5/Q14) **Cost-plus allocation basis is chosen per agreement:** fixed %, headcount or revenue. **Monthly invoices are dated the last day of the service month.** |
+| D12 | (16 Oct 2026, answers to Q5/Q14) **Cost-plus allocation basis is chosen per agreement:** fixed %, headcount or revenue. ~~**Monthly invoices are dated the last day of the service month.**~~ (dating replaced by D13) |
 | D11 | (16 Oct 2026, answer to Q1) **No late-payment penalties** on intercompany invoices. The penalty feature is not built. |
+| D13 | (17 Oct 2026, replaces the dating part of D12) **Invoice issue date = the actual issue date** (when final approval issues it); the service month is recorded in `supply_date_from` / `supply_date_to`. An alert is raised when an invoice for month M is still not issued after the 15th of month M+1 (ZATCA 15-day rule). Credit notes record a `trigger_date` and warn when created after the 15th of the month following the trigger month. **VAT rate is taken at the tax point (issue date).** |
+| D14 | (17 Oct 2026) **Partial months are pro-rated:** fixed fees (and the cost-plus pool share) are pro-rated by the calendar days the agreement is active in the billing period. |
+| D15 | (17 Oct 2026) **Agents and integrations create drafts only and cannot submit for approval.** (Approvals engine change follows separately on main as approvals D20; this module blocks it now.) |
+| D16 | (17 Oct 2026, answer to Q2) **No VAT group:** every recharge carries VAT per its category; no VAT-group feature. |
 
 ## 3. Data model
 All models: `entity` FK (the issuing entity unless stated), `source` (choice: `human`, `import`, `agent`; plus `source_agent` char, required when `agent`), `created_by`, `created_at`. Money is `Decimal(18,2)` with explicit `currency` (default entity `base_currency`). "Bilingual" = `_en` and `_ar` fields, both required.
@@ -205,7 +209,7 @@ Underlying costs stay in the issuer's expense accounts; the recharge is booked g
 | System | Direction | What |
 | --- | --- | --- |
 | `ledger` | out | Journal entries via `create_entry` / `post_entry`; reads posted lines for cost pools; `intercompany_balances` for reconciliation |
-| ZATCA module (separate spec) | out / in | After issue: invoice/credit note handed to `zatca.services` for generation, signing, QR and clearance/reporting. In: `zatca_status`, UUID, hash. This spec defines no XML. |
+| ZATCA module (separate spec) | out / in | After issue: invoice/credit note handed to `zatca.services` for generation, signing, QR and clearance/reporting. In: `zatca_status`, UUID, hash. This spec defines no XML. The previous-invoice hash (PIH), invoice counter (ICV), QR code, cryptographic stamp and debit notes (type 383) belong to the ZATCA module, not this one. |
 | Rental module (later wave) | in | Creates `BillableItem` rows and agreements with `source_type="rental.lease"` |
 | HR/payroll (later), GOSI, Mudad | in (later) | Payroll cost per seconded employee for cost pools; no direct GOSI/Mudad calls from this module |
 | AP module (later) | out | Mirror bills move there when it exists (Q11) |
@@ -262,7 +266,7 @@ Per entity; a role on ALM gives nothing on LFN.
 | # | Question | Owner |
 | --- | --- | --- |
 | Q1 | **Answered — none (D11).** ~~Are late-payment penalties used at all? If yes: amount basis, and confirmation they go to 2600 Charity payable and then to which charity, and whether a fixed penalty (not time-based) is acceptable. | Sharia adviser + MP |
-| Q2 | Are any group entities in, or planned for, a ZATCA VAT group? Intra-group supplies inside a VAT group are outside VAT, which conflicts with "VAT invoice on every recharge". | Tax adviser |
+| Q2 | **Answered — no VAT group (D16).** ~~Are any group entities in, or planned for, a ZATCA VAT group? Intra-group supplies inside a VAT group are outside VAT, which conflicts with "VAT invoice on every recharge".~~ | Tax adviser |
 | Q3 | Saudi transfer pricing bylaws: do they apply to these transactions given Zakat (not income tax) status of entities and any foreign shareholders? Required methods, documentation, benchmark and disclosure form. | Tax adviser |
 | Q4 | Equity-method associates: how to treat unrealised profit on recharges in consolidation, and do associates get the same pricing as subsidiaries? | Accountant / auditor |
 | Q5 | Cost-plus allocation: fixed % per agreement, or a driver (headcount, revenue, hours)? Must allocations across a pool sum to 100%, and is Almiras's own share left unbilled? | Accountant + MP |
