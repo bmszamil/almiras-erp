@@ -734,3 +734,37 @@ def test_agent_can_only_draft_sales_documents(w, agent):
     with pytest.raises(access.AccessDenied):
         approve(w, doc, agent)
     assert approve(w, doc).status == "issued"
+
+
+def test_r57_approver_who_returns_a_document_may_still_approve_it(w):
+    doc = invoice(w)
+    services.return_to_draft(doc, user=w.cfo)
+    services.submit_sales_document(doc, user=w.clerk)
+    assert approve(w, doc).approved_by == w.cfo
+
+
+def test_r41_failed_posting_on_clearance_keeps_the_result_and_can_be_retried(w):
+    from ledger.models import Account
+
+    issued = approve(w, invoice(w))
+    Account.objects.filter(entity=w.alm, code="4100").update(is_active=False)
+    with pytest.raises(LedgerError):
+        w.zatca.clear(issued)
+    stored = SalesDocument.objects.get(pk=issued.pk)
+    assert (stored.status, stored.zatca_status, stored.journal_entry_id) == ("issued", "cleared", None)
+    Account.objects.filter(entity=w.alm, code="4100").update(is_active=True)
+    done = services.post_cleared_document(stored, user=w.queue)
+    assert done.status == "final" and done.journal_entry.posted_by == w.cfo
+
+
+def test_r45_zatca_fields_are_written_only_by_the_hand_off(w):
+    doc = services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10))
+    doc.zatca_hash = "forged"
+    with pytest.raises(InvoicingError) as exc:
+        doc.save()
+    assert exc.value.code == "zatca_fields"
+    with pytest.raises(InvoicingError):
+        SalesDocument(entity=w.alm, doc_type="invoice", customer=w.customer, issue_date=date(2027, 1, 1),
+                      currency_id="SAR", created_by=w.clerk, zatca_status="cleared").save()
+    with pytest.raises(InvoicingError):
+        SalesDocument.objects.filter(pk=doc.pk).update(zatca_status="cleared")

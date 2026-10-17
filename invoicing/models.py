@@ -387,6 +387,9 @@ class GuardedQuerySet(models.QuerySet):
     editable_statuses = ("draft",)
 
     def update(self, **kwargs):
+        if any(name.startswith("zatca_") for name in kwargs):  # R45
+            raise error("ZATCA fields are written only by the ZATCA hand-off.",
+                        "حقول الهيئة تكتبها واجهة الربط مع الهيئة فقط.", code="zatca_fields")
         if "status" in kwargs or self.exclude(status__in=self.editable_statuses).exists():
             raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
         return super().update(**kwargs)
@@ -673,6 +676,19 @@ class SalesDocument(Tracked, Snapshot, Guarded):
             models.UniqueConstraint(fields=["entity", "number"], condition=~models.Q(number=""),
                                     name="sales_number_per_entity"),
         ]
+
+    ZATCA_FIELDS = ("zatca_status", "zatca_icv", "zatca_previous_hash", "zatca_hash", "zatca_qr", "zatca_messages")
+
+    def save(self, *args, **kwargs):
+        # R45: zatca_* change only in saves made by the ZATCA hand-off (port and result callback).
+        if not getattr(self, "_service_write", False):
+            stored = type(self)._base_manager.filter(pk=self.pk).values(*self.ZATCA_FIELDS).first() if self.pk else None
+            current = {name: getattr(self, name) for name in self.ZATCA_FIELDS}
+            expected = stored or {name: self._meta.get_field(name).get_default() for name in self.ZATCA_FIELDS}
+            if current != expected:
+                raise error("ZATCA fields are written only by the ZATCA hand-off.",
+                            "حقول الهيئة تكتبها واجهة الربط مع الهيئة فقط.", code="zatca_fields")
+        super().save(*args, **kwargs)
 
     @property
     def zatca_type_code(self):

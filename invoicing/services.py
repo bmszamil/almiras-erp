@@ -615,7 +615,9 @@ def return_to_draft(document, *, user):
         raise error("Only submitted documents return to draft.", "تعود المستندات المقدمة فقط إلى مسودة.",
                     code="not_submitted")
     doc.status = Status.DRAFT
-    _touch(doc, user)
+    # Earlier approvals no longer count (access R42), but returning it does not make the user a modifier:
+    # the approver who sends it back for edits may still approve it later.
+    doc.modified_at = timezone.now()
     doc._service_write = True
     doc.save()
     return doc
@@ -1783,11 +1785,19 @@ def _receipt_lines(document):
     return _with_settlements(entity, document.date, cur, plain, settlements, user)
 
 
+def _no_payment_without_wht(vendor, kind):
+    """D14 / R61 to R64: payments to non-resident vendors carry withholding tax, which is not built in slice 1."""
+    if not vendor.is_resident and kind == VendorPayment.Kind.PAYMENT:
+        raise error("Payments to non-resident vendors wait for withholding tax (R61 to R64, not built yet).",
+                    "المدفوعات للموردين غير المقيمين بانتظار ضريبة الاستقطاع (غير مبنية بعد).", code="wht_not_built")
+
+
 def create_vendor_payment(entity, *, user, vendor, date, amount, currency=None, bank_account=None,
                           kind=VendorPayment.Kind.PAYMENT, reference_en="", reference_ar="", bank_reference=""):
     """Draft vendor payment or refund received (``invoicing.create_vendor_payment``; agents never, catalogue)."""
     access.require(user, entity, "invoicing.create_vendor_payment")
     _same_entity(entity, vendor, "vendor", "المورد")
+    _no_payment_without_wht(vendor, kind)
     if kind not in VendorPayment.Kind.values:
         raise error("Unknown payment kind.", "نوع سند غير معروف.", code="kind")
     with transaction.atomic():
@@ -1838,6 +1848,7 @@ def approve_vendor_payment(payment, *, user):
     """CFO approval posts a submitted vendor payment at once (R59); refused postings roll back (no number used)."""
     payment = VendorPayment.objects.select_related("entity").get(pk=payment.pk)
     grant = access.require(user, payment.entity, "invoicing.approve_vendor_payment", document=payment)
+    _no_payment_without_wht(payment.vendor, payment.kind)
     with transaction.atomic():
         payment = _post_money(payment, user=user, grant=grant, receivable=False)
         payment.approved_by, payment.approved_at = user, payment.posted_at
