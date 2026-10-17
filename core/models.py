@@ -31,6 +31,14 @@ class Entity(models.Model):
     ownership_pct = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal("100"))
     consolidation = models.CharField(max_length=10, choices=Consolidation.choices, default=Consolidation.FULL)
     sharia_enforced = models.BooleanField(default=True)
+    books_in_erp = models.BooleanField(
+        default=False,
+        help_text="True when the entity keeps its own ledger in this ERP. Drives mirror bills for intercompany "
+        "invoices (intercompany spec D8, R15).",
+    )
+    books_in_erp_from = models.DateField(
+        null=True, blank=True, help_text="First invoice date for which a mirror bill is created. Required when books_in_erp."
+    )
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -42,6 +50,13 @@ class Entity(models.Model):
             raise ValidationError("An entity without a parent must be the parent (reporting) entity.")
         if not (Decimal("0") < self.ownership_pct <= Decimal("100")):
             raise ValidationError("Ownership must be above 0% and at most 100%.")
+        if self.books_in_erp and self.books_in_erp_from is None:
+            raise ValidationError({"books_in_erp_from": "Set the date from which the entity keeps its books here. / "
+                                                        "حدد تاريخ بدء القيود في النظام."})
+
+    def keeps_books_on(self, date):
+        """D8/R15: the entity keeps its ledger in this ERP on `date`."""
+        return bool(self.books_in_erp and self.books_in_erp_from is not None and date >= self.books_in_erp_from)
 
     def __str__(self):
         return f"{self.code} — {self.name_en}"
