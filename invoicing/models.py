@@ -3,7 +3,8 @@
 Every business model has an ``entity`` FK (CLAUDE.md, D1). Business logic lives in
 ``invoicing.services``; the guards here only keep issued, posted and reversed
 records from being changed outside those services (R13, R24, R36).
-Money is ``Decimal`` with 2 decimals; rates are data with effective dates (3.2).
+Money is ``Decimal``: SAR amounts with 2 decimals, document-currency amounts with up to 3 (D27, R93); rates are
+data with effective dates (3.2).
 """
 import uuid
 from decimal import Decimal
@@ -16,7 +17,12 @@ from django.db import models
 from core.models import Currency, Entity, bi, validate_country_code, validate_vat_number
 
 ZERO = Decimal("0")
+# SAR and functional amounts: 2 decimals (CLAUDE.md rule 7).
 MONEY = dict(max_digits=18, decimal_places=2, default=ZERO)
+# Amounts in the document's transaction currency (D27, R93): up to 3 decimals, never more than the currency's own
+# minor units (checked by invoicing.services; ledger-fx R8).
+DOC_MONEY_FIELD = dict(max_digits=21, decimal_places=3)
+DOC_MONEY = dict(DOC_MONEY_FIELD, default=ZERO)
 RATE = dict(max_digits=20, decimal_places=10, null=True, blank=True)
 
 
@@ -516,15 +522,15 @@ class LineAmounts(models.Model):
     quantity = models.DecimalField(bi("Quantity", "الكمية"), max_digits=12, decimal_places=3)
     unit_code = models.CharField(bi("Unit", "الوحدة"), max_length=3, default="C62",
                                  validators=[RegexValidator(r"^[A-Z0-9]{2,3}\Z", "UN/ECE rec 20 code. / رمز وحدة UN/ECE.")])
-    unit_price = models.DecimalField(bi("Unit price", "سعر الوحدة"), max_digits=18, decimal_places=2)
-    line_discount = models.DecimalField(bi("Line discount", "خصم البند"), **MONEY)
-    net_amount = models.DecimalField(bi("Net amount", "المبلغ الصافي"), **MONEY)
+    unit_price = models.DecimalField(bi("Unit price", "سعر الوحدة"), **DOC_MONEY_FIELD)
+    line_discount = models.DecimalField(bi("Line discount", "خصم البند"), **DOC_MONEY)
+    net_amount = models.DecimalField(bi("Net amount", "المبلغ الصافي"), **DOC_MONEY)
     vat_category = models.CharField(bi("VAT category", "فئة الضريبة"), max_length=1, choices=VatCategory.choices)
     vat_rate = models.ForeignKey(VatRate, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("VAT rate", "نسبة الضريبة"))
     vat_exemption_reason = models.ForeignKey(VatExemptionReason, null=True, blank=True, on_delete=models.PROTECT,
                                              related_name="+", verbose_name=bi("Exemption reason", "سبب الإعفاء"))
-    vat_amount = models.DecimalField(bi("Line VAT (display)", "ضريبة البند (للعرض)"), **MONEY)
+    vat_amount = models.DecimalField(bi("Line VAT (display)", "ضريبة البند (للعرض)"), **DOC_MONEY)
 
     class Meta:
         abstract = True
@@ -690,10 +696,10 @@ class SalesDocument(Tracked, Snapshot, Guarded):
     retention_class = models.CharField(bi("Retention class", "فئة الحفظ"), max_length=30, choices=Retention.choices,
                                        default=Retention.STANDARD)
     retention_until = models.DateField(bi("Keep until", "يُحفظ حتى"), null=True, blank=True)
-    document_discount = models.DecimalField(bi("Document discount", "خصم المستند"), **MONEY)
-    total_net = models.DecimalField(bi("Total net", "الإجمالي الصافي"), **MONEY)
-    total_vat = models.DecimalField(bi("Total VAT", "إجمالي الضريبة"), **MONEY)
-    total_gross = models.DecimalField(bi("Total gross", "الإجمالي شامل الضريبة"), **MONEY)
+    document_discount = models.DecimalField(bi("Document discount", "خصم المستند"), **DOC_MONEY)
+    total_net = models.DecimalField(bi("Total net", "الإجمالي الصافي"), **DOC_MONEY)
+    total_vat = models.DecimalField(bi("Total VAT", "إجمالي الضريبة"), **DOC_MONEY)
+    total_gross = models.DecimalField(bi("Total gross", "الإجمالي شامل الضريبة"), **DOC_MONEY)
     total_vat_sar = models.DecimalField(bi("Total VAT in SAR", "إجمالي الضريبة بالريال"), **MONEY)
     total_gross_sar = models.DecimalField(bi("Total gross in SAR", "الإجمالي بالريال"), **MONEY)
     vat_breakdown = models.JSONField(bi("VAT per category", "الضريبة حسب الفئة"), default=list, blank=True)
@@ -828,13 +834,14 @@ class PurchaseDocument(Tracked, Guarded):
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
     original_document = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT,
                                           related_name="notes", verbose_name=bi("Original bill", "الفاتورة الأصلية"))
-    vendor_total_vat = models.DecimalField(bi("VAT on the vendor document", "الضريبة في مستند المورد"), **MONEY)
-    vendor_total_gross = models.DecimalField(bi("Total on the vendor document", "الإجمالي في مستند المورد"), **MONEY)
+    vendor_total_vat = models.DecimalField(bi("VAT on the vendor document", "الضريبة في مستند المورد"), **DOC_MONEY)
+    vendor_total_gross = models.DecimalField(bi("Total on the vendor document", "الإجمالي في مستند المورد"),
+                                             **DOC_MONEY)
     reverse_charge = models.BooleanField(bi("Reverse charge", "احتساب عكسي"), default=False)
-    total_net = models.DecimalField(bi("Total net", "الإجمالي الصافي"), **MONEY)
-    total_vat = models.DecimalField(bi("VAT charged by the vendor", "الضريبة التي فرضها المورد"), **MONEY)
-    total_gross = models.DecimalField(bi("Total payable", "إجمالي المستحق"), **MONEY)
-    reverse_charge_vat = models.DecimalField(bi("Reverse-charge VAT", "ضريبة الاحتساب العكسي"), **MONEY)
+    total_net = models.DecimalField(bi("Total net", "الإجمالي الصافي"), **DOC_MONEY)
+    total_vat = models.DecimalField(bi("VAT charged by the vendor", "الضريبة التي فرضها المورد"), **DOC_MONEY)
+    total_gross = models.DecimalField(bi("Total payable", "إجمالي المستحق"), **DOC_MONEY)
+    reverse_charge_vat = models.DecimalField(bi("Reverse-charge VAT", "ضريبة الاحتساب العكسي"), **DOC_MONEY)
     vat_breakdown = models.JSONField(default=list, blank=True, verbose_name=bi("VAT per category", "الضريبة حسب الفئة"))
     requires_purification = models.BooleanField(default=False,
         verbose_name=bi("Requires purification", "يتطلب التطهير"))
@@ -898,7 +905,7 @@ class PurchaseDocumentLine(LineAmounts, GuardedLine):
 class MoneyMovement(Tracked, Guarded):
     number = models.CharField(bi("Number", "الرقم"), max_length=40, blank=True)
     date = models.DateField(bi("Date", "التاريخ"))
-    amount = models.DecimalField(bi("Amount", "المبلغ"), max_digits=18, decimal_places=2)
+    amount = models.DecimalField(bi("Amount", "المبلغ"), **DOC_MONEY_FIELD)
     currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Currency", "العملة"))
     fx_rate = models.DecimalField(bi("Rate to functional currency", "سعر الصرف إلى العملة الوظيفية"), **RATE)
@@ -949,7 +956,7 @@ class CustomerReceipt(MoneyMovement):
         verbose_name=bi("Customer", "العميل"))
     purpose = models.CharField(bi("Purpose", "الغرض"), max_length=10, choices=Purpose.choices,
                                default=Purpose.SETTLEMENT)
-    bank_charge = models.DecimalField(bi("Bank charge", "رسوم بنكية"), **MONEY)
+    bank_charge = models.DecimalField(bi("Bank charge", "رسوم بنكية"), **DOC_MONEY)
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
 
     class Meta:
@@ -1026,7 +1033,7 @@ class Application(models.Model):
     """A planned allocation entered on a draft receipt or payment; becomes an allocation when it posts."""
 
     SOURCE_FIELD = None
-    amount = models.DecimalField(bi("Amount", "المبلغ"), max_digits=18, decimal_places=2)
+    amount = models.DecimalField(bi("Amount", "المبلغ"), **DOC_MONEY_FIELD)
 
     objects = ApplicationQuerySet.as_manager()
 
@@ -1107,7 +1114,7 @@ class AllocationQuerySet(models.QuerySet):
 class Allocation(models.Model):
     """Append-only (R36): an un-allocation is a new row with a negative amount and ``reverses`` set."""
 
-    amount = models.DecimalField(bi("Amount", "المبلغ"), max_digits=18, decimal_places=2)
+    amount = models.DecimalField(bi("Amount", "المبلغ"), **DOC_MONEY_FIELD)
     date = models.DateField(bi("Date", "التاريخ"))
     via_settlement = models.BooleanField(
         bi("Settled in the ledger", "مسوّى في دفتر الأستاذ"), default=False,

@@ -1,4 +1,4 @@
-"""Receipts, payments, allocation and tie-out (invoicing.md R33 to R39, R59, R74; AT-28 to AT-31, AT-97;
+"""Receipts, payments, allocation and tie-out (invoicing.md R33 to R39, R59; AT-28 to AT-31, AT-97;
 ledger-fx R18 settlement in a foreign currency)."""
 from datetime import date
 
@@ -128,12 +128,6 @@ def test_r67_advance_and_deposit_receipts_need_a_contract(w):
         with pytest.raises(InvoicingError) as exc:
             receipt(w, purpose=purpose)
         assert exc.value.code == "purpose" and "عقد" in " ".join(exc.value.messages)
-
-
-def test_r74_receipt_in_a_three_decimal_currency_rejected(w):
-    with pytest.raises(InvoicingError) as exc:
-        receipt(w, currency="BHD")
-    assert exc.value.code == "currency_decimals"
 
 
 def test_e6_refund_to_customer(w):

@@ -119,10 +119,33 @@ def _reference(model, code, what_en, what_ar):
     return obj
 
 
-def _round(amount):
+def _quantum(places):
+    return Decimal(1).scaleb(-places)
+
+
+def _round(amount, places=2):
+    """ROUND_HALF_UP to ``places`` decimals (R9; 2 for SAR, the currency's minor units in the document currency)."""
     with localcontext() as ctx:
         ctx.prec = 60
-        return amount.quantize(CENT, rounding=ROUND_HALF_UP)
+        return amount.quantize(_quantum(places), rounding=ROUND_HALF_UP)
+
+
+def _places(currency):
+    """Decimals of a document currency (D27, R93): the Currency's ``minor_units`` (2 or 3)."""
+    if currency is None:
+        return 2
+    if not isinstance(currency, Currency):
+        currency = Currency.objects.get(code=currency)
+    return currency.minor_units
+
+
+def _doc_places(doc):
+    return _places(doc.currency)
+
+
+def _fmt(amount, places):
+    """An amount as text with exactly ``places`` decimals (VAT breakdown JSON), whatever the column stores."""
+    return str(Decimal(amount).quantize(_quantum(places)))
 
 
 def _decimal(value, what):
@@ -133,15 +156,20 @@ def _decimal(value, what):
         raise InvoicingError(exc.messages, code="float_rejected" if isinstance(value, float) else "not_a_number") from None
 
 
-def _money(value, what, *, positive=False):
+def _money(value, what, *, positive=False, currency=None):
+    """A Decimal amount with at most the currency's decimals (D27, R93; ledger-fx R8): 2 for SAR, USD, ...,
+    3 for KWD, BHD, OMR, JOD. Without ``currency``: 2 decimals."""
     amount = _decimal(value, what)
-    if not fx.has_places(amount, 2):
-        raise error(f"{what}: amounts have at most 2 decimals ({amount}).",
-                    f"{what}: المبالغ بخانتين عشريتين كحد أقصى ({amount}).", code="money_decimals")
+    places = _places(currency)
+    code = currency.code if isinstance(currency, Currency) else (currency or "")
+    if not fx.has_places(amount, places):
+        raise error(f"{what}: {code + ' ' if code else ''}amounts have at most {places} decimals ({amount}).",
+                    f"{what}: المبالغ {('بعملة ' + code + ' ') if code else ''}بحد أقصى {places} خانات عشرية "
+                    f"({amount}).", code="money_decimals")
     if amount < ZERO or (positive and amount == ZERO):
         raise error(f"{what} must be {'above' if positive else 'at least'} zero.",
                     f"يجب أن يكون {what} {'أكبر من' if positive else 'لا يقل عن'} صفر.", code="money_sign")
-    return amount.quantize(CENT)
+    return amount.quantize(_quantum(places))
 
 
 def _source(user):
@@ -157,16 +185,21 @@ def _log_agent(user, entity, permission, document, action):
         )
 
 
+SUPPORTED_MINOR_UNITS = (2, 3)  # D27 / R93: 2-decimal currencies and KWD, BHD, OMR, JOD; 0 (JPY) refused (OQ-58)
+
+
 def _currency(code, entity):
-    """R74 (OQ-48 default) and D13: an active currency with 2 minor units."""
+    """D13, D27 (R93): an active currency with 2 or 3 minor units. 0-decimal currencies stay refused (OQ-58)."""
     cur = Currency.objects.filter(code=str(code or entity.base_currency_id).upper()).first()
     if cur is None or not cur.is_active:
         raise error(f"Currency {code} is unknown or inactive.", f"العملة {code} غير معروفة أو غير نشطة.",
                     code="currency_inactive")
-    if cur.minor_units != 2:
+    if cur.minor_units not in SUPPORTED_MINOR_UNITS:
         raise error(
-            f"Documents in {cur.code} ({cur.minor_units} decimals) are not supported yet (OQ-48).",
-            f"المستندات بعملة {cur.code} ({cur.minor_units} خانات عشرية) غير مدعومة بعد (OQ-48).",
+            f"Documents in {cur.code} ({cur.minor_units} decimals) are not supported; currencies with 2 or 3 decimals "
+            "are (OQ-58).",
+            f"المستندات بعملة {cur.code} ({cur.minor_units} خانات عشرية) غير مدعومة؛ المدعومة عملات بخانتين أو ثلاث "
+            "خانات عشرية.",
             code="currency_decimals",
         )
     return cur
@@ -449,7 +482,7 @@ def _apply_sales_header(doc, fields):
         if value is None and name in ("reason_ar", "reason_en", "notes_en", "notes_ar", "payment_means_code"):
             value = ""
         if name == "document_discount":
-            value = _money(value, "document discount")
+            value = _money(value, "document discount", currency=doc.currency)
         if name == "reason_code" and value is not None and not isinstance(value, NoteReason):
             value = _reference(NoteReason, value, "note reason", "سبب الإشعار")
         setattr(doc, name, value)
@@ -535,8 +568,8 @@ def _sales_line_values(doc, line, *, income_type, quantity, unit_price, descript
     if not fx.has_places(line.quantity, 3) or line.quantity <= ZERO:
         raise error("Quantity must be above zero with at most 3 decimals.", "يجب أن تكون الكمية أكبر من صفر بثلاث خانات كحد أقصى.",
                     code="quantity")
-    line.unit_price = _money(unit_price, "unit price")  # OQ-12: 2 dp
-    line.line_discount = _money(line_discount, "line discount")
+    line.unit_price = _money(unit_price, "unit price", currency=doc.currency)  # D19 / R93: the currency's decimals
+    line.line_discount = _money(line_discount, "line discount", currency=doc.currency)
     line.unit_code = unit_code or "C62"
     line.description_ar = (description_ar or "").strip()
     line.description_en = (description_en or "").strip()
@@ -563,7 +596,7 @@ def _sales_line_values(doc, line, *, income_type, quantity, unit_price, descript
     problems += _line_vat_problems(line, doc.supply_date or doc.issue_date)
     if problems:
         raise _problems_error(problems, "line_invalid")
-    _price_line(line, doc.supply_date or doc.issue_date)
+    _price_line(line, doc.supply_date or doc.issue_date, _doc_places(doc))
 
 
 def _line_vat_problems(line, on):
@@ -595,16 +628,17 @@ def _line_vat_problems(line, on):
     return problems
 
 
-def _price_line(line, on):
-    """R9: net = round(qty x price - discount); line VAT = round(net x rate) for display only."""
+def _price_line(line, on, places=2):
+    """R9 / R93: net = round(qty x price - discount); line VAT = round(net x rate) for display only; both half-up
+    to the document currency's decimals (``places``)."""
     with localcontext() as ctx:
         ctx.prec = 60
-        net = _round(line.quantity * line.unit_price - line.line_discount)
+        net = _round(line.quantity * line.unit_price - line.line_discount, places)
     if net < ZERO:
         raise error("The line discount is larger than the line amount.", "خصم البند أكبر من مبلغه.", code="line_negative")
     line.net_amount = net
     line.vat_rate = _rate_on(line.vat_category, on)
-    line.vat_amount = _round(net * line.vat_rate.rate / HUNDRED) if line.vat_rate else ZERO
+    line.vat_amount = _round(net * line.vat_rate.rate / HUNDRED, places) if line.vat_rate else ZERO
 
 
 @transaction.atomic
@@ -688,7 +722,9 @@ def return_to_draft(document, *, user):
 # --- sales documents: validation, totals and issue ---------------------------------------------------
 
 def _sales_breakdown(doc, lines, sar_rate=None):
-    """R9: VAT per (category, rate) at document level, half-up; line VAT is display only. R56: SAR per category."""
+    """R9: VAT per (category, rate) at document level, half-up to the document currency's decimals (R93); line VAT
+    is display only. R56: SAR per category, 2 dp."""
+    places = _doc_places(doc)
     groups = {}
     for line in lines:
         key = (line.vat_category, line.vat_rate.rate if line.vat_rate else ZERO)
@@ -700,16 +736,17 @@ def _sales_breakdown(doc, lines, sar_rate=None):
                 g["texts"].add((line.exemption_text_en, line.exemption_text_ar))
     breakdown, total_vat, total_vat_sar = [], ZERO, ZERO
     for (category, rate), g in sorted(groups.items()):
-        vat = _round(g["taxable"] * rate / HUNDRED)
-        vat_sar = _round(vat * sar_rate) if sar_rate is not None else vat
-        breakdown.append({"category": category, "rate": str(rate), "taxable": str(g["taxable"]), "vat": str(vat),
-                          "vat_sar": str(vat_sar), "exemption_reasons": sorted(g["reasons"]),
+        vat = _round(g["taxable"] * rate / HUNDRED, places)
+        vat_sar = _round(vat * (sar_rate if sar_rate is not None else Decimal("1")), 2)  # SAR: always 2 dp
+        breakdown.append({"category": category, "rate": str(rate), "taxable": _fmt(g["taxable"], places),
+                          "vat": _fmt(vat, places), "vat_sar": _fmt(vat_sar, 2), "exemption_reasons": sorted(g["reasons"]),
                           **({"exemption_texts": [{"en": en, "ar": ar} for en, ar in sorted(g["texts"])]}
                              if g["texts"] else {})})
         total_vat += vat
         total_vat_sar += vat_sar
     total_net = sum((line.net_amount for line in lines), ZERO)
-    return breakdown, total_net, total_vat, total_vat_sar
+    q = _quantum(places)
+    return breakdown, total_net.quantize(q), total_vat.quantize(q), total_vat_sar
 
 
 def _buyer_snapshot(doc):
@@ -887,9 +924,10 @@ def _issue_problems(doc, *, check_period=True, user=None):
     problems += _flag_problems(doc)
     for line in lines:
         if line.vat_rate_id is None or not _rate_on(line.vat_category, on) or _rate_on(line.vat_category, on).pk != line.vat_rate_id:
-            _price_line(line, on)  # supply date changed after the line was added: priced again at issue
+            _price_line(line, on, _doc_places(doc))  # supply date changed after the line was added: re-priced
     breakdown, net, vat, _ = _sales_breakdown(doc, lines)
     gross = net + vat
+    problems += _third_decimal_problems(doc, lines, breakdown, net, vat)
     snap = _buyer_snapshot(doc)
     if doc.zatca_profile == SalesDocument.Profile.STANDARD:
         problems += _buyer_problems(doc, snap)
@@ -901,6 +939,29 @@ def _issue_problems(doc, *, check_period=True, user=None):
         if period:
             problems.append(period)
     return problems
+
+
+def _third_decimal_problems(doc, lines, breakdown, net, vat):
+    """OQ-62 default (invoicing R93, zatca R-51): until ZATCA confirms that its XML accepts 3-decimal amounts, a
+    sales document in a 3-decimal currency is handed to ZATCA only when every amount ends in 0 in the third decimal
+    (then it is emitted with 2 decimals). Issuing hands it to ZATCA, so such a document is refused here, before a
+    number is used; it can still be drafted and corrected. Unit prices are not amounts in this sense (R9 note).
+    """
+    if _doc_places(doc) <= 2:
+        return []
+    amounts = [net, vat, net + vat, doc.document_discount]
+    for line in lines:
+        amounts += [line.net_amount, line.vat_amount, line.line_discount]
+    for group in breakdown:
+        amounts += [Decimal(group["taxable"]), Decimal(group["vat"])]
+    odd = sorted({a for a in amounts if a != a.quantize(CENT)})
+    if not odd:
+        return []
+    shown = ", ".join(str(a) for a in odd[:5])
+    return [f"{doc.currency_id} amounts with a third decimal other than 0 ({shown}) cannot be sent to ZATCA until "
+            "ZATCA confirms that 3-decimal amounts are accepted (OQ-62); change the lines so that every amount ends "
+            f"in 0. / لا يمكن إرسال مبالغ {doc.currency_id} التي خانتها العشرية الثالثة ليست صفرًا ({shown}) إلى الهيئة "
+            "حتى تؤكد الهيئة قبول المبالغ بثلاث خانات عشرية؛ عدّل البنود بحيث ينتهي كل مبلغ بصفر."]
 
 
 def _natural_person_not_subject_to_vat(customer):
@@ -1023,12 +1084,12 @@ def approve_sales_document(document, *, user):
         fx_rate, rate_date, rate_source, rate_row = _fx_for(entity, doc.currency_id, doc.issue_date, user)
         sar_rate = _sar_rate(entity, doc.currency_id, fx_rate, doc.issue_date, user)
         for line in lines:
-            _price_line(line, on)
+            _price_line(line, on, _doc_places(doc))
             line._service_write = True
             line.save()
         breakdown, net, vat, vat_sar = _sales_breakdown(doc, lines, sar_rate)
         gross = net + vat
-        gross_sar = _round(gross * sar_rate)
+        gross_sar = _round(gross * sar_rate, 2)
         problems = _simplified_problems(doc, gross_sar)
         if problems:
             raise _problems_error(problems, "simplified_threshold")
@@ -1458,7 +1519,7 @@ def allocate(source, target, amount, *, user):
     No GL effect (R35): both sides sit on the same control account. ``invoicing.allocate``.
     """
     access.require(user, target.entity, "invoicing.allocate")
-    amount = _money(amount, "allocation amount", positive=True)
+    amount = _money(amount, "allocation amount", positive=True, currency=target.currency_id)
     sales = isinstance(target, SalesDocument)
     with transaction.atomic():
         model_t = SalesDocument if sales else PurchaseDocument
@@ -1532,8 +1593,8 @@ def create_purchase_document(entity, *, user, vendor, vendor_document_number, ve
             vendor_document_date=vendor_document_date, accounting_date=accounting_date, currency=cur,
             original_document=original_document, due_date=due_date,
             vendor_vat_number=(vendor.vat_number if vendor_vat_number is None else vendor_vat_number) or "",
-            vendor_total_vat=_money(vendor_total_vat, "vendor VAT"),
-            vendor_total_gross=_money(vendor_total_gross, "vendor total"),
+            vendor_total_vat=_money(vendor_total_vat, "vendor VAT", currency=cur),
+            vendor_total_gross=_money(vendor_total_gross, "vendor total", currency=cur),
             reverse_charge=not vendor.is_resident, created_by=user, source=_source(user),
         )
         if attachment is not None:
@@ -1577,7 +1638,7 @@ def update_purchase_document(document, *, user, **fields):
         raise error(f"Unknown fields: {', '.join(sorted(unknown))}.", "حقول غير معروفة.", code="unknown_field")
     for name, value in fields.items():
         if name in ("vendor_total_vat", "vendor_total_gross"):
-            value = _money(value, name)
+            value = _money(value, name, currency=doc.currency)
         setattr(doc, name, value)
     _touch(doc, user)
     doc.save()
@@ -1598,8 +1659,8 @@ def add_purchase_line(document, *, user, account, quantity, unit_price, vat_cate
     if not fx.has_places(line.quantity, 3) or line.quantity <= ZERO:
         raise error("Quantity must be above zero with at most 3 decimals.", "يجب أن تكون الكمية أكبر من صفر.",
                     code="quantity")
-    line.unit_price = _money(unit_price, "unit price")
-    line.line_discount = _money(line_discount, "line discount")
+    line.unit_price = _money(unit_price, "unit price", currency=doc.currency)
+    line.line_discount = _money(line_discount, "line discount", currency=doc.currency)
     line.unit_code = unit_code or "C62"
     line.description_ar, line.description_en = (description_ar or "").strip(), (description_en or "").strip()
     line.vat_category, line.vat_attribution, line.supply_kind = vat_category, vat_attribution, supply_kind or ""
@@ -1618,7 +1679,7 @@ def add_purchase_line(document, *, user, account, quantity, unit_price, vat_cate
         problems.append(f"No VAT rate for category {line.vat_category} on {doc.accounting_date}. / لا توجد نسبة ضريبة.")
     if problems:
         raise _problems_error(problems, "line_invalid")
-    _price_line(line, doc.accounting_date)
+    _price_line(line, doc.accounting_date, _doc_places(doc))
     line.save()
     _touch(doc, user)
     doc.save(update_fields=["modified_by", "modified_at", "version", "updated_at"])
@@ -1637,11 +1698,13 @@ def _purchase_amounts(doc, lines):
     all: every line VAT 0.00, nothing to 1310 and nothing added to cost; lines record category O (OQ-60 default).
     """
     resident = doc.vendor.is_resident
+    places = _doc_places(doc)
     if _unregistered_vendor(doc):
         for line in lines:
             line.vat_amount = ZERO
         net = sum((l.net_amount for l in lines), ZERO)
-        breakdown = [{"category": VatCategory.OUT_OF_SCOPE.value, "rate": "0.00", "taxable": str(net), "vat": "0.00",
+        breakdown = [{"category": VatCategory.OUT_OF_SCOPE.value, "rate": "0.00", "taxable": _fmt(net, places),
+                      "vat": _fmt(ZERO, places),
                       "reverse_charge": False, "unregistered_vendor": True}] if lines else []
         return breakdown, net, ZERO, ZERO, {l.line_no: l.net_amount for l in lines}, ZERO, set()
     recoverable_ok = bool(doc.vendor_vat_number) or not resident  # R30 overrides the VAT-number condition
@@ -1656,9 +1719,9 @@ def _purchase_amounts(doc, lines):
     breakdown, charged, rc_total, recoverable, recoverable_lines = [], ZERO, ZERO, ZERO, set()
     for (category, rate), group in sorted(groups.items(), key=lambda kv: kv[0]):
         taxable = sum((l.net_amount for l in group), ZERO)
-        vat = _round(taxable * rate / HUNDRED)
-        breakdown.append({"category": category, "rate": str(rate), "taxable": str(taxable), "vat": str(vat),
-                          "reverse_charge": not resident})
+        vat = _round(taxable * rate / HUNDRED, places)
+        breakdown.append({"category": category, "rate": str(rate), "taxable": _fmt(taxable, places),
+                          "vat": _fmt(vat, places), "reverse_charge": not resident})
         if resident:
             charged += vat
         else:
@@ -1695,7 +1758,7 @@ def _purchase_problems(doc, check_period=True):
         problems += [_on_line(line.line_no, p) for p in _account_problems(
             entity, line.account, {Account.Type.EXPENSE, Account.Type.ASSET}, "expense or asset")]
         _vat_free_category(doc, line)  # R92: the VAT number may have been removed after the line was added
-        _price_line(line, doc.accounting_date)  # in memory: the rate effective on the accounting date (R10)
+        _price_line(line, doc.accounting_date, _doc_places(doc))  # in memory: the rate on the accounting date (R10)
         if line.vat_rate is None:
             problems.append(_on_line(line.line_no, f"no VAT rate for category {line.vat_category} on {doc.accounting_date}. / "
                                                    f"لا توجد نسبة ضريبة للفئة {line.vat_category} بتاريخ {doc.accounting_date}."))
@@ -1777,7 +1840,7 @@ def approve_purchase_document(document, *, user):
         lines = list(doc.lines.select_related("account", "vat_rate"))
         for line in lines:
             _vat_free_category(doc, line)  # R92: stored as category O when the vendor is not registered
-            _price_line(line, doc.accounting_date)
+            _price_line(line, doc.accounting_date, _doc_places(doc))
         breakdown, net, charged, rc_vat, costs, recoverable, recoverable_lines = _purchase_amounts(doc, lines)
         for line in lines:
             line.vat_recoverable = line.line_no in recoverable_lines  # computed from R29 / R30, never user-set
@@ -1882,15 +1945,16 @@ def create_receipt(entity, *, user, customer, date, amount, currency=None, bank_
                     "مقبوضات الدفعات المقدمة والتأمينات تحتاج إلى عقد مؤهل (الفوترة غير مبنية بعد).", code="purpose")
     if kind not in CustomerReceipt.Kind.values:
         raise error("Unknown receipt kind.", "نوع سند غير معروف.", code="kind")
-    amount = _money(amount, "amount", positive=True)
-    charge = _money(bank_charge, "bank charge")
+    cur = _currency(currency or customer.currency_id, entity)
+    amount = _money(amount, "amount", positive=True, currency=cur)  # R93: the currency's own decimals
+    charge = _money(bank_charge, "bank charge", currency=cur)
     if charge and (kind != CustomerReceipt.Kind.RECEIPT or charge >= amount):
         raise error("A bank charge is below the received amount, on receipts only.",
                     "الرسوم البنكية أقل من المبلغ المقبوض، وفي سندات القبض فقط.", code="bank_charge")
     with transaction.atomic():
         receipt = CustomerReceipt(
             entity=entity, customer=customer, kind=kind, purpose=purpose, date=date, amount=amount, bank_charge=charge,
-            currency=_currency(currency or customer.currency_id, entity), bank_account=_bank_account(entity, bank_account),
+            currency=cur, bank_account=_bank_account(entity, bank_account),
             reference_en=reference_en, reference_ar=reference_ar, bank_reference=bank_reference, created_by=user,
             source=_source(user),
         )
@@ -1933,7 +1997,7 @@ def add_receipt_application(receipt, target, amount, *, user):
     _require_receipt_staff(user, receipt.entity)
     if receipt.status != "draft" or receipt.kind != CustomerReceipt.Kind.RECEIPT:
         raise error("Only draft receipts get applications.", "تُضاف التخصيصات إلى مسودات سندات القبض فقط.", code="not_draft")
-    amount = _money(amount, "amount", positive=True)
+    amount = _money(amount, "amount", positive=True, currency=receipt.currency_id)
     target = SalesDocument.objects.select_for_update(of=("self",)).get(pk=target.pk)
     problems = _application_problems(receipt, target, amount, receivable=True, planned=_planned_for(receipt, target))
     planned = _sum(receipt.applications.all())
@@ -2067,10 +2131,12 @@ def create_vendor_payment(entity, *, user, vendor, date, amount, currency=None, 
     _no_payment_without_wht(vendor, kind)
     if kind not in VendorPayment.Kind.values:
         raise error("Unknown payment kind.", "نوع سند غير معروف.", code="kind")
+    cur = _currency(currency or vendor.currency_id, entity)
     with transaction.atomic():
         payment = VendorPayment(
-            entity=entity, vendor=vendor, kind=kind, date=date, amount=_money(amount, "amount", positive=True),
-            currency=_currency(currency or vendor.currency_id, entity), bank_account=_bank_account(entity, bank_account),
+            entity=entity, vendor=vendor, kind=kind, date=date,
+            amount=_money(amount, "amount", positive=True, currency=cur),
+            currency=cur, bank_account=_bank_account(entity, bank_account),
             reference_en=reference_en, reference_ar=reference_ar, bank_reference=bank_reference, created_by=user,
             source=_source(user),
         )
@@ -2084,7 +2150,7 @@ def add_payment_application(payment, target, amount, *, user):
     access.require(user, payment.entity, "invoicing.create_vendor_payment")
     if payment.status != "draft" or payment.kind != VendorPayment.Kind.PAYMENT:
         raise error("Only draft payments get applications.", "تُضاف التخصيصات إلى مسودات سندات الصرف فقط.", code="not_draft")
-    amount = _money(amount, "amount", positive=True)
+    amount = _money(amount, "amount", positive=True, currency=payment.currency_id)
     target = PurchaseDocument.objects.select_for_update(of=("self",)).get(pk=target.pk)
     problems = _application_problems(payment, target, amount, receivable=False, planned=_planned_for(payment, target))
     if _sum(payment.applications.all()) + amount > payment.amount:

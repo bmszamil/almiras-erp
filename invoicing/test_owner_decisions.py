@@ -202,3 +202,91 @@ def test_at93_migration_makes_existing_vendors_business():
     finally:
         new = migrate(leaf)
     assert new.get_model("invoicing", "Vendor").objects.get(code="OLD").vendor_kind == "business"
+
+
+# --- D27 / R93: 3-decimal currencies (AT-98, AT-99; OQ-62 default) ------------------------------------------
+
+def _rate(w, code, rate, on=date(2027, 1, 10)):
+    from ledger import services as ledger
+
+    treasurer = make_user(f"treasury_{code.lower()}_{on:%m%d}")
+    member(treasurer, w.alm, "group_treasury")
+    return ledger.create_rate(user=treasurer, from_currency=code, to_currency="SAR", on=on, rate=D(rate), group=w.alm)
+
+
+def _draft(w, currency, lines):
+    doc = services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10),
+                                         supply_date=date(2027, 1, 10), currency=currency)
+    for qty, price in lines:
+        services.add_sales_line(doc, user=w.clerk, income_type="rent_commercial", quantity=qty, unit_price=price,
+                                description_ar="بند اختبار")
+    return doc
+
+
+def test_at98_kwd_document_amounts_round_to_three_decimals_and_sar_vat_to_two(w):
+    _rate(w, "KWD", "12.2000")
+    doc = _draft(w, "KWD", [("3", "333.333")])
+    line = doc.lines.get()
+    assert (line.net_amount, line.vat_amount) == (D("999.999"), D("150.000"))  # half-up to 3 dp (R9 method)
+    lines = list(doc.lines.select_related("vat_rate", "vat_exemption_reason"))
+    breakdown, net, vat, vat_sar = services._sales_breakdown(doc, lines, D("12.2000"))
+    assert (net, vat, net + vat, vat_sar) == (D("999.999"), D("150.000"), D("1149.999"), D("1830.00"))
+    assert breakdown[0]["taxable"] == "999.999" and breakdown[0]["vat"] == "150.000" and breakdown[0]["vat_sar"] == "1830.00"
+    # OQ-62 default: a non-zero third decimal cannot go to ZATCA yet, so it is not submitted or issued.
+    with pytest.raises(InvoicingError) as exc:
+        services.submit_sales_document(doc, user=w.clerk)
+    text = " ".join(exc.value.messages)
+    assert "OQ-62" in text and "999.999" in text and "ثلاث خانات" in text
+    doc.refresh_from_db()
+    assert (doc.status, doc.number) == ("draft", "")
+    # Amounts that end in 0 in the third decimal are issued, cleared and booked: txn 3 dp, functional 2 dp.
+    done = final(w, invoice(w, [("rent_commercial", "2", "500.000")], currency="KWD"))
+    assert (done.status, done.total_net, done.total_vat, done.total_gross) == (
+        "final", D("1000.000"), D("150.000"), D("1150.000"))
+    assert (done.total_vat_sar, done.total_gross_sar, done.vat_breakdown[0]["vat_sar"]) == (
+        D("1830.00"), D("14030.00"), "1830.00")
+    assert done.vat_breakdown[0]["vat"] == "150.000"
+    lines = {l.account.code: l for l in done.journal_entry.lines.select_related("account")}
+    assert (lines["1200"].debit, str(lines["1200"].txn_amount), lines["1200"].currency_id) == (
+        D("14030.00"), "1150.000", "KWD")
+    assert (lines["2200"].credit, str(lines["2200"].txn_amount)) == (D("1830.00"), "150.000")
+    assert all(l.debit == l.debit.quantize(D("0.01")) and l.credit == l.credit.quantize(D("0.01")) for l in lines.values())
+
+
+def test_at99_currency_decimals_and_a_bhd_receipt_and_bill(w):
+    kwd = _draft(w, "KWD", [])
+    with pytest.raises(InvoicingError) as exc:  # KWD 4 dp
+        services.add_sales_line(kwd, user=w.clerk, income_type="rent_commercial", quantity="1", unit_price="1.2345",
+                                description_ar="بند")
+    assert exc.value.code == "money_decimals" and "3 decimals" in str(exc.value) and "3 خانات" in str(exc.value)
+    usd = _draft(w, "USD", [])
+    with pytest.raises(InvoicingError) as exc:  # USD 3 dp
+        services.add_sales_line(usd, user=w.clerk, income_type="rent_commercial", quantity="1", unit_price="1.005",
+                                description_ar="بند")
+    assert exc.value.code == "money_decimals" and "2 decimals" in str(exc.value)
+    services.add_sales_line(kwd, user=w.clerk, income_type="rent_commercial", quantity="1", unit_price="1.234",
+                            description_ar="بند")
+    _rate(w, "BHD", "9.9500")
+    _rate(w, "BHD", "9.9500", on=date(2027, 1, 20))
+    inv = final(w, invoice(w, [("rent_commercial", "1", "8.800")], currency="BHD"))
+    assert inv.total_gross == D("10.120")
+    r = services.create_receipt(w.alm, user=w.clerk, customer=w.customer, date=date(2027, 1, 20), amount="10.125",
+                                currency="BHD")
+    with pytest.raises(InvoicingError):  # 4 dp in BHD
+        services.add_receipt_application(r, inv, "10.1201", user=w.clerk)
+    services.add_receipt_application(r, inv, "10.120", user=w.clerk)
+    posted = services.post_receipt(r, user=w.clerk)
+    assert posted.amount == D("10.125")
+    bank = posted.journal_entry.lines.get(account__code="1100")
+    assert (str(bank.txn_amount), bank.debit) == ("10.125", D("100.74"))
+    assert services.open_amount(inv, user=w.clerk) == D("0") and services.payment_state(inv, user=w.clerk) == "paid"
+    assert services.open_amount(posted, user=w.clerk) == D("0.005")
+    # Bills are never sent to ZATCA: a non-zero third decimal is stored and booked (R93).
+    vendor = services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="BH1", name_ar="مورد بحريني",
+                                    is_vat_registered=True, vat_number="340000000000003", currency="BHD")
+    b = bill(w, [("5300", "1", "100.125")], vendor=vendor, number="BH-1")
+    posted_bill = services.approve_purchase_document(b, user=w.cfo)
+    assert (posted_bill.total_net, posted_bill.total_vat, posted_bill.total_gross) == (
+        D("100.125"), D("15.019"), D("115.144"))
+    ap = posted_bill.journal_entry.lines.get(account__code="2100")
+    assert (str(ap.txn_amount), ap.credit) == ("115.144", D("1145.68"))

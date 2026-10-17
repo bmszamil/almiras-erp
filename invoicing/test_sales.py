@@ -1,4 +1,4 @@
-"""Sales documents (invoicing.md R5 to R20, R40 to R48, R56, R57, R68 to R74; AT-1 to AT-20, AT-32 to AT-68)."""
+"""Sales documents (invoicing.md R5 to R20, R40 to R48, R56, R57, R68 to R73, R93; AT-1 to AT-20, AT-32 to AT-67, AT-99)."""
 from datetime import date
 from decimal import Decimal
 
@@ -639,7 +639,7 @@ def test_at64_late_note_warns_but_issues(w):
     assert late.status == "issued" and "2027-04-15" in late.warnings[0] and "الخامس عشر" in late.warnings[0]
 
 
-# --- money and currency (R56, R74; AT-46, AT-47, AT-68) ---------------------------------------------
+# --- money and currency (R56, R93; AT-46, AT-47, AT-99) ---------------------------------------------
 
 def test_at46_float_input_rejected(w):
     doc = services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10))
@@ -671,14 +671,16 @@ def test_at47_foreign_invoice_without_a_rate_rejected(w):
     assert SalesDocument.objects.get(pk=doc.pk).number == ""
 
 
-def test_at68_three_decimal_currency_rejected(w):
+def test_at99_zero_decimal_currency_refused_three_decimal_allowed(w):
+    """R93 (D27; replaces AT-68 / R74): KWD, BHD, OMR and JOD documents are drafted; JPY stays refused (OQ-58)."""
     with pytest.raises(InvoicingError) as exc:
         services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10),
-                                       currency="KWD")
-    assert exc.value.code == "currency_decimals" and "OQ-48" in messages(exc) and "غير مدعومة" in messages(exc)
-    with pytest.raises(InvoicingError):
-        services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10),
                                        currency="JPY")
+    assert exc.value.code == "currency_decimals" and "2 or 3" in messages(exc) and "غير مدعومة" in messages(exc)
+    for code in ("KWD", "BHD", "OMR", "JOD"):
+        doc = services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10),
+                                             currency=code)
+        assert doc.currency_id == code
 
 
 def test_oq18_arabic_line_description_and_notes_required(w):
