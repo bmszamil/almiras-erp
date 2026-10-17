@@ -227,7 +227,8 @@ class Address(models.Model):
 class InvoicingSettings(models.Model):
     """Per-entity invoicing switches (3.0)."""
 
-    entity = models.OneToOneField(Entity, on_delete=models.PROTECT, related_name="invoicing_settings")
+    entity = models.OneToOneField(Entity, on_delete=models.PROTECT, related_name="invoicing_settings",
+        verbose_name=bi("Entity", "الكيان"))
     segregation_required = models.BooleanField(
         bi("Creator may not approve", "لا يعتمد المنشئ"), default=True,
         help_text=bi("OQ-5. Approvals that post are always segregated by the ledger (access OQ-19)",
@@ -241,8 +242,8 @@ class InvoicingSettings(models.Model):
         help_text=bi("Set only after tax-adviser sign-off (R66, OQ-16)", "يُحدَّد بعد موافقة المستشار الضريبي فقط"),
     )
     updated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
-                                   related_name="+")
-    updated_at = models.DateTimeField(auto_now=True)
+                                   related_name="+", verbose_name=bi("Updated by", "حدّثه"))
+    updated_at = models.DateTimeField(auto_now=True, verbose_name=bi("Updated at", "تاريخ التحديث"))
 
     class Meta:
         verbose_name = bi("invoicing settings", "إعدادات الفوترة")
@@ -265,12 +266,14 @@ class DocumentSequence(models.Model):
         RCPT = "RCPT", bi("Customer receipt", "سند قبض")
         PAY = "PAY", bi("Vendor payment", "سند صرف")
 
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
-    doc_type = models.CharField(max_length=4, choices=DocType.choices)
-    year = models.PositiveIntegerField()
-    last_number = models.PositiveIntegerField(default=0)
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    doc_type = models.CharField(bi("Document type", "نوع المستند"), max_length=4, choices=DocType.choices)
+    year = models.PositiveIntegerField(verbose_name=bi("Year", "السنة"))
+    last_number = models.PositiveIntegerField(default=0, verbose_name=bi("Last number", "آخر رقم"))
 
     class Meta:
+        verbose_name = bi("document sequence", "تسلسل المستندات")
+        verbose_name_plural = bi("document sequences", "تسلسلات المستندات")
         constraints = [models.UniqueConstraint(fields=["entity", "doc_type", "year"], name="one_sequence_per_type_year")]
 
     def __str__(self):
@@ -285,7 +288,8 @@ class Customer(Tracked, Address):
         INDIVIDUAL = "individual", bi("Individual", "فرد")
         GOVERNMENT = "government", bi("Government", "جهة حكومية")
 
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="customers")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="customers",
+        verbose_name=bi("Entity", "الكيان"))
     code = models.CharField(bi("Code", "الرمز"), max_length=20)
     name_en = models.CharField(bi("Name (English)", "الاسم (بالإنجليزية)"), max_length=200, blank=True)
     name_ar = models.CharField(bi("Name (Arabic)", "الاسم (بالعربية)"), max_length=200)
@@ -322,8 +326,9 @@ class Customer(Tracked, Address):
 class CustomerIdentifier(models.Model):
     """A buyer ID held by a customer; when several exist the first in the §3.1 priority order is used (R16)."""
 
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
-    customer = models.ForeignKey(Customer, on_delete=models.CASCADE, related_name="identifiers")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    customer = models.ForeignKey(Customer, on_delete=models.CASCADE, related_name="identifiers",
+        verbose_name=bi("Customer", "العميل"))
     scheme = models.CharField(bi("Scheme", "نوع الهوية"), max_length=3, choices=BuyerIdScheme.choices)
     value = models.CharField(bi("Identifier", "رقم الهوية"), max_length=30,
                              validators=[RegexValidator(r"^[A-Za-z0-9]+\Z", "Letters and digits only. / أحرف وأرقام فقط.")])
@@ -340,7 +345,8 @@ class CustomerIdentifier(models.Model):
 
 
 class Vendor(Tracked, Address):
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="vendors")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="vendors",
+        verbose_name=bi("Entity", "الكيان"))
     code = models.CharField(bi("Code", "الرمز"), max_length=20)
     name_en = models.CharField(bi("Name (English)", "الاسم (بالإنجليزية)"), max_length=200, blank=True)
     name_ar = models.CharField(bi("Name (Arabic)", "الاسم (بالعربية)"), max_length=200)
@@ -496,36 +502,63 @@ class LineAmounts(models.Model):
 class Snapshot(models.Model):
     """Seller and buyer data copied at issue and frozen after (R15, R72)."""
 
-    seller_legal_name_en = models.CharField(max_length=200, blank=True)
-    seller_legal_name_ar = models.CharField(max_length=200, blank=True)
-    seller_vat_number = models.CharField(max_length=15, blank=True)
-    seller_cr_number = models.CharField(max_length=20, blank=True)
-    seller_unified_number = models.CharField(max_length=10, blank=True)
-    seller_building_no = models.CharField(max_length=4, blank=True)
-    seller_street_en = models.CharField(max_length=200, blank=True)
-    seller_street_ar = models.CharField(max_length=200, blank=True)
-    seller_district_en = models.CharField(max_length=100, blank=True)
-    seller_district_ar = models.CharField(max_length=100, blank=True)
-    seller_additional_no = models.CharField(max_length=4, blank=True)
-    seller_postal_code = models.CharField(max_length=5, blank=True)
-    seller_city_en = models.CharField(max_length=100, blank=True)
-    seller_city_ar = models.CharField(max_length=100, blank=True)
-    seller_country = models.CharField(max_length=2, blank=True)
-    buyer_name_en = models.CharField(max_length=200, blank=True)
-    buyer_name_ar = models.CharField(max_length=200, blank=True)
-    buyer_vat_number = models.CharField(max_length=15, blank=True)
-    buyer_other_id_scheme = models.CharField(max_length=3, blank=True)
-    buyer_other_id = models.CharField(max_length=30, blank=True)
-    buyer_building_no = models.CharField(max_length=4, blank=True)
-    buyer_street_en = models.CharField(max_length=200, blank=True)
-    buyer_street_ar = models.CharField(max_length=200, blank=True)
-    buyer_district_en = models.CharField(max_length=100, blank=True)
-    buyer_district_ar = models.CharField(max_length=100, blank=True)
-    buyer_additional_no = models.CharField(max_length=4, blank=True)
-    buyer_postal_code = models.CharField(max_length=10, blank=True)
-    buyer_city_en = models.CharField(max_length=100, blank=True)
-    buyer_city_ar = models.CharField(max_length=100, blank=True)
-    buyer_country = models.CharField(max_length=2, blank=True)
+    seller_legal_name_en = models.CharField(max_length=200, blank=True,
+        verbose_name=bi("Seller legal name (English)", "البائع: الاسم القانوني (بالإنجليزية)"))
+    seller_legal_name_ar = models.CharField(max_length=200, blank=True,
+        verbose_name=bi("Seller legal name (Arabic)", "البائع: الاسم القانوني (بالعربية)"))
+    seller_vat_number = models.CharField(max_length=15, blank=True,
+        verbose_name=bi("Seller VAT number", "البائع: الرقم الضريبي"))
+    seller_cr_number = models.CharField(max_length=20, blank=True,
+        verbose_name=bi("Seller CR number", "البائع: رقم السجل التجاري"))
+    seller_unified_number = models.CharField(max_length=10, blank=True,
+        verbose_name=bi("Seller unified number", "البائع: الرقم الوطني الموحد"))
+    seller_building_no = models.CharField(max_length=4, blank=True,
+        verbose_name=bi("Seller building number", "البائع: رقم المبنى"))
+    seller_street_en = models.CharField(max_length=200, blank=True,
+        verbose_name=bi("Seller street (English)", "البائع: الشارع (بالإنجليزية)"))
+    seller_street_ar = models.CharField(max_length=200, blank=True,
+        verbose_name=bi("Seller street (Arabic)", "البائع: الشارع (بالعربية)"))
+    seller_district_en = models.CharField(max_length=100, blank=True,
+        verbose_name=bi("Seller district (English)", "البائع: الحي (بالإنجليزية)"))
+    seller_district_ar = models.CharField(max_length=100, blank=True,
+        verbose_name=bi("Seller district (Arabic)", "البائع: الحي (بالعربية)"))
+    seller_additional_no = models.CharField(max_length=4, blank=True,
+        verbose_name=bi("Seller secondary number", "البائع: الرقم الإضافي"))
+    seller_postal_code = models.CharField(max_length=5, blank=True,
+        verbose_name=bi("Seller postal code", "البائع: الرمز البريدي"))
+    seller_city_en = models.CharField(max_length=100, blank=True,
+        verbose_name=bi("Seller city (English)", "البائع: المدينة (بالإنجليزية)"))
+    seller_city_ar = models.CharField(max_length=100, blank=True,
+        verbose_name=bi("Seller city (Arabic)", "البائع: المدينة (بالعربية)"))
+    seller_country = models.CharField(max_length=2, blank=True, verbose_name=bi("Seller country", "البائع: الدولة"))
+    buyer_name_en = models.CharField(max_length=200, blank=True,
+        verbose_name=bi("Buyer name (English)", "المشتري: الاسم (بالإنجليزية)"))
+    buyer_name_ar = models.CharField(max_length=200, blank=True,
+        verbose_name=bi("Buyer name (Arabic)", "المشتري: الاسم (بالعربية)"))
+    buyer_vat_number = models.CharField(max_length=15, blank=True,
+        verbose_name=bi("Buyer VAT number", "المشتري: الرقم الضريبي"))
+    buyer_other_id_scheme = models.CharField(max_length=3, blank=True,
+        verbose_name=bi("Buyer ID scheme", "المشتري: نوع الهوية"))
+    buyer_other_id = models.CharField(max_length=30, blank=True, verbose_name=bi("Buyer ID", "المشتري: رقم الهوية"))
+    buyer_building_no = models.CharField(max_length=4, blank=True,
+        verbose_name=bi("Buyer building number", "المشتري: رقم المبنى"))
+    buyer_street_en = models.CharField(max_length=200, blank=True,
+        verbose_name=bi("Buyer street (English)", "المشتري: الشارع (بالإنجليزية)"))
+    buyer_street_ar = models.CharField(max_length=200, blank=True,
+        verbose_name=bi("Buyer street (Arabic)", "المشتري: الشارع (بالعربية)"))
+    buyer_district_en = models.CharField(max_length=100, blank=True,
+        verbose_name=bi("Buyer district (English)", "المشتري: الحي (بالإنجليزية)"))
+    buyer_district_ar = models.CharField(max_length=100, blank=True,
+        verbose_name=bi("Buyer district (Arabic)", "المشتري: الحي (بالعربية)"))
+    buyer_additional_no = models.CharField(max_length=4, blank=True,
+        verbose_name=bi("Buyer secondary number", "المشتري: الرقم الإضافي"))
+    buyer_postal_code = models.CharField(max_length=10, blank=True,
+        verbose_name=bi("Buyer postal code", "المشتري: الرمز البريدي"))
+    buyer_city_en = models.CharField(max_length=100, blank=True,
+        verbose_name=bi("Buyer city (English)", "المشتري: المدينة (بالإنجليزية)"))
+    buyer_city_ar = models.CharField(max_length=100, blank=True,
+        verbose_name=bi("Buyer city (Arabic)", "المشتري: المدينة (بالعربية)"))
+    buyer_country = models.CharField(max_length=2, blank=True, verbose_name=bi("Buyer country", "المشتري: الدولة"))
 
     class Meta:
         abstract = True
@@ -564,7 +597,8 @@ class SalesDocument(Tracked, Snapshot, Guarded):
         REAL_ESTATE = "capital_asset_real_estate", bi("Real estate capital asset (15 years)", "أصل عقاري (15 سنة)")
         MOVABLE = "movable_capital_asset", bi("Movable capital asset", "أصل رأسمالي منقول")
 
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="sales_documents")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="sales_documents",
+        verbose_name=bi("Entity", "الكيان"))
     doc_type = models.CharField(bi("Document type", "نوع المستند"), max_length=12, choices=DocType.choices)
     zatca_profile = models.CharField(bi("ZATCA profile", "نوع الفاتورة"), max_length=10, choices=Profile.choices,
                                      default=Profile.STANDARD)
@@ -574,7 +608,7 @@ class SalesDocument(Tracked, Snapshot, Guarded):
     flag_summary = models.BooleanField(bi("Summary", "ملخصة"), default=False)
     flag_self_billed = models.BooleanField(bi("Self-billed", "فوترة ذاتية"), default=False)
     number = models.CharField(bi("Number", "الرقم"), max_length=40, blank=True)
-    uuid = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
+    uuid = models.UUIDField(default=uuid.uuid4, editable=False, unique=True, verbose_name=bi("UUID", "المعرّف الفريد"))
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     submitted_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                      related_name="+", verbose_name=bi("Submitted by", "قدّمه"))
@@ -582,7 +616,8 @@ class SalesDocument(Tracked, Snapshot, Guarded):
     approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                     related_name="+", verbose_name=bi("Approved by", "اعتمده"))
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
-    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="documents")
+    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="documents",
+        verbose_name=bi("Customer", "العميل"))
     issue_date = models.DateField(bi("Issue date", "تاريخ الإصدار"))
     issue_time = models.TimeField(bi("Issue time", "وقت الإصدار"), null=True, blank=True)
     supply_date = models.DateField(bi("Supply date", "تاريخ التوريد"), null=True, blank=True)
@@ -616,17 +651,19 @@ class SalesDocument(Tracked, Snapshot, Guarded):
     requires_purification = models.BooleanField(bi("Requires purification", "يتطلب التطهير"), default=False)
     is_intercompany = models.BooleanField(bi("Intercompany", "بين شركات المجموعة"), default=False)
     journal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
-                                      related_name="+")
+                                      related_name="+", verbose_name=bi("Journal entry", "القيد اليومي"))
     notes_en = models.TextField(bi("Notes (English)", "ملاحظات (بالإنجليزية)"), blank=True)
     notes_ar = models.TextField(bi("Notes (Arabic)", "ملاحظات (بالعربية)"), blank=True)
     # ZATCA fields: written only through the ZATCA hand-off (invoicing.zatca_port and the result callback, R45).
     zatca_status = models.CharField(bi("ZATCA status", "حالة الهيئة"), max_length=24, choices=ZatcaStatus.choices,
                                     default=ZatcaStatus.NOT_SUBMITTED)
-    zatca_icv = models.PositiveIntegerField(null=True, blank=True)
-    zatca_previous_hash = models.CharField(max_length=128, blank=True)
-    zatca_hash = models.CharField(max_length=128, blank=True)
-    zatca_qr = models.TextField(blank=True)
-    zatca_messages = models.JSONField(default=list, blank=True)
+    zatca_icv = models.PositiveIntegerField(null=True, blank=True,
+        verbose_name=bi("Invoice counter (ICV)", "عداد الفاتورة"))
+    zatca_previous_hash = models.CharField(max_length=128, blank=True,
+        verbose_name=bi("Previous invoice hash", "تجزئة الفاتورة السابقة"))
+    zatca_hash = models.CharField(max_length=128, blank=True, verbose_name=bi("Invoice hash", "تجزئة الفاتورة"))
+    zatca_qr = models.TextField(blank=True, verbose_name=bi("QR code", "رمز الاستجابة السريعة"))
+    zatca_messages = models.JSONField(default=list, blank=True, verbose_name=bi("ZATCA messages", "رسائل الهيئة"))
 
     class Meta:
         verbose_name = bi("sales document", "مستند مبيعات")
@@ -659,8 +696,9 @@ class SalesDocument(Tracked, Snapshot, Guarded):
 
 
 class SalesDocumentLine(LineAmounts, GuardedLine):
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
-    document = models.ForeignKey(SalesDocument, on_delete=models.CASCADE, related_name="lines")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    document = models.ForeignKey(SalesDocument, on_delete=models.CASCADE, related_name="lines",
+        verbose_name=bi("Document", "المستند"))
     income_type = models.ForeignKey(IncomeType, on_delete=models.PROTECT, related_name="+",
                                     verbose_name=bi("Income type", "نوع الإيراد"))
     income_account = models.ForeignKey("ledger.Account", on_delete=models.PROTECT, related_name="+",
@@ -690,10 +728,12 @@ class PurchaseDocument(Tracked, Guarded):
         POSTED = "posted", bi("Posted", "مرحّل")
         REVERSED = "reversed", bi("Reversed", "معكوس")
 
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="purchase_documents")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="purchase_documents",
+        verbose_name=bi("Entity", "الكيان"))
     doc_type = models.CharField(bi("Document type", "نوع المستند"), max_length=20, choices=DocType.choices,
                                 default=DocType.BILL)
-    vendor = models.ForeignKey(Vendor, on_delete=models.PROTECT, related_name="documents")
+    vendor = models.ForeignKey(Vendor, on_delete=models.PROTECT, related_name="documents",
+        verbose_name=bi("Vendor", "المورد"))
     number = models.CharField(bi("Number", "الرقم"), max_length=40, blank=True)
     vendor_document_number = models.CharField(bi("Vendor document number", "رقم مستند المورد"), max_length=60)
     vendor_document_date = models.DateField(bi("Vendor document date", "تاريخ مستند المورد"))
@@ -722,14 +762,15 @@ class PurchaseDocument(Tracked, Guarded):
     total_vat = models.DecimalField(bi("VAT charged by the vendor", "الضريبة التي فرضها المورد"), **MONEY)
     total_gross = models.DecimalField(bi("Total payable", "إجمالي المستحق"), **MONEY)
     reverse_charge_vat = models.DecimalField(bi("Reverse-charge VAT", "ضريبة الاحتساب العكسي"), **MONEY)
-    vat_breakdown = models.JSONField(default=list, blank=True)
-    requires_purification = models.BooleanField(default=False)
+    vat_breakdown = models.JSONField(default=list, blank=True, verbose_name=bi("VAT per category", "الضريبة حسب الفئة"))
+    requires_purification = models.BooleanField(default=False,
+        verbose_name=bi("Requires purification", "يتطلب التطهير"))
     is_intercompany = models.BooleanField(bi("Intercompany", "بين شركات المجموعة"), default=False)
     attachment = models.FileField(bi("Vendor document", "مستند المورد"), upload_to="invoicing/purchase/%Y/", blank=True)
     journal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
-                                      related_name="+")
+                                      related_name="+", verbose_name=bi("Journal entry", "القيد اليومي"))
     reversal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
-                                       related_name="+")
+                                       related_name="+", verbose_name=bi("Reversal entry", "قيد العكس"))
 
     class Meta:
         verbose_name = bi("purchase document", "مستند مشتريات")
@@ -757,8 +798,9 @@ class PurchaseDocumentLine(LineAmounts, GuardedLine):
         GOODS = "goods", bi("Goods", "سلع")
         SERVICES = "services", bi("Services", "خدمات")
 
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
-    document = models.ForeignKey(PurchaseDocument, on_delete=models.CASCADE, related_name="lines")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    document = models.ForeignKey(PurchaseDocument, on_delete=models.CASCADE, related_name="lines",
+        verbose_name=bi("Document", "المستند"))
     vat_attribution = models.CharField(bi("VAT attribution", "إسناد الضريبة"), max_length=8,
                                        choices=Attribution.choices, default=Attribution.TAXABLE)
     supply_kind = models.CharField(bi("Supply kind", "نوع التوريد"), max_length=8, choices=SupplyKind.choices,
@@ -798,9 +840,9 @@ class MoneyMovement(Tracked, Guarded):
                                   related_name="+", verbose_name=bi("Posted by", "رحّله"))
     posted_at = models.DateTimeField(bi("Posted at", "تاريخ الترحيل"), null=True, blank=True)
     journal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
-                                      related_name="+")
+                                      related_name="+", verbose_name=bi("Journal entry", "القيد اليومي"))
     reversal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
-                                       related_name="+")
+                                       related_name="+", verbose_name=bi("Reversal entry", "قيد العكس"))
 
     class Meta:
         abstract = True
@@ -821,9 +863,11 @@ class CustomerReceipt(MoneyMovement):
         POSTED = "posted", bi("Posted", "مرحّل")
         REVERSED = "reversed", bi("Reversed", "معكوس")
 
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="customer_receipts")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="customer_receipts",
+        verbose_name=bi("Entity", "الكيان"))
     kind = models.CharField(bi("Kind", "النوع"), max_length=8, choices=Kind.choices, default=Kind.RECEIPT)
-    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="receipts")
+    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="receipts",
+        verbose_name=bi("Customer", "العميل"))
     purpose = models.CharField(bi("Purpose", "الغرض"), max_length=10, choices=Purpose.choices,
                                default=Purpose.SETTLEMENT)
     bank_charge = models.DecimalField(bi("Bank charge", "رسوم بنكية"), **MONEY)
@@ -854,9 +898,11 @@ class VendorPayment(MoneyMovement):
         POSTED = "posted", bi("Posted", "مرحّل")
         REVERSED = "reversed", bi("Reversed", "معكوس")
 
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="vendor_payments")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="vendor_payments",
+        verbose_name=bi("Entity", "الكيان"))
     kind = models.CharField(bi("Kind", "النوع"), max_length=16, choices=Kind.choices, default=Kind.PAYMENT)
-    vendor = models.ForeignKey(Vendor, on_delete=models.PROTECT, related_name="payments")
+    vendor = models.ForeignKey(Vendor, on_delete=models.PROTECT, related_name="payments",
+        verbose_name=bi("Vendor", "المورد"))
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     submitted_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                      related_name="+", verbose_name=bi("Submitted by", "قدّمه"))
@@ -898,28 +944,36 @@ class Application(models.Model):
 
 
 class ReceiptApplication(Application):
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
-    receipt = models.ForeignKey(CustomerReceipt, on_delete=models.CASCADE, related_name="applications")
-    target = models.ForeignKey(SalesDocument, on_delete=models.PROTECT, related_name="+")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    receipt = models.ForeignKey(CustomerReceipt, on_delete=models.CASCADE, related_name="applications",
+        verbose_name=bi("Receipt", "سند القبض"))
+    target = models.ForeignKey(SalesDocument, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Allocated to", "مخصص إلى"))
 
     @property
     def source_document(self):
         return self.receipt
 
     class Meta:
+        verbose_name = bi("receipt application", "تخصيص سند قبض")
+        verbose_name_plural = bi("receipt applications", "تخصيصات سندات القبض")
         constraints = [models.CheckConstraint(condition=models.Q(amount__gt=0), name="receipt_application_positive")]
 
 
 class PaymentApplication(Application):
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
-    payment = models.ForeignKey(VendorPayment, on_delete=models.CASCADE, related_name="applications")
-    target = models.ForeignKey(PurchaseDocument, on_delete=models.PROTECT, related_name="+")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    payment = models.ForeignKey(VendorPayment, on_delete=models.CASCADE, related_name="applications",
+        verbose_name=bi("Payment", "سند الصرف"))
+    target = models.ForeignKey(PurchaseDocument, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Allocated to", "مخصص إلى"))
 
     @property
     def source_document(self):
         return self.payment
 
     class Meta:
+        verbose_name = bi("payment application", "تخصيص سند صرف")
+        verbose_name_plural = bi("payment applications", "تخصيصات سندات الصرف")
         constraints = [models.CheckConstraint(condition=models.Q(amount__gt=0), name="payment_application_positive")]
 
 
@@ -945,8 +999,9 @@ class Allocation(models.Model):
         help_text=bi("Made at posting with a settlement line (foreign currency, ledger-fx R18)",
                      "أُنشئ عند الترحيل ببند تسوية (عملة أجنبية)"),
     )
-    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Created by", "أنشأه"))
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=bi("Created at", "تاريخ الإنشاء"))
 
     objects = AllocationQuerySet.as_manager()
 
@@ -968,14 +1023,15 @@ class Allocation(models.Model):
 
 
 class ReceivableAllocation(Allocation):
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     receipt = models.ForeignKey(CustomerReceipt, null=True, blank=True, on_delete=models.PROTECT,
-                                related_name="allocations")
+                                related_name="allocations", verbose_name=bi("Receipt", "سند القبض"))
     credit_note = models.ForeignKey(SalesDocument, null=True, blank=True, on_delete=models.PROTECT,
-                                    related_name="allocations_from")
-    target = models.ForeignKey(SalesDocument, on_delete=models.PROTECT, related_name="allocations_to")
+                                    related_name="allocations_from", verbose_name=bi("Credit note", "الإشعار الدائن"))
+    target = models.ForeignKey(SalesDocument, on_delete=models.PROTECT, related_name="allocations_to",
+        verbose_name=bi("Allocated to", "مخصص إلى"))
     reverses = models.OneToOneField("self", null=True, blank=True, on_delete=models.PROTECT,
-                                    related_name="reversed_by")
+                                    related_name="reversed_by", verbose_name=bi("Reverses", "يعكس"))
 
     class Meta:
         verbose_name = bi("receivable allocation", "تخصيص ذمم مدينة")
@@ -991,14 +1047,16 @@ class ReceivableAllocation(Allocation):
 
 
 class PayableAllocation(Allocation):
-    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     payment = models.ForeignKey(VendorPayment, null=True, blank=True, on_delete=models.PROTECT,
-                                related_name="allocations")
+                                related_name="allocations", verbose_name=bi("Payment", "سند الصرف"))
     vendor_credit_note = models.ForeignKey(PurchaseDocument, null=True, blank=True, on_delete=models.PROTECT,
-                                           related_name="allocations_from")
-    target = models.ForeignKey(PurchaseDocument, on_delete=models.PROTECT, related_name="allocations_to")
+                                           related_name="allocations_from",
+                                               verbose_name=bi("Vendor credit note", "إشعار المورد الدائن"))
+    target = models.ForeignKey(PurchaseDocument, on_delete=models.PROTECT, related_name="allocations_to",
+        verbose_name=bi("Allocated to", "مخصص إلى"))
     reverses = models.OneToOneField("self", null=True, blank=True, on_delete=models.PROTECT,
-                                    related_name="reversed_by")
+                                    related_name="reversed_by", verbose_name=bi("Reverses", "يعكس"))
 
     class Meta:
         verbose_name = bi("payable allocation", "تخصيص ذمم دائنة")
