@@ -1,0 +1,53 @@
+# Reverse proxy for the Almiras ERP (Caddy, Apache-2.0). TLS terminates here with the certificate the owner
+# supplies (files mounted from deploy/secrets/tls/); no ACME / Let's Encrypt or other foreign service is
+# contacted (auto_https disable_certs). HTTP is redirected to HTTPS. Static files are served from the volume
+# the web container fills at start; everything else goes to gunicorn.
+{
+	admin off
+	auto_https disable_certs
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$ALMIRAS_DOMAIN} {
+	tls /etc/caddy/tls/erp.crt /etc/caddy/tls/erp.key {
+		protocols tls1.2 tls1.3
+	}
+
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+		X-Frame-Options "DENY"
+		-Server
+	}
+
+	# Optional: restrict the whole site to the offices' / VPN address ranges (deploy/README.md).
+	@outside not remote_ip {$ALMIRAS_ALLOWED_CIDRS:0.0.0.0/0 ::/0}
+	respond @outside "Forbidden" 403
+
+	handle_path /static/* {
+		root * /srv/static
+		file_server
+	}
+
+	handle {
+		reverse_proxy web:8000 {
+			# Always set by the proxy, never passed through from the client (DJANGO_BEHIND_TLS_PROXY=1).
+			header_up X-Forwarded-Proto https
+			header_up X-Forwarded-Host {host}
+		}
+	}
+
+	request_body {
+		max_size 25MB
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

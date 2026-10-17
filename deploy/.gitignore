@@ -1,0 +1,6 @@
+# Site secrets, certificates and keys are created at install on the KSA host and never committed.
+secrets/*
+!secrets/README.example
+.env
+openbao/rendered/
+*.agekey

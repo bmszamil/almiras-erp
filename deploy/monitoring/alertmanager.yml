@@ -1,0 +1,33 @@
+# Alertmanager (Apache-2.0). Delivery by e-mail through the group's KSA-hosted mail server only (zatca D-5,
+# invoicing R53: no offshore processor receives data; alerts carry counts and job names, no personal data).
+# Placeholders: replace the smarthost and addresses at install. The SMTP password is a Docker secret file.
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: "mail.example.invalid:587"
+  smtp_from: "erp-alerts@example.invalid"
+  smtp_auth_username: "erp-alerts@example.invalid"
+  smtp_auth_password_file: /run/secrets/smtp_password
+  smtp_require_tls: true
+
+route:
+  receiver: it-operations
+  group_by: [alertname]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # ZATCA deadline and secret-store alerts also go to the ZATCA admins and the Managing Partner (R-23, R-47).
+    - matchers: ['alertname =~ "Zatca.*|OpenBaoSealedOrDown"']
+      receiver: zatca-and-key-holders
+      repeat_interval: 1h
+      continue: false
+
+receivers:
+  - name: it-operations
+    email_configs:
+      - to: "it-operations@example.invalid"
+        send_resolved: true
+  - name: zatca-and-key-holders
+    email_configs:
+      - to: "it-operations@example.invalid, zatca-admins@example.invalid, managing-partner@example.invalid"
+        send_resolved: true

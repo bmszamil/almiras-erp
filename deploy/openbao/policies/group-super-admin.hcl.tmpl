@@ -1,0 +1,64 @@
+# Policy "group-super-admin-${GROUP}": the Managing Partner of group ${GROUP} (zatca D-3, D-12, R-50; access R51).
+# Holds the group super key and is the only identity that creates or rotates an entity master key (R-50 b,
+# AT-71) and grants per-entity custody (R-50 c). Not the root token: the root token is revoked after bootstrap.
+# The super key itself is never delegated through the ERP (R-50 c, OQ-34 c).
+
+# Group super key (transit, non-exportable): create, configure, rotate, use for wrapping.
+path "zatca-group-${GROUP}/keys/super_key" {
+  capabilities = ["create", "read", "update"]
+}
+path "zatca-group-${GROUP}/keys/super_key/rotate" {
+  capabilities = ["update"]
+}
+path "zatca-group-${GROUP}/keys/super_key/config" {
+  capabilities = ["update"]
+}
+path "zatca-group-${GROUP}/+/super_key" {
+  capabilities = ["update"]
+}
+
+# Entity master keys, one block per entity of the group (rendered from group-super-admin-entity.hcl.tmpl):
+# create the transit mount "zatca-<ENTITY>" and its key, rotate it (R-50 b), re-wrap after a rotation.
+${ENTITY_BLOCKS}
+
+# Grant and revoke custody (R-41, R-50 c): per-entity policies and the named humans' identities.
+path "sys/policies/acl/entity-custodian-*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+path "sys/policies/acl/erp-signer-*" {
+  capabilities = ["create", "read", "update", "list"]
+}
+path "identity/entity/*" {
+  capabilities = ["create", "read", "update", "list"]
+}
+path "identity/entity-alias/*" {
+  capabilities = ["create", "read", "update", "list"]
+}
+path "identity/group/*" {
+  capabilities = ["create", "read", "update", "list"]
+}
+path "auth/userpass/users/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# Read-only views for the ceremony record.
+path "sys/mounts" {
+  capabilities = ["read"]
+}
+path "sys/audit" {
+  capabilities = ["read", "sudo"]
+}
+path "sys/policies/acl" {
+  capabilities = ["list"]
+}
+
+# Never: raw storage, root token generation, removing the audit trail.
+path "sys/raw/*" {
+  capabilities = ["deny"]
+}
+path "sys/generate-root/*" {
+  capabilities = ["deny"]
+}
+path "sys/audit/*" {
+  capabilities = ["deny"]
+}

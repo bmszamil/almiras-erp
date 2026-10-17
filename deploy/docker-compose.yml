@@ -1,0 +1,421 @@
+# Almiras ERP, single-host install on a KSA-hosted Linux VM (zatca D-5, R-43). Open source only.
+# Run from deploy/:  docker compose up -d     (site values in deploy/.env, secrets in deploy/secrets/)
+# One-off steps:     docker compose run --rm migrate          (owner role, at deployment only)
+#                    docker compose run --rm web release-check (app role: checks + access R45 / AT-47)
+# Profiles:          grafana (optional dashboards), drill (throwaway restore target for backup/restore-test.sh)
+name: almiras
+
+x-app: &app
+  image: ${ALMIRAS_IMAGE:-almiras-erp:local}
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  init: true
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  environment: &app-env
+    TZ: Asia/Riyadh
+    DJANGO_SETTINGS_MODULE: config.settings
+    DJANGO_DEBUG: "0"
+    DJANGO_ALLOWED_HOSTS: ${ALMIRAS_DOMAIN:?set ALMIRAS_DOMAIN in deploy/.env},localhost
+    DJANGO_CSRF_TRUSTED_ORIGINS: https://${ALMIRAS_DOMAIN}
+    DJANGO_BEHIND_TLS_PROXY: "1"
+    DJANGO_SECRET_KEY_FILE: /run/secrets/django_secret_key
+    POSTGRES_DB: almiras
+    POSTGRES_HOST: db
+    POSTGRES_PORT: "5432"
+    # The running application always connects as the restricted role (access R45).
+    POSTGRES_USER: erp_app
+    POSTGRES_PASSWORD_FILE: /run/secrets/db_app_password
+    HR_PERSONAL_DATA_KEYS_FILE: /run/secrets/hr_personal_data_keys
+    HR_PERSONAL_DATA_HASH_KEY_FILE: /run/secrets/hr_personal_data_hash_key
+    HR_REQUIRE_VERIFIED_PARAMETERS: "1"
+    BANKING_DATA_KEYS_FILE: /run/secrets/banking_data_keys
+    ZATCA_SECRET_STORE: zatca.keystore.OpenBaoSecretStore
+    ZATCA_OPENBAO_ADDRESS: https://openbao:8200
+    ZATCA_OPENBAO_AUTH_ROLE: erp-zatca
+    ZATCA_SANDBOX_BASE_URL: ${ZATCA_SANDBOX_BASE_URL:-}
+    ZATCA_SIMULATION_BASE_URL: ${ZATCA_SIMULATION_BASE_URL:-}
+    ZATCA_PRODUCTION_BASE_URL: ${ZATCA_PRODUCTION_BASE_URL:-}
+    ZATCA_PRODUCTION_ALLOWED: ${ZATCA_PRODUCTION_ALLOWED:-0}
+    ACCESS_GRANT_MAX_AGE_SECONDS: ${ACCESS_GRANT_MAX_AGE_SECONDS:-900}
+    # KSA-hosted mail server (placeholder values in .env; password is a secret file).
+    DJANGO_EMAIL_HOST: ${DJANGO_EMAIL_HOST:?set DJANGO_EMAIL_HOST in deploy/.env}
+    DJANGO_EMAIL_PORT: ${DJANGO_EMAIL_PORT:-587}
+    DJANGO_EMAIL_USER: ${DJANGO_EMAIL_USER:-}
+    DJANGO_EMAIL_PASSWORD_FILE: /run/secrets/smtp_password
+    DJANGO_DEFAULT_FROM_EMAIL: ${DJANGO_DEFAULT_FROM_EMAIL:-erp@example.invalid}
+  secrets: &app-secrets
+    - django_secret_key
+    - db_app_password
+    - hr_personal_data_keys
+    - hr_personal_data_hash_key
+    - banking_data_keys
+    - openbao_ca
+    - openbao_erp_role_id
+    - openbao_erp_secret_id
+    - smtp_password
+
+services:
+  proxy:
+    image: caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      ALMIRAS_DOMAIN: ${ALMIRAS_DOMAIN}
+      ALMIRAS_ALLOWED_CIDRS: ${ALMIRAS_ALLOWED_CIDRS:-0.0.0.0/0 ::/0}
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./secrets/tls:/etc/caddy/tls:ro
+      - static:/srv/static:ro
+      - caddy_data:/data
+    networks: [edge]
+    depends_on:
+      web: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 443"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  web:
+    <<: *app
+    command: ["web"]
+    environment:
+      <<: *app-env
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-3}
+      GUNICORN_FORWARDED_ALLOW_IPS: "*"
+    volumes:
+      - static:/srv/static
+    networks: [edge, backend, egress]
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "/opt/almiras/bin/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+
+  scheduler:
+    <<: *app
+    command: ["scheduler"]
+    environment:
+      <<: *app-env
+      ALMIRAS_ALERT_WEBHOOK_URL: ${ALMIRAS_ALERT_WEBHOOK_URL:-}
+    volumes:
+      - metrics:/var/lib/almiras/metrics
+    networks: [backend, egress]
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "/opt/almiras/bin/healthcheck.py", "scheduler"]
+      interval: 60s
+      timeout: 5s
+      start_period: 300s
+      retries: 3
+
+  # One-off: docker compose run --rm migrate. The ONLY service with the owner role's password (access R45).
+  migrate:
+    <<: *app
+    profiles: [ops]
+    restart: "no"
+    command: ["migrate"]
+    environment:
+      <<: *app-env
+      POSTGRES_USER: erp_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_owner_password
+    secrets:
+      - django_secret_key
+      - db_owner_password
+      - hr_personal_data_keys
+      - hr_personal_data_hash_key
+      - banking_data_keys
+      - smtp_password
+    networks: [backend]
+    depends_on:
+      db: {condition: service_healthy}
+
+  db:
+    image: ${ALMIRAS_POSTGRES_IMAGE:-almiras-postgres:16}
+    build:
+      context: ..
+      dockerfile: deploy/postgres/Dockerfile
+    restart: unless-stopped
+    shm_size: 256mb
+    command:
+      - postgres
+      - -c
+      - hba_file=/almiras/pg_hba.conf
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=${ALMIRAS_WAL_ARCHIVING:-off}
+      - -c
+      - archive_command=/almiras/bin/wal-archive.sh "%p" "%f"
+      - -c
+      - archive_timeout=900
+      - -c
+      - log_timezone=Asia/Riyadh
+      - -c
+      - timezone=UTC
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+      - -c
+      - log_line_prefix=%m [%p] %q%u@%d
+    environment:
+      TZ: Asia/Riyadh
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_superuser_password
+      POSTGRES_DB: almiras
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8 --data-checksums"
+      ALMIRAS_DB_OWNER_PASSWORD_FILE: /run/secrets/db_owner_password
+      ALMIRAS_DB_APP_PASSWORD_FILE: /run/secrets/db_app_password
+      ALMIRAS_DB_BACKUP_PASSWORD_FILE: /run/secrets/db_backup_password
+      ALMIRAS_DB_MONITOR_PASSWORD_FILE: /run/secrets/db_monitor_password
+      ALMIRAS_BACKUP_RECIPIENTS: /run/secrets/backup_recipients
+    secrets:
+      - db_superuser_password
+      - db_owner_password
+      - db_app_password
+      - db_backup_password
+      - db_monitor_password
+      - backup_recipients
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/pg_hba.conf:/almiras/pg_hba.conf:ro
+      - ${ALMIRAS_BACKUP_ROOT:-/srv/almiras/backups}/wal:/backups/wal
+    networks: [backend]
+    healthcheck:
+      # Over the local socket as the postgres OS user (peer), so the check itself logs no rejected login.
+      test: ["CMD", "gosu", "postgres", "pg_isready", "-q", "-h", "/var/run/postgresql", "-d", "almiras"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 6
+
+  backup:
+    image: ${ALMIRAS_POSTGRES_IMAGE:-almiras-postgres:16}
+    restart: unless-stopped
+    user: postgres
+    entrypoint: ["supercronic", "-passthrough-logs", "/almiras/backup/crontab"]
+    environment:
+      TZ: Asia/Riyadh
+      PGHOST: db
+      PGDATABASE: almiras
+      PGUSER: erp_backup
+      PGPASSWORD_FILE: /run/secrets/db_backup_password
+      ALMIRAS_BACKUP_RECIPIENTS: /run/secrets/backup_recipients
+      ALMIRAS_WAL_ARCHIVING: ${ALMIRAS_WAL_ARCHIVING:-off}
+      ALMIRAS_METRICS_DIR: /metrics
+      BACKUP_ROOT: /backups
+      BACKUP_RETENTION_DAILY_DAYS: ${BACKUP_RETENTION_DAILY_DAYS:-35}
+      BACKUP_RETENTION_MONTHLY_DAYS: ${BACKUP_RETENTION_MONTHLY_DAYS:-400}
+      BACKUP_RETENTION_BASE_DAYS: ${BACKUP_RETENTION_BASE_DAYS:-15}
+      BACKUP_RETENTION_OPENBAO_DAYS: ${BACKUP_RETENTION_OPENBAO_DAYS:-35}
+      BAO_ADDR: https://openbao:8200
+      BAO_CACERT: /run/secrets/openbao_ca
+      BAO_TOKEN_FILE: /run/secrets/openbao_backup_token
+    secrets:
+      - db_backup_password
+      - backup_recipients
+      - openbao_ca
+      - openbao_backup_token
+    volumes:
+      - ${ALMIRAS_BACKUP_ROOT:-/srv/almiras/backups}:/backups
+      - metrics:/metrics
+    networks: [backend]
+    depends_on:
+      db: {condition: service_healthy}
+
+  openbao:
+    image: openbao/openbao:2.7.1@sha256:6d2b93856e3fcf7b18ad855a0b51eaba474dc8b79cf554379ea32034797d2acf
+    restart: unless-stopped
+    command: ["server", "-config=/openbao/config/config.hcl"]
+    environment:
+      # For the Managing Partner's CLI inside the container (docker compose exec openbao bao ...).
+      BAO_ADDR: https://127.0.0.1:8200
+      BAO_CACERT: /openbao/tls/ca.crt
+      SKIP_SETCAP: "true"
+    volumes:
+      - ./openbao/config.hcl:/openbao/config/config.hcl:ro
+      - ./secrets/openbao-tls:/openbao/tls:ro
+      - openbao_data:/openbao/file
+      - ${ALMIRAS_OPENBAO_AUDIT_DIR:-/srv/almiras/openbao-audit}:/openbao/logs
+    # No published port: the Managing Partner works on the host over SSH with "docker compose exec openbao bao ..."
+    # (the backend network is internal). Only the ERP containers and the backup service reach it.
+    networks: [backend]
+    healthcheck:
+      # Exit 0 = unsealed, 2 = sealed (unhealthy until the Managing Partner unseals, zatca D-10 / R-47).
+      test: ["CMD", "bao", "status"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  node-exporter:
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --collector.textfile.directory=/textfile
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+      - metrics:/textfile:ro
+    networks: [backend]
+    depends_on:
+      scheduler: {condition: service_started}
+      backup: {condition: service_started}
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_URI: db:5432/almiras?sslmode=disable
+      DATA_SOURCE_USER: erp_monitor
+      DATA_SOURCE_PASS_FILE: /run/secrets/db_monitor_password
+    secrets: [db_monitor_password]
+    networks: [backend]
+    depends_on:
+      db: {condition: service_healthy}
+
+  prometheus:
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=90d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - ./secrets/openbao-tls/ca.crt:/etc/prometheus/openbao-ca.crt:ro
+      - prometheus_data:/prometheus
+    ports:
+      # Loopback only (SSH tunnel for the operator); the "ops" network exists only to publish the port.
+      - "127.0.0.1:9090:9090"
+    networks: [backend, ops]
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    secrets: [smtp_password]
+    ports:
+      - "127.0.0.1:9093:9093"
+    networks: [backend, egress]
+
+  grafana:
+    image: grafana/grafana-oss:12.4.3@sha256:2e986801428cd689c2358605289c90ab37d2b39e24808874971f54c99bcdc412
+    profiles: [grafana]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    secrets: [grafana_admin_password]
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [backend, ops]
+
+  # --- restore drill (backup/restore-test.sh): throwaway, isolated, nothing persists -----------------------
+  restore-db:
+    image: ${ALMIRAS_POSTGRES_IMAGE:-almiras-postgres:16}
+    profiles: [drill]
+    command: ["postgres", "-c", "hba_file=/almiras/pg_hba.conf"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_superuser_password
+      POSTGRES_DB: almiras
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8 --data-checksums"
+      ALMIRAS_DB_OWNER_PASSWORD_FILE: /run/secrets/db_owner_password
+      ALMIRAS_DB_APP_PASSWORD_FILE: /run/secrets/db_app_password
+      ALMIRAS_DB_BACKUP_PASSWORD_FILE: /run/secrets/db_backup_password
+      ALMIRAS_DB_MONITOR_PASSWORD_FILE: /run/secrets/db_monitor_password
+    secrets: [db_superuser_password, db_owner_password, db_app_password, db_backup_password, db_monitor_password]
+    volumes:
+      - ./postgres/pg_hba.conf:/almiras/pg_hba.conf:ro
+    tmpfs: [/var/lib/postgresql/data]
+    networks: [drill]
+    healthcheck:
+      # Over the local socket as the postgres OS user (peer), so the check itself logs no rejected login.
+      test: ["CMD", "gosu", "postgres", "pg_isready", "-q", "-h", "/var/run/postgresql", "-d", "almiras"]
+      interval: 5s
+      timeout: 5s
+      start_period: 60s
+      retries: 12
+
+  restore-check:
+    <<: *app
+    profiles: [drill]
+    restart: "no"
+    command: ["release-check"]
+    environment:
+      <<: *app-env
+      POSTGRES_HOST: restore-db
+    volumes:
+      - metrics:/var/lib/almiras/metrics
+    networks: [drill]
+
+networks:
+  edge: {}
+  egress: {}
+  ops: {}
+  backend:
+    internal: true
+    ipam:
+      config:
+        # Fixed so the OpenBao AppRole can be bound to it (ALMIRAS_BAO_APP_CIDR in openbao/bootstrap.sh).
+        - subnet: ${ALMIRAS_BACKEND_SUBNET:-172.30.20.0/24}
+  drill:
+    internal: true
+
+volumes:
+  pgdata: {}
+  static: {}
+  metrics: {}
+  openbao_data: {}
+  caddy_data: {}
+  prometheus_data: {}
+  alertmanager_data: {}
+  grafana_data: {}
+
+# File-based secrets, created at install under deploy/secrets/ (git-ignored; README "Secrets"). Never committed.
+secrets:
+  django_secret_key: {file: ./secrets/django_secret_key}
+  db_superuser_password: {file: ./secrets/db_superuser_password}
+  db_owner_password: {file: ./secrets/db_owner_password}
+  db_app_password: {file: ./secrets/db_app_password}
+  db_backup_password: {file: ./secrets/db_backup_password}
+  db_monitor_password: {file: ./secrets/db_monitor_password}
+  hr_personal_data_keys: {file: ./secrets/hr_personal_data_keys}
+  hr_personal_data_hash_key: {file: ./secrets/hr_personal_data_hash_key}
+  banking_data_keys: {file: ./secrets/banking_data_keys}
+  backup_recipients: {file: ./secrets/backup-recipients.txt}
+  openbao_ca: {file: ./secrets/openbao-tls/ca.crt}
+  openbao_backup_token: {file: ./secrets/openbao_backup_token}
+  openbao_erp_role_id: {file: ./secrets/openbao_erp_role_id}
+  openbao_erp_secret_id: {file: ./secrets/openbao_erp_secret_id}
+  smtp_password: {file: ./secrets/smtp_password}
+  grafana_admin_password: {file: ./secrets/grafana_admin_password}

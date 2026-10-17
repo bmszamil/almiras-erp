@@ -1,0 +1,10 @@
+# Backup schedule (supercronic in the "backup" service; TZ=Asia/Riyadh). Each script writes Prometheus metrics
+# (backup_<kind>.prom) and exits non-zero on failure; monitoring/alert-rules.yml alerts on both.
+#
+# Nightly logical dump of the ERP database (custom format, age-encrypted), after the 00:30 billing run and the
+# 01:15 zatca_daily job.
+0    2    *   *   *     /almiras/backup/pg-backup.sh
+# Nightly OpenBao raft snapshot (age-encrypted on top of the OpenBao barrier encryption).
+30   2    *   *   *     /almiras/backup/openbao-snapshot.sh
+# Weekly base backup for point-in-time recovery; does nothing unless ALMIRAS_WAL_ARCHIVING=on.
+0    3    *   *   5     /almiras/backup/pg-basebackup.sh

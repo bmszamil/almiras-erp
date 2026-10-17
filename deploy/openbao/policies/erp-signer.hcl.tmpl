@@ -1,0 +1,14 @@
+# Policy "erp-signer-${ENTITY}": the ERP's runtime signing identity (AppRole "erp-zatca") for entity ${ENTITY}.
+# R-41: "The ERP's runtime signing identity in OpenBao reads only the paths of entities it signs for."
+# Attached to the AppRole once per entity that signs; removed when the entity stops signing. Read and unwrap
+# only: no writes, no key configuration, no other entity.
+
+path "zatca-kv/data/zatca/${ENTITY}/*" {
+  capabilities = ["read"]
+}
+path "zatca-${ENTITY}/decrypt/master_key" {
+  capabilities = ["update"]
+}
+path "zatca-${ENTITY}/keys/master_key" {
+  capabilities = ["read"]
+}

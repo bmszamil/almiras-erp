@@ -1,0 +1,149 @@
+# Minimal alert rules for the Almiras ERP host. Annotations in English and Arabic (CLAUDE.md).
+groups:
+  - name: almiras-host
+    rules:
+      - alert: DiskAlmostFull
+        expr: |
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"}) < 0.15
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Disk {{ $labels.mountpoint }} has less than 15% free"
+          summary_ar: "المساحة الحرة على القرص {{ $labels.mountpoint }} أقل من 15%"
+      - alert: DiskCritical
+        expr: |
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"}) < 0.05
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Disk {{ $labels.mountpoint }} has less than 5% free: PostgreSQL and WAL archiving will stop"
+          summary_ar: "المساحة الحرة على القرص {{ $labels.mountpoint }} أقل من 5%"
+      - alert: TargetDown
+        expr: up{job=~"node|postgres|alertmanager"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Monitoring target {{ $labels.job }} is down"
+          summary_ar: "هدف المراقبة {{ $labels.job }} متوقف"
+
+  - name: almiras-database
+    rules:
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "PostgreSQL is not reachable"
+          summary_ar: "قاعدة البيانات PostgreSQL غير متاحة"
+      - alert: PostgresWalArchiveFailing
+        expr: increase(pg_stat_archiver_failed_count[30m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "WAL archiving failed in the last 30 minutes (backups/wal); disk will fill if it continues"
+          summary_ar: "فشلت أرشفة سجلات WAL خلال آخر 30 دقيقة"
+
+  - name: almiras-backups
+    rules:
+      - alert: BackupFailed
+        expr: almiras_backup_last_status != 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Backup {{ $labels.kind }} failed on its last run"
+          summary_ar: "فشل النسخ الاحتياطي {{ $labels.kind }} في آخر تشغيل"
+      - alert: BackupMissing
+        expr: |
+          time() - almiras_backup_last_success_timestamp_seconds{kind=~"pg_dump|openbao_snapshot"} > 26 * 3600
+        labels: {severity: critical}
+        annotations:
+          summary: "No successful {{ $labels.kind }} backup for more than 26 hours"
+          summary_ar: "لا توجد نسخة احتياطية ناجحة من {{ $labels.kind }} منذ أكثر من 26 ساعة"
+      - alert: BackupNeverRan
+        expr: absent(almiras_backup_last_success_timestamp_seconds{kind="pg_dump"})
+        for: 26h
+        labels: {severity: critical}
+        annotations:
+          summary: "The nightly database backup has never succeeded on this host"
+          summary_ar: "لم ينجح النسخ الاحتياطي الليلي لقاعدة البيانات على هذا الخادم أبدًا"
+      - alert: RestoreDrillOverdue
+        expr: time() - almiras_restore_test_last_run_timestamp_seconds > 35 * 86400 or almiras_restore_test_last_status != 0
+        labels: {severity: warning}
+        annotations:
+          summary: "The monthly restore drill (backup/restore-test.sh) is overdue or failed"
+          summary_ar: "اختبار الاستعادة الشهري متأخر أو فشل"
+
+  - name: almiras-jobs
+    rules:
+      - alert: ScheduledJobFailed
+        expr: almiras_job_last_exit_code{task!="zatca_deadline_check"} != 0 and almiras_job_last_exit_code != 75
+        labels: {severity: warning}
+        annotations:
+          summary: "Scheduled job {{ $labels.task }} failed (exit code {{ $value }})"
+          summary_ar: "فشلت المهمة المجدولة {{ $labels.task }}"
+      - alert: BillingRunFailed
+        expr: almiras_job_last_exit_code{task="billing_run"} != 0
+        labels: {severity: critical}
+        annotations:
+          summary: "billing_run aborted (billing R66): due invoices were not generated"
+          summary_ar: "توقفت دورة الفوترة: لم تُصدر الفواتير المستحقة"
+      - alert: DailyJobMissed
+        expr: |
+          time() - almiras_job_last_success_timestamp_seconds{
+            task=~"billing_run|zatca_daily|hr_refresh_status|hr_document_alerts|hr_resignation_deadlines|hr_gosi_exclusion_reminders"
+          } > 26 * 3600
+        labels: {severity: critical}
+        annotations:
+          summary: "Daily job {{ $labels.task }} has not succeeded for more than 26 hours"
+          summary_ar: "لم تنجح المهمة اليومية {{ $labels.task }} منذ أكثر من 26 ساعة"
+      - alert: SchedulerStopped
+        expr: time() - almiras_job_last_run_timestamp_seconds{task="zatca_process_queue"} > 10 * 60
+        labels: {severity: critical}
+        annotations:
+          summary: "The ZATCA queue job has not run for 10 minutes: the scheduler is stopped or stuck"
+          summary_ar: "لم تعمل مهمة طابور الزكاة والضريبة منذ 10 دقائق"
+      - alert: DbRoleCheckFailed
+        expr: almiras_job_last_exit_code{task="db_role_check"} != 0
+        labels: {severity: critical}
+        annotations:
+          summary: "access R45 / AT-47: the application database role can bypass a guard (grant drift)"
+          summary_ar: "دور قاعدة البيانات للتطبيق يملك صلاحيات زائدة (R45)"
+
+  - name: almiras-zatca
+    rules:
+      # zatca R-23: a stamped simplified invoice must be reported within 24 hours.
+      - alert: ZatcaReportingDeadlineAtRisk
+        expr: almiras_zatca_simplified_at_risk > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} simplified invoice(s) close to the 24-hour ZATCA reporting deadline"
+          summary_ar: "{{ $value }} فاتورة مبسطة قريبة من مهلة الإبلاغ البالغة 24 ساعة"
+      - alert: ZatcaReportingDeadlinePassed
+        expr: almiras_zatca_simplified_overdue > 0 or almiras_job_last_exit_code{task="zatca_deadline_check"} == 2
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $value }} simplified invoice(s) past the 24-hour deadline: file the ZATCA failure notice (R-35)"
+          summary_ar: "انقضت مهلة الإبلاغ لفواتير مبسطة: قدّم إشعار التعذر لهيئة الزكاة والضريبة والجمارك (R-35)"
+      - alert: ZatcaQueueStuck
+        expr: almiras_zatca_queue_oldest_age_seconds > 30 * 60 or almiras_job_last_exit_code{task="zatca_deadline_check"} == 3
+        labels: {severity: critical}
+        annotations:
+          summary: "An e-invoice has waited in the ZATCA queue for more than 30 minutes"
+          summary_ar: "فاتورة إلكترونية تنتظر في الطابور منذ أكثر من 30 دقيقة"
+      - alert: ZatcaDeadlineCheckNotRunning
+        expr: |
+          time() - almiras_zatca_deadline_check_timestamp_seconds > 30 * 60
+            or almiras_zatca_deadline_check_ok == 0
+            or almiras_job_last_exit_code{task="zatca_deadline_check"} == 4
+        labels: {severity: critical}
+        annotations:
+          summary: "The ZATCA deadline watchdog has not run or failed: deadlines are not being watched"
+          summary_ar: "مراقب مهلة الإبلاغ لا يعمل"
+      # zatca R-47 / D-10: a sealed store stops signing and submission until the Managing Partner unseals it.
+      - alert: OpenBaoSealedOrDown
+        expr: up{job="openbao"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "OpenBao is sealed or down: ZATCA signing and submission are stopped until it is unsealed"
+          summary_ar: "مخزن الأسرار OpenBao مغلق أو متوقف: التوقيع والإرسال متوقفان حتى فتحه"

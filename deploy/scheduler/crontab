@@ -1,0 +1,41 @@
+# Almiras ERP scheduled jobs (supercronic; container TZ=Asia/Riyadh, so all times are Riyadh time, UTC+3, no DST).
+# Every line goes through run-job.sh: one run at a time, timeout, JSON log line, Prometheus metrics, alert hook.
+# Runs as erp_app (the restricted database role) in the "scheduler" container. Never as the owner role.
+#
+# min hour dom mon dow   command
+#
+# --- ZATCA e-invoicing (zatca.md) ------------------------------------------------------------------------------
+# R-20..R-27, R-35: stamp, submit, retry, results, deadline checks. "Schedule it every minute."
+*    *    *   *   *     /opt/almiras/bin/run-job.sh zatca_process_queue --timeout 300 -- python manage.py zatca_process_queue
+# R-10 credential renewal/expiry, R-23/R-35 deadline checks. Daily, after the nightly billing run.
+15   1    *   *   *     /opt/almiras/bin/run-job.sh zatca_daily --timeout 1800 -- python manage.py zatca_daily
+# Monitoring watchdog for the 24 h simplified reporting deadline (R-23) and a stuck queue. Exit 1 at risk,
+# 2 overdue, 3 queue stuck (deploy/bin/zatca_deadline_check.py). Read-only.
+*/10 *    *   *   *     /opt/almiras/bin/run-job.sh zatca_deadline_check --timeout 120 -- python /opt/almiras/bin/zatca_deadline_check.py
+#
+# --- HR (hr.md) ------------------------------------------------------------------------------------------------
+# R25: deliver secondment end events to billing, every 5 minutes.
+*/5  *    *   *   *     /opt/almiras/bin/run-job.sh hr_deliver_assignment_events --timeout 600 -- python manage.py hr_deliver_assignment_events
+# Daily status refresh (start/terminate on their dates); before the billing run so ended secondments are known.
+5    0    *   *   *     /opt/almiras/bin/run-job.sh hr_refresh_status --timeout 1800 -- python manage.py hr_refresh_status
+# R30: month-end leave accrual, idempotent; on the 1st it accrues the month just ended (command default).
+45   1    1   *   *     /opt/almiras/bin/run-job.sh hr_accrue_leave --timeout 3300 -- python manage.py hr_accrue_leave
+# R43: document expiry alerts, daily (morning, so HR officers see them at the start of the working day).
+0    7    *   *   *     /opt/almiras/bin/run-job.sh hr_document_alerts --timeout 1800 -- python manage.py hr_document_alerts
+# R41 (Labour Law Art. 79 bis): day-20/27 reminders and deemed acceptance on day 30, daily.
+10   7    *   *   *     /opt/almiras/bin/run-job.sh hr_resignation_deadlines --timeout 1800 -- python manage.py hr_resignation_deadlines
+# R65: GOSI exclusion reminders (the job itself acts on the 25th and the last day of the leaving month), daily.
+20   7    *   *   *     /opt/almiras/bin/run-job.sh hr_gosi_exclusion_reminders --timeout 1800 -- python manage.py hr_gosi_exclusion_reminders
+#
+# --- Billing (billing.md) -----------------------------------------------------------------------------------
+# R66: daily at 00:30 Asia/Riyadh; exit code non-zero when a run aborted. Missed runs: scheduler-start.sh catch-up.
+30   0    *   *   *     /opt/almiras/bin/run-job.sh billing_run --timeout 3300 -- python manage.py billing_run
+#
+# --- Deployment self-check --------------------------------------------------------------------------------------
+# access R45 / AT-47: the application role still cannot bypass triggers (catches grant drift). Weekly, Sunday.
+40   5    *   *   0     /opt/almiras/bin/run-job.sh db_role_check --timeout 300 -- python /opt/almiras/bin/dbrole.py verify
+#
+# Not scheduled on purpose:
+# - hr_rehash_personal_data: one-off after an HR key rotation (deploy/README.md "Key rotation").
+# - invoicing anonymisation (invoicing R52) and any ZATCA archive purge (R-30): no job may run before the
+#   retention rules are confirmed (zatca OQ-8, OQ-31). Payroll (payroll.md) jobs: module not built yet.

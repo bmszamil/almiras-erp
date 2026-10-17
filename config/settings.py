@@ -244,6 +244,16 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 
+# Deployment behind the TLS reverse proxy (deploy/README.md). All unset by default, so local runs and tests are
+# unchanged. STATIC_ROOT: where collectstatic writes (the image build); the proxy serves the files.
+STATIC_ROOT = os.environ.get("DJANGO_STATIC_ROOT") or None
+CSRF_TRUSTED_ORIGINS = [o for o in os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if o]
+if os.environ.get("DJANGO_BEHIND_TLS_PROXY", "0") == "1":
+    # The proxy terminates TLS and always sets X-Forwarded-Proto itself (never passed through from clients).
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
 
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
@@ -253,3 +263,18 @@ MAILERS = {
         "BACKEND": "django.core.mail.backends.console.EmailBackend",
     },
 }
+# Production: SMTP through the group's KSA-hosted mail server (deploy/README.md; zatca D-5). Unset = console.
+if os.environ.get("DJANGO_EMAIL_HOST"):
+    MAILERS = {
+        "default": {
+            "BACKEND": "django.core.mail.backends.smtp.EmailBackend",
+            "OPTIONS": {
+                "host": os.environ["DJANGO_EMAIL_HOST"],
+                "port": int(os.environ.get("DJANGO_EMAIL_PORT", "587")),
+                "username": os.environ.get("DJANGO_EMAIL_USER", ""),
+                "password": os.environ.get("DJANGO_EMAIL_PASSWORD", ""),
+                "use_tls": os.environ.get("DJANGO_EMAIL_USE_TLS", "1") == "1",
+            },
+        },
+    }
+DEFAULT_FROM_EMAIL = os.environ.get("DJANGO_DEFAULT_FROM_EMAIL", "webmaster@localhost")

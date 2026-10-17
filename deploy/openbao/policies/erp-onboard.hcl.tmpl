@@ -1,0 +1,13 @@
+# Policy "erp-onboard-${ENTITY}": the ERP's onboarding / renewal identity for entity ${ENTITY} (AppRole
+# "erp-onboard-${ENTITY}"). Its secret-id is issued per ceremony by a custodian of that entity (single use,
+# short TTL), so the ERP can write a new EGS key or CSID secret only while a delegated human is acting (R-41).
+
+path "zatca-${ENTITY}/encrypt/master_key" {
+  capabilities = ["update"]
+}
+path "zatca-kv/data/zatca/${ENTITY}/*" {
+  capabilities = ["create", "update"]
+}
+path "zatca-kv/metadata/zatca/${ENTITY}/*" {
+  capabilities = ["read"]
+}

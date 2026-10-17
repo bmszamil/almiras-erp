@@ -1,0 +1,16 @@
+# -- entity ${ENTITY}
+path "sys/mounts/zatca-${ENTITY}" {
+  capabilities = ["create", "read", "update"]
+}
+path "zatca-${ENTITY}/keys/master_key" {
+  capabilities = ["create", "read", "update"]
+}
+path "zatca-${ENTITY}/keys/master_key/rotate" {
+  capabilities = ["update"]
+}
+path "zatca-${ENTITY}/keys/master_key/config" {
+  capabilities = ["update"]
+}
+path "zatca-${ENTITY}/rewrap/master_key" {
+  capabilities = ["update"]
+}

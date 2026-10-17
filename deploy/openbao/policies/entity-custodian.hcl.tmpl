@@ -1,0 +1,40 @@
+# Policy "entity-custodian-${ENTITY}": a named key custodian of entity ${ENTITY} (zatca 3.9
+# KeyCustodianDelegation scopes master_key / onboard_renew / revoke / restore; R-41, R-50 c; access R51).
+# Granted only by the Managing Partner, for ONE entity, recorded in the ERP (openbao_policy_ref) and revocable.
+# Cannot rotate or create the entity master key (needs the super key, R-50 b, AT-71), cannot touch any other
+# entity's paths (R-2, R-50 a), cannot read plaintext of anything.
+
+# Use (not rotate) the entity master key: wrap new EGS keys and CSID secrets, re-wrap after a rotation by the MP.
+path "zatca-${ENTITY}/encrypt/master_key" {
+  capabilities = ["update"]
+}
+path "zatca-${ENTITY}/rewrap/master_key" {
+  capabilities = ["update"]
+}
+path "zatca-${ENTITY}/keys/master_key" {
+  capabilities = ["read"]
+}
+
+# Write and version EGS private keys and CSID secrets (ciphertext under the entity master key only).
+path "zatca-kv/data/zatca/${ENTITY}/*" {
+  capabilities = ["create", "update", "read"]
+}
+path "zatca-kv/metadata/zatca/${ENTITY}/*" {
+  capabilities = ["read", "list"]
+}
+# Revoke (zatca 3.9 scope "revoke"): soft-delete a version; never destroy (R-30 archive, audit).
+path "zatca-kv/delete/zatca/${ENTITY}/*" {
+  capabilities = ["update"]
+}
+# Restore (scope "restore"): undelete a soft-deleted version.
+path "zatca-kv/undelete/zatca/${ENTITY}/*" {
+  capabilities = ["update"]
+}
+path "zatca-kv/destroy/*" {
+  capabilities = ["deny"]
+}
+
+# Issue a single-use, short-lived login for the ERP's onboarding identity of THIS entity (onboard / renew).
+path "auth/approle/role/erp-onboard-${ENTITY}/secret-id" {
+  capabilities = ["update"]
+}
