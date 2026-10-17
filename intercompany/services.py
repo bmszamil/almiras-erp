@@ -375,6 +375,7 @@ TIMESHEET_EDITABLE = {"date", "hours", "description_en", "description_ar", "rate
 def create_timesheet(user, agreement, *, worker=None, ctx=None, **fields):
     """Billing clerks record their own entries; holders of timesheet.approve record for anyone; agents
     draft entries for a worker, who (or an approver) submits them (R20)."""
+    agreement = A.objects.get(pk=agreement.pk)
     _require(user, agreement.entity, "intercompany.timesheet.create")
     _check_fields(fields, TIMESHEET_EDITABLE)
     worker = worker or user
@@ -566,6 +567,9 @@ def allocation_share(agreement, period):
 def add_billable_item(user, agreement, *, period_start, period_end, description_en, description_ar, quantity,
                       unit_price, source_type="", source_ref="", ctx=None):
     """Feeding modules (rental leases later) add lines for an agreement; billed by the next run."""
+    agreement = A.objects.get(pk=agreement.pk)
+    if agreement.status not in (A.Status.ACTIVE, A.Status.SUSPENDED):
+        raise Conflict("agreement_not_active", "The agreement is not active.", "الاتفاقية غير نشطة.")
     if user is not None:
         _require(user, agreement.entity, "intercompany.invoice.create")
     item = BillableItem(entity=agreement.entity, agreement=agreement, period_start=period_start,
@@ -756,6 +760,7 @@ def _set_totals(inv):
 
 
 def _check_run_period(entity, period):
+    period = FiscalPeriod.objects.get(pk=period.pk)  # never trust a caller's stale copy of the status
     if period.entity_id != entity.pk:
         raise RuleError("period_entity", "The period belongs to another entity.", "الفترة تتبع منشأة أخرى.")
     if not _is_calendar_month(period):
@@ -765,6 +770,7 @@ def _check_run_period(entity, period):
     if period.status != FiscalPeriod.Status.OPEN:
         raise RuleError("period_closed", f"Period {period.name} is closed for {entity.code}.",
                         f"الفترة {period.name} مقفلة للمنشأة {entity.code}.")
+    return period
 
 
 def run_billing(user, entity, period, ctx=None):
@@ -772,7 +778,7 @@ def run_billing(user, entity, period, ctx=None):
     Creates drafts only; nothing is posted. An unexpected error rolls the run back and records it as failed."""
     _require(user, entity, "intercompany.billing.run")
     _require_human(user)
-    _check_run_period(entity, period)
+    period = _check_run_period(entity, period)
     try:
         with transaction.atomic():
             return _run(user, entity, period, ctx)
@@ -820,7 +826,7 @@ def create_invoice_draft(user, agreement, period, ctx=None):
     """One agreement, one period, outside a run (agents may do this: drafts only, R20)."""
     _require(user, agreement.entity, "intercompany.invoice.create")
     agreement = A.objects.select_for_update().get(pk=agreement.pk)
-    _check_run_period(agreement.entity, period)
+    period = _check_run_period(agreement.entity, period)
     inv = _draft_invoice(agreement, period, user)
     _audit(user, "intercompany.invoice.create", inv, after=snapshot(inv), ctx=ctx)
     return inv
