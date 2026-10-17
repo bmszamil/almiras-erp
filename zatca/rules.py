@@ -16,6 +16,7 @@ SUBTYPE_RE = re.compile(r"^0[12][01]{5}\Z")
 VAT_RE = re.compile(r"^3[0-9]{13}3\Z")
 SELLER_SCHEMES = ("CRN", "MOM", "MLS", "700", "SAG", "OTH")  # BR-KSA-08 priority order
 SUPPORTED_TYPES = ("388", "381", "383")
+SELLER_NAME_MAX = 1000  # BT-27: BR-KSA-F-06-C10 (SDK R3.4.8); the 127-character BT-CL-27 is gone
 
 
 def _digits(value, n):
@@ -93,7 +94,7 @@ def document_problems(data):
                                         country=s.country, additional_no=s.additional_no)
     if not s.name.strip():
         problems.append(local("seller_name_ar"))
-    if len(s.name) > 127:  # BT-27 (SDK BT-CL-27)
+    if len(s.name) > SELLER_NAME_MAX:  # BT-27, BR-KSA-F-06-C10 (characters, not bytes)
         problems.append(local("seller_name_length"))
     if not (s.id_scheme and s.id_value):
         problems.append(local("seller_id"))

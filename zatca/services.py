@@ -593,7 +593,7 @@ def _uuid5(text):
 
 
 def _sign_xml(data, icv, pih, key_ref, master, credential, signing_time):
-    """Build, hash, sign and assemble one document (R-13 to R-15). Raises qr.QrValueTooLong / QrTooLong."""
+    """Build, hash, sign and assemble one document (R-13 to R-15). Raises qr.QrTooLong (R-37)."""
     unsigned = ubl.build_unsigned(data, icv, pih)
     if len(unsigned) > int(_setting("ZATCA_MAX_XML_BYTES", 10 * 1024 * 1024)):  # R-16 / AT-55, before parsing
         raise _LocalProblems([local("xml_size")])
@@ -611,12 +611,14 @@ def _sign_xml(data, icv, pih, key_ref, master, credential, signing_time):
     cert_b64 = crypto.cert_base64(cert)
     qr_b64 = None
     if data.category == "simplified":
+        # Tag 4 = BT-115 PayableAmount, not BT-112 (SDK R3.4.8 findings §3.1; R-15).
         qr_b64 = qr.encode(qr.simplified_values(
             seller_name=data.seller.name, vat_number=data.seller.vat_number,
-            timestamp=data.qr_timestamp, total=ubl.amount(data.total_gross),
+            timestamp=data.qr_timestamp, total=ubl.amount(data.payable),
             vat_total=ubl.amount(data.total_vat), invoice_hash=invoice_hash, signature_b64=signature_b64,
-            public_key_der=crypto.spki_der(cert.public_key()), certificate_signature=cert.signature,
-            signature_r_s=crypto.signature_r_s(signature)))
+            public_key_der=crypto.spki_der(cert.public_key()), certificate_signature=cert.signature))
+        if qr.missing_tags(qr.decode(qr_b64), simplified=True):  # R-15 / AT-14: all 9 tags, none empty
+            raise _LocalProblems([local("qr_tags")])
     args = (signing_time.astimezone(dt_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), crypto.cert_digest(cert_b64),
             crypto.issuer_name(cert, _setting("ZATCA_X509_ISSUER_NAME_STYLE", "rfc2253")), cert.serial_number)
     sp = ubl.signed_properties(*args)
@@ -1147,8 +1149,6 @@ def _stamp(einv, user, now):
             icv, pih = egs.last_icv + 1, egs.last_invoice_hash  # R-11, R-12
             try:
                 signed, invoice_hash, qr_b64 = _sign_xml(data, icv, pih, egs.private_key_ref, master, credential, now)
-            except qr.QrValueTooLong:
-                raise _LocalProblems([local("qr_value")]) from None
             except qr.QrTooLong:
                 raise _LocalProblems([local("qr_length")]) from None
             xsd = _xsd_problems(signed)

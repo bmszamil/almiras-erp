@@ -1,4 +1,5 @@
-"""R-13 to R-15, R-37 on the pure functions (no database): invoice hash against ZATCA SDK 2.0.3, QR TLV."""
+"""R-13 to R-15, R-37, §3.2 on the pure functions (no database): invoice hash against ZATCA SDK 2.0.3, QR TLV and
+CSR template name per SDK R3.4.8 (docs/compliance/zatca-sdk-3-findings-2026-10-17.md)."""
 import base64
 import hashlib
 from pathlib import Path
@@ -76,45 +77,78 @@ def test_r14_signature_over_raw_hash_verifies_and_is_der():
 def _values(**over):
     v = dict(seller_name="شركة", vat_number="311111111100003", timestamp="2026-10-15T07:00:00Z", total="115.00",
              vat_total="15.00", invoice_hash="A" * 44, signature_b64="B" * 96, public_key_der=b"\x30" * 88,
-             certificate_signature=b"\x30" * 71, signature_r_s=(5, 7))
+             certificate_signature=b"\x30" * 71)
     v.update(over)
     return v
 
 
 def test_r15_dtg_layout_tags_1_to_9(settings):
+    """SDK R3.4.8 findings §3.1: 7 = SignatureValue base64 text, 8 = DER SPKI, 9 = certificate signature DER."""
     decoded = qr.decode(qr.encode(qr.simplified_values(**_values())))
-    assert sorted(decoded) == list(range(1, 10))
-    assert decoded[6] == b"A" * 44  # tag 6 = the base64 hash as text (SDK findings §5)
+    assert sorted(decoded) == list(range(1, 10)) and qr.missing_tags(decoded, simplified=True) == []
+    assert decoded[6] == b"A" * 44  # tag 6 = the base64 hash as text
     assert decoded[7] == b"B" * 96 and decoded[8] == b"\x30" * 88 and decoded[9] == b"\x30" * 71
 
 
-def test_r15_old_sdk_layout_only_by_setting(settings):
-    settings.ZATCA_QR_TAGS_7_9_LAYOUT = qr.LAYOUT_SDK_203
-    decoded = qr.decode(qr.encode(qr.simplified_values(**_values())))
-    assert decoded[7] == b"\x30" * 88 and decoded[8] == b"\x05" and decoded[9] == b"\x07"
-    settings.ZATCA_QR_TAGS_7_9_LAYOUT = "something-else"
+def test_r15_sdk_2_0_3_layout_retired(settings):
+    """The 2.0.3 layout (7 SPKI, 8 r, 9 s) fails R3.4.8; a leftover setting asking for it fails loudly."""
+    assert not hasattr(qr, "LAYOUT_SDK_203")
+    for legacy in ("dtg", "dtg_2023_pending_sdk_confirm"):  # the old default still means DTG
+        settings.ZATCA_QR_TAGS_7_9_LAYOUT = legacy
+        assert qr.layout() == qr.LAYOUT_DTG
+    settings.ZATCA_QR_TAGS_7_9_LAYOUT = "sdk_2_0_3"
     with pytest.raises(ImproperlyConfigured):
-        qr.layout()
-    settings.ZATCA_QR_TAGS_7_9_LAYOUT = qr.LAYOUT_DTG
-    settings.ZATCA_QR_TLV_LENGTH_FORM = "ber"
-    with pytest.raises(ImproperlyConfigured):
-        qr.tlv(1, b"x")
+        qr.simplified_values(**_values())
 
 
-def test_r15_value_cap_127_bytes():
+def test_r15_tlv_lengths_are_ber(settings):
+    """SDK R3.4.8 BerTlvBuilder: 1 byte up to 127, 0x81 LL for 128-255, 0x82 LLLL above; no 127-byte cap and the
+    interim length-form setting is no longer read."""
+    settings.ZATCA_QR_TLV_LENGTH_FORM = "one_byte_max_127_pending_sdk_confirm"
     assert qr.tlv(1, b"x" * 127)[:2] == bytes([1, 127])
-    with pytest.raises(qr.QrValueTooLong):
-        qr.tlv(1, b"x" * 128)
+    assert qr.tlv(1, b"x" * 128)[:3] == bytes([1, 0x81, 128])
+    assert qr.tlv(1, b"x" * 200)[:3] == bytes([1, 0x81, 0xC8])  # the SDK-signed 200-byte seller name
+    assert qr.tlv(1, b"x" * 255)[:3] == bytes([1, 0x81, 255])
+    assert qr.tlv(1, b"x" * 256)[:4] == bytes([1, 0x82, 0x01, 0x00])
+    for n in (0, 1, 127, 128, 200, 255, 256, 700):
+        text = base64.b64encode(qr.tlv(1, b"y" * n) + qr.tlv(2, b"z")).decode()
+        assert qr.decode(text) == {1: b"y" * n, 2: b"z"}
+    with pytest.raises(ValueError):
+        qr.tlv(256, b"x")
 
 
-def test_at39_qr_length_700_passes_longer_refused():
-    """R-37: at most 700 base64 characters. Base64 lengths are multiples of 4, so the first refused length is
-    704 (the spec's "701" cannot occur)."""
-    values = [(t, b"x" * 127) for t in range(1, 5)] + [(5, b"y" * 7)]  # 4 * 129 + 9 = 525 bytes
-    assert len(qr.encode(values)) == 700
+def test_r15_decode_refuses_a_one_byte_length_for_a_long_value():
+    """A 200-byte value with the 1-byte length C8 is what the SDK rejects (QRCODE_INVALID); decode refuses it
+    instead of misreading it. Truncated values and repeated tags are refused too."""
+    one_byte = base64.b64encode(bytes([1, 0xC8]) + b"x" * 200).decode()
+    with pytest.raises(qr.QrInvalid):
+        qr.decode(one_byte)
+    for bad in (bytes([1, 5]) + b"abc", bytes([1]), bytes([1, 1]) + b"a" + bytes([1, 1]) + b"b",
+                bytes([1, 0x83, 0, 0, 1]) + b"a"):
+        with pytest.raises(qr.QrInvalid):
+            qr.decode(base64.b64encode(bad).decode())
+    with pytest.raises(qr.QrInvalid):
+        qr.decode("not base64!")
+
+
+def test_at14_missing_tags():
+    full = {t: b"v" for t in range(1, 10)}
+    assert qr.missing_tags(full, simplified=True) == []
+    assert qr.missing_tags({t: b"v" for t in range(1, 9)}, simplified=True) == [9]
+    assert qr.missing_tags({**full, 8: b""}, simplified=True) == [8]  # empty counts as missing
+    assert qr.missing_tags({t: b"v" for t in range(1, 9)}, simplified=False) == []
+    assert qr.missing_tags({t: b"v" for t in range(1, 7)}, simplified=False) == [7, 8]
+
+
+def test_at39_qr_length_1000_passes_longer_refused(settings):
+    """R-37 / BR-CL-KSA-14 (SDK R3.4.8): at most 1000 base64 characters. Base64 lengths are multiples of 4, so the
+    first refused length is 1004. The old ZATCA_QR_MAX_CHARS setting no longer changes the cap."""
+    settings.ZATCA_QR_MAX_CHARS = 700
+    values = [(1, b"x" * 250), (2, b"x" * 250), (3, b"y" * 241)]  # 253 + 253 + 244 = 750 bytes
+    assert len(qr.encode(values)) == 1000 == qr.max_chars()
     with pytest.raises(qr.QrTooLong) as exc:
-        qr.encode(values[:4] + [(5, b"y" * 8)])  # 526 bytes -> 704 characters
-    assert exc.value.length == 704
+        qr.encode(values[:2] + [(3, b"y" * 242)])  # 751 bytes -> 1004 characters
+    assert exc.value.length == 1004 and exc.value.limit == 1000
 
 
 @pytest.mark.parametrize("environment, name", [

@@ -53,7 +53,7 @@ def test_f4_early_morning_riyadh_keeps_the_riyadh_date(live, at):
     xml = einv.signed_xml.encode()
     assert xml_text(xml, "/*/cbc:IssueDate") == TODAY.isoformat()
     assert xml_text(xml, "/*/cbc:IssueTime") == at.strftime("%H:%M:%S")  # KSA-25 in AST, no suffix
-    assert qr.decode(einv.qr_tlv)[3].decode() == f"{TODAY.isoformat()}T{at:%H:%M:%S}Z"  # R-15 / SDK 2.0.3 form
+    assert qr.decode(einv.qr_tlv)[3].decode() == f"{TODAY.isoformat()}T{at:%H:%M:%S}Z"  # R-15; "Z": open (R3.4.8 §3.1)
     assert xml_text(xml, "//xades:SigningTime") == NOW.strftime("%Y-%m-%dT%H:%M:%SZ")  # SigningTime stays UTC
     name, _ = services.export_archive(einv, user=live.accountant)
     assert name.startswith(f"311111111100003_{TODAY:%Y%m%d}_{at:%H%M%S}_")

@@ -16,7 +16,7 @@ import hashlib
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, utils as ec_utils
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID, ObjectIdentifier
 from lxml import etree
 
@@ -101,10 +101,6 @@ def verify_hash_signature(public_key, signature_der: bytes, raw_hash: bytes) -> 
     except InvalidSignature:
         return False
     return True
-
-
-def signature_r_s(signature_der: bytes):
-    return ec_utils.decode_dss_signature(signature_der)
 
 
 def spki_der(public_key) -> bytes:

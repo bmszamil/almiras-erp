@@ -156,21 +156,56 @@ def test_at66_signed_properties_digest_and_structure(live):
 
 def test_at14_simplified_qr_tags_1_to_9(live):
     _, einv = stamped(live, simplified=True)
-    tags = qr.decode(einv.qr_tlv)
-    assert sorted(tags) == list(range(1, 10))
+    tags = qr.decode(einv.qr_tlv)  # strict BER-TLV: no trailing bytes, no repeated tag
+    assert sorted(tags) == list(range(1, 10)) and qr.missing_tags(tags, simplified=True) == []
     assert tags[1].decode() == "شركة TST1 للاختبار"  # Arabic seller name
     assert tags[2] == b"311111111100003"
     xml = xml_of(einv)
-    # finding 4: tag 3 = emitted (Riyadh) IssueDate "T" IssueTime "Z", as SDK 2.0.3 checks it (OQ-18, OQ-28)
+    # tag 3 = emitted (Riyadh) IssueDate "T" IssueTime "Z"; with or without "Z" is open (R-15, OQ-18; R3.4.8 §3.1)
     assert tags[3].decode() == f"{text(xml, '/*/cbc:IssueDate')}T{text(xml, '/*/cbc:IssueTime')}Z"
-    assert tags[4] == b"115.00" and tags[5] == b"15.00"
+    assert tags[4].decode() == text(xml, "/*/cac:LegalMonetaryTotal/cbc:PayableAmount") == "115.00"  # BT-115
+    assert tags[5] == b"15.00"
     assert tags[6].decode() == einv.invoice_hash and len(tags[6]) == 44
     assert tags[7].decode() == text(xml, "//ds:SignatureValue") and base64.b64decode(tags[7])[0] == 0x30
     serialization.load_der_public_key(tags[8])  # raw DER SubjectPublicKeyInfo
     cert = crypto.load_cert_base64(text(xml, "//ds:X509Certificate"))
     assert tags[9] == cert.signature
-    assert all(len(v) <= 127 for v in tags.values())
-    assert ubl.qr_from_xml(xml) == einv.qr_tlv and len(einv.qr_tlv) <= 700
+    assert ubl.qr_from_xml(xml) == einv.qr_tlv and len(einv.qr_tlv) <= 1000
+
+
+def test_at14_simplified_qr_missing_a_tag_is_not_signed(live, monkeypatch):
+    """R-15: a simplified QR without all 9 tags is refused inside the stamp (the SDK would let it pass)."""
+    original = qr.simplified_values
+    monkeypatch.setattr(qr, "simplified_values", lambda **kw: [v for v in original(**kw) if v[0] != 9])
+    doc = issue(live, live.tst1, simplified=True)
+    run(live)
+    einv = einvoice_of(doc)
+    assert einv.icv is None and einv.signed_xml == "" and "qr_tags" in held_codes(einv) and last_icv(live) == 0
+    assert einv.messages.get(code="qr_tags").message_ar
+
+
+def test_r15_qr_tag_4_is_payable_amount_bt115(live, monkeypatch):
+    """SDK R3.4.8 findings §3.1: tag 4 = PayableAmount (BT-115), not TaxInclusiveAmount (BT-112). BT-113 is only
+    non-zero with prepayments, which are refused in the normal flow (R-39), so the local checks are bypassed."""
+    mutate(monkeypatch, prepaid_amount=D("15.00"))
+    monkeypatch.setattr(services.rules, "document_problems", lambda data: [])
+    _, einv = stamped(live, simplified=True)
+    xml = xml_of(einv)
+    assert text(xml, "/*/cac:LegalMonetaryTotal/cbc:TaxInclusiveAmount") == "115.00"
+    assert text(xml, "/*/cac:LegalMonetaryTotal/cbc:PrepaidAmount") == "15.00"
+    assert text(xml, "/*/cac:LegalMonetaryTotal/cbc:PayableAmount") == "100.00"
+    assert qr.decode(einv.qr_tlv)[4] == b"100.00"
+
+
+def test_r15_fake_zatca_cleared_qr_tag_4_is_payable_amount(live):
+    """The fake ZATCA builds the cleared QR the way the SDK does: tag 4 from PayableAmount."""
+    _, einv = stamped(live)
+    xml = einv.signed_xml.replace(">115.00</cbc:PayableAmount>", ">100.00</cbc:PayableAmount>")
+    assert xml != einv.signed_xml
+    body = {"invoice": base64.b64encode(xml.encode()).decode(), "invoiceHash": einv.invoice_hash, "uuid": "u"}
+    cleared = base64.b64decode(FakeZatcaClient.cleared(body).body["clearedInvoice"])
+    tags = qr.decode(ubl.qr_from_xml(cleared))
+    assert tags[4] == b"100.00" and qr.missing_tags(tags, simplified=False) == [] and 9 not in tags
 
 
 def test_at14_standard_qr_comes_from_the_cleared_xml(live):
@@ -179,38 +214,49 @@ def test_at14_standard_qr_comes_from_the_cleared_xml(live):
     run(live)
     einv.refresh_from_db()
     tags = qr.decode(einv.qr_tlv)
-    assert sorted(tags) == list(range(1, 9))  # no tag 9 on standard documents
+    assert sorted(tags) == list(range(1, 9)) and qr.missing_tags(tags, simplified=False) == []  # no tag 9
     assert einv.qr_tlv == ubl.qr_from_xml(einv.cleared_xml.encode())
     doc.refresh_from_db()
     assert doc.zatca_qr == einv.qr_tlv
 
 
-def test_at56_seller_name_bytes_and_characters(live, monkeypatch):
-    name_128_bytes = "ش" * 64  # 2 bytes each in UTF-8
-    mutate(monkeypatch, **{"seller.name": name_128_bytes})
+def test_at56_seller_name_ber_lengths_and_1000_characters(live, monkeypatch):
+    """R-15 as built (SDK R3.4.8 findings §3.1): no 127-byte cap; 128-255-byte values get 0x81 LL. BT-27 allows up
+    to 1000 characters (BR-KSA-F-06-C10); the QR cap (1000 characters, R-37) then limits long names."""
+    for name, form in (("ش" * 64, bytes([1, 0x81, 128])), ("ش" * 100, bytes([1, 0x81, 200])),
+                       ("x" * 128, bytes([1, 0x81, 128])), ("ش" * 63 + "x", bytes([1, 127]))):
+        mutate(monkeypatch, **{"seller.name": name})
+        doc = issue(live, live.tst1, simplified=True)
+        run(live)
+        einv = einvoice_of(doc)
+        assert einv.icv == last_icv(live) and einv.status == "reported", held_codes(einv)
+        assert base64.b64decode(einv.qr_tlv).startswith(form)
+        assert qr.decode(einv.qr_tlv)[1].decode() == name
+    icv = last_icv(live)
+    mutate(monkeypatch, **{"seller.name": "x" * 1000})  # allowed by BT-27, but the QR would exceed 1000 characters
     doc = issue(live, live.tst1, simplified=True)
     run(live)
     einv = einvoice_of(doc)
-    assert einv.status == "pending" and einv.icv is None and "qr_value" in held_codes(einv)
-    assert last_icv(live) == 0
-    msg = einv.messages.get(code="qr_value")
-    assert msg.message_ar
-    mutate(monkeypatch, **{"seller.name": "ش" * 63 + "x"})  # 127 bytes passes the TLV check
-    doc2 = issue(live, live.tst1, simplified=True)
+    assert einv.icv is None and "qr_length" in held_codes(einv) and "seller_name_length" not in held_codes(einv)
+    assert last_icv(live) == icv
+    mutate(monkeypatch, **{"seller.name": "x" * 1001})  # BT-27 > 1000 characters
+    doc = issue(live, live.tst1, simplified=True)
     run(live)
-    assert einvoice_of(doc2).icv == 1
-    mutate(monkeypatch, **{"seller.name": "x" * 128})  # 128 characters: BT-27
-    doc3 = issue(live, live.tst1, simplified=True)
-    run(live)
-    assert "seller_name_length" in held_codes(einvoice_of(doc3)) and last_icv(live) == 1
+    einv = einvoice_of(doc)
+    assert einv.icv is None and "seller_name_length" in held_codes(einv) and last_icv(live) == icv
+    assert einv.messages.get(code="seller_name_length").message_ar
 
 
-def test_at39_qr_over_the_limit_rolls_back_inside_the_stamp(live, settings):
-    settings.ZATCA_QR_MAX_CHARS = 400
+def test_at39_qr_over_the_limit_rolls_back_inside_the_stamp(live, monkeypatch):
+    """R-37: a QR over 1000 characters (here from a 400-character Arabic seller name, 800 bytes) rolls back the
+    stamp: no ICV consumed, bilingual message."""
+    mutate(monkeypatch, **{"seller.name": "ش" * 400})
     doc = issue(live, live.tst1, simplified=True)
     run(live)
     einv = einvoice_of(doc)
     assert einv.icv is None and "qr_length" in held_codes(einv) and last_icv(live) == 0
+    msg = einv.messages.get(code="qr_length")
+    assert "1000" in msg.message_en and "1000" in msg.message_ar
 
 
 # --- R-16, R-19, R-31, R-40, R-46, R-48, R-51: local checks (no ICV consumed) ------------------------------

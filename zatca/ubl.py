@@ -93,6 +93,12 @@ class InvoiceData:
     retention_class: str = "standard"
     acquisition_date: date | None = None
     attachments: list = field(default_factory=list)  # [(id, base64 text)] extra AdditionalDocumentReference
+    prepaid_amount: Decimal = Decimal("0")  # BT-113; 0 until prepayment deductions are built (R-39)
+
+    @property
+    def payable(self):
+        """BT-115 PayableAmount = BT-112 - BT-113 (BR-CO-16); QR tag 4 (R-15; SDK R3.4.8 findings §3.1)."""
+        return Decimal(self.total_gross) - Decimal(self.prepaid_amount)
 
     @property
     def issue_local(self):
@@ -114,10 +120,10 @@ class InvoiceData:
     @property
     def qr_timestamp(self):
         """QR tag 3, built from the emitted IssueDate and IssueTime as R-15 writes it: ``IssueDate "T" IssueTime
-        "Z"``. SDK 2.0.3 (checked offline 2026-10-17) accepts exactly that concatenation for an AST IssueTime and
-        refuses the UTC time, the bare local time and ``+03:00`` ("timeStamp does not match with qr code
-        timeStamp"), although the "Z" then does not mean UTC. Kept pending a current SDK or the sandbox
-        [SDK-confirm: needs current SDK or sandbox] (OQ-18, OQ-28)."""
+        "Z"``. SDK 2.0.3 accepts exactly that concatenation for an AST IssueTime and refuses the UTC time, the
+        bare local time and ``+03:00``. SDK R3.4.8's generator writes the form **without** ``Z``, but its validator
+        accepts both (SDK R3.4.8 findings §3.1), so the current form is kept; with or without ``Z`` is an open
+        question for the sandbox [SDK-confirm: sandbox] (R-15, OQ-18, OQ-28)."""
         return f"{self.issue_date_text}T{self.issue_time_text}Z"
 
 
@@ -260,8 +266,8 @@ def build_unsigned(data: InvoiceData, icv: int, pih: str) -> bytes:
     _sub(lmt, CBC, "TaxExclusiveAmount", amount(data.total_net), currencyID=cur)
     _sub(lmt, CBC, "TaxInclusiveAmount", amount(data.total_gross), currencyID=cur)
     _sub(lmt, CBC, "AllowanceTotalAmount", amount(0), currencyID=cur)
-    _sub(lmt, CBC, "PrepaidAmount", amount(0), currencyID=cur)
-    _sub(lmt, CBC, "PayableAmount", amount(data.total_gross), currencyID=cur)
+    _sub(lmt, CBC, "PrepaidAmount", amount(data.prepaid_amount), currencyID=cur)  # BT-113
+    _sub(lmt, CBC, "PayableAmount", amount(data.payable), currencyID=cur)  # BT-115 (QR tag 4)
 
     for line in data.lines:
         il = _sub(root, CAC, "InvoiceLine")
