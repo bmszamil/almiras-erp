@@ -4,7 +4,7 @@ service function); each command is run by an operator from the KSA-hosted host (
 from django.db import IntegrityError, transaction
 
 from . import crypto, services
-from .models import Employee, EmployeeDocument, error
+from .models import Employee, EmployeeDocument, PregnancyNotice, error
 
 
 def resignation_deadlines(*, today=None):
@@ -35,6 +35,9 @@ def rehash_personal_data():
                 counts["employees"] += 1
             for doc in EmployeeDocument._base_manager.order_by("pk").iterator():
                 EmployeeDocument._base_manager.filter(pk=doc.pk).update(number=doc.number)
+                counts["documents"] += 1
+            for notice in PregnancyNotice._base_manager.order_by("pk").iterator():
+                PregnancyNotice._base_manager.filter(pk=notice.pk).update(document_ref=notice.document_ref)
                 counts["documents"] += 1
     except IntegrityError:
         raise error("Two current employees of one entity have the same ID number; nothing was re-hashed (R9).",

@@ -481,10 +481,31 @@ class Employee(Tracked):
         self._masked = True
         return self
 
+    # Finding 9: the only status moves (R8 activation, R38 termination, R41 withdrawal); the PostgreSQL trigger
+    # (migration 0016) repeats them.
+    STATUS_MOVES = frozenset({("draft", "active"), ("active", "on_notice"), ("active", "terminated"),
+                              ("on_notice", "terminated"), ("on_notice", "active")})
+
     def save(self, *args, **kwargs):
         allowed, self._service_write = getattr(self, "_service_write", False), False
         if not allowed or getattr(self, "_masked", False):
             raise error(*SERVICE_ONLY, code="service_only")
+        stored = (type(self)._base_manager.filter(pk=self.pk).values("status", "employment_basis", "entity_id",
+                                                                     "employee_code").first() if self.pk else None)
+        if stored is None:
+            if self.status != self.Status.DRAFT:
+                raise error("An employee is created as a draft (R8).", "يُنشأ الموظف مسودة.", code="employee_status")
+        else:
+            if stored["entity_id"] != self.entity_id or stored["employee_code"] != self.employee_code:
+                raise error("An employee's entity and code never change (R1, R3).", "لا يتغير كيان الموظف ولا رمزه.",
+                            code="employee_identity")
+            if stored["status"] != self.status and (stored["status"], self.status) not in self.STATUS_MOVES:
+                raise error(f"An employee's status does not move from {stored['status']} to {self.status} (R8, R38).",
+                            f"لا تنتقل حالة الموظف من {stored['status']} إلى {self.status}.", code="employee_status")
+            if (stored["employment_basis"] != self.employment_basis
+                    and EmploymentContract._base_manager.filter(employee_id=self.pk, status="approved").exists()):
+                raise error("The employment basis cannot change once a contract is approved (R49).",
+                            "لا يتغير أساس التوظيف بعد اعتماد عقد.", code="basis_fixed")
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
@@ -1390,7 +1411,26 @@ class FinalSettlementInput(models.Model):
                                    verbose_name=bi("Created by", "أنشأه"))
     created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
 
+    objects = AppendOnlyQuerySet.as_manager()
+
     class Meta:
         verbose_name = bi("final settlement input", "مدخلات المخالصة النهائية")
         verbose_name_plural = bi("final settlement inputs", "مدخلات المخالصات النهائية")
         ordering = ["id"]
+
+    def save(self, *args, **kwargs):
+        """Finding 9 (probe P6): written once as a draft by HR; afterwards only its status moves from draft to
+        superseded (recalculation) or discarded (withdrawal), through hr.services. A new figure is a new row."""
+        allowed, self._service_write = getattr(self, "_service_write", False), False
+        if self.pk is None:
+            if self.status != self.Status.DRAFT:
+                raise error(*SERVICE_ONLY, code="service_only")
+        else:
+            stored = type(self)._base_manager.filter(pk=self.pk).values_list("status", flat=True).first()
+            if (not allowed or kwargs.get("update_fields") != ["status"] or stored != self.Status.DRAFT
+                    or self.status not in (self.Status.SUPERSEDED, self.Status.DISCARDED)):
+                raise error(*APPEND_ONLY, code="append_only")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error(*APPEND_ONLY, code="append_only")
