@@ -1,4 +1,4 @@
-"""PostgreSQL only: the immutability triggers (migration 0002) and AT-12 chain continuity under concurrency."""
+"""PostgreSQL only: the immutability triggers (migrations 0002, 0004) and AT-12 chain continuity under concurrency."""
 import threading
 from datetime import timedelta
 
@@ -97,6 +97,37 @@ def test_triggers_on_credentials_delegations_tasks_and_keys(cleared):
     _refused("UPDATE zatca_entitymasterkey SET key_version = 0")
     _refused("DELETE FROM zatca_entitymasterkey")
     _refused("DELETE FROM zatca_zatcaprofile")
+
+
+@pytest.mark.django_db
+def test_triggers_key_refs_change_only_with_a_version_bump(cleared):
+    """Finding 16 (migration 0004)."""
+    for table in ("zatca_entitymasterkey", "zatca_groupsuperkey"):
+        _refused(f"UPDATE {table} SET key_ref = key_ref || '-other'")  # new reference, same version
+        _refused(f"UPDATE {table} SET key_version = key_version + 1")  # new version, same reference
+        _refused(f"UPDATE {table} SET key_ref = key_ref || '-old', key_version = key_version - 1")
+    _refused("UPDATE zatca_entitymasterkey SET protected_by_id = protected_by_id + 1000")
+    _ok("UPDATE zatca_entitymasterkey SET key_ref = key_ref || '-v2', key_version = key_version + 1 "
+        "WHERE entity_id = %s", [cleared.tst1.pk])
+    _ok("UPDATE zatca_groupsuperkey SET holder_id = holder_id")  # holder changes are allowed (and logged)
+
+
+@pytest.mark.django_db
+def test_triggers_egs_status_and_private_key_ref(cleared):
+    """Finding 16 (migration 0004): R-5 transitions and the private key reference only with a new CSR."""
+    egs = cleared.egs1.pk
+    for status in ("draft", "csr_ready", "compliance_csid", "compliance_passed"):
+        _refused("UPDATE zatca_egsunit SET status = %s WHERE id = %s", [status, egs])
+    _refused("UPDATE zatca_egsunit SET private_key_ref = private_key_ref || 'x' WHERE id = %s", [egs])
+    _refused("UPDATE zatca_egsunit SET private_key_ref = '', csr_pem = 'new' WHERE id = %s", [egs])
+    _ok("UPDATE zatca_egsunit SET private_key_ref = private_key_ref || 'x', csr_pem = 'new' WHERE id = %s", [egs])
+    _ok("UPDATE zatca_egsunit SET status = 'renewal_due' WHERE id = %s", [egs])
+    _ok("UPDATE zatca_egsunit SET status = 'revoked' WHERE id = %s", [egs])
+    _refused("UPDATE zatca_egsunit SET status = 'active' WHERE id = %s", [egs])  # revoked is final
+    # the services' own paths still pass the triggers: renewal and revocation of a fresh unit
+    unit = onboard(cleared, cleared.tst2, cleared.admin2)
+    unit = services.renew_production_csid(unit, "246810", user=cleared.admin2)
+    services.revoke_egs_unit(unit, user=cleared.admin2, reason="test")
 
 
 @pytest.mark.django_db
