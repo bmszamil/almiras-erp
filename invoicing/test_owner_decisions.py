@@ -290,3 +290,28 @@ def test_at99_currency_decimals_and_a_bhd_receipt_and_bill(w):
         D("100.125"), D("15.019"), D("115.144"))
     ap = posted_bill.journal_entry.lines.get(account__code="2100")
     assert (str(ap.txn_amount), ap.credit) == ("115.144", D("1145.68"))
+
+
+# --- D25 / R96: an issued document never returns to draft (AT-102) ------------------------------------------
+
+def test_at102_issued_final_and_rejected_documents_never_return_to_draft(w):
+    from django.db import DatabaseError, connection, transaction
+
+    from invoicing.conftest import approve
+    from invoicing.models import SalesDocument
+
+    issued = approve(w, invoice(w))
+    done = final(w, invoice(w))
+    rejected = w.zatca.reject(approve(w, invoice(w)))
+    for doc, status in ((issued, "issued"), (done, "final"), (rejected, "rejected")):
+        assert SalesDocument.objects.get(pk=doc.pk).status == status
+        for user in (w.clerk, w.cfo):
+            with pytest.raises(InvoicingError) as exc:
+                services.return_to_draft(doc, user=user)
+            assert exc.value.code == "not_submitted" and "مسودة" in str(exc.value)
+        if connection.vendor == "postgresql":  # the lock trigger of invoicing 0007
+            for target in ("draft", "submitted"):
+                with pytest.raises(DatabaseError), transaction.atomic(), connection.cursor() as cursor:
+                    cursor.execute("UPDATE invoicing_salesdocument SET status = %s WHERE id = %s", [target, doc.pk])
+        stored = SalesDocument.objects.get(pk=doc.pk)
+        assert (stored.status, stored.number) == (status, doc.number)

@@ -1813,6 +1813,11 @@ def submit_purchase_document(document, *, user):
     problems = _purchase_problems(doc, check_period=False)
     if problems:
         raise _problems_error(problems, "document_invalid")
+    if _unregistered_vendor(doc):  # R92 / OQ-60 default: recorded as category O while the lines are still a draft
+        for line in doc.lines.exclude(vat_category=VatCategory.OUT_OF_SCOPE):
+            line.vat_category = VatCategory.OUT_OF_SCOPE
+            _price_line(line, doc.accounting_date, _doc_places(doc))
+            line.save()
     doc.status = PStatus.SUBMITTED
     doc.submitted_by, doc.submitted_at = user, timezone.now()
     _bump(doc)
@@ -1844,8 +1849,7 @@ def approve_purchase_document(document, *, user):
             raise _problems_error(problems, "document_invalid")
         entity = doc.entity
         lines = list(doc.lines.select_related("account", "vat_rate"))
-        for line in lines:
-            _vat_free_category(doc, line)  # R92: stored as category O when the vendor is not registered
+        for line in lines:  # R92: lines of an unregistered vendor's bill were stored as category O at submission
             _price_line(line, doc.accounting_date, _doc_places(doc))
         breakdown, net, charged, rc_vat, costs, recoverable, recoverable_lines = _purchase_amounts(doc, lines)
         for line in lines:
