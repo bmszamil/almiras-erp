@@ -146,3 +146,24 @@ def apply_all(apps):
     """Every version in order (tests that flush the database reload the reference data with this)."""
     apply(apps)
     apply_v2(apps)
+
+
+# Withholding tax categories for payments to non-residents (D14, OQ-8; WHT guideline §3 p.28, p.31, verification
+# I18). REFERENCE DATA, NOT VERIFIED: rates, the category split and the effective date await tax-adviser sign-off
+# (``is_verified`` stays False; R62, R63). ``valid_from`` 2004-07-30 is a placeholder for "in force before any
+# Almiras payment" (not verified either). ``return_line_code`` is left blank until the return form is confirmed.
+# code, name_en, name_ar [AR-review], rate, sharia_prohibited
+WHT_CATEGORIES_V1 = (
+    ("management_fees", "Management fees", "أتعاب الإدارة", "20.00", False),
+    ("royalties", "Royalties", "الإتاوات", "15.00", False),
+    ("dividends", "Dividends", "توزيعات الأرباح", "5.00", False),
+    ("rent", "Rent", "الإيجار", "5.00", False),
+    ("loan_charges", "Loan charges", "أعباء القروض", "5.00", True),
+    ("insurance", "Insurance or reinsurance premiums", "أقساط التأمين أو إعادة التأمين", "5.00", False),
+    ("technical_services", "Technical and consulting services", "الخدمات الفنية والاستشارية", "5.00", False),
+    ("air_freight", "Air tickets, air or sea freight", "تذاكر الطيران والشحن الجوي أو البحري", "5.00", False),
+    ("international_telecom", "International telecommunication services", "خدمات الاتصالات الدولية", "5.00", False),
+    ("land_transport", "Land transport within KSA", "النقل البري داخل المملكة", "15.00", False),
+    ("other_payments", "Any other payments", "أي دفعات أخرى", "15.00", False),
+)
+WHT_VALID_FROM_V1 = "2004-07-30"

@@ -9,8 +9,9 @@ vendor IBANs are hidden or masked unless the user holds
 Names of individuals are searchable only by users with that right; others
 find individuals by code or number. ``Customer.__str__`` never includes an
 individual's name, so admin titles, breadcrumbs and history pages show only
-the code; list columns use ``Customer.display_name`` after the check. Access logging per view is not built in
-slice 1.
+the code; list columns use ``Customer.display_name`` after the check. Every page that shows an individual's
+personal data unmasked (a change page, or a list whose columns show their names) writes one
+``personal_data_viewed`` AccessLog row per entity, listing the records (R51, AT-44, AT-88).
 """
 from django.contrib import admin
 from django.db.models import Q
@@ -18,6 +19,7 @@ from django.db.models import Q
 from core import access
 from core.admin import EntityScopedAdmin
 
+from . import services
 from .models import (
     CustomerReceipt,
     Customer,
@@ -85,12 +87,59 @@ def _masked_customer(request, customer):
 _masked_party = _masked_customer
 
 
+def _shown(request, obj, party):
+    """Remember an individual's record shown unmasked on this page (logged once the page is rendered, R51)."""
+    if _is_individual(party):
+        shown = getattr(request, "_invoicing_personal_shown", None)
+        if shown is None:
+            shown = request._invoicing_personal_shown = {}
+        shown.setdefault(party.entity_id, set()).add((obj._meta.label_lower, obj.pk))
+
+
+def _log_shown(request):
+    shown = getattr(request, "_invoicing_personal_shown", None) or {}
+    from core.models import Entity
+
+    for entity_id, records in shown.items():
+        services._log_personal_data(request.user, Entity.objects.get(pk=entity_id), sorted(records), "admin")
+    request._invoicing_personal_shown = {}
+
+
+class PersonalViewLogMixin:
+    """R51 / AT-44: log every admin page that shows an individual's personal data unmasked."""
+
+    party_path = ""  # "" for the party itself; "customer" / "vendor" for documents
+
+    def _party(self, obj):
+        return getattr(obj, self.party_path) if self.party_path else obj
+
+    def change_view(self, request, object_id, form_url="", extra_context=None):
+        response = super().change_view(request, object_id, form_url, extra_context)
+        obj = self.get_object(request, object_id)
+        if obj is not None:
+            party = self._party(obj)
+            if _is_individual(party) and _may_see_personal(request, party.entity):
+                _shown(request, obj, party)
+        return self._log_after_render(request, response)
+
+    def changelist_view(self, request, extra_context=None):
+        return self._log_after_render(request, super().changelist_view(request, extra_context))
+
+    def _log_after_render(self, request, response):
+        if hasattr(response, "add_post_render_callback") and not getattr(response, "is_rendered", True):
+            response.add_post_render_callback(lambda r: _log_shown(request))
+        else:
+            _log_shown(request)
+        return response
+
+
 def _customer_column(request, path, field, label):
     """A list column showing ``field`` of the party at ``path`` (""=the object), masked for individuals."""
     def column(obj):
         party = getattr(obj, path) if path else obj
         if _masked_party(request, party):
             return MASK
+        _shown(request, obj, party)
         if field:
             return getattr(party, field)
         return party.display_name(personal=not _is_individual(party) or _may_see_personal(request, party.entity))
@@ -121,7 +170,7 @@ class PersonalSearchMixin:
         return qs, duplicates
 
 
-class CustomerAdmin(PersonalSearchMixin, ReadOnlyScopedAdmin):
+class CustomerAdmin(PersonalViewLogMixin, PersonalSearchMixin, ReadOnlyScopedAdmin):
     list_filter = ["customer_kind", "is_active"]
     search_fields = ["code", "name_en", "name_ar"]
 
@@ -139,7 +188,7 @@ class CustomerAdmin(PersonalSearchMixin, ReadOnlyScopedAdmin):
 PERSONAL_VENDOR_FIELDS = PERSONAL_CUSTOMER_FIELDS + ("bank_iban",)
 
 
-class VendorAdmin(PersonalSearchMixin, ReadOnlyScopedAdmin):
+class VendorAdmin(PersonalViewLogMixin, PersonalSearchMixin, ReadOnlyScopedAdmin):
     """Individual vendors are personal data like individual customers (D24, R91, R86)."""
 
     list_filter = ["vendor_kind", "is_resident", "is_active"]
@@ -172,7 +221,8 @@ class SalesLineInline(admin.TabularInline):
         return False
 
 
-class SalesDocumentAdmin(PersonalSearchMixin, ReadOnlyScopedAdmin):
+class SalesDocumentAdmin(PersonalViewLogMixin, PersonalSearchMixin, ReadOnlyScopedAdmin):
+    party_path = "customer"
     list_filter = ["doc_type", "status", "zatca_status", "zatca_profile"]
     search_fields = ["number", "customer__code", "customer__name_ar", "customer__name_en"]
     customer_path = "customer"
@@ -193,7 +243,8 @@ class PurchaseLineInline(SalesLineInline):
     model = PurchaseDocumentLine
 
 
-class PurchaseDocumentAdmin(PersonalSearchMixin, ReadOnlyScopedAdmin):
+class PurchaseDocumentAdmin(PersonalViewLogMixin, PersonalSearchMixin, ReadOnlyScopedAdmin):
+    party_path = "vendor"
     list_filter = ["doc_type", "status"]
     search_fields = ["number", "vendor_document_number", "vendor__code", "vendor__name_ar", "vendor__name_en"]
     customer_path = "vendor"

@@ -22,7 +22,7 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 from zoneinfo import ZoneInfo
 
 from django.db import transaction
-from django.db.models import Q, Sum
+from django.db.models import Q, QuerySet, Sum
 from django.utils import timezone
 
 from core import access
@@ -50,6 +50,7 @@ from .models import (
     PaymentMeans,
     PurchaseDocument,
     PurchaseDocumentLine,
+    PurificationTransfer,
     ReceiptApplication,
     ReceivableAllocation,
     SalesDocument,
@@ -57,8 +58,11 @@ from .models import (
     VatCategory,
     VatExemptionReason,
     VatRate,
+    TreatyCertificate,
     Vendor,
     VendorPayment,
+    WhtCategory,
+    WhtDeduction,
     error,
 )
 
@@ -74,7 +78,9 @@ SIMPLIFIED_LIMIT_SAR = Decimal("1000.00")  # R48: "less than SAR 1,000"; gross i
 # Accounts (ledger/coa_template.py; invoicing §5).
 AR, AR_GROUP, AP, AP_GROUP = "1200", "1210", "2100", "2110"
 VAT_OUTPUT, VAT_INPUT, BANK, BANK_CHARGES = "2200", "1310", "1100", "5700"
-CONTROL_ACCOUNTS = frozenset({AR, AR_GROUP, AP, AP_GROUP, VAT_OUTPUT, VAT_INPUT})
+WHT_PAYABLE, WHT_BORNE = "2220", "5920"  # PROPOSED accounts (§5, E20 to E22; D29)
+NON_COMPLIANT_INCOME, CHARITY_PAYABLE = "4900", "2600"  # E14, E15
+CONTROL_ACCOUNTS = frozenset({AR, AR_GROUP, AP, AP_GROUP, VAT_OUTPUT, VAT_INPUT, WHT_PAYABLE})
 
 Status = SalesDocument.Status
 PStatus = PurchaseDocument.Status
@@ -352,6 +358,14 @@ def party_problems(party):
     if isinstance(party, Vendor) and party.vendor_kind not in Vendor.Kind.values:  # D24 / R91: required
         problems.append("The vendor kind (business, individual or government) is required. / "
                         "نوع المورد (منشأة أو فرد أو جهة حكومية) مطلوب.")
+    if isinstance(party, Vendor) and party.wht_category_id is not None:
+        if party.is_resident:  # D14: withholding tax is for payments to non-residents only
+            problems.append("A withholding tax category is set only on non-resident vendors. / "
+                            "تُحدَّد فئة ضريبة الاستقطاع للموردين غير المقيمين فقط.")
+        if party.wht_category.sharia_prohibited and party.entity.sharia_enforced:
+            problems.append(f"Withholding tax category {party.wht_category.code} (loan charges) never arises where "
+                            "Sharia is enforced (OQ-8, R5). / فئة ضريبة الاستقطاع (أعباء القروض) لا تنشأ في كيان يطبق "
+                            "الضوابط الشرعية.")
     if isinstance(party, Vendor) and not party.is_resident:
         try:
             validate_country_code(party.residence_country)
@@ -369,7 +383,9 @@ PARTY_FIELDS = {
     "city_ar", "postal_code", "country",
 }
 CUSTOMER_FIELDS = PARTY_FIELDS | {"customer_kind"}
-VENDOR_FIELDS = PARTY_FIELDS - {"payment_terms_days"} | {"vendor_kind", "is_resident", "residence_country", "bank_iban"}
+WHT_VENDOR_FIELDS = {"wht_category", "wht_gross_up"}  # D14: entered by holders of invoicing.enter_wht_data
+VENDOR_FIELDS = PARTY_FIELDS - {"payment_terms_days"} | {"vendor_kind", "is_resident", "residence_country",
+                                                          "bank_iban"} | WHT_VENDOR_FIELDS
 
 
 def _save_party(party, user, fields, allowed):
@@ -379,6 +395,10 @@ def _save_party(party, user, fields, allowed):
     for name, value in fields.items():
         if name == "currency":
             value = _currency(value, party.entity)
+        if name == "wht_category" and value is not None and not isinstance(value, WhtCategory):
+            value = _wht_category(value)
+        if name == "wht_gross_up":
+            value = bool(value)
         setattr(party, name, value)
     if party.currency_id is None:
         party.currency_id = party.entity.base_currency_id
@@ -427,6 +447,8 @@ def add_customer_identifier(customer, scheme, value, *, user):
 def create_vendor(entity, *, user, **fields):
     """Create a vendor in ``entity`` (``invoicing.manage_vendor``). ``vendor_kind`` is required (D24, R91)."""
     access.require(user, entity, "invoicing.manage_vendor")
+    if set(fields) & WHT_VENDOR_FIELDS:
+        access.require(user, entity, "invoicing.enter_wht_data")
     return _save_party(Vendor(entity=entity, created_by=user, source=_source(user)), user, fields, VENDOR_FIELDS)
 
 
@@ -434,6 +456,8 @@ def create_vendor(entity, *, user, **fields):
 def update_vendor(vendor, *, user, **fields):
     vendor = Vendor.objects.select_for_update(of=("self",)).get(pk=vendor.pk)
     access.require(user, vendor.entity, "invoicing.manage_vendor")
+    if set(fields) & WHT_VENDOR_FIELDS:
+        access.require(user, vendor.entity, "invoicing.enter_wht_data")
     vendor.modified_by, vendor.modified_at = user, timezone.now()
     return _save_party(vendor, user, fields, VENDOR_FIELDS)
 
@@ -512,19 +536,27 @@ def create_sales_document(entity, *, user, customer, issue_date, doc_type=SalesD
     elif doc_type != SalesDocument.DocType.INVOICE:
         raise error("A credit or debit note references its original invoice.", "الإشعار يشير إلى فاتورته الأصلية.",
                     code="original_required")
-    cur = _currency(currency or (original_document.currency_id if original_document else customer.currency_id), entity)
     with transaction.atomic():
-        doc = SalesDocument(
-            entity=entity, doc_type=doc_type, customer=customer, issue_date=issue_date, currency=cur,
-            original_document=original_document, created_by=user, source=_source(user),
-        )
-        if _natural_person_not_subject_to_vat(customer):  # OQ-19: simplified for individuals by default (R48)
-            doc.zatca_profile = SalesDocument.Profile.SIMPLIFIED
-        if original_document is not None:  # zatca R-19: the category follows the original invoice
-            doc.zatca_profile = original_document.zatca_profile
-        _apply_sales_header(doc, fields)
-        doc.save()
+        doc = _new_sales_document(entity, user=user, customer=customer, issue_date=issue_date, doc_type=doc_type,
+                                  currency=currency, original_document=original_document, fields=fields)
         _log_agent(user, entity, "invoicing.create_sales_document", doc, "create_draft")
+    return doc
+
+
+def _new_sales_document(entity, *, user, customer, issue_date, doc_type, currency, original_document, fields,
+                        source=None, **links):
+    """A saved draft (rights checked by the caller)."""
+    cur = _currency(currency or (original_document.currency_id if original_document else customer.currency_id), entity)
+    doc = SalesDocument(
+        entity=entity, doc_type=doc_type, customer=customer, issue_date=issue_date, currency=cur,
+        original_document=original_document, created_by=user, source=source or _source(user), **links,
+    )
+    if _natural_person_not_subject_to_vat(customer):  # OQ-19: simplified for individuals by default (R48)
+        doc.zatca_profile = SalesDocument.Profile.SIMPLIFIED
+    if original_document is not None:  # zatca R-19: the category follows the original invoice
+        doc.zatca_profile = original_document.zatca_profile
+    _apply_sales_header(doc, fields)
+    doc.save()
     return doc
 
 
@@ -548,9 +580,28 @@ def _touch(doc, user):
     _bump(doc)
 
 
+# R73 / billing R56 (OQ-26 default): on a document created from billing a reviewer completes these header fields
+# only; lines, amounts, dates and the supply period come from billing.
+BILLING_HEADER_FIELDS = {"payment_means_code", "reason_code", "reason_ar", "reason_en", "notes_en", "notes_ar"}
+
+
+def _refuse_billing_lines(doc):
+    if doc.from_billing:
+        raise error(
+            "The lines of a document created from billing are read-only for every user; correct the contract in "
+            "billing instead (R73, billing R56).",
+            "بنود المستند المنشأ من الفوترة للقراءة فقط لكل المستخدمين؛ صحّح العقد في وحدة الفوترة بدلًا من ذلك.",
+            code="billing_lines_read_only")
+
+
 @transaction.atomic
 def update_sales_document(document, *, user, **fields):
     doc = _draft_sales(document, user)
+    if doc.from_billing and set(fields) - BILLING_HEADER_FIELDS:
+        raise error(
+            "On a document created from billing only the payment means, reason and notes are completed here "
+            f"({', '.join(sorted(set(fields) - BILLING_HEADER_FIELDS))} not allowed; billing R56).",
+            "في المستند المنشأ من الفوترة تُستكمل هنا وسيلة الدفع والسبب والملاحظات فقط.", code="billing_header_read_only")
     _apply_sales_header(doc, fields)
     _touch(doc, user)
     doc.save()
@@ -654,6 +705,7 @@ def add_sales_line(document, *, user, income_type, quantity, unit_price, descrip
     """Add a line to a draft (R5 Sharia, R9 VAT, R10 rates, OQ-18 Arabic). ``exemption_text_ar`` / ``_en``: the
     taxpayer's own reason, required (Arabic) with VATEX-SA-OOS and only with it (row 1c)."""
     doc = _draft_sales(document, user)
+    _refuse_billing_lines(doc)
     last = doc.lines.order_by("-line_no").values_list("line_no", flat=True).first() or 0
     line = SalesDocumentLine(entity=doc.entity, document=doc, line_no=last + 1)
     _sales_line_values(doc, line, income_type=income_type, quantity=quantity, unit_price=unit_price,
@@ -670,6 +722,7 @@ def add_sales_line(document, *, user, income_type, quantity, unit_price, descrip
 @transaction.atomic
 def delete_sales_line(line, *, user):
     doc = _draft_sales(line.document, user)
+    _refuse_billing_lines(doc)
     found = SalesDocumentLine.objects.filter(pk=line.pk, document=doc).first()
     if found is None:
         raise error("The line is not on this document.", "البند ليس في هذا المستند.", code="line_missing")
@@ -682,6 +735,9 @@ def delete_sales_line(line, *, user):
 def delete_sales_draft(document, *, user):
     """Drafts may be deleted (R13); a document with a number never is (R14, R17)."""
     doc = _draft_sales(document, user)
+    if doc.from_billing:  # billing R46c, R48: billing discards its own drafts (discard_adjustment_draft)
+        raise error("A draft created from billing is discarded in billing, not deleted here.",
+                    "تُستبعد المسودة المنشأة من الفوترة في وحدة الفوترة، ولا تُحذف هنا.", code="billing_document")
     if doc.number:
         raise error("A numbered document is never deleted.", "لا يُحذف مستند له رقم.", code="numbered")
     doc.lines.all().delete()
@@ -1060,75 +1116,93 @@ def approve_sales_document(document, *, user):
         if doc.status != Status.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
         _refuse_stale_grant(grant, doc, seen_version)
-        if not (doc.entity.vat_number or "").strip():
-            # R94 / OQ-59 default: the title, type and posting path of an unregistered entity's documents (they are
-            # not tax invoices and never go to ZATCA) await tax sign-off; until then they are drafted only.
-            raise _problems_error([
-                f"{doc.entity.code} has no VAT number: its documents carry no VAT and are not tax invoices. Which "
-                "document title and type it issues, and how it posts, await tax sign-off (OQ-59), so it cannot be "
-                "issued yet; it stays submitted. / "
-                f"ليس للكيان {doc.entity.code} رقم ضريبي: مستنداته بلا ضريبة وليست فواتير ضريبية. ولا يزال عنوان "
-                "المستند ونوعه وطريقة ترحيله بانتظار اعتماد المستشار الضريبي، فلا يمكن إصداره بعد؛ ويبقى مقدَّمًا."
-            ], "entity_not_vat_registered")
-        if doc.original_document_id:  # R18 cap: one note at a time per original (review item 4)
-            doc.original_document = SalesDocument.objects.select_for_update(of=("self",)).get(
-                pk=doc.original_document_id)
-        # 6b / BR-KSA-04: the issue date is the day of issue (approval) in Riyadh, never the draft's date and
-        # never a future one; the draft's date is kept as the date requested. Time and date come from one clock.
-        now = _riyadh_now()
-        doc.requested_issue_date = doc.issue_date
-        doc.issue_date = now.date()
-        doc.issue_time = now.time().replace(microsecond=0)
-        problems = _issue_problems(doc, user=user)
-        if problems:
-            raise _problems_error(problems, "document_invalid")
-        entity = doc.entity
-        lines = list(doc.lines.select_related("vat_rate", "vat_exemption_reason", "income_account", "income_type"))
-        on = doc.supply_date or doc.issue_date
-        fx_rate, rate_date, rate_source, rate_row = _fx_for(entity, doc.currency_id, doc.issue_date, user)
-        sar_rate = _sar_rate(entity, doc.currency_id, fx_rate, doc.issue_date, user)
-        for line in lines:
-            _price_line(line, on, _doc_places(doc))
-            line._service_write = True
-            line.save()
-        breakdown, net, vat, vat_sar = _sales_breakdown(doc, lines, sar_rate)
-        gross = net + vat
-        gross_sar = _round(gross * sar_rate, 2)
-        problems = _simplified_problems(doc, gross_sar)
-        if problems:
-            raise _problems_error(problems, "simplified_threshold")
-        snap = _buyer_snapshot(doc)
-        for name, value in snap.items():
-            setattr(doc, name, value or "")
-        for name in ("vat_number", "cr_number", "unified_number", "building_no", "street_en", "street_ar",
-                     "district_en", "district_ar", "additional_no", "postal_code", "city_en", "city_ar", "country"):
-            setattr(doc, f"seller_{name}", getattr(entity, name) or "")
-        doc.seller_legal_name_en, doc.seller_legal_name_ar = entity.legal_name_en, entity.legal_name_ar
-        doc.total_net, doc.total_vat, doc.total_gross = net, vat, gross
-        doc.total_vat_sar, doc.total_gross_sar, doc.vat_breakdown = vat_sar, gross_sar, breakdown
-        doc.fx_rate, doc.fx_rate_date, doc.fx_rate_source, doc.sar_rate = fx_rate, rate_date, rate_source, sar_rate
-        doc.fx_exchange_rate = rate_row
-        doc.requires_purification = any(
-            line.income_account.requires_purification
-            or (line.income_account.sharia_prohibited and not entity.sharia_enforced) for line in lines
-        )
-        doc.is_intercompany = doc.customer.group_entity_id is not None
-        if any(line.income_type.is_real_estate_rent for line in lines):
-            doc.retention_class = SalesDocument.Retention.REAL_ESTATE
-        doc.retention_until = _retention_until(entity, doc)
-        doc.due_date = doc.due_date or doc.issue_date  # OQ-3 default: prefilled with the document date
-        doc.number = _next_number(entity, doc.doc_type, doc.issue_date.year)
-        doc.status = Status.ISSUED
-        doc.approved_by, doc.approved_at = user, timezone.now()
-        doc.approved_version = doc.version  # R87: the clearance posting relies on this very version
-        doc._service_write = True
-        doc.save()
+        _issue_submitted(doc, rate_user=user, approved_by=user, approved_at=timezone.now())
         access.use_grant(grant, target=doc)  # a used, current approval: the clearance posting checks it (access R42)
         port = zatca_port.get_port()
         transaction.on_commit(lambda: port.submit_document(SalesDocument.objects.get(pk=doc.pk), user))
     # R95 (D30a): a credit or debit note is dated and taxed on its own issue date; R71's 15-day warning from
     # adjustment_event_date is withdrawn (that date is information only).
     doc.warnings = _issue_date_warnings(doc) + _late_invoice_warnings(doc)
+    return doc
+
+
+NOT_VAT_REGISTERED = (
+    "{code} has no VAT number: its documents carry no VAT and are not tax invoices. Which document title and type it "
+    "issues, and how it posts, await tax sign-off (OQ-59), so it cannot be issued yet; it stays submitted.",
+    "ليس للكيان {code} رقم ضريبي: مستنداته بلا ضريبة وليست فواتير ضريبية. ولا يزال عنوان المستند ونوعه وطريقة ترحيله "
+    "بانتظار اعتماد المستشار الضريبي، فلا يمكن إصداره بعد؛ ويبقى مقدَّمًا.",
+)
+
+
+def _not_vat_registered(entity):
+    en, ar = NOT_VAT_REGISTERED
+    return _problems_error([f"{en.format(code=entity.code)} / {ar.format(code=entity.code)}"],
+                           "entity_not_vat_registered")
+
+
+def _issue_submitted(doc, *, rate_user, approved_by, approved_at):
+    """Issue a locked, submitted document (R57, R14, R15, R78): number, snapshots, totals and the recorded
+    approval, in the caller's transaction. ``approved_by`` is the person whose approval is recorded: the CFO who
+    approves it, or for an invoice auto-issued from billing the approver of the billed contract version (R60,
+    billing R53). ``rate_user`` reads the exchange rates. The caller records the grant use and the ZATCA hand-off.
+    """
+    if not (doc.entity.vat_number or "").strip():
+        # R94 / OQ-59 default: the title, type and posting path of an unregistered entity's documents (they are
+        # not tax invoices and never go to ZATCA) await tax sign-off; until then they are drafted only.
+        raise _not_vat_registered(doc.entity)
+    if doc.original_document_id:  # R18 cap: one note at a time per original (review item 4)
+        doc.original_document = SalesDocument.objects.select_for_update(of=("self",)).get(
+            pk=doc.original_document_id)
+    # 6b / BR-KSA-04: the issue date is the day of issue (approval) in Riyadh, never the draft's date and
+    # never a future one; the draft's date is kept as the date requested. Time and date come from one clock.
+    now = _riyadh_now()
+    doc.requested_issue_date = doc.issue_date
+    doc.issue_date = now.date()
+    doc.issue_time = now.time().replace(microsecond=0)
+    problems = _issue_problems(doc, user=rate_user)
+    if problems:
+        raise _problems_error(problems, "document_invalid")
+    entity = doc.entity
+    lines = list(doc.lines.select_related("vat_rate", "vat_exemption_reason", "income_account", "income_type"))
+    on = doc.supply_date or doc.issue_date
+    fx_rate, rate_date, rate_source, rate_row = _fx_for(entity, doc.currency_id, doc.issue_date, rate_user)
+    sar_rate = _sar_rate(entity, doc.currency_id, fx_rate, doc.issue_date, rate_user)
+    for line in lines:
+        _price_line(line, on, _doc_places(doc))
+        line._service_write = True
+        line.save()
+    breakdown, net, vat, vat_sar = _sales_breakdown(doc, lines, sar_rate)
+    gross = net + vat
+    gross_sar = _round(gross * sar_rate, 2)
+    problems = _simplified_problems(doc, gross_sar)
+    if problems:
+        raise _problems_error(problems, "simplified_threshold")
+    snap = _buyer_snapshot(doc)
+    for name, value in snap.items():
+        setattr(doc, name, value or "")
+    for name in ("vat_number", "cr_number", "unified_number", "building_no", "street_en", "street_ar",
+                 "district_en", "district_ar", "additional_no", "postal_code", "city_en", "city_ar", "country"):
+        setattr(doc, f"seller_{name}", getattr(entity, name) or "")
+    doc.seller_legal_name_en, doc.seller_legal_name_ar = entity.legal_name_en, entity.legal_name_ar
+    doc.total_net, doc.total_vat, doc.total_gross = net, vat, gross
+    doc.total_vat_sar, doc.total_gross_sar, doc.vat_breakdown = vat_sar, gross_sar, breakdown
+    doc.fx_rate, doc.fx_rate_date, doc.fx_rate_source, doc.sar_rate = fx_rate, rate_date, rate_source, sar_rate
+    doc.fx_exchange_rate = rate_row
+    doc.requires_purification = any(
+        line.income_account.requires_purification
+        or (line.income_account.sharia_prohibited and not entity.sharia_enforced) for line in lines
+    )
+    doc.is_intercompany = doc.customer.group_entity_id is not None
+    if any(line.income_type.is_real_estate_rent for line in lines):
+        doc.retention_class = SalesDocument.Retention.REAL_ESTATE
+    doc.retention_until = _retention_until(entity, doc)
+    doc.due_date = doc.due_date or doc.issue_date  # OQ-3 default: prefilled with the document date
+    doc.number = _next_number(entity, doc.doc_type, doc.issue_date.year)
+    doc.status = Status.ISSUED
+    doc.approved_by, doc.approved_at = approved_by, approved_at
+    doc.approved_version = doc.version  # R87: the clearance posting relies on this very version
+    doc._service_write = True
+    doc.save()
     return doc
 
 
@@ -1442,8 +1516,8 @@ def _available(source):
         amount = source.amount - _sum(ReceivableAllocation.objects.filter(receipt=source))
     elif isinstance(source, SalesDocument):
         amount = source.total_gross - _sum(ReceivableAllocation.objects.filter(credit_note=source))
-    elif isinstance(source, VendorPayment):
-        amount = source.amount - _sum(PayableAllocation.objects.filter(payment=source))
+    elif isinstance(source, VendorPayment):  # AP settled: cash plus tax withheld (R62)
+        amount = source.settled_amount - _sum(PayableAllocation.objects.filter(payment=source))
     else:
         amount = source.total_gross - _sum(PayableAllocation.objects.filter(vendor_credit_note=source))
     return _in_minor_units(amount, source)
@@ -1680,8 +1754,11 @@ def update_purchase_document(document, *, user, **fields):
 @transaction.atomic
 def add_purchase_line(document, *, user, account, quantity, unit_price, vat_category=VatCategory.STANDARD,
                       vat_attribution=PurchaseDocumentLine.Attribution.TAXABLE, supply_kind="", description_ar="",
-                      description_en="", line_discount="0", unit_code="C62"):
-    """Add a line to a draft bill (R5 Sharia, R29 attribution, R30 supply kind for non-resident vendors)."""
+                      description_en="", line_discount="0", unit_code="C62", wht_category=None):
+    """Add a line to a draft bill (R5 Sharia, R29 attribution, R30 supply kind for non-resident vendors).
+
+    ``wht_category`` (code or row; R61): non-resident vendors only, default the vendor's category. A line without
+    one can be booked, but the bill cannot be paid until it has one (R61)."""
     doc = _draft_purchase(document, user)
     entity = doc.entity
     last = doc.lines.order_by("-line_no").values_list("line_no", flat=True).first() or 0
@@ -1698,6 +1775,15 @@ def add_purchase_line(document, *, user, account, quantity, unit_price, vat_cate
     line.vat_category, line.vat_attribution, line.supply_kind = vat_category, vat_attribution, supply_kind or ""
     _vat_free_category(doc, line)
     problems = _account_problems(entity, line.account, {Account.Type.EXPENSE, Account.Type.ASSET}, "expense or asset")
+    if wht_category is not None and not isinstance(wht_category, WhtCategory):
+        wht_category = _wht_category(wht_category)
+    if wht_category is not None and doc.vendor.is_resident:
+        problems.append("A withholding tax category is set only on lines of non-resident vendors (D14). / "
+                        "تُحدَّد فئة ضريبة الاستقطاع لبنود الموردين غير المقيمين فقط.")
+    line.wht_category = wht_category or (doc.vendor.wht_category if not doc.vendor.is_resident else None)
+    if line.wht_category is not None and line.wht_category.sharia_prohibited and entity.sharia_enforced:
+        problems.append(f"Withholding tax category {line.wht_category.code} (loan charges) never arises where Sharia "
+                        "is enforced (OQ-8, R5). / فئة أعباء القروض لا تنشأ في كيان يطبق الضوابط الشرعية.")
     if not (line.description_ar or line.description_en):
         problems.append("A line needs a description. / يحتاج البند إلى وصف.")
     if line.vat_category not in VatCategory.values:
@@ -2071,12 +2157,19 @@ def _post_money(movement, *, user, grant, receivable, approved=False):
     _refuse_stale_grant(grant, movement, seen_version)
     apps = list(movement.applications.select_related("target").order_by("pk"))
     targets = {t.pk: t for t in target_model.objects.select_for_update(of=("self",)).filter(pk__in=[a.target_id for a in apps])}
+    wht_rows = []
+    if not receivable and _needs_wht(movement.vendor, movement.kind):  # R62, R63: computed on the payment date
+        wht_rows, wht_total, wht_problems = _wht_plan(movement, movement.date)
+        if wht_problems:
+            raise _problems_error(wht_problems, "wht_invalid")
+        movement.wht_amount, movement.wht_gross_up = wht_total, bool(movement.vendor.wht_gross_up)
+    settles = movement.amount if receivable else movement.settled_amount
     problems, per_target = [], {}
     for app in apps:
         per_target[app.target_id] = per_target.get(app.target_id, ZERO) + app.amount
     for target_id, amount in per_target.items():  # R34: every application of one target together
         problems += _application_problems(movement, targets[target_id], amount, receivable)
-    if sum((a.amount for a in apps), ZERO) > movement.amount:
+    if sum((a.amount for a in apps), ZERO) > settles:
         problems.append("Applications exceed the amount. / التخصيصات تتجاوز المبلغ.")
     period = _open_period(entity, movement.date)
     if period:
@@ -2092,6 +2185,8 @@ def _post_money(movement, *, user, grant, receivable, approved=False):
         movement.approved_by, movement.approved_at = user, movement.posted_at
     movement._service_write = True
     movement.save()
+    for row in wht_rows:  # R62: one immutable row per bill and category, read by the payment's build_lines
+        _record_wht(movement, row, user)
     try:
         with _posting_as(user):
             entry = ledger.create_entry(entity, movement.date, f"{movement._meta.verbose_name} {movement.number}", None,
@@ -2162,11 +2257,18 @@ def _receipt_lines(document):
     return _with_settlements(document, cur, _pinned(document, plain), settlements)
 
 
+def _needs_wht(vendor, kind):
+    return not vendor.is_resident and kind == VendorPayment.Kind.PAYMENT
+
+
 def _no_payment_without_wht(vendor, kind):
-    """D14 / R61 to R64: payments to non-resident vendors carry withholding tax, which is not built in slice 1."""
-    if not vendor.is_resident and kind == VendorPayment.Kind.PAYMENT:
-        raise error("Payments to non-resident vendors wait for withholding tax (R61 to R64, not built yet).",
-                    "المدفوعات للموردين غير المقيمين بانتظار ضريبة الاستقطاع (غير مبنية بعد).", code="wht_not_built")
+    """D14 / R61: a payment to a non-resident vendor carries withholding tax, so it needs the vendor's withholding
+    tax category; without one it is refused (the slice-1 block stays for those vendors)."""
+    if _needs_wht(vendor, kind) and vendor.wht_category_id is None:
+        raise error(f"Vendor {vendor.code} is not resident: set its withholding tax category before paying it "
+                    "(R61, D14).",
+                    f"المورد {vendor.code} غير مقيم: حدّد فئة ضريبة الاستقطاع له قبل الدفع له.",
+                    code="wht_category_required")
 
 
 def create_vendor_payment(entity, *, user, vendor, date, amount, currency=None, bank_account=None,
@@ -2174,6 +2276,7 @@ def create_vendor_payment(entity, *, user, vendor, date, amount, currency=None, 
     """Draft vendor payment or refund received (``invoicing.create_vendor_payment``; agents never, catalogue)."""
     access.require(user, entity, "invoicing.create_vendor_payment")
     _same_entity(entity, vendor, "vendor", "المورد")
+    vendor = Vendor.objects.get(pk=vendor.pk)  # the stored WHT settings, not the caller's copy
     _no_payment_without_wht(vendor, kind)
     if kind not in VendorPayment.Kind.values:
         raise error("Unknown payment kind.", "نوع سند غير معروف.", code="kind")
@@ -2199,7 +2302,9 @@ def add_payment_application(payment, target, amount, *, user):
     amount = _money(amount, "amount", positive=True, currency=payment.currency_id)
     target = PurchaseDocument.objects.select_for_update(of=("self",)).get(pk=target.pk)
     problems = _application_problems(payment, target, amount, receivable=False, planned=_planned_for(payment, target))
-    if _sum(payment.applications.all()) + amount > payment.amount:
+    # A non-resident payment settles cash plus the tax withheld (R62): its applications are checked against the
+    # cash once the tax is computed, at submission and approval.
+    if not _needs_wht(payment.vendor, payment.kind) and _sum(payment.applications.all()) + amount > payment.amount:
         problems.append("Applications exceed the payment amount. / التخصيصات تتجاوز مبلغ السند.")
     if problems:
         raise _problems_error(problems, "application_invalid")
@@ -2217,6 +2322,11 @@ def submit_vendor_payment(payment, *, user):
     access.require(user, payment.entity, "invoicing.submit_vendor_payment")
     if payment.status != "draft":
         raise error("Only drafts can be submitted.", "يمكن تقديم المسودات فقط.", code="not_draft")
+    if _needs_wht(payment.vendor, payment.kind):
+        _no_payment_without_wht(payment.vendor, payment.kind)
+        _, _, problems = _wht_plan(payment, payment.date)
+        if problems:
+            raise _problems_error(problems, "wht_invalid")
     payment.status = "submitted"
     payment.submitted_by, payment.submitted_at = user, timezone.now()
     _bump(payment)
@@ -2245,16 +2355,634 @@ def _payment_lines(document):
                                         description=label),
                                   _line(control, "credit", document.amount, cur, functional, counterparty, label)])
     plain = [_line(document.bank_account, "credit", document.amount, cur, functional, description=label)]
+    if document.wht_amount:  # E20 / E21: withheld tax payable; borne by the entity on gross-up
+        plain.append(_line(WHT_PAYABLE, "credit", document.wht_amount, cur, functional,
+                           description=f"{label} withholding tax / ضريبة الاستقطاع"))
+        if document.wht_gross_up:
+            plain.append(_line(WHT_BORNE, "debit", document.wht_amount, cur, functional,
+                               description=f"{label} withholding tax borne / ضريبة استقطاع محملة"))
     settlements, applied = [], ZERO
     for app in document.applications.select_related("target").order_by("pk"):
         settlements.append((_control_line(app.target), app.amount, f"{label} → {app.target.number}"))
         applied += app.amount
+    settled = document.settled_amount
     if cur == functional:
-        plain.append(_line(control, "debit", document.amount, cur, functional, counterparty, label))
+        plain.append(_line(control, "debit", settled, cur, functional, counterparty, label))
         return plain
-    if document.amount - applied:
-        plain.append(_line(control, "debit", document.amount - applied, cur, functional, counterparty, label))
+    if settled - applied:
+        plain.append(_line(control, "debit", settled - applied, cur, functional, counterparty, label))
     return _with_settlements(document, cur, _pinned(document, plain), settlements)
+
+
+# --- withholding tax (D14, R61 to R64; OQ-8 reference rates, tax-adviser sign-off pending) ---------------------
+
+def _wht_category(code):
+    """The current row of a WHT category code (rates change by new rows with the same code)."""
+    row = WhtCategory.objects.filter(code=code).order_by("-valid_from").first()
+    if row is None:
+        raise error(f"Unknown withholding tax category {code!r}.", f"فئة ضريبة الاستقطاع {code!r} غير معروفة.",
+                    code="unknown_reference")
+    return row
+
+
+def _wht_rate_row(code, on):
+    """R62: the WhtCategory row of ``code`` effective on ``on`` (the payment date)."""
+    for row in WhtCategory.objects.filter(code=code, valid_from__lte=on).order_by("-valid_from"):
+        if row.valid_to is None or row.valid_to >= on:
+            return row
+    return None
+
+
+def _treaty_certificate(vendor, code, on):
+    """R62: a verified certificate valid on ``on`` for the vendor and category (one naming the category first,
+    then one for all categories)."""
+    qs = TreatyCertificate.objects.filter(entity=vendor.entity, vendor=vendor, verified_at__isnull=False,
+                                          valid_from__lte=on, valid_to__gte=on).select_related("wht_category")
+    specific = [c for c in qs if c.wht_category_id and c.wht_category.code == code]
+    general = [c for c in qs if c.wht_category_id is None]
+    found = sorted(specific, key=lambda c: c.pk) or sorted(general, key=lambda c: c.pk)
+    return found[-1] if found else None
+
+
+def _wht_plan(payment, on):
+    """R61 to R63: withholding tax on a draft or submitted payment to a non-resident vendor, on date ``on``.
+
+    Returns (rows, total, problems). Each application's settled amount is split over the bill's lines by WHT
+    category, pro rata to line net (the last category takes the rounding). Rate: ``WhtCategory.rate`` effective on
+    ``on``, or the ``treaty_rate`` of a verified treaty certificate valid on ``on``. Without gross-up WHT =
+    round(base x rate) and the cash paid must be the settled amount less WHT; with ``vendor.wht_gross_up`` the
+    vendor receives the full amount, WHT = round(base x rate / (1 - rate)) and is borne by the entity (E21).
+    """
+    vendor, entity = payment.vendor, payment.entity
+    places = _places(payment.currency_id)
+    gross_up = bool(vendor.wht_gross_up)
+    problems, rows = [], []
+    per_bill = {}
+    for app in payment.applications.select_related("target").order_by("pk"):
+        per_bill.setdefault(app.target_id, [app.target, ZERO])[1] += app.amount.quantize(_quantum(places))
+    if not per_bill:
+        problems.append("A payment to a non-resident vendor is applied to its bills, so the withholding tax can be "
+                        "computed (R62). / تُخصَّص الدفعة لمورد غير مقيم إلى فواتيره لاحتساب ضريبة الاستقطاع.")
+    for bill, settled in per_bill.values():
+        lines = list(bill.lines.select_related("wht_category").order_by("line_no"))
+        missing = [line.line_no for line in lines if line.wht_category_id is None]
+        if missing:  # R61 / AT-57
+            problems.append(f"Bill {bill.number}: line(s) {', '.join(map(str, missing))} have no withholding tax "
+                            f"category (R61). / الفاتورة {bill.number}: بنود بلا فئة ضريبة استقطاع.")
+            continue
+        by_code = {}
+        for line in lines:
+            by_code[line.wht_category.code] = by_code.get(line.wht_category.code, ZERO) + line.net_amount
+        total_net = sum(by_code.values(), ZERO)
+        left = settled
+        for i, (code, net) in enumerate(sorted(by_code.items())):
+            base = left if i == len(by_code) - 1 else _round(settled * net / total_net, places)
+            left -= base
+            row = _wht_rate_row(code, on)
+            if row is None:
+                problems.append(f"No withholding tax rate for {code} on {on}. / لا توجد نسبة استقطاع للفئة {code} "
+                                f"بتاريخ {on}.")
+                continue
+            if row.sharia_prohibited and entity.sharia_enforced:
+                problems.append(f"Withholding tax category {code} never arises where Sharia is enforced (OQ-8). / "
+                                f"فئة الاستقطاع {code} لا تنشأ في كيان يطبق الضوابط الشرعية.")
+                continue
+            cert = _treaty_certificate(vendor, code, on)
+            rate = cert.treaty_rate if cert else row.rate
+            r = rate / HUNDRED
+            with localcontext() as ctx:
+                ctx.prec = 60
+                wht = _round(base * r / (1 - r), places) if gross_up else _round(base * r, places)
+            rows.append({"bill": bill, "category": row, "base": base, "rate": rate, "certificate": cert,
+                         "wht": wht, "gross_up": gross_up})
+    total = sum((r["wht"] for r in rows), ZERO)
+    settled_total = sum((s for _, s in per_bill.values()), ZERO)
+    expected = settled_total if gross_up else settled_total - total
+    if not problems and payment.amount != expected:
+        problems.append(
+            f"The cash paid must be {expected} {payment.currency_id}: settled {settled_total} "
+            f"{'(withholding tax ' + str(total) + ' borne by the entity)' if gross_up else 'less withholding tax ' + str(total)}"
+            f" (R62, R63). / يجب أن يكون المبلغ المدفوع {expected} {payment.currency_id}: المسدد {settled_total} "
+            f"{'وتتحمل المنشأة ضريبة الاستقطاع ' + str(total) if gross_up else 'ناقص ضريبة الاستقطاع ' + str(total)}.")
+    return rows, total, problems
+
+
+def _record_wht(payment, row, user):
+    """One WhtDeduction (R62, R64); SAR amounts at the payment's pinned rate, as its entry books them."""
+    entity = payment.entity
+    if entity.base_currency_id == SAR:
+        to_sar = (lambda a: fx.convert(a, payment.fx_rate)) if payment.currency_id != SAR else (lambda a: _round(a, 2))
+    else:
+        rate = _sar_rate(entity, payment.currency_id, payment.fx_rate, payment.date, user)
+        to_sar = lambda a: _round(a * rate, 2)  # noqa: E731
+    deduction = WhtDeduction(
+        entity=entity, payment=payment, bill=row["bill"], wht_category=row["category"], base_amount=row["base"],
+        base_amount_sar=to_sar(row["base"]), rate_applied=row["rate"], treaty_certificate=row["certificate"],
+        wht_amount=row["wht"], wht_amount_sar=to_sar(row["wht"]), gross_up=row["gross_up"],
+        return_month=payment.date.replace(day=1),
+    )
+    deduction._service_write = True
+    deduction.save()
+    return deduction
+
+
+def wht_preview(payment, *, user):
+    """What R62 / R63 withhold on a draft or submitted payment if it were posted today on its date:
+    {"rows": [...], "wht": total, "cash_expected": ..., "problems": [...]}. ``invoicing.view``."""
+    payment = VendorPayment.objects.select_related("entity", "vendor").get(pk=payment.pk)
+    access.require(user, payment.entity, "invoicing.view")
+    if not _needs_wht(payment.vendor, payment.kind):
+        return {"rows": [], "wht": ZERO, "cash_expected": payment.amount, "problems": []}
+    rows, total, problems = _wht_plan(payment, payment.date)
+    settled = sum((r["base"] for r in rows), ZERO)
+    return {
+        "rows": [{"bill": r["bill"].number, "category": r["category"].code, "base": r["base"], "rate": r["rate"],
+                  "treaty_certificate": r["certificate"].pk if r["certificate"] else None, "wht": r["wht"],
+                  "gross_up": r["gross_up"]} for r in rows],
+        "wht": total, "cash_expected": settled if payment.vendor.wht_gross_up else settled - total,
+        "problems": problems,
+    }
+
+
+def add_treaty_certificate(vendor, *, user, country, treaty_rate, valid_from, valid_to, received_on,
+                           wht_category=None, document=None):
+    """Enter a treaty certificate for a non-resident vendor (``invoicing.enter_wht_data``; R62). It counts only
+    once a second person verifies it (:func:`verify_treaty_certificate`)."""
+    vendor = Vendor.objects.select_related("entity").get(pk=vendor.pk)
+    access.require(user, vendor.entity, "invoicing.enter_wht_data")
+    if vendor.is_resident:
+        raise error("Treaty certificates are for non-resident vendors.", "شهادات الاتفاقيات للموردين غير المقيمين.",
+                    code="vendor_resident")
+    rate = _decimal(treaty_rate, "treaty rate")
+    if not fx.has_places(rate, 2) or not (ZERO <= rate < HUNDRED):
+        raise error("The treaty rate is a percentage from 0 to below 100 with 2 decimals.",
+                    "نسبة الاتفاقية نسبة مئوية من 0 إلى أقل من 100 بخانتين عشريتين.", code="treaty_rate")
+    if valid_to < valid_from:
+        raise error("The certificate ends before it starts.", "تنتهي الشهادة قبل أن تبدأ.", code="treaty_dates")
+    if wht_category is not None and not isinstance(wht_category, WhtCategory):
+        wht_category = _wht_category(wht_category)
+    cert = TreatyCertificate(entity=vendor.entity, vendor=vendor, country=str(country).upper(), treaty_rate=rate,
+                             wht_category=wht_category, valid_from=valid_from, valid_to=valid_to,
+                             received_on=received_on, created_by=user)
+    try:
+        validate_country_code(cert.country)
+    except Exception:  # noqa: BLE001
+        raise error(f"{country!r} is not an ISO country code.", f"{country!r} ليس رمز دولة صالحًا.",
+                    code="country") from None
+    if document is not None:
+        cert.document = document
+    cert.save()
+    return cert
+
+
+@transaction.atomic
+def verify_treaty_certificate(certificate, *, user):
+    """A second person verifies a treaty certificate (``invoicing.verify_wht_data``; never the one who entered
+    it). From then on it is never edited (3.2)."""
+    cert = TreatyCertificate.objects.select_for_update(of=("self",)).select_related("entity").get(pk=certificate.pk)
+    access.require(user, cert.entity, "invoicing.verify_wht_data")
+    if cert.created_by_id == user.pk:
+        access.deny(user, cert.entity, "invoicing.verify_wht_data", "self_approval")
+    if cert.verified_at is not None:
+        raise error("The certificate is already verified.", "تم التحقق من الشهادة مسبقًا.", code="certificate_verified")
+    cert.verified_by, cert.verified_at = user, timezone.now()
+    cert.save()
+    return cert
+
+
+def wht_return_data(entity, month, *, user):
+    """R64: monthly WHT return data of ``entity`` (``month`` = any day of it), per category and vendor, from
+    ``WhtDeduction``: base, rate, WHT (SAR), treaty reference and country. A payment reversed in the month shows
+    as a negative row. Ties to the 2220 movements of the month's vendor-payment entries (``ledger_2220_sar``).
+    Remittance (E22) is not part of it. Individual vendors are shown by code only (R91)."""
+    access.require(user, entity, "invoicing.view")
+    start = month.replace(day=1)
+    end = date_type(start.year, start.month, calendar.monthrange(start.year, start.month)[1])
+    rows = {}
+
+    def add(d, sign):
+        key = (d.wht_category.code, d.payment.vendor.code, d.rate_applied, d.treaty_certificate_id)
+        r = rows.setdefault(key, {
+            "category": d.wht_category.code, "return_line_code": d.wht_category.return_line_code,
+            "vendor": d.payment.vendor.code, "country": d.payment.vendor.residence_country, "rate": d.rate_applied,
+            "treaty_certificate": d.treaty_certificate_id,
+            "treaty_country": d.treaty_certificate.country if d.treaty_certificate_id else "",
+            "base_sar": ZERO, "wht_sar": ZERO, "gross_up": d.gross_up,
+        })
+        r["base_sar"] += sign * d.base_amount_sar
+        r["wht_sar"] += sign * d.wht_amount_sar
+
+    base_qs = WhtDeduction.objects.filter(entity=entity).select_related(
+        "wht_category", "payment__vendor", "treaty_certificate")
+    for d in base_qs.filter(return_month=start):
+        add(d, 1)
+    for d in base_qs.filter(payment__reversal_entry__date__gte=start, payment__reversal_entry__date__lte=end):
+        add(d, -1)
+    lines = JournalLine.objects.filter(
+        entry__entity=entity, entry__status__in=ledger.BOOKED, entry__date__gte=start, entry__date__lte=end,
+        entry__document_type="invoicing.vendorpayment", account__code=WHT_PAYABLE,
+    ).aggregate(c=Sum("credit"), d=Sum("debit"))
+    ledger_total = (lines["c"] or ZERO) - (lines["d"] or ZERO)
+    out = sorted(rows.values(), key=lambda r: (r["category"], r["vendor"]))
+    total = sum((r["wht_sar"] for r in out), ZERO)
+    return {"entity": entity.code, "month": start, "rows": out, "total_wht_sar": total,
+            "ledger_2220_sar": ledger_total, "difference": total - ledger_total}
+
+
+# --- purification (R54, E14, E15; OQ-30 amount, timing and recipient pending Sharia board sign-off) ----------
+
+PURIFICATION_PERMISSION = {
+    PurificationTransfer.Kind.TRANSFER: "invoicing.post_purification_transfer",
+    PurificationTransfer.Kind.PAYOUT: "invoicing.approve_purification_payout",
+}
+
+
+def _posted_purification(entity, kind, as_of=None, exclude_pk=None):
+    qs = PurificationTransfer.objects.filter(entity=entity, kind=kind, status=PurificationTransfer.Status.POSTED)
+    if as_of is not None:
+        qs = qs.filter(date__lte=as_of)
+    if exclude_pk:
+        qs = qs.exclude(pk=exclude_pk)
+    return qs.aggregate(t=Sum("amount"))["t"] or ZERO
+
+
+def purification_position(entity, *, user, as_of=None):
+    """R6, R54 / AT-45, AT-71: non-compliant income flagged in the ledger (``ledger.purification_amount``), what was
+    transferred to 2600 (E14) and paid out (E15), and what is left to transfer and to pay. ``invoicing.view`` and
+    ``ledger.view``."""
+    access.require(user, entity, "invoicing.view")
+    flagged = ledger.purification_amount(entity, user=user, as_of=as_of)
+    transferred = _posted_purification(entity, PurificationTransfer.Kind.TRANSFER, as_of)
+    paid = _posted_purification(entity, PurificationTransfer.Kind.PAYOUT, as_of)
+    return {"flagged": flagged, "transferred": transferred, "paid_out": paid, "to_transfer": flagged - transferred,
+            "payable": transferred - paid}
+
+
+def _purification_problems(doc, user, exclude_self=True):
+    problems = []
+    entity = doc.entity
+    pk = doc.pk if exclude_self else None
+    if doc.kind == PurificationTransfer.Kind.TRANSFER:
+        flagged = ledger.purification_amount(entity, user=user, as_of=doc.date)
+        left = flagged - _posted_purification(entity, doc.kind, doc.date, exclude_pk=pk)
+        if doc.amount > left:
+            problems.append(f"Only {left} of non-compliant income is left to purify on {doc.date} (R6, R54). / "
+                            f"المتبقي من الإيرادات غير المتوافقة للتطهير {left} فقط بتاريخ {doc.date}.")
+    else:
+        payable = (_posted_purification(entity, PurificationTransfer.Kind.TRANSFER, doc.date)
+                   - _posted_purification(entity, doc.kind, doc.date, exclude_pk=pk))
+        if doc.amount > payable:
+            problems.append(f"Only {payable} is on the charity payable (2600) on {doc.date}; transfer first (E14). / "
+                            f"رصيد مستحقات التطهير {payable} فقط بتاريخ {doc.date}؛ حوّل أولًا.")
+        if not doc.recipient_ar.strip():
+            problems.append("The recipient charity is named in Arabic (OQ-30). / اسم الجهة الخيرية المستفيدة بالعربية مطلوب.")
+        if doc.bank_account_id is None:
+            problems.append("A payout needs the bank account it is paid from. / يحتاج الصرف إلى الحساب البنكي.")
+    period = _open_period(entity, doc.date)
+    if period:
+        problems.append(period)
+    return problems
+
+
+def create_purification_transfer(entity, *, user, kind, date, amount, bank_account=None, recipient_ar="",
+                                 recipient_en="", reference_ar="", reference_en=""):
+    """Record a purification transfer (E14) or payout (E15) as a draft (R54). A person holding
+    ``invoicing.post_purification_transfer`` records it; agents and system users never (R54: a human user). A
+    second person posts it (:func:`post_purification_transfer`)."""
+    if access_services.kind_of(user) != Kind.HUMAN:  # R54: never an agent or a system job
+        access.deny(user, entity, "invoicing.post_purification_transfer", "agent_forbidden")
+    if not access.has(user, entity, "invoicing.post_purification_transfer"):
+        access.deny(user, entity, "invoicing.post_purification_transfer", "no_membership")
+    access.require(user, entity, "ledger.view")  # the amounts come from the ledger's flagged lines
+    if kind not in PurificationTransfer.Kind.values:
+        raise error("Unknown purification kind.", "نوع تطهير غير معروف.", code="kind")
+    doc = PurificationTransfer(
+        entity=entity, kind=kind, date=date, amount=_money(amount, "amount", positive=True,
+                                                           currency=entity.base_currency_id),
+        recipient_ar=(recipient_ar or "").strip(), recipient_en=(recipient_en or "").strip(),
+        reference_ar=reference_ar or "", reference_en=reference_en or "", created_by=user, source=_source(user),
+    )
+    if kind == PurificationTransfer.Kind.PAYOUT:
+        doc.bank_account = _bank_account(entity, bank_account)
+    problems = _purification_problems(doc, user)
+    if problems:
+        raise _problems_error(problems, "purification_invalid")
+    doc.save()
+    return doc
+
+
+def post_purification_transfer(transfer, *, user):
+    """Post a recorded transfer (``invoicing.post_purification_transfer``) or payout
+    (``invoicing.approve_purification_payout``, the CFO): E14 / E15 in one step, numbered ``PUR``. The recorder
+    cannot post it (ledger segregation, access R35); agents never (R54)."""
+    doc = PurificationTransfer.objects.select_related("entity").get(pk=transfer.pk)
+    permission = PURIFICATION_PERMISSION[doc.kind]
+    grant = access.require(user, doc.entity, permission, document=doc)
+    seen_version = doc.version
+    with transaction.atomic():
+        doc = PurificationTransfer.objects.select_for_update(of=("self",)).select_related("entity").get(pk=doc.pk)
+        if doc.status != PurificationTransfer.Status.DRAFT:
+            raise error("Only recorded drafts are posted.", "تُرحَّل المسودات المسجلة فقط.", code="not_draft")
+        _refuse_stale_grant(grant, doc, seen_version)
+        problems = _purification_problems(doc, user)
+        if problems:
+            raise _problems_error(problems, "purification_invalid")
+        doc.number = _next_number(doc.entity, "PUR", doc.date.year)
+        doc.status = PurificationTransfer.Status.POSTED
+        doc.posted_by, doc.posted_at = user, timezone.now()
+        doc._service_write = True
+        doc.save()
+        label = (f"Purification {doc.get_kind_display()} {doc.number} / {doc.number}")
+        try:
+            with _posting_as(user):
+                entry = ledger.create_entry(doc.entity, doc.date, label[:300], None, user=user, reference=doc.number,
+                                            post=True, grant=grant, document=doc)
+        except LedgerError as exc:
+            raise _problems_error(exc.messages, getattr(exc, "code", None) or "posting_refused") from None
+        doc.journal_entry = entry
+        doc._service_write = True
+        doc.save(update_fields=["journal_entry", "updated_at"])
+    return doc
+
+
+def _purification_lines(document):
+    """Registered ``build_lines`` for PurificationTransfer: E14 (Dr 4900 / Cr 2600) or E15 (Dr 2600 / Cr bank)."""
+    _require_posting_context(document, PurificationTransfer.Status.POSTED)
+    label = f"{document.number} {document.reference_ar or document.reference_en}".strip()
+    if document.kind == PurificationTransfer.Kind.TRANSFER:
+        return [{"account": NON_COMPLIANT_INCOME, "debit": document.amount, "description": label},
+                {"account": CHARITY_PAYABLE, "credit": document.amount, "description": label}]
+    return [{"account": CHARITY_PAYABLE, "debit": document.amount, "description": label},
+            {"account": document.bank_account, "credit": document.amount,
+             "description": f"{label} {document.recipient_ar}"[:300]}]
+
+
+# --- personal data (PDPL; R49 to R53, R86, R91) ---------------------------------------------------------------
+
+MASK = "*** / مخفي"
+PERSONAL_PARTY_FIELDS = (
+    "name_en", "name_ar", "vat_number", "street_en", "street_ar", "building_no", "additional_no", "district_en",
+    "district_ar", "city_en", "city_ar", "postal_code",
+)
+BUYER_FIELDS = (
+    "buyer_name_en", "buyer_name_ar", "buyer_vat_number", "buyer_other_id_scheme", "buyer_other_id", "buyer_building_no",
+    "buyer_street_en", "buyer_street_ar", "buyer_district_en", "buyer_district_ar", "buyer_additional_no",
+    "buyer_postal_code", "buyer_city_en", "buyer_city_ar", "buyer_country",
+)
+
+
+def _is_individual(party):
+    kind = party.customer_kind if isinstance(party, Customer) else party.vendor_kind
+    return kind == Customer.Kind.INDIVIDUAL
+
+
+def _may_see_personal(user, entity):
+    """R51: holders of ``invoicing.view_personal_data`` in the entity, people only (agents always see masks)."""
+    return access_services.kind_of(user) == Kind.HUMAN and access.has(user, entity, "invoicing.view_personal_data")
+
+
+def _log_personal_data(user, entity, records, how, event=AccessLog.Event.PERSONAL_DATA_VIEWED):
+    """R51 / AT-44: one AccessLog row per unmasked view or export of individuals' personal data (user, entity,
+    time, the records and how they were shown)."""
+    if not records:
+        return None
+    return access_services.log(
+        event, actor=user, entity=entity, permission="invoicing.view_personal_data",
+        details={"records": [list(r) for r in records], "how": how},
+    )
+
+
+def _party_record(party, unmasked):
+    fields = PERSONAL_PARTY_FIELDS + (("bank_iban",) if isinstance(party, Vendor) else ())
+    record = {"code": party.code, "kind": party.customer_kind if isinstance(party, Customer) else party.vendor_kind,
+              "entity": party.entity.code, "is_vat_registered": party.is_vat_registered, "country": party.country,
+              "masked": not unmasked}
+    for name in fields:
+        record[name] = getattr(party, name) if unmasked else MASK
+    if isinstance(party, Customer):
+        record["identifiers"] = ([{"scheme": i.scheme, "value": i.value} for i in party.identifiers.all()]
+                                 if unmasked else MASK)
+    return record
+
+
+def _view_party(party, user, how):
+    access.require(user, party.entity, "invoicing.view")
+    individual = _is_individual(party)
+    unmasked = not individual or _may_see_personal(user, party.entity)
+    if individual and unmasked:
+        _log_personal_data(user, party.entity, [(party._meta.label_lower, party.pk)], how)
+    return _party_record(party, unmasked)
+
+
+def view_customer(customer, *, user):
+    """A customer's record (R51): an individual's personal data only for holders of
+    ``invoicing.view_personal_data`` in its entity, each such view logged (AT-44); masked for everyone else."""
+    return _view_party(Customer.objects.select_related("entity").get(pk=customer.pk), user, "view")
+
+
+def view_vendor(vendor, *, user):
+    """As :func:`view_customer` for vendors (individual vendors, D24, R91; the IBAN is personal data too)."""
+    return _view_party(Vendor.objects.select_related("entity").get(pk=vendor.pk), user, "view")
+
+
+def _export_parties(model, entity, user):
+    access.require(user, entity, "invoicing.view")
+    unmasked = _may_see_personal(user, entity)
+    rows, shown = [], []
+    for party in model.objects.filter(entity=entity).select_related("entity").order_by("code"):
+        individual = _is_individual(party)
+        rows.append(_party_record(party, unmasked or not individual))
+        if individual and unmasked:
+            shown.append((party._meta.label_lower, party.pk))
+    _log_personal_data(user, entity, shown, "export", AccessLog.Event.PERSONAL_DATA_EXPORTED)
+    return rows
+
+
+def export_customers(entity, *, user):
+    """All customers of ``entity`` as rows (R51): individuals unmasked only for holders of
+    ``invoicing.view_personal_data``; one ``personal_data_exported`` row lists the individuals exported."""
+    return _export_parties(Customer, entity, user)
+
+
+def export_vendors(entity, *, user):
+    return _export_parties(Vendor, entity, user)
+
+
+def view_sales_document(document, *, user):
+    """A sales document's header with its buyer snapshot (R51): an individual buyer's data only for holders of
+    ``invoicing.view_personal_data``, logged; masked otherwise. Amounts, VAT and numbers are not personal data."""
+    doc = SalesDocument.objects.select_related("entity", "customer").get(pk=document.pk)
+    access.require(user, doc.entity, "invoicing.view")
+    individual = _is_individual(doc.customer)
+    unmasked = not individual or _may_see_personal(user, doc.entity)
+    if individual and unmasked:
+        _log_personal_data(user, doc.entity, [(doc._meta.label_lower, doc.pk)], "view")
+    record = {"number": doc.number, "doc_type": doc.doc_type, "status": doc.status, "customer": doc.customer.code,
+              "issue_date": doc.issue_date, "currency": doc.currency_id, "total_net": doc.total_net,
+              "total_vat": doc.total_vat, "total_gross": doc.total_gross, "masked": not unmasked}
+    for name in BUYER_FIELDS:
+        record[name] = getattr(doc, name) if unmasked else MASK
+    return record
+
+
+# --- printable document (R47, R72, R94) -------------------------------------------------------------------------
+
+_SELLER_FIELDS = ("legal_name_en", "legal_name_ar", "vat_number", "cr_number", "unified_number", "building_no",
+                  "street_en", "street_ar", "district_en", "district_ar", "additional_no", "postal_code", "city_en",
+                  "city_ar", "country")
+_BANNERS = {
+    "draft": ("Draft: not an invoice; not to be given to the buyer.", "مسودة: ليست فاتورة ولا تُسلَّم للمشتري."),
+    "not_cleared": ("Not yet cleared or reported by ZATCA: not to be given to the buyer (R44).",
+                    "لم تعتمدها الهيئة أو يُبلَّغ عنها بعد: لا تُسلَّم للمشتري."),
+    "rejected": ("Rejected by ZATCA: not valid; a new document replaces it (R20).",
+                 "رفضتها الهيئة: غير صالحة؛ يحل محلها مستند جديد."),
+    # Worded so that neither title of R47 appears on such a document (R94).
+    "no_vat": ("The seller has no VAT number and charges no VAT; the title and type of this document await tax "
+               "sign-off (R94, OQ-59).",
+               "ليس للبائع رقم ضريبي ولا يفرض الضريبة؛ وعنوان هذا المستند ونوعه بانتظار اعتماد المستشار الضريبي."),
+}
+
+
+def render_sales_document(document, *, user):
+    """The printable document as bilingual HTML (Arabic right-to-left and English; R47, R72).
+
+    Title per R47 (``SalesDocument.title_en`` / ``title_ar``; never "Tax Invoice" for a seller without a VAT
+    number, R94), the seller's CR number and unified national number with their bilingual labels (R72), the
+    buyer, lines, VAT breakdown per category with the SAR VAT, SAR totals and the ZATCA QR from ``zatca_qr``
+    (written by the ZATCA hand-off, R45). Issued documents print their frozen snapshot (R15); drafts print the
+    current data under a "draft" banner. An individual buyer's data is masked without
+    ``invoicing.view_personal_data``; an unmasked print is logged (R51). ``invoicing.view``. No PDF: no HTML-to-PDF
+    library is installed (WeasyPrint is not).
+    """
+    from django.template.loader import render_to_string
+
+    from .qr_svg import qr_svg
+
+    doc = SalesDocument.objects.select_related("entity", "customer", "original_document").get(pk=document.pk)
+    access.require(user, doc.entity, "invoicing.view")
+    places = _doc_places(doc)
+    issued = doc.status in (Status.ISSUED, Status.FINAL, Status.REJECTED)
+    lines = list(doc.lines.select_related("vat_rate", "vat_exemption_reason").order_by("line_no"))
+    if issued:
+        seller = {name: getattr(doc, f"seller_{name}") for name in _SELLER_FIELDS}
+        buyer = {name[len("buyer_"):]: getattr(doc, name) for name in BUYER_FIELDS}
+        breakdown = doc.vat_breakdown
+        totals = {"net": doc.total_net, "vat": doc.total_vat, "gross": doc.total_gross, "vat_sar": doc.total_vat_sar,
+                  "gross_sar": doc.total_gross_sar}
+    else:
+        seller = {name: getattr(doc.entity, name) or "" for name in _SELLER_FIELDS}
+        buyer = {name[len("buyer_"):]: value for name, value in _buyer_snapshot(doc).items()}
+        breakdown, net, vat, _ = _sales_breakdown(doc, lines)
+        totals = {"net": net, "vat": vat, "gross": net + vat, "vat_sar": "—", "gross_sar": "—"}
+    totals = {k: (_fmt(v, 2 if k.endswith("_sar") else places) if isinstance(v, Decimal) else v)
+              for k, v in totals.items()}
+    individual = _is_individual(doc.customer)
+    if individual and not _may_see_personal(user, doc.entity):
+        buyer = {k: (MASK if v else v) for k, v in buyer.items() if k != "country"} | {"country": buyer.get("country")}
+    elif individual:
+        _log_personal_data(user, doc.entity, [(doc._meta.label_lower, doc.pk)], "print")
+    banners = []
+    if not issued:
+        banners.append("draft")
+    elif doc.status == Status.REJECTED:
+        banners.append("rejected")
+    elif not zatca_port.issued_by_status(doc):
+        banners.append("not_cleared")
+    if not (seller["vat_number"] or "").strip():
+        banners.append("no_vat")
+    context = {
+        "doc": doc, "title_en": doc.title_en, "title_ar": doc.title_ar, "seller": seller, "buyer": buyer,
+        "original": doc.original_document.number if doc.original_document_id else "",
+        "lines": [{"line_no": l.line_no, "description_ar": l.description_ar, "description_en": l.description_en,
+                   "quantity": l.quantity.normalize() if l.quantity == l.quantity.to_integral() else l.quantity,
+                   "unit_code": l.unit_code, "unit_price": _fmt(l.unit_price, places),
+                   "discount": _fmt(l.line_discount, places), "net": _fmt(l.net_amount, places),
+                   "category": l.vat_category, "rate": l.vat_rate.rate if l.vat_rate else "",
+                   "vat": _fmt(l.vat_amount, places),
+                   "reason": l.vat_exemption_reason.code if l.vat_exemption_reason_id else ""} for l in lines],
+        "breakdown": breakdown, "totals": totals,
+        "banners": [{"en": _BANNERS[b][0], "ar": _BANNERS[b][1]} for b in banners],
+        "qr_svg": qr_svg(doc.zatca_qr) if doc.zatca_qr else None,
+    }
+    return render_to_string("invoicing/sales_document.html", context)
+
+
+ANONYMISED_EN, ANONYMISED_AR = "ANONYMISED", "مجهّل"
+_ANON_DOC_TEXT = ("buyer_name_en", "buyer_street_en", "buyer_district_en", "buyer_city_en")
+_ANON_DOC_TEXT_AR = ("buyer_name_ar", "buyer_street_ar", "buyer_district_ar", "buyer_city_ar")
+_ANON_DOC_BLANK = ("buyer_vat_number", "buyer_other_id", "buyer_building_no", "buyer_additional_no",
+                   "buyer_postal_code")
+_ANON_PARTY_TEXT = ("name_en", "street_en", "district_en", "city_en")
+_ANON_PARTY_TEXT_AR = ("name_ar", "street_ar", "district_ar", "city_ar")
+_ANON_PARTY_BLANK = ("vat_number", "building_no", "additional_no", "postal_code")
+
+
+def anonymisation_candidates(today):
+    """R52: what the anonymisation job would change on ``today``: final or rejected sales documents of individual
+    customers whose ``retention_until`` has passed, and individual customers whose every document is (or is about
+    to be) anonymised. Customers without documents have no retention date and are left alone."""
+    docs = SalesDocument.objects.filter(
+        customer__customer_kind=Customer.Kind.INDIVIDUAL, status__in=[Status.FINAL, Status.REJECTED],
+        retention_until__lt=today, anonymised_at__isnull=True,
+    ).order_by("pk")
+    doc_ids = set(docs.values_list("pk", flat=True))
+    customers = []
+    for c in Customer.objects.filter(customer_kind=Customer.Kind.INDIVIDUAL, anonymised_at__isnull=True,
+                                     documents__isnull=False).distinct().order_by("pk"):
+        mine = list(c.documents.values_list("pk", "anonymised_at"))
+        if all(pk in doc_ids or at is not None for pk, at in mine):
+            customers.append(c.pk)
+    return sorted(doc_ids), customers
+
+
+def anonymise_expired_personal_data(*, today=None, apply=False):
+    """R52 / AT-43: the anonymisation job (operator command ``invoicing_anonymise``; never a user action).
+
+    Dry run by default: it only reports what it would change. With ``apply=True`` it replaces individuals' names,
+    IDs and addresses on those documents and customers by a fixed token; amounts, VAT, numbers, dates and the ZATCA
+    hash and QR are kept, and journal entries are never touched. Applying is refused unless the setting
+    ``INVOICING_ANONYMISATION_ENABLED`` is True: the retention rules await confirmation (zatca OQ-8, OQ-31), so
+    it is off by default. Returns {"documents": [...], "customers": [...], "applied": bool}.
+    """
+    from django.conf import settings
+
+    today = today or _riyadh_now().date()
+    doc_ids, customer_ids = anonymisation_candidates(today)
+    result = {"documents": doc_ids, "customers": customer_ids, "applied": False, "date": today}
+    if not apply:
+        return result
+    if not getattr(settings, "INVOICING_ANONYMISATION_ENABLED", False):
+        raise error("The anonymisation job is disabled until the retention rules are confirmed (R52); set "
+                    "INVOICING_ANONYMISATION_ENABLED to run it.",
+                    "مهمة إخفاء الهوية معطلة حتى تأكيد قواعد الحفظ؛ فعّل الإعداد لتشغيلها.", code="anonymisation_disabled")
+    now = _riyadh_now()
+    if today > now.date():  # never ahead of time: the database checks the moment against retention_until
+        raise error("The anonymisation date cannot be in the future.", "لا يكون تاريخ إخفاء الهوية في المستقبل.",
+                    code="anonymisation_future")
+    with transaction.atomic():
+        for doc in SalesDocument.objects.select_for_update(of=("self",)).filter(pk__in=doc_ids):
+            for name in _ANON_DOC_TEXT:
+                setattr(doc, name, ANONYMISED_EN)
+            for name in _ANON_DOC_TEXT_AR:
+                setattr(doc, name, ANONYMISED_AR)
+            for name in _ANON_DOC_BLANK:
+                setattr(doc, name, "")
+            doc.anonymised_at = now
+            doc._service_write = True
+            doc.save(update_fields=[*_ANON_DOC_TEXT, *_ANON_DOC_TEXT_AR, *_ANON_DOC_BLANK, "anonymised_at",
+                                    "updated_at"])
+        for c in Customer.objects.select_for_update(of=("self",)).filter(pk__in=customer_ids):
+            for name in _ANON_PARTY_TEXT:
+                setattr(c, name, ANONYMISED_EN)
+            for name in _ANON_PARTY_TEXT_AR:
+                setattr(c, name, ANONYMISED_AR)
+            for name in _ANON_PARTY_BLANK:
+                setattr(c, name, "")
+            c.is_vat_registered, c.is_active, c.anonymised_at = False, False, now
+            c.save()
+            CustomerIdentifier.objects.filter(customer=c).delete()
+    result["applied"] = True
+    return result
 
 
 # --- reversal (R24, R25, R32, R33; OQ-28) -------------------------------------------------------------
@@ -2370,7 +3098,8 @@ def reconcile_subledger(entity, as_of, *, user):
         sign = 1 if d.doc_type == PurchaseDocument.DocType.VENDOR_CREDIT_NOTE else -1
         add(*ctrl(d.vendor, False), d.currency_id, sign * d.total_gross)
     for p in booked(VendorPayment.objects.all()).select_related("vendor__group_entity"):
-        add(*ctrl(p.vendor, False), p.currency_id, -p.amount if p.kind == VendorPayment.Kind.REFUND_RECEIVED else p.amount)
+        add(*ctrl(p.vendor, False), p.currency_id,
+            -p.amount if p.kind == VendorPayment.Kind.REFUND_RECEIVED else p.settled_amount)
     gl = {}
     lines = JournalLine.objects.filter(
         entry__entity=entity, entry__status__in=ledger.BOOKED, entry__date__lte=as_of,
@@ -2387,19 +3116,223 @@ def reconcile_subledger(entity, as_of, *, user):
     return rows
 
 
-# --- billing hooks (R60, R73): not built in slice 1 ---------------------------------------------------
+# --- billing hooks (R60, R73; billing.md R13, R43, R46c, R52 to R56) -----------------------------------------
 
-def create_from_billing(billing_item, user):
-    """R60. Not built: the billing models (billing.md) do not exist yet. Always raises."""
-    raise NotImplementedError(
-        "create_from_billing waits for the billing module (billing.md); not built in invoicing slice 1. / "
-        "إنشاء الفواتير من الفوترة بانتظار وحدة الفوترة؛ غير مبني في المرحلة الأولى."
+BILLING_SOURCE = "system:billing"
+
+
+def _billing_refusal(en, ar, code):
+    return InvoicingError(f"{en} / {ar}", code=code)
+
+
+def _billing_line(doc, row, *, unit_price):
+    """One line of a billing document (quantity 1, the price billing froze); refused like any other line."""
+    last = doc.lines.order_by("-line_no").values_list("line_no", flat=True).first() or 0
+    line = SalesDocumentLine(entity=doc.entity, document=doc, line_no=last + 1)
+    _sales_line_values(
+        doc, line, income_type=row["income_type"], quantity="1", unit_price=unit_price,
+        description_ar=row.get("description_ar", ""), description_en=row.get("description_en", ""),
+        vat_category=row.get("vat_category") or None, vat_exemption_reason=row.get("vat_exemption_reason") or None,
+        income_account=row.get("income_account") or None, line_discount="0", unit_code=row.get("unit_code") or "C62",
     )
+    line._billing_write = True
+    line.save()
+    return line
+
+
+def _locked_billing_document(field, obj):
+    """The non-rejected document created for ``obj`` (a period or an adjustment), locked, or None."""
+    return (SalesDocument.objects.select_for_update(of=("self",))
+            .filter(**{field: obj}).exclude(status=Status.REJECTED).order_by("pk").first())
+
+
+def _save_billing_document(doc, field, obj):
+    """Insert the draft; if a concurrent call created this period's document first, use that one (R60: a DB
+    partial unique constraint, so a race cannot create two)."""
+    from django.db import IntegrityError
+
+    try:
+        with transaction.atomic():
+            doc.save()
+    except IntegrityError:
+        existing = _locked_billing_document(field, obj)
+        if existing is None:
+            raise
+        return existing, False
+    return doc, True
+
+
+def create_from_billing(period, user):
+    """R60 / billing R52, R53: the invoice of one ``BillingPeriod`` from its frozen ``invoice_lines``.
+
+    Only the billing system user (``invoicing.create_from_billing``, Sys:billing) calls it; anyone else gets
+    ``AccessDenied``. The document is created and submitted by that user with ``source="system:billing"`` and
+    ``billing_item`` = the period. With ``InvoicingSettings.auto_issue_from_approved_contract`` and an approved
+    ``billed_version`` it is issued in the same call without per-invoice approval (D20): ``approved_by`` records
+    the human who approved the billed version (the contract approver for version 1). Nobody approves it in that
+    person's name: no ``invoicing.approve_sales_document`` grant is issued or used; posting on clearance accepts
+    the contract approval itself (ledger ``_clearance_approver`` through the registered ``contract_approval``
+    hook). Otherwise it stays ``submitted`` for the CFO.
+
+    Idempotent: a second call returns the period's non-rejected document. All-or-nothing: a refusal raises with a
+    code billing maps (billing R54) and leaves nothing behind: ``entity_not_vat_registered``, ``period_closed``,
+    ``third_decimal_pending``, ``rate_required``, ``contract_not_billable`` or ``document_invalid``.
+    The returned document carries ``warnings`` (en/ar, e.g. the late-invoice warning R84).
+    """
+    entity = period.entity
+    access.require(user, entity, "invoicing.create_from_billing")
+    with transaction.atomic():
+        existing = _locked_billing_document("billing_item", period)
+        if existing is not None:
+            existing.warnings = []
+            return existing
+        contract, version = period.contract, period.billed_version
+        if contract.entity_id != entity.pk or not period.invoice_lines or version is None:
+            raise _billing_refusal("The billing period has no frozen invoice lines or billed version (billing R52).",
+                                   "ليس لفترة الفوترة بنود فاتورة مجمدة أو نسخة مفوترة.", "contract_not_billable")
+        if not (entity.vat_number or "").strip():  # R94 / OQ-59: held by billing
+            raise _not_vat_registered(entity)
+        today = _riyadh_now().date()
+        closed = _open_period(entity, today)
+        if closed:  # R28: the invoice is dated today; billing retries next run
+            raise InvoicingError([closed], code="period_closed")
+        currency = _currency(contract.currency_id, entity)
+        due = today + timedelta(days=version.due_days) if version.due_days is not None else None
+        doc = SalesDocument(
+            entity=entity, doc_type=SalesDocument.DocType.INVOICE, customer=contract.customer, issue_date=today,
+            currency=currency, supply_date=period.period_start, supply_end_date=period.period_end, due_date=due,
+            created_by=user, source=BILLING_SOURCE, billing_item=period,
+        )
+        if _natural_person_not_subject_to_vat(contract.customer):  # OQ-19 (R48)
+            doc.zatca_profile = SalesDocument.Profile.SIMPLIFIED
+        doc, created = _save_billing_document(doc, "billing_item", period)
+        if not created:
+            doc.warnings = []
+            return doc
+        for row in sorted(period.invoice_lines, key=lambda r: r.get("line_no", 0)):
+            _billing_line(doc, row, unit_price=row["net"])
+        doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity", "customer").get(pk=doc.pk)
+        lines = list(doc.lines.select_related("vat_rate", "vat_exemption_reason"))
+        breakdown, net, vat, _ = _sales_breakdown(doc, lines)
+        odd = _third_decimal_problems(doc, lines, breakdown, net, vat)
+        if odd:  # OQ-62: billing holds the period until a person releases it
+            raise InvoicingError(odd, code="third_decimal_pending")
+        problems = _issue_problems(doc, check_period=False)
+        if problems:
+            raise _problems_error(problems, "document_invalid")
+        doc.status = Status.SUBMITTED
+        doc.submitted_by, doc.submitted_at = user, timezone.now()
+        _bump(doc)
+        doc._service_write = True
+        doc.save()
+        approved = version.status == "approved" and version.approved_by_id is not None
+        warnings = []
+        if approved and _settings(entity).auto_issue_from_approved_contract:
+            _issue_submitted(doc, rate_user=user, approved_by=version.approved_by, approved_at=version.approved_at)
+            access_services.log(
+                AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity, permission="invoicing.create_from_billing",
+                details={"document": [doc._meta.label_lower, doc.pk], "action": "issue_from_contract",
+                         "billed_version": ["billing.contractversion", version.pk],
+                         "approved_by": version.approved_by_id},
+            )
+            # The ZATCA queue system user hands it over (zatca R-32): the billing user holds no ZATCA right. A
+            # hand-off failure leaves it not_submitted for the automatic resubmission (R79), never breaks the run.
+            port, queue = zatca_port.get_port(), access.system_user("zatca_queue")
+            transaction.on_commit(lambda: port.submit_document(SalesDocument.objects.get(pk=doc.pk), queue),
+                                  robust=True)
+            warnings = _late_invoice_warnings(doc)
+    doc.warnings = warnings
+    return doc
+
+
+def _contract_approval(document):
+    """Registered ``contract_approval`` (billing R53): the recorded approval of an invoice auto-issued from billing.
+
+    For an invoice with ``source="system:billing"`` and a billing period, the approval that counts is the CFO's
+    approval of the billed contract version: ``billing.approve_contract`` for the contract (version 1) or
+    ``billing.approve_version`` for a later version. The ledger checks that the person recorded as ``posted_by``
+    is that approver and that the access log holds their granted approval of that very record.
+    """
+    from ledger.documents import RecordedApproval
+
+    if (document.source != BILLING_SOURCE or document.billing_item_id is None
+            or document.doc_type != SalesDocument.DocType.INVOICE or document.approved_by_id is None):
+        return None
+    version = document.billing_item.billed_version
+    if version is None or version.status != "approved" or version.approved_by_id != document.approved_by_id:
+        return None
+    if version.version_no == 1:
+        return RecordedApproval("billing.approve_contract", version.contract, version.approved_by_id,
+                                version.approved_at)
+    return RecordedApproval("billing.approve_version", version, version.approved_by_id, version.approved_at)
 
 
 def create_adjustment_from_billing(adjustment, user):
-    """R73. Not built: ``BillingAdjustment`` (billing.md 3.10) does not exist yet. Always raises."""
-    raise NotImplementedError(
-        "create_adjustment_from_billing waits for the billing module (billing.md); not built in invoicing slice 1. / "
-        "إنشاء الإشعارات من تعديلات الفوترة بانتظار وحدة الفوترة؛ غير مبني في المرحلة الأولى."
-    )
+    """R73 / billing R43: the **draft** credit or debit note of one ``BillingAdjustment``.
+
+    Only the billing system user (``invoicing.create_adjustment_from_billing``). Draft only, whatever
+    ``auto_issue_from_approved_contract`` says (R44): a person completes the header (``payment_means_code``)
+    and submits; the CFO approves (R57). ``source="system:billing"``, ``billing_adjustment`` set, the adjustment's
+    invoice as original, its supply period, one line per changed line key (quantity 1, price = the delta) and the
+    version's reason; ``adjustment_event_date`` stays empty (D30a, R95). The lines are read-only for every user
+    (billing R56). Idempotent: a second call returns the adjustment's existing note.
+    """
+    entity = adjustment.entity
+    access.require(user, entity, "invoicing.create_adjustment_from_billing")
+    with transaction.atomic():
+        existing = _locked_billing_document("billing_adjustment", adjustment)
+        if existing is not None:
+            return existing
+        original = SalesDocument.objects.select_related("customer").get(pk=adjustment.original_document_id)
+        _same_entity(entity, original, "original invoice", "الفاتورة الأصلية")
+        if original.status != Status.FINAL or original.doc_type != SalesDocument.DocType.INVOICE:
+            raise _billing_refusal("The original invoice is not final yet; the note waits for it (billing R47).",
+                                   "الفاتورة الأصلية ليست نهائية بعد؛ ينتظر الإشعار اعتمادها.", "original_not_final")
+        doc_type = (SalesDocument.DocType.CREDIT_NOTE if adjustment.kind == "credit"
+                    else SalesDocument.DocType.DEBIT_NOTE)
+        rows = [row for row in adjustment.lines if Decimal(str(row["delta"])) != ZERO]
+        if not rows:
+            raise _billing_refusal("The correction has no changed amount.", "لا يتضمن التصحيح مبلغًا متغيرًا.",
+                                   "nothing_to_correct")
+        version = adjustment.version
+        doc = SalesDocument(
+            entity=entity, doc_type=doc_type, customer=original.customer, issue_date=_riyadh_now().date(),
+            currency=original.currency, original_document=original, zatca_profile=original.zatca_profile,
+            supply_date=adjustment.supply_start, supply_end_date=adjustment.supply_end,
+            reason_ar=(version.reason_ar or "")[:300], reason_en=(version.reason_en or "")[:300],
+            created_by=user, source=BILLING_SOURCE, billing_adjustment=adjustment,
+        )
+        doc, created = _save_billing_document(doc, "billing_adjustment", adjustment)
+        if not created:
+            return doc
+        for row in rows:
+            _billing_line(doc, row, unit_price=str(abs(Decimal(str(row["delta"])))))
+    return SalesDocument.objects.get(pk=doc.pk)
+
+
+def discard_adjustment_draft(document, user):
+    """Billing R46c, R48: delete a superseded or discarded billing correction draft.
+
+    Only the billing system user (``invoicing.create_adjustment_from_billing``) and only a document created by
+    ``create_adjustment_from_billing``. A ``submitted`` note is first returned to draft in the same transaction
+    (R96: only submitted -> draft exists); ``issued``, ``final`` and ``rejected`` notes are refused and never
+    touched.
+    """
+    doc = SalesDocument.objects.select_related("entity").get(pk=document.pk)
+    access.require(user, doc.entity, "invoicing.create_adjustment_from_billing")
+    with transaction.atomic():
+        doc = SalesDocument.objects.select_for_update(of=("self",)).get(pk=doc.pk)
+        if doc.billing_adjustment_id is None or doc.source != BILLING_SOURCE:
+            raise error("Only correction drafts created from billing are discarded here.",
+                        "تُستبعد هنا مسودات التصحيح المنشأة من الفوترة فقط.", code="not_billing_draft")
+        if doc.status not in (Status.DRAFT, Status.SUBMITTED):
+            raise error("An issued, final or rejected note is never discarded or changed (R13, R96).",
+                        "لا يُستبعد الإشعار الصادر أو النهائي أو المرفوض ولا يُعدَّل.", code="not_draft")
+        if doc.status == Status.SUBMITTED:
+            doc.status = Status.DRAFT
+            doc.modified_at = timezone.now()
+            _bump(doc)
+            doc._service_write = True
+            doc.save()
+        QuerySet.delete(SalesDocumentLine.objects.filter(document=doc))  # the billing-line guard refuses all others
+        doc.delete()

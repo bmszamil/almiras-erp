@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+{% comment %}Printable sales document (invoicing R47, R72, R94): Arabic (RTL) and English side by side, values from the
+frozen snapshot. Rendered by invoicing.services.render_sales_document; no logic here beyond layout.{% endcomment %}
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>{{ title_ar }} / {{ title_en }} {{ doc.number }}</title>
+<style>
+  body { font-family: "Noto Naskh Arabic", "Amiri", "DejaVu Sans", sans-serif; font-size: 12px; margin: 24px; }
+  .ltr { direction: ltr; text-align: left; unicode-bidi: embed; }
+  h1 { font-size: 20px; margin: 0 0 8px; display: flex; justify-content: space-between; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+  th, td { border: 1px solid #999; padding: 4px 6px; vertical-align: top; }
+  th { background: #eee; }
+  .num { direction: ltr; text-align: right; white-space: nowrap; }
+  .banner { border: 2px solid #a00; color: #a00; padding: 6px; margin: 8px 0; font-weight: bold; }
+  .parties { display: flex; gap: 16px; }
+  .parties > div { flex: 1; border: 1px solid #999; padding: 6px; }
+  .qr { margin-top: 12px; }
+  .qr code { word-break: break-all; font-size: 9px; }
+</style>
+</head>
+<body>
+<h1><span>{{ title_ar }}</span><span class="ltr">{{ title_en }}</span></h1>
+{% for b in banners %}<div class="banner">{{ b.ar }} / <span class="ltr">{{ b.en }}</span></div>{% endfor %}
+
+<table>
+  <tr><th>رقم المستند / <span class="ltr">Document No.</span></th><td class="num">{{ doc.number|default:"—" }}</td>
+      <th>تاريخ الإصدار / <span class="ltr">Issue date</span></th><td class="num">{{ doc.issue_date|date:"Y-m-d" }} {{ doc.issue_time|time:"H:i:s"|default:"" }}</td></tr>
+  <tr><th>تاريخ التوريد / <span class="ltr">Supply date</span></th><td class="num">{{ doc.supply_date|date:"Y-m-d"|default:"—" }}{% if doc.supply_end_date %} – {{ doc.supply_end_date|date:"Y-m-d" }}{% endif %}</td>
+      <th>تاريخ الاستحقاق / <span class="ltr">Due date</span></th><td class="num">{{ doc.due_date|date:"Y-m-d"|default:"—" }}</td></tr>
+  <tr><th>العملة / <span class="ltr">Currency</span></th><td class="num">{{ doc.currency_id }}</td>
+      <th>المعرّف الفريد / <span class="ltr">UUID</span></th><td class="num">{{ doc.uuid }}</td></tr>
+  {% if original %}<tr><th>الفاتورة الأصلية / <span class="ltr">Original invoice</span></th><td class="num">{{ original }}</td>
+      <th>السبب / <span class="ltr">Reason</span></th><td>{{ doc.reason_ar }}{% if doc.reason_en %} / <span class="ltr">{{ doc.reason_en }}</span>{% endif %}</td></tr>{% endif %}
+</table>
+
+<div class="parties">
+  <div>
+    <strong>البائع / <span class="ltr">Seller</span></strong><br>
+    {{ seller.legal_name_ar }}<br><span class="ltr">{{ seller.legal_name_en }}</span><br>
+    {% if seller.vat_number %}الرقم الضريبي / <span class="ltr">VAT No.</span>: <span class="num">{{ seller.vat_number }}</span><br>{% endif %}
+    {% if seller.cr_number %}رقم السجل التجاري / <span class="ltr">Commercial Registration No.</span>: <span class="num">{{ seller.cr_number }}</span><br>{% endif %}
+    {% if seller.unified_number %}الرقم الوطني الموحد / <span class="ltr">Unified National No.</span>: <span class="num">{{ seller.unified_number }}</span><br>{% endif %}
+    {{ seller.building_no }} {{ seller.street_ar }}، {{ seller.district_ar }}، {{ seller.city_ar }} {{ seller.postal_code }}{% if seller.additional_no %} ({{ seller.additional_no }}){% endif %} {{ seller.country }}<br>
+    <span class="ltr">{{ seller.building_no }} {{ seller.street_en }}, {{ seller.district_en }}, {{ seller.city_en }} {{ seller.postal_code }} {{ seller.country }}</span>
+  </div>
+  <div>
+    <strong>المشتري / <span class="ltr">Buyer</span></strong><br>
+    {{ buyer.name_ar }}<br><span class="ltr">{{ buyer.name_en }}</span><br>
+    {% if buyer.vat_number %}الرقم الضريبي / <span class="ltr">VAT No.</span>: <span class="num">{{ buyer.vat_number }}</span><br>{% endif %}
+    {% if buyer.other_id %}الهوية ({{ buyer.other_id_scheme }}) / <span class="ltr">ID</span>: <span class="num">{{ buyer.other_id }}</span><br>{% endif %}
+    {% if buyer.street_ar or buyer.city_ar %}{{ buyer.building_no }} {{ buyer.street_ar }}، {{ buyer.district_ar }}، {{ buyer.city_ar }} {{ buyer.postal_code }} {{ buyer.country }}<br>{% endif %}
+    {% if buyer.street_en or buyer.city_en %}<span class="ltr">{{ buyer.building_no }} {{ buyer.street_en }}, {{ buyer.district_en }}, {{ buyer.city_en }} {{ buyer.postal_code }} {{ buyer.country }}</span>{% endif %}
+  </div>
+</div>
+
+<table>
+  <tr><th>#</th><th>الوصف / <span class="ltr">Description</span></th><th>الكمية / <span class="ltr">Qty</span></th>
+      <th>سعر الوحدة / <span class="ltr">Unit price</span></th><th>الخصم / <span class="ltr">Discount</span></th>
+      <th>المبلغ الصافي / <span class="ltr">Net</span></th><th>الفئة والنسبة / <span class="ltr">VAT cat. / rate</span></th>
+      <th>الضريبة / <span class="ltr">VAT</span></th></tr>
+  {% for line in lines %}
+  <tr><td class="num">{{ line.line_no }}</td>
+      <td>{{ line.description_ar }}{% if line.description_en %}<br><span class="ltr">{{ line.description_en }}</span>{% endif %}{% if line.reason %}<br><small>{{ line.reason }}</small>{% endif %}</td>
+      <td class="num">{{ line.quantity }} {{ line.unit_code }}</td><td class="num">{{ line.unit_price }}</td>
+      <td class="num">{{ line.discount }}</td><td class="num">{{ line.net }}</td>
+      <td class="num">{{ line.category }} {{ line.rate }}%</td><td class="num">{{ line.vat }}</td></tr>
+  {% endfor %}
+</table>
+
+<table>
+  <tr><th>فئة الضريبة / <span class="ltr">VAT category</span></th><th>النسبة / <span class="ltr">Rate</span></th>
+      <th>المبلغ الخاضع / <span class="ltr">Taxable amount</span> ({{ doc.currency_id }})</th>
+      <th>الضريبة / <span class="ltr">VAT</span> ({{ doc.currency_id }})</th><th>الضريبة بالريال / <span class="ltr">VAT (SAR)</span></th></tr>
+  {% for g in breakdown %}
+  <tr><td>{{ g.category }}{% for r in g.exemption_reasons %} {{ r }}{% endfor %}{% for t in g.exemption_texts %}<br>{{ t.ar }}{% if t.en %} / <span class="ltr">{{ t.en }}</span>{% endif %}{% endfor %}</td>
+      <td class="num">{{ g.rate }}%</td><td class="num">{{ g.taxable }}</td><td class="num">{{ g.vat }}</td><td class="num">{{ g.vat_sar }}</td></tr>
+  {% endfor %}
+</table>
+
+<table>
+  <tr><th>الإجمالي غير شامل الضريبة / <span class="ltr">Total excluding VAT</span></th><td class="num">{{ totals.net }} {{ doc.currency_id }}</td></tr>
+  <tr><th>إجمالي ضريبة القيمة المضافة / <span class="ltr">Total VAT</span></th><td class="num">{{ totals.vat }} {{ doc.currency_id }}</td></tr>
+  <tr><th>الإجمالي شامل الضريبة / <span class="ltr">Total including VAT</span></th><td class="num">{{ totals.gross }} {{ doc.currency_id }}</td></tr>
+  <tr><th>إجمالي الضريبة بالريال / <span class="ltr">Total VAT in SAR</span></th><td class="num">{{ totals.vat_sar }} SAR</td></tr>
+  <tr><th>الإجمالي بالريال / <span class="ltr">Total in SAR</span></th><td class="num">{{ totals.gross_sar }} SAR</td></tr>
+</table>
+
+{% if doc.notes_ar or doc.notes_en %}<p>{{ doc.notes_ar }}{% if doc.notes_en %}<br><span class="ltr">{{ doc.notes_en }}</span>{% endif %}</p>{% endif %}
+
+<div class="qr">
+  {% if qr_svg %}{{ qr_svg|safe }}
+  {% elif doc.zatca_qr %}<p>رمز الاستجابة السريعة (نص) / <span class="ltr">QR payload (no QR encoder installed)</span>:</p><code class="ltr">{{ doc.zatca_qr }}</code>
+  {% else %}<p>لا يوجد رمز استجابة سريعة بعد (لم تعتمده الهيئة أو يُبلَّغ عنه) / <span class="ltr">No QR code yet (not cleared or reported by ZATCA)</span></p>{% endif %}
+</div>
+</body>
+</html>

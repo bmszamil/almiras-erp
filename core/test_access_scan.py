@@ -39,8 +39,9 @@ ALLOW = {
     "invoicing/services.py:vendors": "the scope mechanism for vendors (access.scope with invoicing.view, R2)",
     "invoicing/services.py:sales_documents": "the scope mechanism for sales documents (access.scope, R2)",
     "invoicing/services.py:purchase_documents": "the scope mechanism for purchase documents (access.scope, R2)",
-    "invoicing/services.py:create_from_billing": "stub until billing.md is built: always raises NotImplementedError",
-    "invoicing/services.py:create_adjustment_from_billing": "stub until billing.md is built: always raises",
+    "invoicing/services.py:anonymisation_candidates": "invoicing_anonymise job only: reads retention dates (R52)",
+    "invoicing/services.py:anonymise_expired_personal_data": "invoicing_anonymise operator job only (R52; off by "
+                                                              "default, dry run unless applied)",
     "hr/services.py:employees": "the scope mechanism for employees (access.scope with hr.view, R2)",
     "hr/services.py:get_employee": "the scope mechanism for one employee (get_scoped_or_404 with hr.view, R2)",
     "hr/services.py:param": "reads global statutory reference data (no entity, no personal data; hr R6)",

@@ -112,13 +112,6 @@ def test_settings_change_needs_the_approver(w):
     assert services.invoicing_settings(w.alm, user=w.viewer).deposit_vat_treatment is None
 
 
-def test_billing_hooks_are_not_built(w):
-    with pytest.raises(NotImplementedError):
-        services.create_from_billing(None, w.clerk)
-    with pytest.raises(NotImplementedError):
-        services.create_adjustment_from_billing(None, w.clerk)
-
-
 # --- admin: scoped, read-only, personal data hidden (access R2, R24; invoicing R51 in part) -----------
 
 def _request(user):

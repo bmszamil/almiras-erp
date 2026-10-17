@@ -273,12 +273,13 @@ def test_r18_partial_then_final_settlement_leaves_no_residue(w):
     assert services.payment_state(inv, user=w.clerk) == "paid"
 
 
-def test_d14_no_payment_to_a_non_resident_vendor_until_wht_is_built(w):
+def test_d14_no_payment_to_a_non_resident_vendor_without_a_wht_category(w):
+    """AT-75 as amended by slice 2 (R61): the block stays for non-resident vendors without a WHT category."""
     nr = services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="NR9", name_ar="مورد أجنبي", is_resident=False,
                                 residence_country="GB")
     with pytest.raises(InvoicingError) as exc:
         services.create_vendor_payment(w.alm, user=w.ap, vendor=nr, date=date(2027, 1, 25), amount="100.00")
-    assert exc.value.code == "wht_not_built" and "ضريبة الاستقطاع" in " ".join(exc.value.messages)
+    assert exc.value.code == "wht_category_required" and "ضريبة الاستقطاع" in " ".join(exc.value.messages)
 
 
 # --- reviewer round 6 (items 7, 8): minor units of open amounts; allocation checked on the locked target ------

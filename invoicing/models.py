@@ -187,6 +187,45 @@ class BuyerIdScheme(models.TextChoices):
 BUYER_ID_PRIORITY = [c.value for c in BuyerIdScheme]
 
 
+class WhtCategory(models.Model):
+    """Withholding tax category for payments to non-residents (D14, R61 to R64; 3.2). Global statutory table.
+
+    Reference values from the WHT guideline §3 p.28 (OQ-8), loaded by migration as **unverified** data: rates,
+    categories and effective dates await tax-adviser sign-off (``is_verified`` False). Rates are data with
+    effective dates, never constants; a rate change is a new row with the same ``code``.
+    """
+
+    code = models.SlugField(bi("Code", "الرمز"), max_length=40)
+    name_en = models.CharField(bi("Name (English)", "الاسم (بالإنجليزية)"), max_length=200)
+    name_ar = models.CharField(bi("Name (Arabic)", "الاسم (بالعربية)"), max_length=200)
+    rate = models.DecimalField(bi("Rate %", "النسبة %"), max_digits=5, decimal_places=2,
+                               validators=[MinValueValidator(ZERO)])
+    valid_from = models.DateField(bi("Valid from", "ساري من"))
+    valid_to = models.DateField(bi("Valid to", "ساري حتى"), null=True, blank=True)
+    return_line_code = models.CharField(bi("WHT return line", "بند إقرار الاستقطاع"), max_length=20, blank=True)
+    is_verified = models.BooleanField(
+        bi("Verified by the tax adviser", "معتمد من المستشار الضريبي"), default=False,
+        help_text=bi("Reference data until the tax adviser signs off (OQ-8)", "بيانات مرجعية حتى اعتماد المستشار الضريبي"),
+    )
+    sharia_prohibited = models.BooleanField(
+        bi("Not allowed where Sharia is enforced", "غير مسموح عند تطبيق الضوابط الشرعية"), default=False,
+        help_text=bi("Loan charges never arise in a Sharia-enforcing entity (OQ-8, R5, R7)",
+                     "لا تنشأ أعباء القروض في كيان يطبق الضوابط الشرعية"),
+    )
+
+    class Meta:
+        verbose_name = bi("withholding tax category", "فئة ضريبة الاستقطاع")
+        verbose_name_plural = bi("withholding tax categories", "فئات ضريبة الاستقطاع")
+        ordering = ["code", "valid_from"]
+        constraints = [
+            models.UniqueConstraint(fields=["code", "valid_from"], name="wht_category_one_per_start"),
+            models.CheckConstraint(condition=models.Q(rate__gte=0) & models.Q(rate__lt=100), name="wht_rate_range"),
+        ]
+
+    def __str__(self):
+        return f"{self.code} {self.rate}%"
+
+
 # --- common fields -------------------------------------------------------------------------------
 
 class Tracked(models.Model):
@@ -271,6 +310,7 @@ class DocumentSequence(models.Model):
         VCN = "VCN", bi("Vendor credit note", "إشعار دائن من مورد")
         RCPT = "RCPT", bi("Customer receipt", "سند قبض")
         PAY = "PAY", bi("Vendor payment", "سند صرف")
+        PUR = "PUR", bi("Purification transfer or payout", "تحويل أو صرف مبالغ التطهير")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     doc_type = models.CharField(bi("Document type", "نوع المستند"), max_length=4, choices=DocType.choices)
@@ -311,6 +351,11 @@ class Customer(Tracked, Address):
     currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Default currency", "العملة الافتراضية"))
     is_active = models.BooleanField(bi("Active", "نشط"), default=True)
+    anonymised_at = models.DateTimeField(
+        bi("Anonymised at", "تاريخ إخفاء الهوية"), null=True, blank=True, editable=False,
+        help_text=bi("R52: personal data replaced by a fixed token after the retention period",
+                     "استُبدلت البيانات الشخصية برمز ثابت بعد انتهاء مدة الحفظ"),
+    )
 
     class Meta:
         verbose_name = bi("customer", "عميل")
@@ -380,6 +425,17 @@ class Vendor(Tracked, Address):
     group_entity = models.ForeignKey(Entity, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
                                      verbose_name=bi("Group entity", "كيان من المجموعة"))
     bank_iban = models.CharField(bi("IBAN", "رقم الآيبان"), max_length=34, blank=True)
+    wht_category = models.ForeignKey(
+        WhtCategory, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Withholding tax category", "فئة ضريبة الاستقطاع"),
+        help_text=bi("Non-resident vendors: default for bill lines; payments need it (R61)",
+                     "للموردين غير المقيمين: الافتراضي لبنود الفواتير، وتحتاجه المدفوعات"),
+    )
+    wht_gross_up = models.BooleanField(
+        bi("Entity bears the withholding tax (gross-up)", "تتحمل المنشأة ضريبة الاستقطاع"), default=False,
+        help_text=bi("R63: the vendor receives the full amount; method pending tax sign-off",
+                     "يستلم المورد المبلغ كاملًا؛ الطريقة بانتظار اعتماد المستشار الضريبي"),
+    )
     currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Default currency", "العملة الافتراضية"))
     is_active = models.BooleanField(bi("Active", "نشط"), default=True)
@@ -663,6 +719,19 @@ class SalesDocument(Tracked, Snapshot, Guarded):
     )
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="documents",
         verbose_name=bi("Customer", "العميل"))
+    # R60, R73 (billing.md R52 to R56): the billing period or correction a system-created document comes from.
+    billing_item = models.ForeignKey(
+        "billing.BillingPeriod", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Billing period", "فترة الفوترة"),
+        help_text=bi("Set by create_from_billing; one non-rejected document per period (R60)",
+                     "يُحدَّد عند الإنشاء من الفوترة؛ مستند واحد غير مرفوض لكل فترة"),
+    )
+    billing_adjustment = models.ForeignKey(
+        "billing.BillingAdjustment", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Billing correction", "تصحيح الفوترة"),
+        help_text=bi("Set by create_adjustment_from_billing; its lines are read-only for every user (R73)",
+                     "يُحدَّد عند إنشاء الإشعار من تصحيح الفوترة؛ بنوده للقراءة فقط لكل المستخدمين"),
+    )
     issue_date = models.DateField(bi("Issue date", "تاريخ الإصدار"))
     issue_time = models.TimeField(bi("Issue time", "وقت الإصدار"), null=True, blank=True)
     requested_issue_date = models.DateField(
@@ -720,6 +789,11 @@ class SalesDocument(Tracked, Snapshot, Guarded):
     zatca_hash = models.CharField(max_length=128, blank=True, verbose_name=bi("Invoice hash", "تجزئة الفاتورة"))
     zatca_qr = models.TextField(blank=True, verbose_name=bi("QR code", "رمز الاستجابة السريعة"))
     zatca_messages = models.JSONField(default=list, blank=True, verbose_name=bi("ZATCA messages", "رسائل الهيئة"))
+    anonymised_at = models.DateTimeField(
+        bi("Buyer data anonymised at", "تاريخ إخفاء هوية المشتري"), null=True, blank=True, editable=False,
+        help_text=bi("R52: the individual buyer's snapshot replaced by a fixed token after retention_until; amounts, "
+                     "VAT, number and ZATCA data kept", "استُبدلت بيانات المشتري الفرد برمز ثابت بعد انتهاء مدة الحفظ"),
+    )
 
     class Meta:
         verbose_name = bi("sales document", "مستند مبيعات")
@@ -728,6 +802,15 @@ class SalesDocument(Tracked, Snapshot, Guarded):
         constraints = [
             models.UniqueConstraint(fields=["entity", "number"], condition=~models.Q(number=""),
                                     name="sales_number_per_entity"),
+            # R60 / billing R52: at most one non-rejected document per billing period; a ZATCA rejection frees
+            # the period for a new document under a new number (billing R12).
+            models.UniqueConstraint(fields=["billing_item"],
+                                    condition=models.Q(billing_item__isnull=False) & ~models.Q(status="rejected"),
+                                    name="one_live_document_per_billing_period"),
+            # R73: one non-terminal correction note per billing adjustment (deleted drafts are gone).
+            models.UniqueConstraint(fields=["billing_adjustment"],
+                                    condition=models.Q(billing_adjustment__isnull=False) & ~models.Q(status="rejected"),
+                                    name="one_live_note_per_billing_adjustment"),
         ]
 
     ZATCA_FIELDS = ("zatca_status", "zatca_icv", "zatca_previous_hash", "zatca_hash", "zatca_qr", "zatca_messages")
@@ -742,6 +825,11 @@ class SalesDocument(Tracked, Snapshot, Guarded):
                 raise error("ZATCA fields are written only by the ZATCA hand-off.",
                             "حقول الهيئة تكتبها واجهة الربط مع الهيئة فقط.", code="zatca_fields")
         super().save(*args, **kwargs)
+
+    @property
+    def from_billing(self):
+        """Created by billing (R60, R73): its lines and amounts are read-only for every user (billing R56)."""
+        return self.billing_item_id is not None or self.billing_adjustment_id is not None
 
     @property
     def zatca_type_code(self):
@@ -776,7 +864,30 @@ class SalesDocument(Tracked, Snapshot, Guarded):
         return f"{self.number or 'DRAFT'} {self.get_doc_type_display()} ({self.status})"
 
 
+BILLING_LINES_EN = ("The lines of a document created from billing are read-only; correct the contract in billing "
+                    "instead (R73, billing R56).")
+BILLING_LINES_AR = "بنود المستند المنشأ من الفوترة للقراءة فقط؛ صحّح العقد في وحدة الفوترة بدلًا من ذلك."
+
+
+class SalesLineQuerySet(GuardedLineQuerySet):
+    def _touches_billing(self):
+        return self.filter(models.Q(document__billing_item__isnull=False)
+                           | models.Q(document__billing_adjustment__isnull=False)).exists()
+
+    def update(self, **kwargs):
+        if self._touches_billing():
+            raise error(BILLING_LINES_EN, BILLING_LINES_AR, code="billing_lines_read_only")
+        return super().update(**kwargs)
+
+    def delete(self):
+        if self._touches_billing():
+            raise error(BILLING_LINES_EN, BILLING_LINES_AR, code="billing_lines_read_only")
+        return super().delete()
+
+
 class SalesDocumentLine(LineAmounts, GuardedLine):
+    objects = SalesLineQuerySet.as_manager()
+
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     document = models.ForeignKey(SalesDocument, on_delete=models.CASCADE, related_name="lines",
         verbose_name=bi("Document", "المستند"))
@@ -789,6 +900,24 @@ class SalesDocumentLine(LineAmounts, GuardedLine):
                                          max_length=300, blank=True)
     exemption_text_ar = models.CharField(bi("Exemption reason text (Arabic)", "نص سبب الإعفاء (بالعربية)"),
                                          max_length=300, blank=True)
+
+    def _billing_locked(self):
+        return SalesDocument._base_manager.filter(pk=self.document_id).filter(
+            models.Q(billing_item__isnull=False) | models.Q(billing_adjustment__isnull=False)).exists()
+
+    def save(self, *args, **kwargs):
+        # R73 / billing R56: lines of a billing document are written only by the billing hooks and the approval's
+        # re-pricing (both set a flag); nobody adds, edits or deletes them.
+        if not (getattr(self, "_billing_write", False) or getattr(self, "_service_write", False)) \
+                and self._billing_locked():
+            raise error(BILLING_LINES_EN, BILLING_LINES_AR, code="billing_lines_read_only")
+        self._billing_write = False
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if self._billing_locked():
+            raise error(BILLING_LINES_EN, BILLING_LINES_AR, code="billing_lines_read_only")
+        return super().delete(*args, **kwargs)
 
     class Meta:
         verbose_name = bi("sales document line", "بند مستند مبيعات")
@@ -901,6 +1030,12 @@ class PurchaseDocumentLine(LineAmounts, GuardedLine):
     vat_recoverable = models.BooleanField(bi("VAT recoverable", "الضريبة قابلة للاسترداد"), default=False)
     account = models.ForeignKey("ledger.Account", on_delete=models.PROTECT, related_name="+",
                                 verbose_name=bi("Expense or asset account", "حساب المصروف أو الأصل"))
+    wht_category = models.ForeignKey(
+        WhtCategory, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Withholding tax category", "فئة ضريبة الاستقطاع"),
+        help_text=bi("Required to pay a non-resident vendor (R61); defaults to the vendor's",
+                     "مطلوبة للدفع لمورد غير مقيم؛ الافتراضي فئة المورد"),
+    )
 
     class Meta:
         verbose_name = bi("purchase document line", "بند مستند مشتريات")
@@ -1009,6 +1144,14 @@ class VendorPayment(MoneyMovement):
     approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                     related_name="+", verbose_name=bi("Approved by", "اعتمده"))
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+    wht_amount = models.DecimalField(bi("Withholding tax", "ضريبة الاستقطاع"), **DOC_MONEY)
+    wht_gross_up = models.BooleanField(bi("Withholding tax borne by the entity", "الضريبة تتحملها المنشأة"),
+                                       default=False)
+
+    @property
+    def settled_amount(self):
+        """AP settled by the payment (3.5, R62, R63): cash plus withheld tax, unless the entity bears the tax."""
+        return self.amount + (ZERO if self.wht_gross_up else self.wht_amount)
 
     class Meta:
         verbose_name = bi("vendor payment", "سند صرف لمورد")
@@ -1022,6 +1165,159 @@ class VendorPayment(MoneyMovement):
 
     def __str__(self):
         return f"{self.number or 'DRAFT'} {self.amount} {self.currency_id} ({self.status})"
+
+
+class TreatyCertificate(models.Model):
+    """Treaty relief evidence for a non-resident vendor (R62; 3.2). Never edited after verification; a new
+    certificate replaces it. ``treaty_rate`` 0.00 = exempt; ``wht_category`` null = all categories."""
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    vendor = models.ForeignKey(Vendor, on_delete=models.PROTECT, related_name="treaty_certificates",
+                               verbose_name=bi("Vendor", "المورد"))
+    country = models.CharField(bi("Treaty country", "دولة الاتفاقية"), max_length=2, validators=[validate_country_code])
+    treaty_rate = models.DecimalField(bi("Treaty rate %", "نسبة الاتفاقية %"), max_digits=5, decimal_places=2,
+                                      validators=[MinValueValidator(ZERO)])
+    wht_category = models.ForeignKey(WhtCategory, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+                                     verbose_name=bi("Category (blank = all)", "الفئة (فارغ = الكل)"))
+    valid_from = models.DateField(bi("Valid from", "ساري من"))
+    valid_to = models.DateField(bi("Valid to", "ساري حتى"))
+    document = models.FileField(bi("Certificate", "الشهادة"), upload_to="invoicing/treaty/%Y/", blank=True)
+    received_on = models.DateField(bi("Received on", "تاريخ الاستلام"))
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                   verbose_name=bi("Entered by", "أدخله"))
+    created_at = models.DateTimeField(bi("Entered at", "تاريخ الإدخال"), auto_now_add=True)
+    verified_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="+", verbose_name=bi("Verified by", "تحقق منه"))
+    verified_at = models.DateTimeField(bi("Verified at", "تاريخ التحقق"), null=True, blank=True)
+
+    class Meta:
+        verbose_name = bi("treaty certificate", "شهادة اتفاقية ضريبية")
+        verbose_name_plural = bi("treaty certificates", "شهادات الاتفاقيات الضريبية")
+        constraints = [
+            models.CheckConstraint(condition=models.Q(treaty_rate__gte=0) & models.Q(treaty_rate__lt=100),
+                                   name="treaty_rate_range"),
+            models.CheckConstraint(condition=models.Q(valid_to__gte=models.F("valid_from")), name="treaty_dates"),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self)._base_manager.filter(pk=self.pk).values("verified_at").first()
+            if stored and stored["verified_at"] is not None:
+                raise error("A verified treaty certificate is never edited; enter a new one.",
+                            "لا تُعدَّل شهادة الاتفاقية بعد التحقق منها؛ أدخل شهادة جديدة.", code="certificate_verified")
+        if self.entity_id != self.vendor.entity_id:
+            raise error("A certificate belongs to its vendor's entity.", "تتبع الشهادة كيان المورد.",
+                        code="entity_mismatch")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error("Treaty certificates are never deleted.", "لا تُحذف شهادات الاتفاقيات.", code="certificate_kept")
+
+    def __str__(self):
+        return f"{self.vendor.code} {self.country} {self.treaty_rate}% ({self.valid_from}–{self.valid_to})"
+
+
+class WhtQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise error("Withholding tax deductions are never changed.", "لا تُعدَّل استقطاعات الضريبة.", code="wht_immutable")
+
+    def delete(self):
+        raise error("Withholding tax deductions are never deleted.", "لا تُحذف استقطاعات الضريبة.", code="wht_immutable")
+
+
+class WhtDeduction(models.Model):
+    """One per payment x bill x category (R62 to R64; 3.5). Immutable: written when the payment posts and kept
+    when it is reversed (the reversal shows in the return data of its month). Source of the WHT return data."""
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    payment = models.ForeignKey(VendorPayment, on_delete=models.PROTECT, related_name="wht_deductions",
+                                verbose_name=bi("Payment", "سند الصرف"))
+    bill = models.ForeignKey(PurchaseDocument, on_delete=models.PROTECT, related_name="+",
+                             verbose_name=bi("Bill", "الفاتورة"))
+    wht_category = models.ForeignKey(WhtCategory, on_delete=models.PROTECT, related_name="+",
+                                     verbose_name=bi("Category", "الفئة"))
+    base_amount = models.DecimalField(bi("Base", "الوعاء"), **DOC_MONEY_FIELD)
+    base_amount_sar = models.DecimalField(bi("Base in SAR", "الوعاء بالريال"), max_digits=18, decimal_places=2)
+    rate_applied = models.DecimalField(bi("Rate applied %", "النسبة المطبقة %"), max_digits=5, decimal_places=2)
+    treaty_certificate = models.ForeignKey(TreatyCertificate, null=True, blank=True, on_delete=models.PROTECT,
+                                           related_name="+", verbose_name=bi("Treaty certificate", "شهادة الاتفاقية"))
+    wht_amount = models.DecimalField(bi("Withholding tax", "ضريبة الاستقطاع"), **DOC_MONEY_FIELD)
+    wht_amount_sar = models.DecimalField(bi("Withholding tax in SAR", "ضريبة الاستقطاع بالريال"), max_digits=18,
+                                         decimal_places=2)
+    gross_up = models.BooleanField(bi("Borne by the entity", "تتحملها المنشأة"), default=False)
+    return_month = models.DateField(bi("Return month", "شهر الإقرار"))
+    created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
+
+    objects = WhtQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = bi("withholding tax deduction", "استقطاع ضريبي")
+        verbose_name_plural = bi("withholding tax deductions", "استقطاعات ضريبية")
+        ordering = ["entity", "return_month", "pk"]
+        constraints = [models.UniqueConstraint(fields=["payment", "bill", "wht_category"], name="one_wht_row_per_category")]
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None and type(self)._base_manager.filter(pk=self.pk).exists():
+            raise error("Withholding tax deductions are never changed.", "لا تُعدَّل استقطاعات الضريبة.",
+                        code="wht_immutable")
+        if not getattr(self, "_service_write", False):
+            raise error("Withholding tax is computed by invoicing.services when the payment posts.",
+                        "تحتسب خدمات الفوترة ضريبة الاستقطاع عند ترحيل الدفعة.", code="service_only")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error("Withholding tax deductions are never deleted.", "لا تُحذف استقطاعات الضريبة.", code="wht_immutable")
+
+
+class PurificationTransfer(Tracked, Guarded):
+    """Purification of non-compliant income (R54, E14, E15; CLAUDE.md rule 5).
+
+    ``transfer`` (E14): Dr 4900 / Cr 2600 for flagged income still to purify (``ledger.purification_amount``).
+    ``payout`` (E15): Dr 2600 / Cr bank to the recipient charity. Recorded by a person and posted by a
+    **second** person (the ledger refuses the recorder): transfers with ``invoicing.post_purification_transfer``,
+    payouts with ``invoicing.approve_purification_payout`` (CFO). Never by an agent. Amount, timing and recipient
+    stay OQ-30 (Sharia board sign-off). Amounts are in the entity's functional currency.
+    """
+
+    class Kind(models.TextChoices):
+        TRANSFER = "transfer", bi("Transfer to charity payable (E14)", "تحويل إلى مستحقات التطهير")
+        PAYOUT = "payout", bi("Payout to charity (E15)", "صرف للجهة الخيرية")
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", bi("Draft", "مسودة")
+        POSTED = "posted", bi("Posted", "مرحّل")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    kind = models.CharField(bi("Kind", "النوع"), max_length=8, choices=Kind.choices)
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    number = models.CharField(bi("Number", "الرقم"), max_length=40, blank=True)
+    date = models.DateField(bi("Date", "التاريخ"))
+    amount = models.DecimalField(bi("Amount", "المبلغ"), max_digits=18, decimal_places=2)
+    bank_account = models.ForeignKey("ledger.Account", null=True, blank=True, on_delete=models.PROTECT,
+                                     related_name="+", verbose_name=bi("Bank account (payout)", "الحساب البنكي (الصرف)"))
+    recipient_en = models.CharField(bi("Recipient (English)", "الجهة المستفيدة (بالإنجليزية)"), max_length=200,
+                                    blank=True)
+    recipient_ar = models.CharField(bi("Recipient (Arabic)", "الجهة المستفيدة (بالعربية)"), max_length=200, blank=True)
+    reference_en = models.CharField(bi("Reference (English)", "المرجع (بالإنجليزية)"), max_length=200, blank=True)
+    reference_ar = models.CharField(bi("Reference (Arabic)", "المرجع (بالعربية)"), max_length=200, blank=True)
+    posted_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                  related_name="+", verbose_name=bi("Posted by", "رحّله"))
+    posted_at = models.DateTimeField(bi("Posted at", "تاريخ الترحيل"), null=True, blank=True)
+    journal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                      related_name="+", verbose_name=bi("Journal entry", "القيد اليومي"))
+
+    class Meta:
+        verbose_name = bi("purification transfer", "تحويل مبالغ التطهير")
+        verbose_name_plural = bi("purification transfers", "تحويلات مبالغ التطهير")
+        ordering = ["entity", "-date", "number"]
+        constraints = [
+            models.UniqueConstraint(fields=["entity", "number"], condition=~models.Q(number=""),
+                                    name="purification_number_per_entity"),
+            models.CheckConstraint(condition=models.Q(amount__gt=0), name="purification_amount_positive"),
+        ]
+
+    def __str__(self):
+        return f"{self.number or 'DRAFT'} {self.get_kind_display()} {self.amount} ({self.status})"
 
 
 class ApplicationQuerySet(models.QuerySet):
