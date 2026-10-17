@@ -136,10 +136,15 @@ def _problems(problems, code="invalid"):
     return exc
 
 
+ENGLISH_ONLY_AR = "التفاصيل متاحة بالإنجليزية فقط."  # "details in English only"
+
+
 def _split(text):
-    """English and Arabic halves of an "English / العربية" message."""
+    """English and Arabic halves of an "English / العربية" message. Text with no Arabic half (an unexpected
+    exception, another module's English-only message) goes to English only; the Arabic side says the details are
+    in English, never the English text itself (review nit 14)."""
     en, sep, ar = str(text).partition(" / ")
-    return (en, ar) if sep else (str(text), str(text))
+    return (en, ar) if sep and ar.strip() else (str(text), ENGLISH_ONLY_AR)
 
 
 def _today():

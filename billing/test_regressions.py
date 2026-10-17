@@ -107,6 +107,7 @@ def test_p3_unexpected_error_in_one_period_fails_it_and_the_run_continues(w, mon
     p = failed[0]
     assert (p.error_code, p.sales_document, p.invoice_lines) == ("unexpected", None, None)  # rolled back
     assert "RuntimeError" in p.failure_reason_en and "غير متوقع" in p.failure_reason_ar
+    assert "RuntimeError" not in p.failure_reason_ar  # English details stay in English (nit 14)
     item = r.items.get(billing_period=p)
     assert (item.outcome, item.error_code) == ("failed", "unexpected")
     nxt = run(w, date(2027, 1, 2))  # retried automatically

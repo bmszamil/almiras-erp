@@ -354,6 +354,13 @@ def test_r66_aborted_run_exits_non_zero(w, monkeypatch):
         call_command("billing_run", "--date", "2027-03-01", "--entity", "ALM", stdout=StringIO())
     r = BillingRun.objects.filter(entity=w.alm).latest("pk")
     assert r.status == "aborted" and "unexpected failure" in r.messages[0]["en"]
+    assert "unexpected" not in r.messages[0]["ar"] and r.messages[0]["ar"] == services.ENGLISH_ONLY_AR  # nit 14
+
+
+def test_split_keeps_english_out_of_the_arabic_side():
+    assert services._split("Plain English only") == ("Plain English only", services.ENGLISH_ONLY_AR)
+    assert services._split("Refused. / مرفوض.") == ("Refused.", "مرفوض.")
+    assert services._split("Trailing / ") == ("Trailing / ", services.ENGLISH_ONLY_AR)
 
 
 def test_runs_are_append_only_after_finish(w):
