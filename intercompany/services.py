@@ -753,9 +753,9 @@ def _draft_invoice(agreement, period, user, run=None):
 
 def _set_totals(inv):
     agg = inv.lines.aggregate(n=Sum("net_amount"), v=Sum("vat_amount"))
-    inv.net_total = agg["n"] or ZERO
-    inv.vat_total = agg["v"] or ZERO
-    inv.gross_total = inv.net_total + inv.vat_total
+    inv.net_total = money(agg["n"] or ZERO)
+    inv.vat_total = money(agg["v"] or ZERO)
+    inv.gross_total = money(inv.net_total + inv.vat_total)
     inv.save()
 
 
@@ -1279,7 +1279,7 @@ CONSOLIDATION_LABELS = {
 def _balance(entity, account_code, counterparty, as_of, sign):
     t = _posted_lines().filter(entry__entity=entity, account__code=account_code, counterparty_entity=counterparty,
                                entry__date__lte=as_of).aggregate(d=Sum("debit"), c=Sum("credit"))
-    return sign * ((t["d"] or ZERO) - (t["c"] or ZERO))
+    return money(sign * ((t["d"] or ZERO) - (t["c"] or ZERO)))
 
 
 def reconciliation_report(user, as_of, entity=None):

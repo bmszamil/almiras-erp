@@ -22,7 +22,7 @@ from ledger.models import Account, FiscalPeriod
 
 from . import serializers as out
 from . import services
-from .models import ServiceType
+from .models import ServiceAgreement, ServiceType
 
 
 def _valid(serializer_cls, data, partial=False):
@@ -64,6 +64,12 @@ def _period(entity, name):
     if p is None:
         raise NotFound("period_not_found", "Period not found.", "الفترة غير موجودة.")
     return p
+
+
+def _agreement_for(user, pk, perm):
+    """Agreement referenced by a new draft: any agreement of an entity where the user holds `perm`
+    (a PA or agent drafting hours or invoices need not hold intercompany.agreement.view)."""
+    return _get(ServiceAgreement.objects.filter(entity__in=access.entities_with_perm(user, perm)), pk)
 
 
 def _filter_entity(request, qs, field="entity"):
@@ -170,7 +176,7 @@ class TimesheetListView(APIView):
 
     def post(self, request):
         data = _valid(out.TimesheetInput, request.data)
-        a = _get(services.visible_agreements(request.user), data.pop("agreement", None))
+        a = _agreement_for(request.user, data.pop("agreement", None), "intercompany.timesheet.create")
         worker = None
         if username := data.pop("worker", None):
             worker = User.objects.filter(username=username, is_active=True).first()
@@ -245,7 +251,7 @@ class BillableItemListView(APIView):
 
     def post(self, request):
         data = _valid(out.ItemInput, request.data)
-        a = _get(services.visible_agreements(request.user), data.pop("agreement"))
+        a = _agreement_for(request.user, data.pop("agreement"), "intercompany.invoice.create")
         item = services.add_billable_item(request.user, a, ctx=ctx_for(request), **data)
         return Response(out.item_out(item), status=status.HTTP_201_CREATED)
 
@@ -273,7 +279,7 @@ class InvoiceListView(APIView):
 
     def post(self, request):
         """Manual draft for one agreement and period: {agreement, period}."""
-        a = _get(services.visible_agreements(request.user), request.data.get("agreement"))
+        a = _agreement_for(request.user, request.data.get("agreement"), "intercompany.invoice.create")
         inv = services.create_invoice_draft(request.user, a, _period(a.entity, request.data.get("period", "")),
                                             ctx=ctx_for(request))
         return Response(out.invoice_out(inv, request.user), status=status.HTTP_201_CREATED)
@@ -370,7 +376,7 @@ class ReconciliationView(APIView):
         if code := request.query_params.get("entity"):
             entity = _entity(request.user, code, "intercompany.report.view")
         report = services.reconciliation_report(request.user, as_of, entity=entity)
-        if request.query_params.get("format") == "xlsx":
+        if request.query_params.get("export") == "xlsx":  # ("format" is reserved by DRF)
             lang = request.query_params.get("lang") or request.user.language
             lang = "ar" if lang == "ar" else "en"
             resp = HttpResponse(services.reconciliation_xlsx(report, lang),

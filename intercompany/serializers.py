@@ -10,6 +10,13 @@ DEC = {"max_digits": 18, "decimal_places": 2, "coerce_to_string": True}
 
 
 def money(v):
+    """Money and percentages as Decimal strings with 2 decimals (approvals R22)."""
+    from .services import money as q
+
+    return None if v is None else str(q(v))
+
+
+def _pct(v):
     return None if v is None else str(v)
 
 
@@ -26,8 +33,8 @@ def agreement_out(a):
         "id": a.pk, "number": a.number, "entity": entity_ref(a.entity), "counterparty": entity_ref(a.counterparty),
         "service_type": a.service_type.code, "description": bi(a.description_en, a.description_ar),
         "pricing_method": a.pricing_method, "currency": a.currency, "hourly_rate": money(a.hourly_rate),
-        "fixed_fee": money(a.fixed_fee), "markup_pct": money(a.markup_pct), "cost_pool": a.cost_pool_id,
-        "allocation_basis": a.allocation_basis, "allocation_pct": money(a.allocation_pct),
+        "fixed_fee": money(a.fixed_fee), "markup_pct": _pct(a.markup_pct), "cost_pool": a.cost_pool_id,
+        "allocation_basis": a.allocation_basis, "allocation_pct": _pct(a.allocation_pct),
         "vat_treatment": a.vat_treatment,
         "vat_exemption_reason": bi(a.vat_exemption_reason_en, a.vat_exemption_reason_ar),
         "billing_frequency": a.billing_frequency, "payment_terms_days": a.payment_terms_days,
@@ -122,7 +129,7 @@ def report_out(report):
         if isinstance(v, list):
             return [conv(x) for x in v]
         if hasattr(v, "quantize"):
-            return str(v)
+            return money(v)
         return v
 
     return conv(report)
