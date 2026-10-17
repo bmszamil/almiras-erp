@@ -26,7 +26,6 @@ from invoicing.test_purification import (
     ready,
     recipient,
 )
-from ledger import services as ledger
 from ledger.models import Account
 
 pytestmark = pytest.mark.django_db
@@ -48,9 +47,12 @@ def payout(w, amount, charity, on=FEB5, **extra):
                                                  recipient=charity, **extra)
 
 
-def journal(w, on, lines):
-    entry = ledger.create_entry(w.alm, on, "Bank charge / رسوم بنكية", lines, user=w.accountant)
-    return ledger.post_entry(entry, access.require(w.cfo, w.alm, "ledger.post_entry", document=entry))
+def bank_txn(w, account, kind, amount, on):
+    """A posted banking transaction on the purification account (D31b: bank charges, Islamic profit and conventional
+    interest are the only bank transactions allowed on it), drafted by the accountant and approved by the CFO."""
+    txn = banking.create_bank_transaction(account, user=w.accountant, kind=kind, amount=D(amount), date=on)
+    banking.submit_bank_transaction(txn, user=w.accountant)
+    return banking.approve_bank_transaction(txn, user=w.cfo)
 
 
 def sub_people(w):
@@ -101,9 +103,10 @@ def test_at103_wrong_iban_bank_names_and_duplicates_are_refused(w):
     assert "Arabic name" in refused("charity_recipient_invalid", add, name_ar=" ")
     from banking.models import Bank
     Bank.objects.create(code="abroad", name_en="Abroad Bank", name_ar="بنك خارجي", country="AE")
-    assert "Saudi bank" in refused("charity_recipient_invalid", add, bank="abroad")
-    Bank.objects.filter(code="alrajhi").update(verified=True)  # a verified bank code is checked (banking R3)
-    assert "Positions 5-6" in refused("charity_recipient_invalid", add, iban=make_iban("20", "000000000000504444"))
+    # review fix 8: the bank is the one the IBAN names (positions 5-6), verified or not; another bank is refused
+    assert "belongs to Al Rajhi Bank" in refused("charity_recipient_invalid", add, bank="abroad")
+    assert "belongs to Riyad Bank" in refused("charity_recipient_invalid", add,
+                                              iban=make_iban("20", "000000000000504444"))
     add()
     assert "already an active charity recipient" in refused("charity_recipient_invalid", add, name_en="Again")
 
@@ -195,8 +198,9 @@ def test_at104_payout_needs_the_purification_account_and_an_approved_active_reci
 def test_at104_designation_changed_after_recording_is_refused_at_posting(w):
     account, charity = ready(w)
     draft = payout(w, "100.00", charity)
-    # the account holds 1,000.00: move it out so the account can be closed (banking: no closing with money in it)
-    journal(w, date(2027, 2, 1), [{"account": "1100", "debit": D("1000.00")}, {"account": "1140", "credit": D("1000.00")}])
+    # the account holds 1,000.00: reverse the funding so the account can be closed (banking: no closing with money)
+    services.reverse_purification_transfer(PurificationTransfer.objects.get(kind="funding"), user=w.accountant,
+                                           reason="moving bank")
     banking.close_bank_account(account, user=w.cfo, active_to=date(2027, 2, 28), reason="moving bank")
     refused("purification_account_required", services.post_purification_transfer, draft, user=w.cfo)
 
@@ -229,12 +233,12 @@ def test_at104_funding_is_limited_to_what_was_transferred_and_not_yet_funded(w):
 def test_at104_payout_is_capped_by_the_purification_account_balance_on_every_later_date(w):
     flagged_invoice(w, "1000.00")
     _posted(w, "transfer", "1000.00", JAN31)
-    purification_account(w)
+    account = purification_account(w)
     charity = recipient(w)
     _posted(w, "funding", "400.00", JAN31, bank_account="1100")
     text = refused("purification_invalid", payout, w, "500.00", charity)  # 2600 holds 1,000.00 but 1140 only 400.00
     assert "400.00" in text and "1140" in text
-    journal(w, date(2027, 3, 1), [{"account": "5700", "debit": D("100.00")}, {"account": "1140", "credit": D("100.00")}])
+    bank_txn(w, account, "bank_charge", "100.00", date(2027, 3, 1))
     text = refused("purification_invalid", payout, w, "400.00", charity, on=date(2027, 2, 10))
     assert "300.00" in text and "2027-03-01" in text  # a later bank charge leaves only 300.00
     assert _posted(w, "payout", "300.00", date(2027, 2, 10), recipient=charity).status == "posted"

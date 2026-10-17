@@ -44,6 +44,13 @@ CONTROL_CODES = frozenset({"1200", "2100", "1210", "2110", "2310", "2320"})
 CUSTOMER_STATEMENT = "مستخلص عميل"
 
 
+def _opening_entry_allowed(entry):
+    """``ledger.restricted`` allowance: the opening entry of an import (``source="import"``, linked to its
+    ``ImportedEntry`` of kind ``opening``). Replayed journals are not accepted on restricted accounts."""
+    return entry.source == JournalEntry.Source.IMPORT and ImportedEntry.objects.filter(
+        journal_entry_id=entry.pk, entity_id=entry.entity_id, kind=ImportedEntry.Kind.OPENING).exists()
+
+
 def _fail(en, ar, code=""):
     exc = MigrationError(bi(en, ar))
     exc.code = code or None

@@ -30,6 +30,7 @@ from core.access import services as access_services
 from core.access.models import AccessLog, Kind
 from core.models import Currency, Entity
 from ledger import fx
+from ledger import restricted as ledger_restricted
 from ledger import services as ledger
 from ledger.models import Account, FiscalPeriod, JournalEntry, JournalLine, LedgerError
 
@@ -1518,6 +1519,12 @@ def available_kinds(statement_line, *, user):
     line = StatementLine.objects.select_related("bank_account", "entity").get(pk=statement_line.pk)
     access.require(user, line.entity, "banking.view")
     labelled = _labelled_interest(line.narrative, line.transaction_code, line.bank_reference)
+    if line.bank_account.is_purification_account:  # D31b: fundings and payouts are booked by invoicing
+        if line.direction == StatementLine.Direction.DEBIT:
+            return [] if labelled else [Kind_.BANK_CHARGE]
+        if labelled or line.bank_account.sharia_basis == BankAccount.ShariaBasis.CONVENTIONAL:
+            return [Kind_.CONVENTIONAL_INTEREST_CREDIT]
+        return [Kind_.ISLAMIC_PROFIT, Kind_.CONVENTIONAL_INTEREST_CREDIT]
     if line.direction == StatementLine.Direction.DEBIT:
         return [] if labelled else [Kind_.BANK_CHARGE, Kind_.OWN_TRANSFER, Kind_.INTERCOMPANY_TRANSFER]
     if labelled or line.bank_account.sharia_basis == BankAccount.ShariaBasis.CONVENTIONAL:
@@ -1605,6 +1612,55 @@ def _txn_problems(txn, user):
     elif txn.counterparty_entity_id or txn.intercompany_account_id or txn.settles_line_id:
         problems.append("Only intercompany transfers carry a counterparty. / التحويل بين الشركات وحده يحمل طرفًا مقابلًا.")
     return problems
+
+
+# invoicing R54 amendment D31b, review fix 1: besides invoicing's purification fundings and payouts, only these
+# bank transactions touch the purification account; never transfers out of or into it, never by an agent.
+PURIFICATION_KINDS = frozenset({Kind_.BANK_CHARGE, Kind_.ISLAMIC_PROFIT, Kind_.CONVENTIONAL_INTEREST_CREDIT})
+
+
+def _touches_purification_account(txn):
+    accounts = [txn.bank_account, txn.to_bank_account if txn.to_bank_account_id else None]
+    return any(a is not None and (a.is_purification_account or a.gl_account.code == PURIFICATION_GL)
+               for a in accounts)
+
+
+def _purification_txn_check(txn, user, permission):
+    """D31b review fix 1: a bank transaction on the purification account is a bank charge, Islamic profit or
+    conventional interest credited, drafted and handled by people only. Money moves into the account only by an
+    invoicing purification funding (Dr 1140 / Cr operating bank; the other account's statement line is matched to
+    that entry) and out of it only by a purification payout to an approved charity. A bank charge never takes the
+    account below zero on its date or later (checked again at posting under the purification lock)."""
+    if not _touches_purification_account(txn):
+        return
+    entity = txn.entity
+    for person in (user, txn.created_by):
+        if person is not None and access_services.kind_of(person) != Kind.HUMAN:
+            access.deny(user, entity, permission, "agent_forbidden")
+    if txn.kind not in PURIFICATION_KINDS:
+        raise error("Money leaves or enters the purification account only through invoicing: a purification funding "
+                    "(from an operating bank account) or a payout to an approved charity. Transfers between own "
+                    "accounts and intercompany transfers out of or into it are refused (D31b).",
+                    "لا تخرج الأموال من حساب التطهير ولا تدخله إلا من خلال الفوترة: تمويل حساب التطهير (من حساب "
+                    "بنكي تشغيلي) أو صرف لجهة خيرية معتمدة. يُرفض التحويل بين حسابات الكيان والتحويل بين شركات "
+                    "المجموعة منه أو إليه.", code="purification_account_restricted")
+    if txn.kind == Kind_.BANK_CHARGE and txn.amount is not None and txn.date is not None:
+        room, at = ledger._booked_balance_floor(entity, PURIFICATION_GL, txn.date)
+        if txn.amount > room:
+            raise error(f"The purification account holds only {room} on {at}; a bank charge of {txn.amount} would "
+                        "take it below zero. Fund the purification account first (invoicing: purification funding), "
+                        "then book the charge (D31b).",
+                        f"رصيد حساب التطهير {room} فقط بتاريخ {at}؛ الرسوم البنكية البالغة {txn.amount} تجعله سالبًا. "
+                        "موّل حساب التطهير أولًا (الفوترة: تمويل حساب التطهير) ثم سجّل الرسوم.",
+                        code="purification_account_balance")
+
+
+def _purification_gl_allowed(entry):
+    """``ledger.restricted`` allowance for 1140: a posted bank charge, Islamic profit or conventional interest of the
+    purification account itself."""
+    return BankTransaction.objects.filter(
+        pk=entry.document_id, entity_id=entry.entity_id, kind__in=PURIFICATION_KINDS, to_bank_account__isnull=True,
+        bank_account__is_purification_account=True, bank_account__gl_account__code=PURIFICATION_GL).exists()
 
 
 def _settles_problems(txn, item):
@@ -1695,6 +1751,7 @@ def create_bank_transaction(bank_account, *, user, kind, statement_line=None, am
     problems = _txn_problems(txn, user)
     if problems:
         raise _problems(problems, "txn_invalid")
+    _purification_txn_check(txn, user, "banking.create_bank_transaction")
     if _cross_currency(txn):
         access.require(user, entity, "ledger.use_manual_rate")  # R31: the actual bank rate is a manual rate (R16)
     with transaction.atomic():
@@ -1758,6 +1815,7 @@ def update_bank_transaction(txn, *, user, **changes):
         problems = _txn_problems(txn, user)
         if problems:
             raise _problems(problems, "txn_invalid")
+        _purification_txn_check(txn, user, "banking.create_bank_transaction")
         if _cross_currency(txn):
             access.require(user, txn.entity, "ledger.use_manual_rate")
         txn.modified_by, txn.modified_at = user, timezone.now()
@@ -1776,6 +1834,7 @@ def submit_bank_transaction(txn, *, user):
         problems = _txn_problems(txn, user)
         if problems:
             raise _problems(problems, "txn_invalid")
+        _purification_txn_check(txn, user, "banking.submit_bank_transaction")
         txn.status, txn.submitted_by, txn.submitted_at = TStatus.SUBMITTED, user, timezone.now()
         _save(txn)
         _event(txn.entity, user, Event.BANK_TRANSACTION_SUBMITTED, txn)
@@ -1809,6 +1868,10 @@ def approve_bank_transaction(txn, *, user):
         problems = _txn_problems(txn, txn.created_by)
         if problems:
             raise _problems(problems, "txn_invalid")
+        restriction = ledger_restricted.get(PURIFICATION_GL)
+        if _touches_purification_account(txn) and restriction is not None and restriction.lock is not None:
+            restriction.lock(entity)  # the purification lock before its checks, as invoicing takes it (D31b)
+        _purification_txn_check(txn, user, "banking.approve_bank_transaction")
         functional = entity.base_currency_id
         if txn.currency_id != functional:  # pinned at approval; the entry books at this rate (R34)
             try:

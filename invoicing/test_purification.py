@@ -118,7 +118,8 @@ def test_at45_transfer_funding_then_payout_by_a_second_person(w):
     assert ledger.purification_amount(w.alm, user=w.accountant) == D("1200.00")
     assert services.purification_position(w.alm, user=w.accountant) == {
         "flagged": D("1200.00"), "transferred": D("1200.00"), "funded": D("1200.00"), "paid_out": D("1200.00"),
-        "to_transfer": D("0.00"), "to_fund": D("0.00"), "payable": D("0.00")}
+        "to_transfer": D("0.00"), "to_fund": D("0.00"), "payable": D("0.00"),
+        "purification_account_balance": D("0.00")}
     for user in (make_agent("purifier"), w.queue):  # AT-45: agents and system users are refused
         with pytest.raises(access.AccessDenied):
             services.create_purification_transfer(w.alm, user=user, kind="payout", date=date(2027, 2, 5),

@@ -1396,6 +1396,18 @@ class WhtDeduction(models.Model):
         raise error("Withholding tax deductions are never deleted.", "لا تُحذف استقطاعات الضريبة.", code="wht_immutable")
 
 
+class PurificationQuerySet(GuardedQuerySet):
+    """D31b review fix 6: ``bulk_create`` skips save(): only drafts without number or entry are added in bulk."""
+
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        if any(o.status != "draft" or o.number or o.journal_entry_id or o.reversal_entry_id or o.posted_by_id
+               for o in objs):
+            raise error(STATUS_ONLY_BY_SERVICES.split(" / ")[0], STATUS_ONLY_BY_SERVICES.split(" / ")[1],
+                        code="service_only")
+        return super().bulk_create(objs, *args, **kwargs)
+
+
 class PurificationTransfer(Tracked, Guarded):
     """Purification of non-compliant income (R54, E14, E15; CLAUDE.md rule 5).
 
@@ -1452,7 +1464,10 @@ class PurificationTransfer(Tracked, Guarded):
     reversed_at = models.DateTimeField(bi("Reversed at", "تاريخ العكس"), null=True, blank=True)
     reversal_reason = models.CharField(bi("Reversal reason", "سبب العكس"), max_length=300, blank=True)
 
+    objects = PurificationQuerySet.as_manager()
+
     class Meta:
+        base_manager_name = "objects"  # review fix 6: _base_manager writes go through the guarded queryset
         verbose_name = bi("purification transfer", "تحويل مبالغ التطهير")
         verbose_name_plural = bi("purification transfers", "تحويلات مبالغ التطهير")
         ordering = ["entity", "-date", "number"]
@@ -1476,6 +1491,9 @@ class _ServiceOnlyQuerySet(models.QuerySet):
         raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
 
     def bulk_update(self, objs, fields, *args, **kwargs):
+        raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
+
+    def bulk_create(self, objs, *args, **kwargs):  # skips save(): never pre-approved or pre-cancelled rows
         raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
 
 
@@ -1525,6 +1543,7 @@ class CharityRecipient(models.Model):
     DEACTIVATION_FIELDS = frozenset({"is_active", "deactivated_by_id", "deactivated_at", "deactivation_reason"})
 
     class Meta:
+        base_manager_name = "objects"  # review fix 6: _base_manager.update/bulk writes are refused too
         verbose_name = bi("charity recipient", "جهة خيرية مستفيدة")
         verbose_name_plural = bi("charity recipients", "الجهات الخيرية المستفيدة")
         ordering = ["entity", "name_en"]
@@ -1555,6 +1574,10 @@ class CharityRecipient(models.Model):
             raise error("Charity recipients change only through invoicing.services.",
                         "تتغير الجهات الخيرية المستفيدة من خلال خدمات الفوترة فقط.", code="service_only")
         stored = _stored_values(self)
+        if stored is None and (self.approved_by_id is not None or self.approved_at is not None or not self.is_active
+                               or self.deactivated_by_id is not None or self.deactivated_at is not None):
+            raise error("A charity recipient is added unapproved and active; a second person approves it (D31b).",
+                        "تُضاف الجهة الخيرية المستفيدة غير معتمدة ونشطة؛ ويعتمدها شخص آخر.", code="recipient_immutable")
         if stored is not None:
             changed = {name for name, value in stored.items() if getattr(self, name) != value}
             approving = (stored["approved_by_id"] is None and changed <= self.APPROVAL_FIELDS
@@ -1581,12 +1604,22 @@ class PurificationInstruction(models.Model):
     class Status(models.TextChoices):
         PENDING = "pending", bi("Pending (to send to the bank)", "معلقة (للإرسال إلى البنك)")
         CANCELLED = "cancelled", bi("Cancelled (payout reversed)", "ملغاة (عُكس الصرف)")
+        # Placeholders for the bank file (banking OQ-2, invoicing OQ-64(d)): nothing sets them yet. Once an
+        # instruction is exported its payout is never reversed.
+        EXPORTED = "exported", bi("Exported to a bank file", "مُصدَّرة في ملف بنكي")
+        SENT = "sent", bi("Sent to the bank", "مُرسلة إلى البنك")
+
+    SENT_STATUSES = frozenset({Status.EXPORTED, Status.SENT})
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     payout = models.OneToOneField(PurificationTransfer, on_delete=models.PROTECT, related_name="bank_instruction",
                                   verbose_name=bi("Payout", "الصرف"))
     from_account = models.ForeignKey("banking.BankAccount", on_delete=models.PROTECT, related_name="+",
                                      verbose_name=bi("From (purification account)", "من (حساب التطهير)"))
+    from_iban_last4 = models.CharField(bi("From IBAN last 4", "آخر 4 خانات من آيبان حساب التطهير"), max_length=4,
+                                       default="", editable=False)
+    from_iban_hash = models.CharField(bi("From IBAN keyed hash", "البصمة المفتاحية لآيبان حساب التطهير"),
+                                      max_length=64, default="", editable=False)
     recipient = models.ForeignKey(CharityRecipient, on_delete=models.PROTECT, related_name="instructions",
                                   verbose_name=bi("Recipient", "المستفيد"))
     beneficiary_name_en = models.CharField(bi("Beneficiary (English)", "المستفيد (بالإنجليزية)"), max_length=200)
@@ -1596,6 +1629,8 @@ class PurificationInstruction(models.Model):
     beneficiary_iban = EncryptedTextField(bi("Beneficiary IBAN", "آيبان المستفيد"), plain_max_length=34)
     beneficiary_iban_last4 = models.CharField(bi("Beneficiary IBAN last 4", "آخر 4 خانات من آيبان المستفيد"),
                                               max_length=4)
+    beneficiary_iban_hash = models.CharField(bi("Beneficiary IBAN keyed hash", "البصمة المفتاحية لآيبان المستفيد"),
+                                             max_length=64, default="", editable=False)
     amount = models.DecimalField(bi("Amount", "المبلغ"), max_digits=18, decimal_places=2)
     currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Currency", "العملة"))
@@ -1615,6 +1650,7 @@ class PurificationInstruction(models.Model):
     CANCEL_FIELDS = frozenset({"status", "cancelled_by_id", "cancelled_at", "cancel_reason"})
 
     class Meta:
+        base_manager_name = "objects"  # review fix 6: _base_manager.update/bulk writes are refused too
         verbose_name = bi("purification bank instruction", "أمر بنكي لصرف التطهير")
         verbose_name_plural = bi("purification bank instructions", "أوامر بنكية لصرف التطهير")
         ordering = ["entity", "-execution_date", "pk"]
@@ -1633,6 +1669,10 @@ class PurificationInstruction(models.Model):
             raise error("Bank instructions are written only when a payout posts or is reversed.",
                         "تُكتب الأوامر البنكية عند ترحيل الصرف أو عكسه فقط.", code="service_only")
         stored = _stored_values(self)
+        if stored is None and (self.status != self.Status.PENDING or self.cancelled_by_id is not None
+                               or self.cancelled_at is not None):
+            raise error("A bank instruction is created pending when its payout posts (D31b).",
+                        "يُنشأ الأمر البنكي معلقًا عند ترحيل الصرف.", code="instruction_immutable")
         if stored is not None:
             changed = {name for name, value in stored.items() if getattr(self, name) != value}
             cancelling = (stored["status"] == self.Status.PENDING and self.status == self.Status.CANCELLED
@@ -1640,6 +1680,10 @@ class PurificationInstruction(models.Model):
             if changed and not cancelling:
                 raise error("A bank instruction never changes; it is only cancelled with its payout's reversal.",
                             "لا يتغير الأمر البنكي؛ يُلغى فقط بعكس الصرف.", code="instruction_immutable")
+            if cancelling and not PurificationTransfer._base_manager.filter(
+                    pk=self.payout_id, status=PurificationTransfer.Status.REVERSED).exists():
+                raise error("A bank instruction is cancelled only once its payout is reversed (D31b).",
+                            "يُلغى الأمر البنكي فقط بعد عكس الصرف.", code="instruction_immutable")
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):

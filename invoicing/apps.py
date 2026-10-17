@@ -12,7 +12,7 @@ class InvoicingConfig(AppConfig):
     verbose_name = "Invoicing / الفوترة"
 
     def ready(self):
-        from ledger import documents
+        from ledger import documents, restricted
 
         from . import services
         from .models import CustomerReceipt, PurchaseDocument, PurificationTransfer, SalesDocument, VendorPayment
@@ -49,3 +49,17 @@ class InvoicingConfig(AppConfig):
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._purification_lines,
         )
+        # D31b review fix 1 and 2: GL 1140 (the purification account) is posted only by purification fundings and
+        # payouts, the banking kinds banking allows on it and migration openings (and their reversals); every such
+        # entry takes the purification lock and never takes the account below zero.
+        restricted.restrict(
+            services.PURIFICATION_BANK, name_en="Bank - purification account", name_ar="البنك - حساب التطهير",
+            posted_by_en="purification fundings and payouts (invoicing), bank charges, Islamic profit and conventional "
+                         "interest on the purification account (banking), migration opening balances and their "
+                         "reversals",
+            posted_by_ar="تمويل حساب التطهير والصرف منه (الفوترة)، والرسوم البنكية والأرباح الإسلامية والفوائد "
+                         "التقليدية على حساب التطهير (البنوك)، والأرصدة الافتتاحية المرحّلة، وعكسها",
+            lock=services._lock_purification, check=services._purification_gl_check,
+        )
+        restricted.allow(services.PURIFICATION_BANK, document_type="invoicing.purificationtransfer",
+                         predicate=services._purification_gl_allowed)

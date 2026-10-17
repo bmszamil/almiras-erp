@@ -12,7 +12,7 @@ from django.db import IntegrityError, connection, transaction
 
 from banking import iban as iban_rules
 from banking import services
-from banking.conftest import CUTOVER, journal, postgres_only
+from banking.conftest import postgres_only
 from banking.models import Bank, BankAccount, BankAccountChange, BankingError, BankingEvent
 from banking.testing import make_iban
 from core import access
@@ -37,6 +37,13 @@ def purification_draft(w, entity=None, **overrides):
     fields.update(overrides)
     user = fields.pop("user", w.a if entity == w.alm else w.users[entity.code]["acc"])
     return services.create_bank_account(entity, user=user, **fields)
+
+
+def posted_txn(w, account, kind, amount, on, **extra):
+    """A bank transaction drafted and submitted by the accountant and approved by the approver."""
+    txn = services.create_bank_transaction(account, user=w.a, kind=kind, amount=D(amount), date=on, **extra)
+    services.submit_bank_transaction(txn, user=w.a)
+    return services.approve_bank_transaction(txn, user=w.p)
 
 
 def refused(w, code="purification_account_invalid", code_=None, **overrides):
@@ -163,11 +170,12 @@ def test_d31b_designation_through_a_change_request_moves_the_account_to_1140(w):
 
 def test_d31b_purification_account_with_money_is_not_closed(w):
     account = services.approve_bank_account(purification_draft(w), user=w.p)
-    journal(w, w.alm, CUTOVER, [{"account": "1140", "debit": D("50.00")}, {"account": "3900", "credit": D("50.00")}])
+    # review fix 1: no manual journal touches 1140; interest credited and a bank charge are allowed bank documents
+    posted_txn(w, account, "conventional_interest_credit", "50.00", date(2027, 1, 10))
     with pytest.raises(BankingError) as exc:
         services.close_bank_account(account, user=w.p, active_to=date(2027, 6, 30), reason="moving bank")
     assert exc.value.code == "purification_balance" and "50.00" in str(exc.value)
-    journal(w, w.alm, CUTOVER, [{"account": "3900", "debit": D("50.00")}, {"account": "1140", "credit": D("50.00")}])
+    posted_txn(w, account, "bank_charge", "50.00", date(2027, 1, 20))
     closed = services.close_bank_account(account, user=w.p, active_to=date(2027, 6, 30), reason="moving bank")
     assert closed.status == "closed" and services.purification_account(w.alm, user=w.a) is None
     replacement = purification_draft(w, code="RIYAD-PUR-2", iban=make_iban("20", "000000000000404444"))

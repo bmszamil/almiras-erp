@@ -296,13 +296,22 @@ class SettingsAdmin(ReadOnlyScopedAdmin):
 class CharityRecipientAdmin(ReadOnlyScopedAdmin):
     """D31b: IBANs masked here; ``invoicing.services.reveal_charity_recipient_iban`` shows them (logged)."""
 
-    list_display = ["entity", "name_en", "name_ar", "bank", "masked_iban", "platform_reference", "is_active",
-                    "created_by", "approved_by", "approved_at"]
+    list_display = ["entity", "name_en", "name_ar", "bank", "iban_bank", "masked_iban", "platform_reference",
+                    "is_active", "created_by", "approved_by", "approved_at"]
     list_filter = [("entity", admin.RelatedOnlyFieldListFilter), "is_active"]
-    fields = ["entity", "name_en", "name_ar", "bank", "masked_iban", "platform_reference", "is_active", "created_by",
-              "created_at", "approved_by", "approved_at", "deactivated_by", "deactivated_at", "deactivation_reason"]
+    fields = ["entity", "name_en", "name_ar", "bank", "iban_bank", "masked_iban", "platform_reference", "is_active",
+              "created_by", "created_at", "approved_by", "approved_at", "deactivated_by", "deactivated_at",
+              "deactivation_reason"]
     readonly_fields = fields
     status_field = None
+
+    @admin.display(description="Bank named by the IBAN (positions 5-6) / البنك حسب الآيبان (الخانتان 5-6)")
+    def iban_bank(self, obj):
+        """Review finding 8: what the approver checks against ``bank``."""
+        from .services import _bank_from_iban
+
+        bank = _bank_from_iban(obj.iban)
+        return f"{bank.name_en} / {bank.name_ar} ({bank.sa_bank_code})" if bank else "? / غير معروف"
 
     @admin.display(description="IBAN (masked) / الآيبان (مخفي)")
     def masked_iban(self, obj):
