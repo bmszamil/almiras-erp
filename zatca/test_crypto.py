@@ -117,6 +117,23 @@ def test_at39_qr_length_700_passes_longer_refused():
     assert exc.value.length == 704
 
 
+@pytest.mark.parametrize("environment, name", [
+    ("production", "ZATCA-Code-Signing"), ("simulation", "PREZATCA-Code-Signing"),
+    ("sandbox", "TSTZATCA-Code-Signing")])
+def test_oq26_csr_template_name_per_environment(environment, name):
+    """§3.2: SDK R3.4.8 -csr / -sim / -nonprod (findings §3.6)."""
+    assert crypto.template_name(environment) == name
+    key = crypto.generate_private_key()
+    csr = crypto.build_csr(key, common_name="TST-1-311111111100003", org_unit="Branch", org_name="Fake Co",
+                           serial_number="1-a|2-b|3-c", vat_number="311111111100003", invoice_type="1100",
+                           location="ABCD1234", industry="Real estate", environment=environment)
+    from cryptography import x509
+    from cryptography.x509.oid import ObjectIdentifier
+
+    ext = csr.extensions.get_extension_for_oid(ObjectIdentifier("1.3.6.1.4.1.311.20.2")).value.value
+    assert ext == bytes([0x0C, len(name)]) + name.encode()
+
+
 def test_r7_otp_format():
     assert rules.otp_ok("123456")
     for bad in ("12345", "12a456", "1234567", "١٢٣٤٥٦", 123456, None):

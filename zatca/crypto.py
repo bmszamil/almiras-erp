@@ -120,9 +120,13 @@ def _utf8_der(text: str) -> bytes:
     return bytes([0x0C, len(data)]) + data
 
 
+TEMPLATE_NAMES = {"production": "ZATCA-Code-Signing", "simulation": "PREZATCA-Code-Signing"}
+
+
 def template_name(environment: str) -> str:
-    """§3.2: ``ZATCA-Code-Signing`` in production, ``TSTZATCA-Code-Signing`` otherwise (simulation: OQ-26)."""
-    return "ZATCA-Code-Signing" if environment == "production" else "TSTZATCA-Code-Signing"
+    """§3.2: ``ZATCA-Code-Signing`` in production, ``PREZATCA-Code-Signing`` in simulation (SDK R3.4.8 ``-sim``;
+    findings §3.6, OQ-26), ``TSTZATCA-Code-Signing`` otherwise (sandbox; SDK ``-nonprod``)."""
+    return TEMPLATE_NAMES.get(environment, "TSTZATCA-Code-Signing")
 
 
 def build_csr(private_key, *, common_name, org_unit, org_name, serial_number, vat_number, invoice_type, location,
@@ -195,10 +199,11 @@ def cert_digest(cert_b64: str) -> str:
 
 
 def issuer_name(cert, style="rfc2253") -> str:
-    """X509IssuerName (R-14): RFC 2253 order with ", " separators (Java 11 / SUN form, the target).
+    """X509IssuerName (R-14): RFC 2253 order with ", " separators (the SUN form; settled by SDK R3.4.8, whose
+    samples all carry it and whose validator accepts it with SUN as the first JCA provider; findings §3.3).
 
-    ``style="bc"`` gives the BouncyCastle form (``DC=local,DC=gov,...``); used only by the offline SDK check,
-    which runs on Java 21 with BouncyCastle as provider 1 (findings §3). [SDK-confirm: needs current SDK].
+    ``style="bc"`` gives the BouncyCastle form (``DC=local,DC=gov,...``), an artefact of running the SDK with
+    BouncyCastle as provider 1; kept only for comparing against such a JVM, never for submission.
     """
     if style == "bc":
         return ",".join(rdn.rfc4514_string() for rdn in cert.issuer.rdns)
