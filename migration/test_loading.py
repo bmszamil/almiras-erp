@@ -208,3 +208,15 @@ def test_at14_agents_cannot_import(w, mapped):
     with pytest.raises((AccessDenied, MigrationError)):
         services.load_opening_balances(w.alm, tb_file(), user=agent, cutover=YEAR_END, apply=True)
     assert not JournalEntry.objects.exists()
+
+
+def test_rerun_after_posting_and_closing_a_period_skips_imported_entries(w, mapped):
+    from ledger.models import FiscalPeriod
+    replay(w)
+    services.post_imported_entries(w.alm, user=w.p, kind="journal", apply=True)
+    FiscalPeriod.objects.filter(entity=w.alm, name="2026-01").update(status="closed")
+    rows = journal_rows() + [t.line(26000005, date(2026, 3, 1), "5201", "مصروف إيجار", debit="10.00"),
+                             t.line(26000005, date(2026, 3, 1), "1101", "الصندوق الرئيسي", credit="10.00")]
+    plan = services.load_journal_entries(w.alm, journal_file(rows), user=w.a, cutover=CUTOVER, apply=True)
+    assert plan.report.ok, [p.message for p in plan.report.errors]
+    assert [i.legacy_key for i in plan.created] == ["26000005"] and len(plan.skipped) == 4

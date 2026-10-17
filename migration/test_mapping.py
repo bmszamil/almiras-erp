@@ -37,6 +37,10 @@ def test_approved_map_is_locked_everywhere(w, mapped):
         AccountMapRow.objects.filter(account_map=mapped).update(note="x")
     with pytest.raises(MigrationError):
         AccountMapRow.objects.filter(account_map=mapped).delete()
+    with pytest.raises(MigrationError):  # a bulk update cannot unlock it either
+        AccountMap.objects.filter(pk=mapped.pk).update(status="draft")
+    with pytest.raises(MigrationError):
+        AccountMap.objects.filter(pk=mapped.pk).delete()
     mapped.note = "x"
     with pytest.raises(MigrationError):
         mapped.save()

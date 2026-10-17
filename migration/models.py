@@ -20,6 +20,20 @@ LOCKED = ("An approved or superseded account map never changes; draft a new vers
           "لا تتغير خريطة الحسابات المعتمدة أو المستبدلة؛ أعدّ نسخة جديدة.")
 
 
+class AccountMapQuerySet(models.QuerySet):
+    """Bulk writes skip ``save()``/``delete()``: an approved or superseded map is refused here too (R13)."""
+
+    def update(self, **kwargs):
+        if self.exclude(status=AccountMap.Status.DRAFT).exists():
+            raise MigrationError(LOCKED)
+        return super().update(**kwargs)
+
+    def delete(self):
+        if self.exclude(status=AccountMap.Status.DRAFT).exists():
+            raise MigrationError(LOCKED)
+        return super().delete()
+
+
 class AccountMap(models.Model):
     class Status(models.TextChoices):
         DRAFT = "draft", bi("Draft", "مسودة")
@@ -41,6 +55,8 @@ class AccountMap(models.Model):
     approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                     related_name="+", verbose_name=bi("Approved by", "اعتمدها"))
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+
+    objects = AccountMapQuerySet.as_manager()
 
     class Meta:
         verbose_name = bi("Legacy account map", "خريطة حسابات النظام السابق")

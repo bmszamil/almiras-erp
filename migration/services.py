@@ -378,7 +378,7 @@ def _entries(rows):
     return groups
 
 
-def _journal_checks(report, entity, journal, cutover):
+def _journal_checks(report, entity, journal, cutover, imported=frozenset()):
     rows = journal.rows
     for r in rows:
         where = dict(row=r.row, entry_no=r.entry_no, account_code=r.account_code)
@@ -412,7 +412,7 @@ def _journal_checks(report, entity, journal, cutover):
             report.problems.append(error("several_dates", f"Entry {no} has several dates: {dates}.",
                                          f"القيد {no} له أكثر من تاريخ: {dates}.", **where))
         on = dates[0] if dates else None
-        if on is not None:
+        if on is not None and no not in imported:  # an entry imported unchanged is skipped: its period may be closed
             p = _period_problem(periods, on, **where)
             if p:
                 report.problems.append(p)
@@ -421,9 +421,9 @@ def _journal_checks(report, entity, journal, cutover):
                                              f"{cutover}; it is already in the opening balances.",
                                              f"القيد {no} ({on}) في تاريخ القطع {cutover} أو قبله؛ وهو ضمن الأرصدة الافتتاحية.",
                                              **where))
-            if len(no) == 8 and int(no) // 1_000_000 != on.year % 100:
-                report.problems.append(warning("number_year", f"Entry {no}: number prefix {no[:2]} but dated {on}.",
-                                               f"القيد {no}: بادئة الرقم {no[:2]} وتاريخه {on}.", **where))
+        if on is not None and len(no) == 8 and int(no) // 1_000_000 != on.year % 100:
+            report.problems.append(warning("number_year", f"Entry {no}: number prefix {no[:2]} but dated {on}.",
+                                           f"القيد {no}: بادئة الرقم {no[:2]} وتاريخه {on}.", **where))
         if len(no) == 8:
             seqs[no[:2]].add(int(no[2:]))
         by_source[lines[0].source or "-"] += 1
@@ -559,7 +559,21 @@ def _tie_out(report, journal_rows, tb):
 def _journal_report(entity, journal, *, cutover, trial_balance, source_system, amap):
     report = Report(entity.code, "journal", journal.name, journal.sha256)
     report.problems += journal.problems
-    groups = _journal_checks(report, entity, journal, cutover)
+    rows = _map_rows(amap)
+    done = dict(ImportedEntry.objects.filter(entity=entity, source_system=source_system, kind=ImportedEntry.Kind.JOURNAL,
+                                             legacy_key__in=list(_entries(journal.rows))).values_list("legacy_key",
+                                                                                                     "lines_hash"))
+    unchanged = set()
+    for no, lines in _entries(journal.rows).items():
+        if no in done:
+            specs = _journal_line_specs(lines, rows)
+            if specs is not None and _lines_hash(specs) == done[no]:
+                unchanged.add(no)
+            else:
+                report.problems.append(error("changed_after_import", f"Entry {no} was imported before with different "
+                                             "lines (or another map).", f"القيد {no} استُورد سابقًا ببنود مختلفة (أو بخريطة "
+                                             "أخرى).", entry_no=no))
+    groups = _journal_checks(report, entity, journal, cutover, imported=unchanged)
     used = _journal_totals(journal.rows)
     rows = _mapping_problems(report, entity, amap, used)
     report.account_totals = [{"code": c, "name": t["name"], "rows": t["rows"], "debit": t["debit"],
@@ -568,16 +582,7 @@ def _journal_report(entity, journal, *, cutover, trial_balance, source_system, a
     if trial_balance is not None:
         _tb_checks(report, trial_balance)
         _tie_out(report, journal.rows, trial_balance)
-    done = dict(ImportedEntry.objects.filter(entity=entity, source_system=source_system, kind=ImportedEntry.Kind.JOURNAL,
-                                             legacy_key__in=list(groups)).values_list("legacy_key", "lines_hash"))
     report.already_imported = sorted(done)
-    if done and amap is not None:
-        for no in sorted(done):
-            specs = _journal_line_specs(groups[no], rows)
-            if specs is not None and _lines_hash(specs) != done[no]:
-                report.problems.append(error("changed_after_import", f"Entry {no} was imported before with different "
-                                             "lines (or another map).", f"القيد {no} استُورد سابقًا ببنود مختلفة (أو بخريطة "
-                                             "أخرى).", entry_no=no))
     return report, groups, rows
 
 
