@@ -411,11 +411,13 @@ def _anniversary(start, years, basis, year_days=None):
 
 
 def _years_between(start, end_exclusive, basis, year_days):
-    """Service years from ``start`` up to (not including) ``end_exclusive``. Gregorian: days / the parameter's
-    Gregorian divisor (AT-21). Hijri: completed Umm al-Qura years plus the remaining days / the parameter's Hijri
-    divisor (OQ-36 default: whole Hijri years + days/354)."""
+    """Service years from ``start`` up to (not including) ``end_exclusive``: the completed anniversaries in the
+    contract's calendar (Art. 10, R58: the same Gregorian day for ``gregorian``, the same Umm al-Qura day for
+    ``hijri``) plus the remaining days of the part year / the parameter's divisor for that calendar (OQ-36 default:
+    365 Gregorian, 354 Hijri). The divisor applies to the part year only (finding 5), so the 2-, 5- and 10-year
+    thresholds fall on the anniversaries whatever leap days lie between."""
     days = (end_exclusive - start).days
-    if basis == EmploymentContract.CalendarBasis.GREGORIAN or days <= 0:
+    if days <= 0:
         return Fraction(days, year_days)
     n = 0
     while _anniversary(start, n + 1, basis) <= end_exclusive:

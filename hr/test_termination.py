@@ -91,41 +91,66 @@ def test_art54_probation_termination_only_during_probation(w):
 
 # --- R39 / AT-21: EOSB figures with the unverified seed (Art. 84, 85 as corrected) ------------------------
 
-@pytest.mark.parametrize("days, kind, expected", [
-    (4 * 365, "resignation", "5333.33"),
-    (4 * 365, "employer_termination", "16000.00"),
-    (12 * 365, "resignation", "76000.00"),       # 5 × 4,000 + 7 × 8,000
-    (365, "resignation", "0.00"),
-    (4 * 365, "art80_dismissal", "0.00"),
-    (2774, "end_of_fixed_term", "40800.00"),       # 7.6 years: 5 × 4,000 + 2.6 × 8,000
-    (5 * 365, "resignation", "6666.67"),          # exactly 5.000 years: 1/3 (Art. 85 "not more than five")
-    (5 * 365 + 1, "resignation", "13347.95"),     # just above 5 years: 2/3
-    (10 * 365, "resignation", "60000.00"),        # 10 years: full award
-    (2 * 365, "resignation", "2666.67"),          # 2 years: 1/3
-    (4 * 365, "employee_notice_art75", "5333.33"),
-    (4 * 365, "mutual_agreement", "16000.00"),
-    (4 * 365, "closure", "16000.00"),
-    (4 * 365, "activity_ended", "16000.00"),
-    (4 * 365, "bankruptcy", "16000.00"),
-    (4 * 365, "death", "16000.00"),
-    (4 * 365, "probation_termination", "0.00"),
+def _hired_for(years, extra_days=0):
+    """The hire date that gives ``years`` completed Gregorian anniversaries plus ``extra_days`` on AS_OF."""
+    last_anniversary = AS_OF + timedelta(days=1 - extra_days)
+    return last_anniversary.replace(year=last_anniversary.year - years)
+
+
+@pytest.mark.parametrize("years, extra, kind, expected", [
+    (4, 0, "resignation", "5333.33"),
+    (4, 0, "employer_termination", "16000.00"),
+    (12, 0, "resignation", "76000.00"),       # 5 × 4,000 + 7 × 8,000
+    (1, 0, "resignation", "0.00"),
+    (4, 0, "art80_dismissal", "0.00"),
+    (7, 219, "end_of_fixed_term", "40800.00"),  # 7.6 years: 5 × 4,000 + 2.6 × 8,000
+    # Finding 5: "exactly 5 years" is the fifth anniversary (2022-06-01 to 2027-05-31, a leap day inside): 1/3.
+    (5, 0, "resignation", "6666.67"),
+    (5, 1, "resignation", "13347.95"),        # 5 years + 1 day: 2/3 × (20,000.00 + 8,000.00 × 1/365)
+    (10, 0, "resignation", "60000.00"),       # 10 years: full award
+    (2, 0, "resignation", "2666.67"),         # 2 years: 1/3
+    (4, 0, "employee_notice_art75", "5333.33"),
+    (4, 0, "mutual_agreement", "16000.00"),
+    (4, 0, "closure", "16000.00"),
+    (4, 0, "activity_ended", "16000.00"),
+    (4, 0, "bankruptcy", "16000.00"),
+    (4, 0, "death", "16000.00"),
+    (4, 0, "probation_termination", "0.00"),
 ])
-def test_at21_eosb_figures(w, days, kind, expected):
-    emp = hired(w, hire_date=_years_ago(days))  # BASIC 6,000 + HOUSING 1,500 + TRANSPORT 500 = 8,000
+def test_at21_eosb_figures(w, years, extra, kind, expected):
+    hire = _hired_for(years, extra)
+    emp = hired(w, hire_date=hire)  # BASIC 6,000 + HOUSING 1,500 + TRANSPORT 500 = 8,000
     r = services.calculate_eosb(emp, AS_OF, kind, user=w.p)
-    assert r.wage_basis == D("8000.00") and r.service_days == days
+    assert r.wage_basis == D("8000.00") and r.service_days == (AS_OF - hire).days + 1
+    assert r.service_years == years + Fraction(extra, 365)
     assert r.award == D(expected), (r.full_award, r.fraction)
     assert not EosbCalculation.objects.exists()  # pure: nothing written
 
 
 def test_at21_exact_fraction_value(w):
-    emp = hired(w, hire_date=_years_ago(5 * 365 + 1))
+    emp = hired(w, hire_date=_hired_for(5, 1))
     r = services.calculate_eosb(emp, AS_OF, "resignation", user=w.h)
     assert r.fraction == Fraction(2, 3) and r.service_years == Fraction(1826, 365)
 
 
+@pytest.mark.parametrize("hire, as_of, years, fraction", [
+    # Review probe P1: 2022-06-01 to 2027-05-31 is 1,826 days (29 Feb 2024 inside) but exactly 5 years.
+    (date(2022, 6, 1), date(2027, 5, 31), Fraction(5), "1/3"),
+    # P1b: one day short of the second anniversary: under 2 years, no award.
+    (date(2025, 6, 2), date(2027, 5, 31), 1 + Fraction(364, 365), "0"),
+    # P1c: two days short of 10 years: still the 2/3 band.
+    (date(2017, 6, 3), date(2027, 5, 31), 9 + Fraction(363, 365), "2/3"),
+    (date(2017, 6, 1), date(2027, 5, 31), Fraction(10), "1"),
+])
+def test_r39_gregorian_thresholds_are_completed_anniversaries(w, hire, as_of, years, fraction):
+    w.clock.set(date(2027, 6, 1))
+    emp = hired(w, hire_date=hire)
+    r = services.calculate_eosb(emp, as_of, "employee_notice_art75", user=w.h)
+    assert r.service_years == years and str(r.fraction) == fraction
+
+
 def test_r39_unpaid_days_beyond_twenty_are_excluded(w):
-    emp = hired(w, hire_date=_years_ago(4 * 365))
+    emp = hired(w, hire_date=_years_ago(4 * 365))  # 1,460 days to AS_OF
     req = services.request_leave(emp, "UNPAID", user=w.h, start_date=date(2027, 3, 1), end_date=date(2027, 3, 30),
                                  reason_ar="ظرف")
     services.approve_leave(req, user=w.h2)
@@ -134,7 +159,7 @@ def test_r39_unpaid_days_beyond_twenty_are_excluded(w):
 
 
 def test_at21_snapshot_immutable_recalc_supersedes_then_refused(w):
-    emp = hired(w, hire_date=_years_ago(4 * 365))
+    emp = hired(w, hire_date=_hired_for(4))
     t = _approve(w, emp, last_working_day=AS_OF, notice_given_on=AS_OF - timedelta(days=60))
     snap = EosbCalculation.objects.get(termination=t)
     assert snap.award == D("16000.00") and snap.fraction_text == "1" and snap.parameter_ids

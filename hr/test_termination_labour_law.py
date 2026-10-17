@@ -171,7 +171,7 @@ def test_at36_art87_windows(w):
 
 
 def test_at36_art75_worker_notice_award_carries_the_legal_flag(w):
-    emp = hired(w, hire_date=LWD - timedelta(days=4 * 365 - 1))  # 4 years
+    emp = hired(w, hire_date=date(2023, 7, 1))  # 4 years: the fourth anniversary is the day after LWD
     t = _approve(w, emp, "employee_notice_art75", notice_given_on=LWD - timedelta(days=30))
     snap = EosbCalculation.objects.get(termination=t)
     assert snap.fraction_text == "1/3" and snap.award == D("5333.33")
