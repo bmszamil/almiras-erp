@@ -6,12 +6,14 @@ Rules enforced here and in ledger.services:
 - Postings into a closed period, a closed entity or another entity's account are rejected.
 - Accounts flagged as Sharia-prohibited (e.g. conventional interest) cannot be posted
   to in an entity that enforces Sharia rules.
+- Manual entries (requires_approval=True) go draft -> pending_approval -> approved -> posted
+  through the approvals engine; while pending or approved they are locked like posted entries.
 """
 from decimal import Decimal
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
 
 from core.models import Entity
 
@@ -56,6 +58,19 @@ class Account(models.Model):
         return f"{self.code} {self.name_en}"
 
 
+class FiscalPeriodQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        if "status" in kwargs:
+            raise LedgerError("Period status changes only through ledger.services (close/reopen).")
+        return super().update(**kwargs)
+
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        if any(o.status != "open" for o in objs):
+            raise LedgerError("New periods start open.")
+        return super().bulk_create(objs, *args, **kwargs)
+
+
 class FiscalPeriod(models.Model):
     class Status(models.TextChoices):
         OPEN = "open", "Open"
@@ -66,6 +81,8 @@ class FiscalPeriod(models.Model):
     start_date = models.DateField()
     end_date = models.DateField()
     status = models.CharField(max_length=6, choices=Status.choices, default=Status.OPEN)
+
+    objects = FiscalPeriodQuerySet.as_manager()
 
     class Meta:
         unique_together = [("entity", "name")]
@@ -80,15 +97,97 @@ class FiscalPeriod(models.Model):
         if overlap.exists():
             raise ValidationError("Period overlaps an existing period for this entity.")
 
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = FiscalPeriod.objects.filter(pk=self.pk).values_list("status", flat=True).first()
+            if stored != self.status and getattr(self, "_via_service", False) is not True:
+                raise LedgerError("Period status changes only through ledger.services (close/reopen).")
+        elif self.status != self.Status.OPEN:
+            raise LedgerError("New periods start open.")
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.entity.code} {self.name} ({self.status})"
+
+
+class JournalEntryQuerySet(models.QuerySet):
+    """Bulk update/delete cannot bypass the posting lock: allowed only when every affected row is a
+    draft, and never for workflow fields (status, numbering, approval flag, creator, source)."""
+
+    WORKFLOW_FIELDS = {"status", "number", "period", "period_id", "posted_by", "posted_by_id", "posted_at",
+                       "requires_approval", "source", "created_by", "created_by_id", "reversal_of",
+                       "reversal_of_id", "entity", "entity_id"}
+
+    def _locked_drafts(self, what):
+        """Lock the targeted rows and return a queryset of exactly those rows if all are drafts.
+        Must run inside a transaction (review D: no check-then-act race)."""
+        ids = list(self.select_for_update().values_list("pk", flat=True))
+        drafts = JournalEntry.objects.filter(pk__in=ids, status=JournalEntry.Status.DRAFT)
+        if drafts.count() != len(ids):
+            raise LedgerError(f"Bulk {what} is allowed on draft entries only. / التعديل الجماعي للمسودات فقط.")
+        return drafts
+
+    def update(self, **kwargs):
+        if set(kwargs) & self.WORKFLOW_FIELDS:
+            raise LedgerError("Status and workflow fields change only through ledger.services.")
+        with transaction.atomic():
+            return models.QuerySet.update(self._locked_drafts("update"), **kwargs)
+
+    def delete(self):
+        with transaction.atomic():
+            return models.QuerySet.delete(self._locked_drafts("delete"))
+
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        if any(o.status != JournalEntry.Status.DRAFT or not o.requires_approval for o in objs):
+            raise LedgerError("Only manual drafts can be bulk-created; use ledger.services.create_entry.")
+        return super().bulk_create(objs, *args, **kwargs)
+
+
+class JournalLineQuerySet(models.QuerySet):
+    def _locked_draft_lines(self, what):
+        """Lock the parent entries, then act only on lines of entries that are still drafts (review D)."""
+        rows = list(self.values_list("pk", "entry_id"))
+        line_ids = [r[0] for r in rows]
+        entry_ids = {r[1] for r in rows}
+        locked = list(JournalEntry.objects.select_for_update()
+                      .filter(pk__in=entry_ids, status=JournalEntry.Status.DRAFT).values_list("pk", flat=True))
+        if len(locked) != len(entry_ids):
+            raise LedgerError(f"Bulk {what} of lines is allowed on draft entries only.")
+        lines = JournalLine.objects.filter(pk__in=line_ids, entry__status=JournalEntry.Status.DRAFT)
+        if lines.count() != len(line_ids):
+            raise LedgerError(f"Bulk {what} of lines is allowed on draft entries only.")
+        return lines
+
+    def update(self, **kwargs):
+        if "entry" in kwargs or "entry_id" in kwargs:
+            raise LedgerError("Lines cannot be moved to another entry.")
+        with transaction.atomic():
+            return models.QuerySet.update(self._locked_draft_lines("update"), **kwargs)
+
+    def delete(self):
+        with transaction.atomic():
+            return models.QuerySet.delete(self._locked_draft_lines("delete"))
+
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        ids = {o.entry_id for o in objs}
+        if JournalEntry.objects.filter(pk__in=ids).exclude(status=JournalEntry.Status.DRAFT).exists():
+            raise LedgerError("Lines can only be added to draft entries.")
+        return super().bulk_create(objs, *args, **kwargs)
 
 
 class JournalEntry(models.Model):
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"
+        PENDING_APPROVAL = "pending_approval", "Pending approval"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
         POSTED = "posted", "Posted"
         REVERSED = "reversed", "Reversed"
+
+    # Fields post_entry writes; the only change allowed on an approved entry.
+    POSTING_FIELDS = {"period", "number", "status", "posted_by", "posted_at"}
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="journal_entries")
     number = models.CharField(max_length=40, blank=True, help_text="Assigned on posting, never reused")
@@ -96,7 +195,17 @@ class JournalEntry(models.Model):
     period = models.ForeignKey(FiscalPeriod, null=True, blank=True, on_delete=models.PROTECT, related_name="entries")
     description = models.CharField(max_length=500)
     reference = models.CharField(max_length=100, blank=True, help_text="Source document code")
-    status = models.CharField(max_length=8, choices=Status.choices, default=Status.DRAFT)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
+    source = models.CharField(
+        max_length=60, default="human", help_text="human / import / agent:<name> (who or what created the entry)"
+    )
+    requires_approval = models.BooleanField(
+        default=True,
+        help_text="Manual entries need approval before posting (the default). Only module services may "
+        "create system entries (create_entry(system=True)); reversals follow D15.",
+    )
+
+    objects = JournalEntryQuerySet.as_manager()
     reversal_of = models.OneToOneField(
         "self", null=True, blank=True, on_delete=models.PROTECT, related_name="reversed_by"
     )
@@ -125,13 +234,35 @@ class JournalEntry(models.Model):
 
     def save(self, *args, **kwargs):
         stored = self._stored_status()
+        update_fields = kwargs.get("update_fields")
         # A posted entry may only change to "reversed"; a reversed entry never changes.
         if stored == self.Status.REVERSED:
             raise LedgerError("Reversed entries are locked.")
+        if stored == self.Status.REJECTED:
+            raise LedgerError("Rejected entries are locked. Create a new entry. / القيد المرفوض مقفل.")
         if stored == self.Status.POSTED and not (
-            self.status == self.Status.REVERSED and kwargs.get("update_fields") == ["status"]
+            self.status == self.Status.REVERSED and update_fields == ["status"]
         ):
             raise LedgerError("Posted entries cannot be edited. Reverse the entry instead.")
+        # Pending or approved entries are locked (R11); only the approval workflow moves their status.
+        if stored == self.Status.PENDING_APPROVAL and not (
+            update_fields == ["status"] and getattr(self, "_workflow", False) is True
+            and self.status in {self.Status.DRAFT, self.Status.APPROVED, self.Status.REJECTED}
+        ):
+            raise LedgerError(
+                "Entries pending approval cannot be edited. / لا يمكن تعديل قيد بانتظار الاعتماد."
+            )
+        if stored == self.Status.APPROVED and not (
+            self.status == self.Status.POSTED and getattr(self, "_posting", False) is True
+            and update_fields is not None and set(update_fields) <= self.POSTING_FIELDS
+        ):
+            raise LedgerError("Approved entries are locked until posted. / القيد المعتمد مقفل حتى يُرحّل.")
+        if stored in {None, self.Status.DRAFT} and self.status != self.Status.DRAFT and not (
+            (self.status == self.Status.POSTED and getattr(self, "_posting", False) is True)
+            or (self.status == self.Status.PENDING_APPROVAL and getattr(self, "_workflow", False) is True)
+        ):
+            # Status jumps only through ledger.services.post_entry / the approval workflow.
+            raise LedgerError("Status can only change through ledger.services. / لا تتغير الحالة إلا عبر خدمات الدفتر.")
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
@@ -152,6 +283,8 @@ class JournalEntry(models.Model):
 
 
 class JournalLine(models.Model):
+    objects = JournalLineQuerySet.as_manager()
+
     entry = models.ForeignKey(JournalEntry, on_delete=models.CASCADE, related_name="lines")
     account = models.ForeignKey(Account, on_delete=models.PROTECT, related_name="lines")
     description = models.CharField(max_length=300, blank=True)
@@ -191,6 +324,25 @@ class JournalLine(models.Model):
 
     def __str__(self):
         return f"{self.account.code} Dr {self.debit} Cr {self.credit}"
+
+
+class JournalEntryEditor(models.Model):
+    """Every user who created or edited a draft entry (review A). Editors count as creators for
+    segregation of duties (R8) and D10. Rows are never changed; they go only with a deleted draft."""
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
+    entry = models.ForeignKey(JournalEntry, on_delete=models.CASCADE, related_name="editors")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
+    action = models.CharField(max_length=10, choices=[("create", "Create"), ("edit", "Edit")])
+    at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["entry", "at", "id"]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise LedgerError("Editor records cannot be changed.")
+        super().save(*args, **kwargs)
 
 
 class EntrySequence(models.Model):

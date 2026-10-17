@@ -2,3 +2,5 @@ django>=6.1,<6.2
 psycopg[binary]>=3.2
 pytest>=8
 pytest-django>=4.9
+django-otp>=1.7,<1.8
+djangorestframework>=3.16,<4

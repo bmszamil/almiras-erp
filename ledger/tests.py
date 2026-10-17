@@ -28,7 +28,7 @@ def sub(alm):
     return e
 
 
-def rent_invoice(entity, counterparty=None, post=True, amount="1000"):
+def rent_invoice(entity, counterparty=None, post=True, system=True, amount="1000"):
     return services.create_entry(
         entity, date(2027, 1, 15), "Warehouse rent Jan",
         [
@@ -36,7 +36,7 @@ def rent_invoice(entity, counterparty=None, post=True, amount="1000"):
             {"account": "4110", "credit": amount},
             {"account": "2200", "credit": D(amount) * D("0.15")},
         ],
-        post=post,
+        post=post, system=True,
     )
 
 
@@ -49,14 +49,14 @@ def test_balanced_entry_posts_and_is_numbered(alm, sub):
 
 def test_numbers_are_sequential(alm):
     for _ in range(2):
-        services.create_entry(alm, date(2027, 2, 1), "x", [{"account": "1100", "debit": 5}, {"account": "3100", "credit": 5}], post=True)
+        services.create_entry(alm, date(2027, 2, 1), "x", [{"account": "1100", "debit": 5}, {"account": "3100", "credit": 5}], post=True, system=True)
     numbers = list(JournalEntry.objects.values_list("number", flat=True).order_by("number"))
     assert numbers == ["ALM-JE-2027-000001", "ALM-JE-2027-000002"]
 
 
 def test_unbalanced_entry_is_rejected(alm):
     with pytest.raises(LedgerError, match="does not balance"):
-        services.create_entry(alm, date(2027, 1, 5), "bad", [{"account": "1100", "debit": 100}, {"account": "3100", "credit": 90}], post=True)
+        services.create_entry(alm, date(2027, 1, 5), "bad", [{"account": "1100", "debit": 100}, {"account": "3100", "credit": 90}], post=True, system=True)
 
 
 def test_posted_entry_cannot_be_edited_or_deleted(alm, sub):
@@ -76,36 +76,36 @@ def test_posted_entry_cannot_be_edited_or_deleted(alm, sub):
 
 def test_reversal_nets_to_zero_and_locks_original(alm, sub):
     e = rent_invoice(alm, counterparty=sub)
-    rev = services.reverse_entry(e, reason="wrong amount")
+    rev = services.reverse_entry(e, reason="wrong amount", system=True)
     e.refresh_from_db()
     assert e.status == JournalEntry.Status.REVERSED
     assert rev.reversal_of == e and rev.status == JournalEntry.Status.POSTED
     assert services.trial_balance(alm, date(2027, 12, 31)) == []
     with pytest.raises(LedgerError):
-        services.reverse_entry(e)
+        services.reverse_entry(e, reason="again", system=True)
 
 
 def test_closed_period_rejects_posting(alm):
     period = alm.periods.get(name="2027-01")
     services.close_period(period)
     with pytest.raises(LedgerError, match="closed"):
-        services.create_entry(alm, date(2027, 1, 20), "late", [{"account": "1100", "debit": 1}, {"account": "3100", "credit": 1}], post=True)
+        services.create_entry(alm, date(2027, 1, 20), "late", [{"account": "1100", "debit": 1}, {"account": "3100", "credit": 1}], post=True, system=True)
 
 
 def test_no_period_rejects_posting(alm):
     with pytest.raises(LedgerError, match="No fiscal period"):
-        services.create_entry(alm, date(2028, 1, 1), "x", [{"account": "1100", "debit": 1}, {"account": "3100", "credit": 1}], post=True)
+        services.create_entry(alm, date(2028, 1, 1), "x", [{"account": "1100", "debit": 1}, {"account": "3100", "credit": 1}], post=True, system=True)
 
 
 def test_sharia_prohibited_account_is_blocked(alm):
     with pytest.raises(LedgerError, match="Sharia-prohibited"):
-        services.create_entry(alm, date(2027, 1, 31), "interest", [{"account": "5610", "debit": 50}, {"account": "1100", "credit": 50}], post=True)
+        services.create_entry(alm, date(2027, 1, 31), "interest", [{"account": "5610", "debit": 50}, {"account": "1100", "credit": 50}], post=True, system=True)
 
 
 def test_sharia_block_off_when_entity_does_not_enforce(alm):
     alm.sharia_enforced = False
     alm.save()
-    e = services.create_entry(alm, date(2027, 1, 31), "interest", [{"account": "5610", "debit": 50}, {"account": "1100", "credit": 50}], post=True)
+    e = services.create_entry(alm, date(2027, 1, 31), "interest", [{"account": "5610", "debit": 50}, {"account": "1100", "credit": 50}], post=True, system=True)
     assert e.status == JournalEntry.Status.POSTED
 
 
@@ -116,13 +116,13 @@ def test_intercompany_needs_counterparty(alm):
 
 def test_header_account_not_postable(alm):
     with pytest.raises(LedgerError, match="not open for posting"):
-        services.create_entry(alm, date(2027, 1, 2), "x", [{"account": "1000", "debit": 1}, {"account": "3100", "credit": 1}], post=True)
+        services.create_entry(alm, date(2027, 1, 2), "x", [{"account": "1000", "debit": 1}, {"account": "3100", "credit": 1}], post=True, system=True)
 
 
 def test_cannot_use_another_entitys_account(alm, sub):
     sub_cash = Account.objects.get(entity=sub, code="1100")
     with pytest.raises(LedgerError, match="another entity"):
-        services.create_entry(alm, date(2027, 1, 2), "x", [{"account": sub_cash, "debit": 1}, {"account": "3100", "credit": 1}], post=True)
+        services.create_entry(alm, date(2027, 1, 2), "x", [{"account": sub_cash, "debit": 1}, {"account": "3100", "credit": 1}], post=True, system=True)
 
 
 def test_line_must_be_one_sided():
@@ -145,7 +145,7 @@ def test_intercompany_balances_mirror(alm, sub):
     services.create_entry(
         sub, date(2027, 1, 15), "Warehouse rent Jan from ALM",
         [{"account": "5200", "debit": 1000}, {"account": "1310", "debit": 150}, {"account": "2110", "credit": 1150, "counterparty": alm}],
-        post=True,
+        post=True, system=True,
     )
     ic = services.intercompany_balances(date(2027, 1, 31))
     assert ic[("ALM", "LZM")] == -ic[("LZM", "ALM")] == D("1150.00")
