@@ -258,3 +258,51 @@ def test_contract_for_terminated_employee_refused(w):
     with pytest.raises(HrError):
         services.create_contract(emp, user=w.h)
     assert make_user("x").pk
+
+
+# --- R17 / AT-33: rehire and probation ----------------------------------------------------------------------
+
+def _left(w, id_number):
+    emp = hired(w, id_number=id_number, hire_date=date(2026, 6, 1))
+    t = services.record_termination(emp, user=w.h, kind="employer_termination", last_working_day=date(2027, 3, 31),
+                                    notice_given_on=date(2027, 1, 1), reason_ar="سبب")
+    services.approve_termination(services.submit_termination(t, user=w.h), user=w.c)
+    return emp
+
+
+def test_at33_rehire_same_job_within_six_months_gets_no_probation(w):
+    _left(w, "1000000901")
+    again = employee(w, id_number="1000000901", hire_date=date(2027, 6, 1))
+    with pytest.raises(HrError) as exc:
+        _submit(w, again, probation_agreement_ref="AGR-1")
+    assert "Art. 54" in exc.value.messages[0]
+
+
+def test_at33_rehire_after_six_months_needs_the_written_agreement(w):
+    _left(w, "1000000902")
+    w.clock.set(date(2027, 11, 1))
+    again = employee(w, id_number="1000000902", hire_date=date(2027, 11, 1))
+    with pytest.raises(HrError) as exc:
+        _submit(w, again)
+    assert "written agreement" in exc.value.messages[0]
+    c = contract(w, again, probation_agreement_ref="Written agreement 2027/11")
+    assert c.status == "approved" and c.probation_days == 90
+
+
+def test_at33_rehire_in_another_job_needs_the_written_agreement(w):
+    _left(w, "1000000903")
+    again = employee(w, id_number="1000000903", hire_date=date(2027, 6, 1))
+    with pytest.raises(HrError):
+        _submit(w, again, job_title_en="Driver", job_title_ar="سائق")
+    assert contract(w, again, job_title_en="Driver", job_title_ar="سائق",
+                    probation_agreement_ref="AGR-2").status == "approved"
+
+
+def test_at33_probation_end_skips_founding_day_and_sick_days(w):
+    emp = hired(w, hire_date=date(2027, 2, 1))  # probation 90 days
+    c = emp.contracts.get(status="approved")
+    assert services.probation_end_date(c, user=w.h) == date(2027, 5, 2)  # Founding Day 2027-02-22 skipped
+    req = services.request_leave(emp, "SICK", user=w.h, start_date=date(2027, 3, 10), end_date=date(2027, 3, 12),
+                                 document_ref="MED-1")
+    services.approve_leave(req, user=w.h2)
+    assert services.probation_end_date(c, user=w.h) == date(2027, 5, 5)  # and the 3 sick days

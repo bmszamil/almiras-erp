@@ -835,7 +835,8 @@ def overtime_approver(employee, on, *, user):
 # =====================================================================================================
 
 CONTRACT_FIELDS = frozenset({
-    "effective_date", "contract_type", "start_date", "end_date", "calendar_basis", "calendar_basis_ref", "probation_periods", "job_title_en",
+    "effective_date", "contract_type", "start_date", "end_date", "calendar_basis", "calendar_basis_ref", "probation_periods",
+    "probation_agreement_ref", "job_title_en",
     "job_title_ar", "occupation_code", "weekly_hours", "daily_hours", "annual_leave_days", "notice_days_employer",
     "notice_days_employee", "currency", "department", "grade", "qiwa_contract_ref", "suspension_agreement_ref", "paid_monthly",
 })
@@ -966,13 +967,19 @@ def _statutory_contract_problems(contract, emp, use, jurisdiction):
             earlier = Termination.objects.filter(
                 entity=emp.entity, employee__id_number_hash=emp.id_number_hash, status=Termination.Status.APPROVED,
             ).exclude(employee=emp).order_by("-last_working_day").first()
-            if earlier is not None and _add_months(earlier.last_working_day, months) > contract.start_date:
+            if earlier is not None:
+                recent = _add_months(earlier.last_working_day, months) > contract.start_date
                 same_job = (earlier.contract.job_title_ar.strip() == contract.job_title_ar.strip()
                             or earlier.contract.job_title_en.strip().lower() == contract.job_title_en.strip().lower())
-                if same_job:
+                if recent and same_job:
                     problems.append(f"This person was employed here within {months} months in the same job: no new "
                                     "probation (Art. 54). / عمل هذا الشخص لدى المنشأة نفسها في الوظيفة ذاتها خلال "
                                     f"{months} أشهر: لا تجوز فترة تجربة جديدة.")
+                elif not (contract.probation_agreement_ref or "").strip():
+                    problems.append("This person was employed here before: a new probation (another job, or "
+                                    f"{months}+ months since the last employment ended) needs the written agreement "
+                                    "reference (Art. 54). / سبق أن عمل هذا الشخص لدى المنشأة: تتطلب فترة التجربة الجديدة "
+                                    "(وظيفة أخرى أو مرور المدة منذ انتهاء العمل السابق) مرجع الاتفاق المكتوب.")
     # R16 as corrected (Art. 37, Regs Art. 12): a non-Saudi's contract is always fixed-term.
     if contract.contract_type == EmploymentContract.ContractType.UNLIMITED and not emp.is_saudi:
         problems.append("A non-Saudi's contract must be fixed-term; an open-ended contract is refused (Art. 37, Regs "
@@ -1505,6 +1512,9 @@ def _sick_plan(use, jurisdiction, req, terms):
     for i, tier in enumerate(rule["tiers"], start=1):
         acc += int(tier["days"])
         bounds.append((acc, i, _decimal(tier["pay_pct"], "pay_pct")))
+    # R64 (Regs Art. 24): an official holiday inside sick leave is paid in full whatever the tier.
+    holidays = _holidays(use, jurisdiction, req.start_date, req.end_date)
+    holiday_pct = _decimal(rule["holiday_pay_pct"], "holiday_pay_pct") if "holiday_pay_pct" in rule else None
     plan, beyond = [], 0
     for d in new:
         cycle_start, n = cycles[d]
@@ -1512,7 +1522,8 @@ def _sick_plan(use, jurisdiction, req, terms):
         if tier is None:
             beyond += 1
         else:
-            plan.append((d, cycle_start, tier[1], tier[2]))
+            holiday = d in holidays and holiday_pct is not None
+            plan.append((d, cycle_start, tier[1], holiday_pct if holiday else tier[2], holiday))
     return plan, beyond, bounds[-1][0]
 
 
@@ -1664,9 +1675,9 @@ def approve_leave(leave_request, *, user):
     elif req.leave_type.code == "SICK":
         terms = _terms_on(req.employee, req.start_date)
         plan, _, _ = _sick_plan(use, jurisdiction, req, terms)
-        for d, cycle_start, tier, pct in plan:
+        for d, cycle_start, tier, pct, holiday in plan:
             SickLeaveDay.objects.create(entity=req.entity, employee=req.employee, date=d, leave_request=req,
-                                        cycle_start=cycle_start, tier_no=tier, pay_pct=pct)
+                                        cycle_start=cycle_start, tier_no=tier, pay_pct=pct, official_holiday=holiday)
         _suspend_annual_for_sick(req, use, jurisdiction, user)
     return req
 
@@ -1801,9 +1812,12 @@ def approve_leave_adjustment(adjustment, *, user):
 
 
 def _unpaid_days_of(r, start, end):
-    """The unpaid days of one approved request between start and end."""
+    """The unpaid days of one approved request between start and end (from ``unpaid_from`` when only its tail is
+    unpaid, e.g. the maternity shortfall after a late birth)."""
     if r.unpaid or r.leave_type.paid_rule == LeaveType.PaidRule.UNPAID:
         return set(_days(max(r.start_date, start), min(r.end_date, end)))
+    if r.unpaid_from is not None:
+        return set(_days(max(r.unpaid_from, start), min(r.end_date, end)))
     return set()
 
 
@@ -1814,6 +1828,52 @@ def _unpaid_days(emp, start, end):
                                          end_date__gte=start).select_related("leave_type"):
         result |= _unpaid_days_of(r, start, end)
     return result
+
+
+def sick_pay_days(employee, start, end, *, user):
+    """R32, R64 (payroll R17): each approved sick day between start and end with its pay %, tier and whether it is
+    an official holiday (paid in full whatever the tier)."""
+    access.require(user, employee.entity, "hr.view")
+    return [(d.date, d.pay_pct, d.tier_no, d.official_holiday) for d in SickLeaveDay.objects.filter(
+        employee=employee, date__range=(start, end), leave_request__status__in=(LR.APPROVED, LR.TAKEN)).order_by("date")]
+
+
+@transaction.atomic
+def record_birth(leave_request, birth_date, *, user):
+    """R33 / AT-35 (Art. 151): record the actual birth on approved maternity leave. When fewer than the mandatory
+    days after birth remain (a late birth), the leave is extended to complete them and the extension is unpaid."""
+    req = _lock(LeaveRequest, leave_request.pk)
+    access.require(user, req.entity, "hr.request_leave")
+    if req.leave_type.code != "MATERNITY" or req.status != LR.APPROVED or req.actual_event_date is not None:
+        raise error("The birth is recorded once, on approved maternity leave.",
+                    "تُسجَّل الولادة مرة واحدة على إجازة وضع معتمدة.", code="leave_status")
+    if birth_date < req.start_date or birth_date > req.end_date:
+        raise error("The birth falls outside this maternity leave; record the leave from the birth instead.",
+                    "الولادة خارج إجازة الوضع هذه؛ سجّل الإجازة اعتبارًا من الولادة.", code="birth_outside_leave")
+    use = ParamUse()
+    jurisdiction = _jurisdiction(req.employee, "leave", "الإجازات")
+    rule = use.get(jurisdiction, "leave.maternity", req.start_date)
+    shortfall = int(rule["post_birth_mandatory_days"]) - ((req.end_date - birth_date).days + 1)
+    req.actual_event_date = birth_date
+    if shortfall > 0:
+        first, last = req.end_date + timedelta(days=1), req.end_date + timedelta(days=shortfall)
+        clash = LeaveRequest.objects.filter(employee=req.employee, status__in=LIVE, start_date__lte=last,
+                                            end_date__gte=first).exclude(pk=req.pk).first()
+        if clash is not None:
+            raise error(f"The mandatory weeks after birth run to {last}; cancel the leave from {clash.start_date} first "
+                        "(Art. 151).", f"تمتد الأسابيع الإلزامية بعد الولادة حتى {last}؛ ألغِ الإجازة التي تبدأ في "
+                        f"{clash.start_date} أولًا.", code="leave_overlap")
+        req.unpaid_from, req.end_date = first, last
+        req.days += shortfall
+    req.modified_by, req.modified_at = user, timezone.now()
+    return _save(req)
+
+
+def probation_end_date(contract, *, user):
+    """R17 / AT-33 (Regs Art. 19): the last probation day, skipping Eid al-Fitr, Eid al-Adha, National Day, Founding
+    Day and approved sick days; None without probation."""
+    access.require(user, contract.entity, "hr.view")
+    return _probation_end(ParamUse(), contract, _jurisdiction(contract.employee))
 
 
 def unpaid_leave_days(employee, start, end, *, user):

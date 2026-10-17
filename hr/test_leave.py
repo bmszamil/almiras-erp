@@ -338,3 +338,58 @@ def test_r62_five_year_anniversary_moves_later_by_suspended_days(w):
     services.accrue_leave(2027, 1)
     # 10 suspended days: the 30-day rate starts on 2027-01-12 instead of 2027-01-02: (21×11 + 30×20) / (12×31).
     assert _accrual(e, "2027-01") == D("2.23")
+
+
+# --- R64 / AT-17: official holidays inside sick leave are paid in full ----------------------------------------
+
+def test_at17_official_holiday_in_the_75_tier_is_paid_in_full(w):
+    holidays = services.param("SA", "calendar.official_holidays", date(2027, 1, 1))
+    holidays.value = {**holidays.value, "date_ranges": [["2027-03-09", "2027-03-11"]]}  # Eid al-Fitr (test dates)
+    holidays.save()
+    e = hired(w, hire_date=date(2025, 1, 1))
+    _approved_leave(w, e, "SICK", date(2027, 1, 1), date(2027, 1, 30), document_ref="MED-1")  # tier 1 used up
+    _approved_leave(w, e, "SICK", date(2027, 2, 20), date(2027, 2, 24), document_ref="MED-2")
+    _approved_leave(w, e, "SICK", date(2027, 3, 8), date(2027, 3, 12), document_ref="MED-3")
+    days = {d: (pct, tier, hol) for d, pct, tier, hol in services.sick_pay_days(e, date(2027, 2, 1), date(2027, 3, 31),
+                                                                              user=w.p)}
+    assert days[date(2027, 2, 21)] == (D("75.00"), 2, False)
+    assert days[date(2027, 2, 22)] == (D("100.00"), 2, True)  # Founding Day (Regs Art. 24)
+    assert days[date(2027, 3, 8)] == (D("75.00"), 2, False)
+    assert days[date(2027, 3, 9)] == days[date(2027, 3, 11)] == (D("100.00"), 2, True)  # Eid
+    assert SickLeaveDay.objects.filter(employee=e, official_holiday=True).count() == 4
+
+
+# --- R33 / AT-35: maternity after a late birth --------------------------------------------------------------
+
+def test_at35_late_birth_completes_the_mandatory_six_weeks_unpaid(w):
+    f = hired(w, gender="female")  # 6 months' service on 2027-07-04: no service condition for pay
+    req = _approved_leave(w, f, "MATERNITY", date(2027, 7, 4), date(2027, 9, 25), event_date=date(2027, 8, 1),
+                          document_ref="MAT-1")
+    assert req.days == 84 and not req.unpaid
+    req = services.record_birth(req, date(2027, 8, 25), user=w.h)  # 52 days used before the birth
+    assert req.actual_event_date == date(2027, 8, 25)
+    assert req.end_date == date(2027, 10, 5) and req.unpaid_from == date(2027, 9, 26) and req.days == 94
+    assert services.unpaid_leave_days(f, date(2027, 7, 1), date(2027, 10, 31), user=w.p) == 10  # 42 - 32
+    with pytest.raises(HrError):
+        services.record_birth(req, date(2027, 8, 25), user=w.h)  # once
+
+
+def test_r33_on_time_birth_leaves_maternity_fully_paid(w):
+    f = hired(w, gender="female")
+    req = _approved_leave(w, f, "MATERNITY", date(2027, 7, 4), date(2027, 9, 25), event_date=date(2027, 8, 1),
+                          document_ref="MAT-1")
+    req = services.record_birth(req, date(2027, 8, 1), user=w.h)
+    assert req.end_date == date(2027, 9, 25) and req.unpaid_from is None
+    assert services.unpaid_leave_days(f, date(2027, 7, 1), date(2027, 10, 31), user=w.p) == 0
+
+
+def test_r33_late_birth_extension_never_overlaps_other_leave(w):
+    f = hired(w, gender="female")
+    req = _approved_leave(w, f, "MATERNITY", date(2027, 7, 4), date(2027, 9, 25), event_date=date(2027, 8, 1),
+                          document_ref="MAT-1")
+    _approved_leave(w, f, "UNPAID", date(2027, 9, 28), date(2027, 9, 30), reason_ar="ظرف")
+    with pytest.raises(HrError) as exc:
+        services.record_birth(req, date(2027, 8, 25), user=w.h)
+    assert exc.value.code == "leave_overlap"
+    with pytest.raises(HrError):
+        services.record_birth(req, date(2027, 10, 1), user=w.h)  # outside the leave

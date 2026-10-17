@@ -460,6 +460,9 @@ class EmploymentContract(Tracked, ServiceGuarded):
     # within the parameter maximum.
     probation_periods = models.JSONField(bi("Probation periods (days)", "فترات التجربة (بالأيام)"), default=list,
                                          blank=True)
+    # R17 (Art. 54): a rehire's new probation (other job, or 6+ months since the last employment) is agreed in writing.
+    probation_agreement_ref = models.CharField(bi("Written agreement for a new probation", "الاتفاق المكتوب على تجربة جديدة"),
+                                               max_length=200, blank=True)
     job_title_en = models.CharField(bi("Job title (English)", "المسمى الوظيفي (بالإنجليزية)"), max_length=200)
     job_title_ar = models.CharField(bi("Job title (Arabic)", "المسمى الوظيفي (بالعربية)"), max_length=200)
     occupation_code = models.CharField(bi("Occupation code", "رمز المهنة"), max_length=20, blank=True)
@@ -713,6 +716,11 @@ class LeaveRequest(Tracked, ServiceGuarded):
     event_date = models.DateField(bi("Event date (birth, death, marriage)", "تاريخ الواقعة (ولادة، وفاة، زواج)"),
                                   null=True, blank=True)
     unpaid = models.BooleanField(bi("Unpaid", "بدون أجر"), default=False)
+    # R33 (Art. 151): the actual birth for maternity leave; days from ``unpaid_from`` complete the mandatory weeks
+    # after a late birth and are unpaid.
+    actual_event_date = models.DateField(bi("Actual date of the event (birth)", "التاريخ الفعلي للواقعة (الولادة)"),
+                                         null=True, blank=True)
+    unpaid_from = models.DateField(bi("Unpaid from", "بدون أجر اعتبارًا من"), null=True, blank=True)
     declarations = models.JSONField(bi("Declarations", "الإقرارات"), default=dict, blank=True)
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     submitted_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
@@ -818,6 +826,8 @@ class SickLeaveDay(models.Model):
                                       verbose_name=bi("Leave request", "طلب الإجازة"))
     cycle_start = models.DateField(bi("Sick-leave year starts", "بداية سنة الإجازة المرضية"))
     tier_no = models.PositiveSmallIntegerField(bi("Tier", "الشريحة"))
+    # R64 (Regs Art. 24): an official holiday inside sick leave is paid in full whatever the tier.
+    official_holiday = models.BooleanField(bi("Official holiday", "عطلة رسمية"), default=False)
     pay_pct = models.DecimalField(bi("Pay %", "نسبة الأجر"), max_digits=5, decimal_places=2)
 
     objects = AppendOnlyQuerySet.as_manager()
