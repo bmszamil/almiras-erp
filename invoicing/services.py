@@ -960,6 +960,39 @@ def approve_sales_document(document, *, user):
 
 # --- ZATCA result and posting on clearance (R41 to R44) ------------------------------------------
 
+def resubmit_to_zatca(document, *, user):
+    """Hand an issued document to ZATCA again when the after-commit hand-off failed (R40; review item 6).
+
+    Only documents ``issued`` with ``zatca_status = not_submitted`` (the hand-off never recorded a submission).
+    Interim default until the owner decides (spec OQ-57): the ZATCA queue system user (automatic retry, with
+    ``zatca.process_queue``) or a person holding the ``zatca_admin`` role in the entity (``zatca.retry_failed``
+    through that role); agents never. Every resubmission is logged in the AccessLog.
+    """
+    from core.access.models import Membership
+
+    doc = SalesDocument.objects.select_related("entity").get(pk=document.pk)
+    entity = doc.entity
+    if access_services.kind_of(user) == Kind.SYSTEM:
+        permission = "zatca.process_queue"
+        access.require(user, entity, permission)
+    else:  # agents are refused here: zatca.retry_failed is not open to agents (catalogue)
+        permission = "zatca.retry_failed"
+        grant = access.require(user, entity, permission)
+        if not Membership.objects.filter(pk__in=grant.membership_ids, role__code="zatca_admin").exists():
+            access.deny(user, entity, permission, "no_membership")
+    with transaction.atomic():
+        doc = SalesDocument.objects.select_for_update(of=("self",)).get(pk=doc.pk)
+        if doc.status != Status.ISSUED or doc.zatca_status != SalesDocument.ZatcaStatus.NOT_SUBMITTED:
+            raise error("Only issued documents that were never handed to ZATCA are resubmitted.",
+                        "يُعاد إرسال المستندات الصادرة التي لم تُسلَّم للهيئة فقط.", code="not_resubmittable")
+        access_services.log(
+            AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity, permission=permission,
+            details={"document": [doc._meta.label_lower, doc.pk], "action": "zatca_resubmit"},
+        )
+    zatca_port.get_port().submit_document(SalesDocument.objects.get(pk=doc.pk), user)  # after commit, as R40
+    return SalesDocument.objects.get(pk=doc.pk)
+
+
 def on_zatca_result(document, result, *, user):
     """Callback from zatca with the result for an issued document (R41, R42).
 

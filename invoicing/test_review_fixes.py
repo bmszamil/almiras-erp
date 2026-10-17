@@ -260,3 +260,46 @@ def test_pinned_rate_rows_are_for_document_postings_only_and_must_fit_the_date(w
     with pytest.raises(LedgerError):  # before the row's date
         ledger._build_line(w.alm, date(2026, 12, 31), spec[0], w.accountant)
     assert ledger._build_line(w.alm, date(2027, 1, 3), spec[0], w.accountant).fx_rate == D("3.75")
+
+
+# --- 6. resubmitting a document whose ZATCA hand-off failed after commit ---------------------------
+
+def _failed_hand_off(w):
+    """An issued document whose after-commit hand-off raised: still not_submitted."""
+    with mock.patch.object(w.zatca, "submit_document", side_effect=RuntimeError("connection reset")):
+        with pytest.raises(RuntimeError):
+            approve(w, invoice(w))
+    doc = SalesDocument.objects.get(status="issued")
+    assert doc.zatca_status == "not_submitted"
+    return doc
+
+
+def test_item6_queue_user_resubmits_and_it_is_logged(w):
+    from core.access.models import AccessLog
+
+    doc = _failed_hand_off(w)
+    again = services.resubmit_to_zatca(doc, user=w.queue)
+    assert again.zatca_status == "pending" and w.zatca.submitted[-1][0] == doc.pk
+    assert AccessLog.objects.filter(actor=w.queue, details__action="zatca_resubmit").count() == 1
+    with pytest.raises(InvoicingError) as exc:  # now pending: nothing to resubmit
+        services.resubmit_to_zatca(doc, user=w.queue)
+    assert exc.value.code == "not_resubmittable"
+    assert w.zatca.clear(again).status == "final"
+
+
+def test_item6_only_zatca_admins_resubmit_by_hand_never_agents(w):
+    from core.access.models import AccessLog
+    from core.access.testing import make_agent, make_user, member
+
+    doc = _failed_hand_off(w)
+    for user in (w.accountant, w.cfo, w.clerk):  # the accountant holds zatca.retry_failed, but not as zatca_admin
+        with pytest.raises(access.AccessDenied):
+            services.resubmit_to_zatca(doc, user=user)
+    agent = make_agent("zatca-helper")
+    with pytest.raises(access.AccessDenied) as exc:
+        services.resubmit_to_zatca(doc, user=agent)
+    assert exc.value.code == "agent_forbidden"
+    admin = make_user("zadmin")
+    member(admin, w.alm, "zatca_admin")
+    assert services.resubmit_to_zatca(doc, user=admin).zatca_status == "pending"
+    assert AccessLog.objects.filter(actor=admin, details__action="zatca_resubmit").exists()
