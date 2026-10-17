@@ -111,6 +111,11 @@ The validation report and profiles are not stored: they are printed and optional
     `ledger.services.post_entry` with `require(approver, entity, "ledger.post_entry", document=draft)`. Before
     posting, the draft's lines are compared with the `lines_hash` recorded at import; a changed draft is refused
     (discard and re-import). Ledger rules (period, balance, Sharia, intercompany) apply as for any entry.
+    *Amended 2026-10-17 (invoicing R54 D31b code-review fixes, as built):* restricted accounts (`ledger.restricted`;
+    today GL 1140, the purification account) accept lines of the **opening** entry only (`source="import"` with its
+    `ImportedEntry` of kind `opening`, registered by this app); a replayed journal with a 1140 line is drafted but
+    refused when posted (`restricted_account`, listed in the posting dry run). PostgreSQL: `invoicing/0023`.
+    **[ledger hook + DB; tests `test_restricted_accounts.py`]**
 17. Discard: import drafts may be discarded (link and draft deleted) by `migration.import`; posted entries are only
     reversed in the ledger (CLAUDE.md rule 1).
 18. Post-load tie-out: the ERP trial balance at the as-of date (posted entries, optionally plus import drafts),
