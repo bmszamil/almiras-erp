@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     "access",
     "ledger",
     "approvals",
+    "intercompany",
 ]
 
 AUTH_USER_MODEL = "access.User"
@@ -217,6 +218,9 @@ REST_FRAMEWORK = {
 # Approvals plug-in contract (spec §3.3): document type code -> adapter in the owning module.
 APPROVAL_ADAPTERS = {
     "ledger.journal_entry": "ledger.approval.JournalEntryApproval",
+    "intercompany.agreement": "intercompany.approval.AgreementApproval",
+    "intercompany.invoice": "intercompany.approval.InvoiceApproval",
+    "intercompany.bill": "intercompany.approval.BillApproval",
 }
 
 ERP_BASE_URL = os.environ.get("ERP_BASE_URL", "")
