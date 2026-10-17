@@ -1,10 +1,17 @@
-"""AT-69 (opt-in): validate a module-signed fake simplified 388 with the ZATCA SDK, offline.
+"""AT-69 (opt-in): validate module-signed fake documents with ZATCA SDK R3.4.8, offline.
 
-Collected only when ``ZATCA_SDK_DIR`` points to an unpacked SDK (never in the repo) and ``ZATCA_SDK_CMD`` is an
-executable that runs ``fatoora`` without network (e.g. ``unshare -n``, BouncyCastle first on Java >= 16) and
-takes ``-validate -invoice <file>``. The SDK compares X509IssuerName / serial against its own configured
-certificate, so the document is signed with the SDK's bundled dummy key and certificate, in the SDK 2.0.3 QR
-layout and BouncyCastle issuer style. QR results are recorded, not gating (OQ-28).
+Collected only when ``ZATCA_SDK_DIR`` points to an unpacked copy of the SDK (never in the repo; CI has none, so this
+file is skipped there) and ``ZATCA_SDK_CMD`` is an executable that runs the SDK without network and takes the
+path of one XML file, e.g. a wrapper around ``docs/compliance/zatca-sdk-kit/scripts/sdk3/fat348.sh -validate
+-invoice <file>`` (``unshare -n``). Java: 11, or a later JVM with the JCA provider order **SUN first, BouncyCastle
+second** (``scripts/sdk3/bc-second.security``): SUN gives the RFC 2253 issuer string the SDK's samples carry and BC
+supplies secp256k1. BouncyCastle first fails ``wrong X509IssuerName`` (findings §2).
+
+Target (``docs/compliance/zatca-sdk-3-findings-2026-10-17.md``): the module's defaults, i.e. DTG QR layout, BER
+TLV lengths and the ``rfc2253`` issuer style; no 2.0.3 workarounds (seller additional number, buyer region). The
+SDK compares X509IssuerName / serial against its own certificate, so documents are signed with the SDK's bundled
+dummy key and certificate. QR is **gating** for simplified documents. The SDK checks PIH against its one
+``pih.txt`` (the R-12 seed), so each test signs the first document of a fresh EGS chain.
 """
 import os
 import subprocess
@@ -13,28 +20,23 @@ from pathlib import Path
 import pytest
 
 from zatca import crypto, qr
-from zatca.conftest import NOW, einvoice_of, issue, onboard
+from zatca.conftest import NOW, einvoice_of, issue, mutate, onboard
 
 pytestmark = pytest.mark.django_db
 SDK = Path(os.environ.get("ZATCA_SDK_DIR", "/nonexistent"))
 
 
-def _sdk_unit(zw, settings):
+def _sdk_unit(zw):
     """Onboard TST1 through the services, then let its unit sign with the SDK's dummy key and certificate."""
     from zatca import keystore, services
     from zatca.models import EgsCredential
 
-    settings.ZATCA_QR_TAGS_7_9_LAYOUT = qr.LAYOUT_SDK_203
-    settings.ZATCA_X509_ISSUER_NAME_STYLE = "bc"
     certs = SDK / "Data" / "Certificates"
     pem = (certs / "ec-secp256k1-priv-key.pem").read_text().strip()
     if "BEGIN" not in pem:
         pem = f"-----BEGIN EC PRIVATE KEY-----\n{pem}\n-----END EC PRIVATE KEY-----\n"
     sdk_key = crypto.load_private_key(pem.encode())
     sdk_cert = crypto.load_cert_base64((certs / "cert.pem").read_text().strip())
-    # SDK 2.0.3's 2021 rules require the seller additional number (BR-KSA-09/-64); the 2023 Data Dictionary makes
-    # it optional (KSA-23 "O", spec R-4). The fake entity gets one so the old SDK can check the rest.
-    type(zw.tst1).objects.filter(pk=zw.tst1.pk).update(additional_no="5678")
     egs = onboard(zw, zw.tst1, zw.admin1)
     egs.private_key_ref = zw.fakes.store.write_private_key(keystore.private_key_path("TST1", "EGS1"),
                                                            crypto.private_key_pem(sdk_key), services._master_ref(zw.tst1))
@@ -58,28 +60,43 @@ def _validate(zw, monkeypatch, stamp_cred, doc, tmp_path, name):
     assert einv.icv, list(einv.messages.values_list("code", "message_en"))
     path = Path(os.environ.get("ZATCA_SDK_OUT", tmp_path)) / name
     path.write_text(einv.signed_xml, encoding="utf-8")
-    out = subprocess.run([os.environ["ZATCA_SDK_CMD"], str(path)], capture_output=True, text=True, timeout=300).stdout
-    return einv, out
+    run = subprocess.run([os.environ["ZATCA_SDK_CMD"], str(path)], capture_output=True, text=True, timeout=300)
+    return einv, run.stdout + run.stderr
 
 
-def _passed(out, minimum):
-    results = [line for line in out.splitlines() if "validation result" in line]
+def _passed(out, stages):
+    """Every listed stage reports PASSED (gating, QR included) and the global result is PASSED."""
+    for stage in stages:
+        assert f"[{stage}] validation result : PASSED" in out, out
     assert "GLOBAL VALIDATION RESULT = PASSED" in out, out
-    assert len(results) >= minimum and all("PASSED" in r for r in results), out
+    assert "wrong X509IssuerName" not in out, out  # provider order: SUN first, BouncyCastle second
+    assert "Tag 4" not in out, out  # tag 4 = BT-115 (findings §3.1)
 
 
-def test_at69_sdk_validates_a_module_signed_simplified_invoice(zw, settings, monkeypatch, tmp_path):
-    cred = _sdk_unit(zw, settings)
-    _, out = _validate(zw, monkeypatch, cred, issue(zw, zw.tst1, simplified=True), tmp_path, "module-simp-388.xml")
-    _passed(out, 6)  # XSD, EN, KSA, QR, SIGNATURE, PIH
+SIMPLIFIED = ("XSD", "EN", "KSA", "QR", "SIGNATURE", "PIH")
+STANDARD = ("XSD", "EN", "KSA", "PIH")  # the SDK checks signature and QR on simplified documents only
 
 
-def test_sdk_validates_module_signed_standard_invoice(zw, settings, monkeypatch, tmp_path):
-    """The SDK checks PIH against the initial literal, so only the first document of the chain is checked."""
-    from zatca.conftest import mutate
+def test_at69_sdk_validates_a_module_signed_simplified_invoice(zw, monkeypatch, tmp_path):
+    cred = _sdk_unit(zw)
+    einv, out = _validate(zw, monkeypatch, cred, issue(zw, zw.tst1, simplified=True), tmp_path, "module-simp-388.xml")
+    assert qr.missing_tags(qr.decode(einv.qr_tlv), simplified=True) == []  # the SDK does not enforce presence
+    _passed(out, SIMPLIFIED)
 
-    cred = _sdk_unit(zw, settings)
-    # required by SDK 2.0.3's 2021 rules only (BR-KSA-63, BR-KSA-10); optional in the 2023 documents
-    mutate(monkeypatch, **{"buyer.additional_no": "6789", "buyer.region": "Makkah Region"})
+
+def test_at69_sdk_validates_a_long_seller_name_with_ber_length(zw, monkeypatch, tmp_path):
+    """A 200-byte Arabic seller name: tag 1 carries the BER long form 0x81 C8 (R-15 as built)."""
+    import base64
+
+    cred = _sdk_unit(zw)
+    mutate(monkeypatch, **{"seller.name": "ش" * 100})
+    einv, out = _validate(zw, monkeypatch, cred, issue(zw, zw.tst1, simplified=True), tmp_path,
+                          "module-simp-388-name200.xml")
+    assert base64.b64decode(einv.qr_tlv)[:3] == bytes([1, 0x81, 200])
+    _passed(out, SIMPLIFIED)
+
+
+def test_sdk_validates_module_signed_standard_invoice(zw, monkeypatch, tmp_path):
+    cred = _sdk_unit(zw)
     _, out = _validate(zw, monkeypatch, cred, issue(zw, zw.tst1), tmp_path, "module-std-388.xml")
-    _passed(out, 4)
+    _passed(out, STANDARD)
