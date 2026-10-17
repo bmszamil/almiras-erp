@@ -2,7 +2,7 @@
 
 **Compliance status: Technical rules checked 2026-10-16 against official ZATCA documents (see docs/compliance/zatca-verification-2026-10-16.md) and, offline, against ZATCA SDK 2.0.3 (see docs/compliance/zatca-sdk-findings-2026-10-16.md; kit in docs/compliance/zatca-sdk-kit/). Signature, hash, CSR OIDs and QR tag 6 settled; items where the 2022 SDK conflicts with the 2023 documents, and expert items, remain.** (Earlier record: `docs/compliance/track-a-2026-10-16.md`.)
 
-Status: draft for review · Written: 2026-10-16 · Revised: 2026-10-16 (compliance review applied; project-owner decisions D-1 to D-9 recorded) · Revised: 2026-10-16 (ZATCA verification report Z1–Z43 applied) · Revised: 2026-10-16 (project-owner decisions D-10, D-11) · Revised: 2026-10-16 (ZATCA SDK 2.0.3 findings applied) · Author: spec-writer agent
+Status: draft for review · Written: 2026-10-16 · Revised: 2026-10-16 (compliance review applied; project-owner decisions D-1 to D-9 recorded) · Revised: 2026-10-16 (ZATCA verification report Z1–Z43 applied) · Revised: 2026-10-16 (project-owner decisions D-10, D-11) · Revised: 2026-10-16 (ZATCA SDK 2.0.3 findings applied) · Amended: 2026-10-17 (§5 note: invoicing slice 1 posting as built) · Author: spec-writer agent
 Depends on: `core` (Entity, incl. national-address fields in `invoicing.md` §3.0), `docs/specs/invoicing.md` (AR/AP documents), `docs/specs/ledger-fx.md` (currency, D-6)
 
 > **Tags.** A citation in parentheses, e.g. "(XML v1.2 BR-KSA-40, p.56)", points to an official ZATCA document checked on 2026-10-16; abbreviations (XML, DD, SFIS, DTG, DG, IR, DPM, TIR, PSG, WHT, QRG) are listed in the Sources table of `docs/compliance/zatca-verification-2026-10-16.md`.
@@ -276,8 +276,19 @@ What `invoicing` must and must not do based on this module's status:
 | Standard, `cleared*` | Edit it | Post it (date = issue date), issue the **cleared** XML/QR to buyer |
 | Simplified (B2C), `stamped` / `queued` / `submitting` | Edit it; post the journal entry (D-8) | Give the stamped document to the buyer (issued at stamping, R-23) |
 | Simplified, `reported*` | Edit it | Post it (D-8) |
-| Simplified, `rejected` after hand-over to the buyer | Edit it; post its draft entry | Re-issue a corrected document under a new number (D-4); no GL effect to reverse since nothing was posted. Whether the buyer copy also needs a credit note: DTG FAQs conflict (p.77 "cancelled via a credit note and a new invoice" vs p.71 "no need to issue another invoice") **[Needs expert sign-off: tax]** (OQ-6) |
+| Simplified, `rejected` after hand-over to the buyer | Edit it; post any entry for it (none exists, see note below) | Re-issue a corrected document under a new number (D-4); no GL effect to reverse since nothing was posted. Whether the buyer copy also needs a credit note: DTG FAQs conflict (p.77 "cancelled via a credit note and a new invoice" vs p.71 "no need to issue another invoice") **[Needs expert sign-off: tax]** (OQ-6) |
 | 386 prepayment | Treat differently from 388 for issue/post timing | Same rows as above by category; its accounts are set in `invoicing.md` (OQ-16, OQ-22 there) |
+
+*Amended 2026-10-17 (invoicing slice 1 as built, commits e8ec8d0..73c1220; invoicing.md R40 to R43, R75, R79):*
+| Event | What invoicing does |
+| --- | --- |
+| CFO approval (issue) | Number, snapshots, totals; **no journal entry, not even a draft**. Hand-off to ZATCA after commit through `invoicing.zatca_port` (until this module exists; default port leaves documents `pending`) |
+| `cleared*` / `reported*` result | `invoicing.services.on_zatca_result` records the result, then posts the document in **one step**: `ledger.services.create_entry(..., post=True, grant=<invoicing.post_on_clearance>, posted_by=<recorded CFO approver>, document=...)`, dated the issue date; lines are built by the document's registered `build_lines` hook. The caller is the ZATCA queue system user; the ledger checks the approver's used approval and logs `post_on_clearance` (D-8) |
+| `rejected` result | Document `rejected`; **nothing is booked**; the number stays used (D-4) |
+| Hand-off failed after commit | Resubmit service (pending fix, invoicing R79; who may call it: invoicing OQ-57) |
+| Period close | `ledger.services.close_period` refuses a period with sales documents still awaiting ZATCA, through the `pending_documents` hook that invoicing registers in `ledger.documents` (`documents_pending`) |
+
+This module still creates no journal entries and never calls `post_entry`, `create_entry` or `reverse_entry`.
 
 ## 6. Integrations
 
