@@ -44,3 +44,25 @@ Six Claude Code agents in `.claude/agents/` (spec-writer, module-builder, test-e
 4. Bank statement import and reconciliation.
 5. Intercompany billing (rentals, IP, secondments, consulting).
 6. Approvals and an Arabic/English web UI.
+
+## Running the tests on PostgreSQL
+
+`python -m pytest -q` uses SQLite by default. Production runs on PostgreSQL, so run the suite there too
+before merging changes that touch locking (`select_for_update`) or queries:
+
+```bash
+# once, as the postgres superuser: a throwaway role that may create the test database
+sudo -u postgres psql -c "CREATE ROLE erp_scratch LOGIN PASSWORD 'scratch-only' CREATEDB;" \
+                      -c "CREATE DATABASE erp_scratch OWNER erp_scratch;"
+
+POSTGRES_DB=erp_scratch POSTGRES_USER=erp_scratch POSTGRES_PASSWORD=scratch-only \
+POSTGRES_HOST=localhost python -m pytest -q
+
+# afterwards
+sudo -u postgres psql -c "DROP DATABASE erp_scratch;" -c "DROP ROLE erp_scratch;"
+```
+
+`config.settings_test` uses the same `POSTGRES_*` variables as `config.settings`; pytest creates and drops
+`test_erp_scratch` itself. Use local scratch credentials only, never real ones. PostgreSQL refuses
+`FOR UPDATE` on the nullable side of an outer join, so lock with `select_for_update(of=("self",))` when a
+locked query uses `select_related` on a nullable foreign key.

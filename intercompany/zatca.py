@@ -78,7 +78,7 @@ def _breakdown(invoice):
 @transaction.atomic
 def set_zatca_status(invoice, status, zatca_hash=""):
     """For the ZATCA module only (R22)."""
-    inv = IntercompanyInvoice.objects.select_for_update().get(pk=invoice.pk)
+    inv = IntercompanyInvoice.objects.select_for_update(of=("self",)).get(pk=invoice.pk)
     if status not in IntercompanyInvoice.ZatcaStatus.values:
         raise RuleError("invalid_status", "Unknown ZATCA status.", "حالة زاتكا غير معروفة.")
     inv.zatca_status, inv.zatca_hash, inv.zatca_updated_at = status, zatca_hash or inv.zatca_hash, timezone.now()

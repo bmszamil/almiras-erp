@@ -156,7 +156,7 @@ def _move(doc, status, **fields):
 
 def _next_number(entity, prefix, year, width):
     """Gap-free per entity, prefix and year; the row is locked until the transaction ends (R11)."""
-    seq, _ = NumberSequence.objects.select_for_update().get_or_create(entity=entity, prefix=prefix, year=year)
+    seq, _ = NumberSequence.objects.select_for_update(of=("self",)).get_or_create(entity=entity, prefix=prefix, year=year)
     seq.last_number += 1
     seq.save(update_fields=["last_number"])
     return f"{entity.code}-{prefix}-{year}-{seq.last_number:0{width}d}"
@@ -307,7 +307,7 @@ def create_agreement(user, *, entity, counterparty, service_type, ctx=None, **fi
 
 @transaction.atomic
 def update_agreement(user, agreement, ctx=None, **fields):
-    agreement = A.objects.select_for_update().get(pk=agreement.pk)
+    agreement = A.objects.select_for_update(of=("self",)).get(pk=agreement.pk)
     _require(user, agreement.entity, "intercompany.agreement.create")
     _require_creator(user, agreement)
     if agreement.status != A.Status.DRAFT:
@@ -325,7 +325,7 @@ def update_agreement(user, agreement, ctx=None, **fields):
 
 @transaction.atomic
 def add_rate(user, agreement, *, role_en, role_ar, hourly_rate, valid_from, valid_to=None, ctx=None):
-    agreement = A.objects.select_for_update().get(pk=agreement.pk)
+    agreement = A.objects.select_for_update(of=("self",)).get(pk=agreement.pk)
     _require(user, agreement.entity, "intercompany.agreement.create")
     _require_creator(user, agreement)
     if agreement.pricing_method != A.Pricing.TIMESHEET:
@@ -343,7 +343,7 @@ def add_rate(user, agreement, *, role_en, role_ar, hourly_rate, valid_from, vali
 def suspend_agreement(user, agreement, reason, from_date=None, ctx=None):
     """Stops billing from `from_date` (default today): the suspension period is recorded and its days are
     never billed (re-review A). Resuming needs a new approval (submit the suspended agreement)."""
-    agreement = A.objects.select_for_update().get(pk=agreement.pk)
+    agreement = A.objects.select_for_update(of=("self",)).get(pk=agreement.pk)
     _require(user, agreement.entity, "intercompany.agreement.manage")
     _require_human(user)
     if not (reason or "").strip():
@@ -370,7 +370,7 @@ def suspend_agreement(user, agreement, reason, from_date=None, ctx=None):
 def close_suspensions(agreement, resumed_on=None):
     """On resume (final approval): the open suspension ends the day before the resume date."""
     resumed_on = resumed_on or today()
-    for sp in AgreementSuspension.objects.select_for_update().filter(agreement=agreement, end_date__isnull=True):
+    for sp in AgreementSuspension.objects.select_for_update(of=("self",)).filter(agreement=agreement, end_date__isnull=True):
         sp.end_date = max(resumed_on - datetime.timedelta(days=1), sp.start_date - datetime.timedelta(days=1))
         with workflow(sp):
             sp.save()
@@ -397,7 +397,7 @@ def _is_suspended(ranges, day):
 
 @transaction.atomic
 def end_agreement(user, agreement, end_date, reason, ctx=None):
-    agreement = A.objects.select_for_update().get(pk=agreement.pk)
+    agreement = A.objects.select_for_update(of=("self",)).get(pk=agreement.pk)
     _require(user, agreement.entity, "intercompany.agreement.manage")
     _require_human(user)
     if not (reason or "").strip():
@@ -450,7 +450,7 @@ def create_timesheet(user, agreement, *, worker=None, ctx=None, **fields):
 
 @transaction.atomic
 def update_timesheet(user, entry, ctx=None, **fields):
-    entry = TS.objects.select_for_update().get(pk=entry.pk)
+    entry = TS.objects.select_for_update(of=("self",)).get(pk=entry.pk)
     _require(user, entry.entity, "intercompany.timesheet.create")
     if user.pk not in (entry.created_by_id, entry.user_id):
         raise AccessDenied("not_own_entry", "You can edit your own entries only.", "يمكنك تعديل سجلاتك فقط.")
@@ -468,7 +468,7 @@ def update_timesheet(user, entry, ctx=None, **fields):
 
 @transaction.atomic
 def submit_timesheet(user, entry, ctx=None):
-    entry = TS.objects.select_for_update().get(pk=entry.pk)
+    entry = TS.objects.select_for_update(of=("self",)).get(pk=entry.pk)
     _require(user, entry.entity, "intercompany.timesheet.create")
     _require_human(user)
     if user.pk not in (entry.user_id, entry.created_by_id) and not access.has_perm(
@@ -484,7 +484,7 @@ def submit_timesheet(user, entry, ctx=None):
 
 @transaction.atomic
 def approve_timesheet(user, entry, ctx=None):
-    entry = TS.objects.select_for_update().get(pk=entry.pk)
+    entry = TS.objects.select_for_update(of=("self",)).get(pk=entry.pk)
     _require(user, entry.entity, "intercompany.timesheet.approve")
     _require_human(user)
     if user.pk in (entry.user_id, entry.created_by_id):
@@ -498,7 +498,7 @@ def approve_timesheet(user, entry, ctx=None):
 
 @transaction.atomic
 def reject_timesheet(user, entry, reason, ctx=None):
-    entry = TS.objects.select_for_update().get(pk=entry.pk)
+    entry = TS.objects.select_for_update(of=("self",)).get(pk=entry.pk)
     _require(user, entry.entity, "intercompany.timesheet.approve")
     _require_human(user)
     if not (reason or "").strip():
@@ -568,7 +568,7 @@ def compute_pool_period(pool, period, user=None, ctx=None):
     if period.entity_id != pool.entity_id:
         raise RuleError("period_entity", "The period belongs to another entity.", "الفترة تتبع منشأة أخرى.")
     with transaction.atomic():
-        cpp = CostPoolPeriod.objects.select_for_update().filter(cost_pool=pool, period=period).first()
+        cpp = CostPoolPeriod.objects.select_for_update(of=("self",)).filter(cost_pool=pool, period=period).first()
         if cpp is None:
             cpp = CostPoolPeriod(entity=pool.entity, cost_pool=pool, period=period, created_by=user,
                                  **source_fields(user))
@@ -735,7 +735,7 @@ def _live_lines():
 
 def _timesheet_lines(agreement, start, end, adjustment):
     """Approved unbilled hours in the window, or (adjustment=True) late-approved hours dated before it."""
-    qs = TS.objects.select_for_update().filter(agreement=agreement, status=TS.Status.APPROVED, invoice_line__isnull=True)
+    qs = TS.objects.select_for_update(of=("self",)).filter(agreement=agreement, status=TS.Status.APPROVED, invoice_line__isnull=True)
     qs = qs.filter(date__lt=start, date__gte=agreement.start_date) if adjustment else qs.filter(date__gte=start,
                                                                                                 date__lte=end)
     if agreement.end_date:
@@ -828,7 +828,7 @@ def _build_lines(agreement, period, key, start, end, days, notes):
         out += _timesheet_lines(agreement, start, end, adjustment=True)
     elif agreement.pricing_method == P.COST_PLUS:
         cpp = compute_pool_period(agreement.cost_pool, period)
-        cpp = CostPoolPeriod.objects.select_for_update().select_related("cost_pool", "period").get(pk=cpp.pk)
+        cpp = CostPoolPeriod.objects.select_for_update(of=("self",)).select_related("cost_pool", "period").get(pk=cpp.pk)
         if cpp.amount > ZERO:
             share, share_text = allocation_share(agreement, period)
             share = share * fraction  # D14: pool share pro-rated by active days
@@ -842,7 +842,7 @@ def _build_lines(agreement, period, key, start, end, days, notes):
         if not out:
             raise RuleError("pool_empty", f"Cost pool {agreement.cost_pool.code} has no cost in {period.name}.",
                             f"لا توجد تكاليف في المجمع {agreement.cost_pool.code} للفترة {period.name}.")
-    items = BillableItem.objects.select_for_update().filter(
+    items = BillableItem.objects.select_for_update(of=("self",)).filter(
         agreement=agreement, status=BillableItem.Status.OPEN, period_end__lte=end).order_by("period_start", "id")
     ranges = suspended_ranges(agreement)
     for item in items:
@@ -863,7 +863,7 @@ def _late_lines(agreement, period, notes):
     elif agreement.pricing_method == A.Pricing.COST_PLUS:
         out += _pool_adjustments(agreement, period, notes)
     ranges = suspended_ranges(agreement)
-    items = BillableItem.objects.select_for_update().filter(
+    items = BillableItem.objects.select_for_update(of=("self",)).filter(
         agreement=agreement, status=BillableItem.Status.OPEN, period_end__lte=agreement.end_date).order_by("period_start", "id")
     for item in items:
         if _is_suspended(ranges, item.period_start):
@@ -973,7 +973,7 @@ def _check_run_period(entity, period):
 def close_ended_agreements(entity=None, on=None):
     """Review 2: agreements whose end date has passed become ended (they stay billable up to that date)."""
     on = on or today()
-    qs = A.objects.select_for_update().filter(status__in=[A.Status.ACTIVE, A.Status.SUSPENDED], end_date__lt=on)
+    qs = A.objects.select_for_update(of=("self",)).filter(status__in=[A.Status.ACTIVE, A.Status.SUSPENDED], end_date__lt=on)
     if entity is not None:
         qs = qs.filter(entity=entity)
     closed = 0
@@ -1010,7 +1010,7 @@ def _run(user, entity, period, ctx):
     run = BillingRun.objects.create(entity=entity, period=period, run_date=today(), created_by=user,
                                     **source_fields(user))
     log, created = [], 0
-    agreements = (A.objects.select_for_update().filter(entity=entity, start_date__lte=period.end_date)
+    agreements = (A.objects.select_for_update(of=("self",)).filter(entity=entity, start_date__lte=period.end_date)
                   .exclude(status=A.Status.DRAFT).exclude(status=A.Status.ENDED, activated_at__isnull=True)
                   .order_by("number"))
     for a in agreements:
@@ -1043,7 +1043,7 @@ def _run(user, entity, period, ctx):
 def create_invoice_draft(user, agreement, period, ctx=None):
     """One agreement, one period, outside a run (agents may do this: drafts only, R20, D15)."""
     _require(user, agreement.entity, "intercompany.invoice.create")
-    agreement = A.objects.select_for_update().get(pk=agreement.pk)
+    agreement = A.objects.select_for_update(of=("self",)).get(pk=agreement.pk)
     period = _check_run_period(agreement.entity, period)
     inv = _draft_invoice(agreement, period, user)
     _audit(user, "intercompany.invoice.create", inv, after=snapshot(inv), ctx=ctx)
@@ -1054,7 +1054,7 @@ def create_invoice_draft(user, agreement, period, ctx=None):
 def update_invoice_draft(user, invoice, *, lines=None, credit_reason_en=None, credit_reason_ar=None, ctx=None):
     """Draft edits are text only: line descriptions (both languages) and credit-note reasons. Amounts come
     from the agreement and billed records; to change them cancel the draft and bill again."""
-    invoice = INV.objects.select_for_update().get(pk=invoice.pk)
+    invoice = INV.objects.select_for_update(of=("self",)).get(pk=invoice.pk)
     _require(user, invoice.entity, "intercompany.invoice.create")
     _require_creator(user, invoice)
     if invoice.status != INV.Status.DRAFT:
@@ -1104,7 +1104,7 @@ def _release(inv):
 
 @transaction.atomic
 def cancel_draft(user, invoice, reason="", ctx=None):
-    invoice = INV.objects.select_for_update().get(pk=invoice.pk)
+    invoice = INV.objects.select_for_update(of=("self",)).get(pk=invoice.pk)
     _require(user, invoice.entity, "intercompany.invoice.create")
     if not user.is_human:
         _require_creator(user, invoice)
@@ -1141,7 +1141,7 @@ def deadline_alerts(on=None):
 
     on = on or today()
     alerted = []
-    live = INV.objects.select_for_update().filter(
+    live = INV.objects.select_for_update(of=("self",)).filter(
         kind=INV.Kind.INVOICE, status__in=[INV.Status.DRAFT, INV.Status.PENDING_APPROVAL, INV.Status.APPROVED],
         deadline_alerted_at__isnull=True).select_related("entity", "counterparty")
     with transaction.atomic():
@@ -1218,7 +1218,7 @@ def create_credit_note(user, invoice, *, reason_en, reason_ar, trigger_date, lin
     """Full (lines=None) or partial credit note. lines: [{"line": InvoiceLine or id, "net_amount": Decimal}].
     A credit note can never exceed the original's uncredited balance (R13). trigger_date: date of the event
     that causes the credit (D13)."""
-    invoice = INV.objects.select_for_update().get(pk=invoice.pk)
+    invoice = INV.objects.select_for_update(of=("self",)).get(pk=invoice.pk)
     _require(user, invoice.entity, "intercompany.invoice.create")
     if invoice.kind != INV.Kind.INVOICE or invoice.status != INV.Status.ISSUED:
         raise Conflict("not_issued", "Credit notes are raised on issued invoices only.",
@@ -1370,7 +1370,7 @@ def validate_for_issue(inv):
     problems += _party_problems(inv.entity, "seller", need_vat=True)
     problems += _party_problems(inv.counterparty, "buyer", need_vat=False)
     if inv.is_credit_note:
-        original = INV.objects.select_for_update().get(pk=inv.credit_of_id)
+        original = INV.objects.select_for_update(of=("self",)).get(pk=inv.credit_of_id)
         if original.status != INV.Status.ISSUED:
             problems.append("The original invoice is not issued.")
         for l in lines:
@@ -1439,7 +1439,7 @@ def _issue(invoice, approver=None, actor=None, ctx=None):
     """R11: number, journal entry (create_entry + post_entry, system entry) and status in one transaction.
     D13: dated the actual issue date, so the entry goes to the open period of that date. A ledger refusal
     (e.g. the issue month is closed) rolls everything back, including the number."""
-    inv = INV.objects.select_for_update().select_related("entity", "counterparty", "agreement").get(pk=invoice.pk)
+    inv = INV.objects.select_for_update(of=("self",)).select_related("entity", "counterparty", "agreement").get(pk=invoice.pk)
     if inv.status != INV.Status.APPROVED:
         raise Conflict("not_approved", "Only approved invoices can be issued.", "يمكن إصدار الفواتير المعتمدة فقط.")
     validate_for_issue(inv)
@@ -1514,7 +1514,7 @@ def bill_snapshot(bill):
 def update_bill_coding(user, bill, lines, ctx=None):
     """R16: only expense account and cost centre change. lines: {line_id: {"expense_account": Account|code,
     "cost_centre": str}}. Amounts, dates and VAT are refused by the model."""
-    bill = BILL.objects.select_for_update().get(pk=bill.pk)
+    bill = BILL.objects.select_for_update(of=("self",)).get(pk=bill.pk)
     _require(user, bill.entity, "intercompany.bill.edit")
     _require_human(user)
     if bill.status not in (BILL.Status.DRAFT, BILL.Status.DISPUTED):
@@ -1546,7 +1546,7 @@ def update_bill_coding(user, bill, lines, ctx=None):
 
 @transaction.atomic
 def dispute_bill(user, bill, reason, ctx=None):
-    bill = BILL.objects.select_for_update().get(pk=bill.pk)
+    bill = BILL.objects.select_for_update(of=("self",)).get(pk=bill.pk)
     _require(user, bill.entity, "intercompany.bill.edit")
     _require_human(user)
     if not (reason or "").strip():
@@ -1560,7 +1560,7 @@ def dispute_bill(user, bill, reason, ctx=None):
 
 @transaction.atomic
 def undispute_bill(user, bill, ctx=None):
-    bill = BILL.objects.select_for_update().get(pk=bill.pk)
+    bill = BILL.objects.select_for_update(of=("self",)).get(pk=bill.pk)
     _require(user, bill.entity, "intercompany.bill.edit")
     _require_human(user)
     if bill.status != BILL.Status.DISPUTED:
@@ -1576,7 +1576,7 @@ def submit_bill(user, bill, ctx=None):
     creator for segregation of duties); the MP of the receiver approves (D7)."""
     from approvals import services as approvals
 
-    bill = BILL.objects.select_for_update().get(pk=bill.pk)
+    bill = BILL.objects.select_for_update(of=("self",)).get(pk=bill.pk)
     _require(user, bill.entity, "intercompany.bill.edit")
     _require_human(user)
     if bill.status != BILL.Status.DRAFT:
@@ -1618,7 +1618,7 @@ def check_bill_postable(bill):
 
 def post_bill(bill):
     """Called by final approval of the bill (D11) inside the approval transaction."""
-    bill = BILL.objects.select_for_update().get(pk=bill.pk)
+    bill = BILL.objects.select_for_update(of=("self",)).get(pk=bill.pk)
     if bill.status != BILL.Status.APPROVED:
         raise Conflict("not_approved", "Only approved bills can be posted.", "يمكن ترحيل الفواتير المعتمدة فقط.")
     check_bill_postable(bill)
