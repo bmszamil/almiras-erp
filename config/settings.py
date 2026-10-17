@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     "ledger",
     "invoicing",
     "hr",
+    "billing",
     "zatca",
 ]
 
@@ -92,9 +93,12 @@ HR_REQUIRE_VERIFIED_PARAMETERS = os.environ.get("HR_REQUIRE_VERIFIED_PARAMETERS"
 # only, for rotation). Development falls back to a key derived from SECRET_KEY; the hr.E001 check refuses that
 # fallback when DEBUG is off.
 HR_PERSONAL_DATA_KEYS = [k for k in os.environ.get("HR_PERSONAL_DATA_KEYS", "").split(",") if k]
-# R24/R25: where ended secondments are delivered (billing.md 3.6). The default sends nothing: billing is not built,
-# so no billing assignment is linked to any HR assignment.
-HR_BILLING_PORT = "hr.billing_port.UnlinkedBillingPort"
+# R24/R25: where ended secondments are delivered (billing.md 3.6, R57): billing's port, which ends linked billing
+# secondments through billing.services.end_secondment(..., source="hr_event").
+HR_BILLING_PORT = "billing.hr_port.BillingHrPort"
+# billing.md R13, R43: the invoicing services billing calls (create_from_billing and create_adjustment_from_billing
+# are still stubs in invoicing; billing is tested against billing.testing.FakeInvoicing).
+BILLING_INVOICING_PORT = "billing.invoicing_port.InvoicingServicesPort"
 # R38/R41: where HR hands a terminated employee's final-settlement inputs to payroll (payroll.md 3.8, not built).
 HR_PAYROLL_PORT = "hr.payroll_port.NoPayrollPort"
 HR_ASSIGNMENT_EVENT_MAX_ATTEMPTS = 5  # R25 default
