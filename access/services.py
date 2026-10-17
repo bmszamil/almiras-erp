@@ -239,9 +239,11 @@ def can_view_security(user, row):
 
 
 @transaction.atomic
-def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ctx=None, setup=False):
+def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ctx=None, setup=False,
+                 _approved_change=None):
     """Grant a role. granter=None is the operator bootstrap (`grant_access` command).
-    D19: roles of a Managing Partner change only through a Chairman (or setup mode)."""
+    D19: roles of a Managing Partner change only through a Chairman (or setup mode).
+    D21: roles of a Chairman change only through an applied dual-control change (`_approved_change`)."""
     if is_system_user(user):
         raise RuleError("system_user", "The ERP system user cannot be given roles.",
                         "لا يمكن منح أدوار لمستخدم النظام.")
@@ -254,7 +256,9 @@ def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ct
             f"Service agents cannot hold role {role.code}.",
             f"لا يمكن لوكلاء الخدمة حمل الدور {role.code}.",
         )
-    if granter is not None:
+    if _approved_change is not None:
+        _require_applying(_approved_change, user)
+    elif granter is not None:
         _require_grant_rights(granter, user, entity, role, setup)
     grant, created = EntityAccess.objects.get_or_create(
         user=user, entity=entity, role=role,
@@ -268,20 +272,42 @@ def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ct
         grant.revoked_at = None
         grant.granted_by = granter
         grant.save()
-    audit(granter or system_user(), "access.grant", grant, entity=entity, before=before, after=snapshot(grant), ctx=ctx)
+    audit(granter or system_user(), "access.grant", grant, entity=entity, before=before,
+          after=_with_change(snapshot(grant), _approved_change), ctx=ctx)
     return grant
 
 
 @transaction.atomic
-def revoke_access(revoker, grant, ctx=None, setup=False):
+def revoke_access(revoker, grant, ctx=None, setup=False, _approved_change=None):
     if revoker is None:
         raise AccessDenied("permission_denied", "A revoke needs an acting user.", "يتطلب السحب مستخدماً منفذاً.")
-    _require_grant_rights(revoker, grant.user, grant.entity, grant.role, setup)
+    if _approved_change is not None:
+        _require_applying(_approved_change, grant.user)
+    else:
+        _require_grant_rights(revoker, grant.user, grant.entity, grant.role, setup)
     before = snapshot(grant)
     grant.revoked_at = timezone.now()
     grant.save(update_fields=["revoked_at"])
-    audit(revoker, "access.revoke", grant, entity=grant.entity, before=before, after=snapshot(grant), ctx=ctx)
+    audit(revoker, "access.revoke", grant, entity=grant.entity, before=before,
+          after=_with_change(snapshot(grant), _approved_change), ctx=ctx)
     return grant
+
+
+def _require_applying(change, target):
+    """D21: only a dual-control change that is being applied right now (both approvals given, see
+    access.dual_control.apply) may change a Chairman's account without the normal checks."""
+    from .models import ChairmanChange
+
+    if not (isinstance(change, ChairmanChange) and getattr(change, "_applying", False) is True
+            and change.status == ChairmanChange.Status.APPLIED and change.target_id == target.pk):
+        raise AccessDenied("chairman_dual_control", "This change needs an approved dual-control request (D21).",
+                           "يتطلب هذا التغيير طلب رقابة مزدوجة معتمداً (D21).")
+
+
+def _with_change(after, change):
+    if change is None:
+        return after
+    return {**(after or {}), "chairman_change": change.pk}
 
 
 def _require_grant_rights(actor, user, entity, role, setup):
@@ -290,8 +316,9 @@ def _require_grant_rights(actor, user, entity, role, setup):
     - Nobody grants or revokes their own roles, in any mode (closes self-promotion to Chairman).
     - D19: only a holder of the Chairman role in that entity grants or revokes the Chairman role, so
       nobody can create a Chairman to get around the Managing Partner protection. Setup mode excepted.
-    - D19/D21: roles of a Managing Partner or Chairman change only through a Chairman of all of their
-      MP and Chairman entities (can_manage_user).
+    - D19: roles of a Managing Partner change only through a Chairman of all of their MP entities.
+    - D21: roles of a Chairman change only through a dual-control change (CFO + MP of the group root),
+      so here they are refused for everyone except setup mode (can_manage_user).
     - Otherwise access.entity_access.manage in the entity.
     """
     if actor.pk == user.pk:
@@ -354,9 +381,9 @@ def can_manage_user(actor, target, setup=False):
     - Nobody manages themselves; the ERP system user is never managed (2a).
     - D19: a Managing Partner is managed only by a user holding the Chairman role (an active grant)
       in every entity where the target is MP. Other MPs and user managers cannot. Setup mode excepted.
-    - D21: a Chairman is protected the same way: managed only by another Chairman holding an active
-      grant in every entity where the target is Chairman (and, if the target is also MP, in every MP
-      entity). A Managing Partner never manages a Chairman, even one who also holds the Chairman role.
+    - D21: nobody alone manages a user holding the Chairman role (any non-revoked grant) — not another
+      Chairman, not the MP, not the CFO. Changes go through access.dual_control (CFO + MP of the group
+      root entity). Setup mode and operator commands (no acting user) excepted.
     - Everyone else (review B): access.user.manage in every entity where the target holds a grant.
     - Superusers are managed only in setup mode.
     """
@@ -368,10 +395,9 @@ def can_manage_user(actor, target, setup=False):
         return True
     if target.is_superuser:
         return False
-    mp_of, chair_of = mp_entities(target), chairman_entities(target)
-    if chair_of and is_protected_mp(actor):
-        return False  # D21: an MP can never manage a Chairman
-    protected = mp_of | chair_of
+    if is_protected_chairman(target):
+        return False  # D21: dual control only
+    protected = mp_entities(target)
     if protected:
         chair = set(active_grants(actor).filter(role__code=CHAIRMAN_ROLE_CODE).values_list("entity_id", flat=True))
         return protected <= chair
@@ -384,41 +410,51 @@ def can_manage_user(actor, target, setup=False):
     return target_entities <= managed
 
 
-def mp_holders(role):
-    """Managing Partners and Chairmen (D21) holding `role` (any non-revoked grant)."""
-    holders = User.objects.filter(entity_access__role=role, entity_access__revoked_at__isnull=True).distinct()
-    return [u for u in holders if is_protected(u)]
+def role_holders(role):
+    """Users holding `role` (any non-revoked grant)."""
+    return list(User.objects.filter(entity_access__role=role, entity_access__revoked_at__isnull=True).distinct())
+
+
+def role_affects_chairman(role):
+    """D21: editing the chairman role, or a role any Chairman holds, changes a Chairman's privileges."""
+    return role.code == CHAIRMAN_ROLE_CODE or any(is_protected_chairman(u) for u in role_holders(role))
 
 
 def can_edit_role(actor, role, setup=False):
-    """D19 for role edits: changing a role held by a Managing Partner changes that MP's privileges, so
-    the editor must be able to manage every MP or Chairman (D21) holding it (see can_manage_user). The
-    managing_partner and chairman roles themselves always need a Chairman. The normal
-    role-edit right is checked separately (admin). Setup mode excepted."""
+    """Role edits change the privileges of everyone holding the role.
+
+    - D21: a role affecting a Chairman is changed only through a dual-control change (refused here).
+    - D19: a role held by a Managing Partner (and managing_partner itself) needs a Chairman who can
+      manage every MP holding it (see can_manage_user).
+    The normal role-edit right is checked separately (admin). Setup mode excepted."""
     if setup:
         return True
-    holders = mp_holders(role)
-    if role.code not in (MP_ROLE_CODE, CHAIRMAN_ROLE_CODE) and not holders:
+    if role_affects_chairman(role):
+        return False
+    mps = [u for u in role_holders(role) if is_protected_mp(u)]
+    if role.code != MP_ROLE_CODE and not mps:
         return True
     if actor is None or not active_grants(actor).filter(role__code=CHAIRMAN_ROLE_CODE).exists():
         return False
-    return all(can_manage_user(actor, mp) for mp in holders)
+    return all(can_manage_user(actor, mp) for mp in mps)
 
 
 def require_manage_user(actor, target, setup=False):
     if not can_manage_user(actor, target, setup=setup):
         if actor is not None and actor.pk != target.pk and not is_system_user(target):
+            if is_protected_chairman(target):
+                raise AccessDenied(
+                    "chairman_dual_control",
+                    "A Chairman's account changes only through a dual-control request approved by a CFO and a "
+                    "Managing Partner of the group (D21).",
+                    "لا يتغير حساب رئيس مجلس الإدارة إلا بطلب رقابة مزدوجة يعتمده المدير المالي والشريك المدير "
+                    "للمجموعة (D21).",
+                )
             if is_protected_mp(target):
                 raise AccessDenied(
                     "mp_protected",
                     "Only the Chairman can change, lock or disable a Managing Partner (D19).",
                     "لا يحق إلا لرئيس مجلس الإدارة تعديل الشريك المدير أو قفله أو تعطيله (D19).",
-                )
-            if is_protected_chairman(target):
-                raise AccessDenied(
-                    "chairman_protected",
-                    "Only another Chairman can change, lock or disable a Chairman (D21).",
-                    "لا يحق إلا لرئيس مجلس إدارة آخر تعديل رئيس مجلس الإدارة أو قفله أو تعطيله (D21).",
                 )
         raise AccessDenied(
             "cannot_manage_user",
@@ -448,17 +484,21 @@ def create_user(actor, *, username, full_name_en, full_name_ar, email="", langua
 
 
 @transaction.atomic
-def deactivate_user(actor, user, ctx=None, setup=False):
-    """R3: users are deactivated, never deleted. D19 applies to Managing Partners."""
+def deactivate_user(actor, user, ctx=None, setup=False, _approved_change=None):
+    """R3: users are deactivated, never deleted. D19 applies to Managing Partners, D21 to Chairmen."""
     if actor is None or is_system_user(user):
         raise AccessDenied("cannot_manage_user", "This user cannot be deactivated here.", "لا يمكن تعطيل هذا المستخدم هنا.")
-    require_manage_user(actor, user, setup=setup)
+    if _approved_change is not None:
+        _require_applying(_approved_change, user)
+    else:
+        require_manage_user(actor, user, setup=setup)
     before = snapshot(user, ["is_active"])
     user.is_active = False
     user.save(update_fields=["is_active"])
     for token in user.service_tokens.filter(revoked_at__isnull=True):
         revoke_service_token(actor, token, ctx=ctx, setup=setup)
-    audit(actor, "access.user.deactivate", user, before=before, after=snapshot(user, ["is_active"]), ctx=ctx)
+    audit(actor, "access.user.deactivate", user, before=before,
+          after=_with_change(snapshot(user, ["is_active"]), _approved_change), ctx=ctx)
     return user
 
 
@@ -526,13 +566,15 @@ def revoke_service_token(actor, token, ctx=None, setup=False):
 
 
 @transaction.atomic
-def enroll_totp(actor, user, name="Authenticator app", ctx=None, setup=False):
+def enroll_totp(actor, user, name="Authenticator app", ctx=None, setup=False, _approved_change=None):
     """Create a confirmed TOTP device (D14). Replaces a device of the same name. Returns the device."""
     from django_otp.plugins.otp_totp.models import TOTPDevice
 
     if is_system_user(user):
         raise RuleError("system_user", "The ERP system user cannot sign in.", "لا يمكن لمستخدم النظام تسجيل الدخول.")
-    if actor is not None and actor.pk != user.pk:
+    if _approved_change is not None:
+        _require_applying(_approved_change, user)
+    elif actor is not None and actor.pk != user.pk:
         require_manage_user(actor, user, setup=setup)
     if not user.is_human or not user.is_active:
         raise RuleError("totp_for_human", "Authenticator apps are for active human users.",
@@ -541,7 +583,8 @@ def enroll_totp(actor, user, name="Authenticator app", ctx=None, setup=False):
     TOTPDevice.objects.filter(pk__in=replaced).delete()
     device = TOTPDevice.objects.create(user=user, name=name, confirmed=True)
     audit(actor or system_user(), "access.totp.enroll", user,
-          after={"device_id": device.pk, "name": name, "replaced_devices": replaced}, ctx=ctx)
+          after=_with_change({"device_id": device.pk, "name": name, "replaced_devices": replaced}, _approved_change),
+          ctx=ctx)
     return device
 
 
@@ -591,11 +634,304 @@ def access_review_report(viewer, on=None, ctx=None):
 
 
 @transaction.atomic
-def unlock_user(actor, user, ctx=None, setup=False):
+def unlock_user(actor, user, ctx=None, setup=False, _approved_change=None):
     """Clear a sign-in lockout for `user` (failures before this point stop counting). Audited.
     actor=None is the `unlock_user` management command (server operator)."""
     if is_system_user(user):
         raise RuleError("system_user", "The ERP system user cannot sign in.", "لا يمكن لمستخدم النظام تسجيل الدخول.")
-    if actor is not None:
+    if _approved_change is not None:
+        _require_applying(_approved_change, user)
+    elif actor is not None:
         require_manage_user(actor, user, setup=setup)
-    return audit(actor or system_user(), "access.unlock", user, after={"username": user.username}, ctx=ctx)
+    return audit(actor or system_user(), "access.unlock", user,
+                 after=_with_change({"username": user.username}, _approved_change), ctx=ctx)
+
+
+# ---------------------------------------------------------------- D21: dual control for Chairman accounts
+
+DUAL_CONTROL_ROLES = ("cfo", MP_ROLE_CODE)
+CHAIRMAN_UPDATE_FIELDS = {"is_active", "is_staff", "full_name_en", "full_name_ar", "email", "language"}
+
+
+def group_root_entity():
+    """The group root entity (no parent). D21 approvals come from its CFO and MP."""
+    roots = list(Entity.objects.filter(parent__isnull=True, is_active=True)[:2])
+    if len(roots) != 1:
+        raise RuleError("no_group_root", "Exactly one active group root entity is needed for dual control.",
+                        "يلزم وجود منشأة أم واحدة نشطة للمجموعة للرقابة المزدوجة.")
+    return roots[0]
+
+
+def _affected_chairmen(change):
+    if change.target_id:
+        return {change.target_id}
+    return {u.pk for u in role_holders(change.role) if is_protected_chairman(u)}
+
+
+def _dual_roles(user, entity):
+    return set(active_grants(user, entity).filter(role__code__in=DUAL_CONTROL_ROLES)
+               .values_list("role__code", flat=True))
+
+
+def _require_dual_approver(actor, change):
+    """A CFO or MP of the root entity; active human; never an affected Chairman (D21)."""
+    if actor is None or not actor.is_active or not actor.is_human:
+        raise AccessDenied("dual_control_approver", "Only active people can request or approve this change.",
+                           "يقدّم هذا التغيير أو يعتمده الأشخاص النشطون فقط.")
+    if actor.pk in _affected_chairmen(change):
+        raise AccessDenied("dual_control_own_account", "A Chairman cannot request or approve changes to his own "
+                           "account or roles (D21).", "لا يحق لرئيس مجلس الإدارة طلب تغيير حسابه أو أدواره أو اعتماده (D21).")
+    roles = _dual_roles(actor, change.entity)
+    if not roles:
+        raise AccessDenied(
+            "dual_control_approver",
+            f"Only a CFO or Managing Partner of {change.entity.code} can request or approve changes to a "
+            "Chairman's account (D21).",
+            f"لا يحق إلا للمدير المالي أو الشريك المدير في {change.entity.code} طلب تغيير حساب رئيس مجلس الإدارة "
+            "أو اعتماده (D21).",
+        )
+    return roles
+
+
+def _clean_payload(action, target, role, payload, entity):
+    from django.contrib.auth.hashers import make_password
+    from django.contrib.auth.password_validation import validate_password
+    from django.core.exceptions import ValidationError
+
+    from .models import ChairmanChange as CC
+
+    payload = dict(payload or {})
+    if action == CC.Action.PASSWORD:
+        raw = payload.pop("password", "")
+        try:
+            validate_password(raw, target)
+        except ValidationError as exc:
+            raise RuleError("invalid_password", " ".join(exc.messages), "كلمة المرور غير مقبولة.")
+        return {"password_hash": make_password(raw)}  # never stored in plain text
+    if action == CC.Action.TOTP:
+        return {"name": payload.get("name") or "Authenticator app"}
+    if action in (CC.Action.DEACTIVATE, CC.Action.UNLOCK):
+        return {}
+    if action == CC.Action.UPDATE:
+        fields = payload.get("fields") or {}
+        bad = set(fields) - CHAIRMAN_UPDATE_FIELDS
+        if not fields or bad:
+            raise RuleError("invalid_fields", f"Fields that can change here: {sorted(CHAIRMAN_UPDATE_FIELDS)}.",
+                            "الحقول المسموح بتغييرها هنا محدودة.")
+        return {"fields": fields}
+    if action == CC.Action.GRANT:
+        grant_role = Role.objects.get(code=payload["role"])
+        grant_entity = Entity.objects.get(code=payload["entity"])
+        return {"role": grant_role.code, "entity": grant_entity.code,
+                "valid_from": to_json(payload.get("valid_from")), "valid_to": to_json(payload.get("valid_to"))}
+    if action == CC.Action.REVOKE:
+        grant = EntityAccess.objects.get(pk=payload["grant"], user=target, revoked_at__isnull=True)
+        return {"grant": grant.pk, "role": grant.role.code, "entity": grant.entity.code}
+    if action == CC.Action.ROLE_PERMISSIONS:
+        codes = sorted(set(payload.get("permissions") or []))
+        from .models import Permission
+
+        found = set(Permission.objects.filter(code__in=codes).values_list("code", flat=True))
+        if found != set(codes):
+            raise RuleError("unknown_permission", f"Unknown permissions: {sorted(set(codes) - found)}.",
+                            "صلاحيات غير معروفة.")
+        return {"permissions": codes}
+    raise RuleError("invalid_action", "Unknown change.", "تغيير غير معروف.")
+
+
+def _public_payload(change):
+    return {k: v for k, v in change.payload.items() if k != "password_hash"}
+
+
+@transaction.atomic
+def request_chairman_change(actor, action, *, target=None, role=None, payload=None, entity=None, ctx=None):
+    """D21: a CFO or MP of the group root proposes a change to a Chairman's account (or to a role a
+    Chairman holds). Their request counts as their approval; a second person in the other role must
+    approve before it applies."""
+    import datetime as _dt
+
+    from django.conf import settings
+
+    from .models import ChairmanChange as CC, ChairmanChangeApproval
+
+    entity = entity or group_root_entity()
+    if entity.parent_id is not None:
+        raise RuleError("not_root_entity", "Dual control runs in the group root entity.",
+                        "تتم الرقابة المزدوجة في المنشأة الأم للمجموعة.")
+    action = CC.Action(action)
+    if action == CC.Action.ROLE_PERMISSIONS:
+        if role is None or target is not None or not role_affects_chairman(role):
+            raise RuleError("not_chairman_change", "Use the normal role edit: no Chairman holds this role.",
+                            "استخدم تعديل الأدوار المعتاد: لا يحمل أي رئيس مجلس إدارة هذا الدور.")
+    elif target is None or role is not None or not is_protected_chairman(target):
+        raise RuleError("not_chairman_change", "Dual control is only for users holding the Chairman role.",
+                        "الرقابة المزدوجة لحسابات رؤساء مجلس الإدارة فقط.")
+    if target is not None and is_system_user(target):
+        raise RuleError("system_user", "The ERP system user cannot be changed.", "لا يمكن تعديل مستخدم النظام.")
+    days = getattr(settings, "ERP_CHAIRMAN_CHANGE_EXPIRY_DAYS", 7)
+    at = timezone.now()
+    change = CC(entity=entity, target=target, role=role, action=action, requested_by=actor, requested_at=at,
+                expires_at=at + _dt.timedelta(days=days))
+    roles = _require_dual_approver(actor, change)
+    change.payload = _clean_payload(action, target, role, payload, entity)
+    change.save()
+    ChairmanChangeApproval.objects.create(change=change, approver=actor, roles=sorted(roles), at=at)
+    audit(actor, "access.chairman_change.request", change, entity=entity,
+          after={"action": action, "target": target.pk if target else None, "role": role.code if role else None,
+                 "payload": _public_payload(change), "expires_at": change.expires_at, "approver_roles": sorted(roles)},
+          ctx=ctx)
+    return change
+
+
+def _expire_if_due(change):
+    """Commit the expiry of a due request in its own transaction (so the caller's refusal keeps it)."""
+    from .models import ChairmanChange as CC
+
+    with transaction.atomic():
+        locked = CC.objects.select_for_update().get(pk=change.pk)
+        if locked.status != CC.Status.PENDING or locked.expires_at > timezone.now():
+            return False
+        locked.status = CC.Status.EXPIRED
+        locked.decided_at = timezone.now()
+        locked._allow_save = True
+        locked.save(update_fields=["status", "decided_at"])
+        audit(system_user(), "access.chairman_change.expire", locked, entity=locked.entity,
+              before={"status": CC.Status.PENDING}, after={"status": CC.Status.EXPIRED})
+    return True
+
+
+def expire_chairman_changes():
+    """Cron helper: expire all due pending requests. Returns how many expired."""
+    from .models import ChairmanChange as CC
+
+    due = CC.objects.filter(status=CC.Status.PENDING, expires_at__lte=timezone.now())
+    return sum(1 for c in due if _expire_if_due(c))
+
+
+def _dual_complete(change):
+    """Two distinct approvers, one currently a CFO and the other currently an MP of the root entity."""
+    people = [(a.approver, _dual_roles(a.approver, change.entity)) for a in change.approvals.select_related("approver")
+              if a.approver.is_active and a.approver.pk not in _affected_chairmen(change)]
+    for i, (u1, r1) in enumerate(people):
+        for u2, r2 in people[i + 1:]:
+            if u1.pk != u2.pk and (("cfo" in r1 and MP_ROLE_CODE in r2) or (MP_ROLE_CODE in r1 and "cfo" in r2)):
+                return True
+    return False
+
+
+def _lock_pending(change):
+    from .errors import Conflict
+    from .models import ChairmanChange as CC
+
+    locked = CC.objects.select_for_update().select_related("entity", "target", "role").get(pk=change.pk)
+    if locked.status != CC.Status.PENDING:
+        raise Conflict("dual_control_decided", f"This request is already {locked.status}.",
+                       "تم البت في هذا الطلب.")
+    if locked.expires_at <= timezone.now():  # expired between the pre-check and the lock
+        raise Conflict("dual_control_expired", "This request has expired.", "انتهت صلاحية هذا الطلب.")
+    return locked
+
+
+def _refuse_if_expired(change):
+    """Run before the caller's transaction so a committed expiry survives the refusal."""
+    from .errors import Conflict
+
+    if _expire_if_due(change):
+        raise Conflict("dual_control_expired", "This request has expired.", "انتهت صلاحية هذا الطلب.")
+
+
+def approve_chairman_change(actor, change, ctx=None):
+    """Second approval. Applies the change when a CFO and an MP (two people) have approved. Returns
+    (change, result); result is the applied object (e.g. the new TOTP device) or None."""
+    from .errors import Conflict
+    from .models import ChairmanChangeApproval
+
+    _refuse_if_expired(change)
+    with transaction.atomic():
+        change = _lock_pending(change)
+        roles = _require_dual_approver(actor, change)
+        if change.approvals.filter(approver=actor).exists():
+            raise Conflict("dual_control_same_person", "You have already approved this request; a second person "
+                           "must approve.", "سبق أن اعتمدت هذا الطلب؛ يجب أن يعتمده شخص آخر.")
+        ChairmanChangeApproval.objects.create(change=change, approver=actor, roles=sorted(roles))
+        audit(actor, "access.chairman_change.approve", change, entity=change.entity,
+              after={"approver_roles": sorted(roles)}, ctx=ctx)
+        result = None
+        if _dual_complete(change):
+            result = _apply_chairman_change(actor, change, ctx)
+        return change, result
+
+
+def reject_chairman_change(actor, change, reason="", ctx=None):
+    _refuse_if_expired(change)
+    with transaction.atomic():
+        return _reject(actor, change, reason, ctx)
+
+
+def _reject(actor, change, reason, ctx):
+    from .models import ChairmanChange as CC
+
+    change = _lock_pending(change)
+    _require_dual_approver(actor, change)
+    change.status = CC.Status.REJECTED
+    change.decided_at, change.decided_by, change.reason = timezone.now(), actor, reason or ""
+    change._allow_save = True
+    change.save(update_fields=["status", "decided_at", "decided_by", "reason"])
+    audit(actor, "access.chairman_change.reject", change, entity=change.entity,
+          before={"status": CC.Status.PENDING}, after={"status": change.status, "reason": change.reason}, ctx=ctx)
+    return change
+
+
+def _apply_chairman_change(actor, change, ctx):
+    from .models import ChairmanChange as CC
+
+    change.status = CC.Status.APPLIED
+    change.decided_at, change.decided_by = timezone.now(), actor
+    change._allow_save = True
+    change.save(update_fields=["status", "decided_at", "decided_by"])
+    change._applying = True
+    target, p, result = change.target, change.payload, None
+    try:
+        if change.action == CC.Action.PASSWORD:
+            before = {"has_usable_password": target.has_usable_password()}
+            target.password = p["password_hash"]
+            target.save(update_fields=["password"])
+            audit(actor, "access.user.password_change", target, before=before,
+                  after={"chairman_change": change.pk}, ctx=ctx)
+        elif change.action == CC.Action.TOTP:
+            result = enroll_totp(actor, target, name=p["name"], ctx=ctx, _approved_change=change)
+        elif change.action == CC.Action.DEACTIVATE:
+            result = deactivate_user(actor, target, ctx=ctx, _approved_change=change)
+        elif change.action == CC.Action.UNLOCK:
+            result = unlock_user(actor, target, ctx=ctx, _approved_change=change)
+        elif change.action == CC.Action.UPDATE:
+            fields = sorted(p["fields"])
+            before = snapshot(target, fields)
+            for f in fields:
+                setattr(target, f, p["fields"][f])
+            target.full_clean(exclude=["password"])
+            target.save(update_fields=fields)
+            privileged = set(fields) & {"is_active", "is_staff"}
+            audit(actor, "access.user.privilege_change" if privileged else "access.user.update", target,
+                  before=before, after=_with_change(snapshot(target, fields), change), ctx=ctx)
+        elif change.action == CC.Action.GRANT:
+            vf, vt = p.get("valid_from"), p.get("valid_to")
+            result = grant_access(actor, target, Entity.objects.get(code=p["entity"]), p["role"],
+                                  valid_from=datetime.date.fromisoformat(vf) if vf else None,
+                                  valid_to=datetime.date.fromisoformat(vt) if vt else None,
+                                  ctx=ctx, _approved_change=change)
+        elif change.action == CC.Action.REVOKE:
+            result = revoke_access(actor, EntityAccess.objects.get(pk=p["grant"]), ctx=ctx, _approved_change=change)
+        elif change.action == CC.Action.ROLE_PERMISSIONS:
+            from .models import Permission
+
+            role = change.role
+            before = sorted(role.permissions.values_list("code", flat=True))
+            role.permissions.set(Permission.objects.filter(code__in=p["permissions"]))
+            audit(actor, "access.role.change", role, entity=None, before={"permissions": before},
+                  after={"permissions": p["permissions"], "chairman_change": change.pk}, ctx=ctx)
+    finally:
+        change._applying = False
+    audit(actor, "access.chairman_change.apply", change, entity=change.entity,
+          after={"action": change.action, "payload": _public_payload(change)}, ctx=ctx)
+    return result

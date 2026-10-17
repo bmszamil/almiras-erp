@@ -291,3 +291,92 @@ class ServiceToken(models.Model):
 
     def __str__(self):
         return f"token {self.label or self.pk} for {self.user}"
+
+
+class ChairmanChangeQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise BilingualError("dual_control", "Dual-control changes move only through their service.",
+                             "لا تتغير طلبات الرقابة المزدوجة إلا عبر خدمتها.")
+
+    def delete(self):
+        raise BilingualError("dual_control", "Dual-control changes cannot be deleted.",
+                             "لا يمكن حذف طلبات الرقابة المزدوجة.")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        self.update()
+
+
+class ChairmanChange(models.Model):
+    """D21 dual control: a proposed change to the account of a user holding the Chairman role (or to a
+    role a Chairman holds). Applies only after a CFO and a Managing Partner of the group root entity,
+    two distinct people and neither of them an affected Chairman, have both approved. The requester's
+    request counts as their approval. Created and moved only through access.dual_control."""
+
+    class Action(models.TextChoices):
+        PASSWORD = "password", "Set password"
+        TOTP = "totp_enroll", "Enrol authenticator app"
+        DEACTIVATE = "deactivate", "Deactivate"
+        UNLOCK = "unlock", "Clear sign-in lockout"
+        UPDATE = "update", "Change account fields"
+        GRANT = "grant", "Grant role"
+        REVOKE = "revoke", "Revoke role"
+        ROLE_PERMISSIONS = "role_permissions", "Change role permissions"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPLIED = "applied", "Applied"
+        REJECTED = "rejected", "Rejected"
+        EXPIRED = "expired", "Expired"
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+",
+                               help_text="The group root entity whose CFO and MP approve")
+    target = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+                               help_text="The Chairman whose account changes (empty for role edits)")
+    role = models.ForeignKey(Role, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+                             help_text="The role whose permissions change (role edits only)")
+    action = models.CharField(max_length=20, choices=Action.choices)
+    payload = models.JSONField(default=dict, blank=True, help_text="Proposed change; passwords only as a hash")
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name="+")
+    requested_at = models.DateTimeField(default=timezone.now)
+    expires_at = models.DateTimeField()
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    reason = models.TextField(blank=True)
+
+    objects = ChairmanChangeQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["-requested_at", "-id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(target__isnull=False) | models.Q(role__isnull=False),
+                name="chairman_change_has_subject",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding and getattr(self, "_allow_save", False) is not True:
+            raise BilingualError("dual_control", "Dual-control changes move only through their service.",
+                                 "لا تتغير طلبات الرقابة المزدوجة إلا عبر خدمتها.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise BilingualError("dual_control", "Dual-control changes cannot be deleted.",
+                             "لا يمكن حذف طلبات الرقابة المزدوجة.")
+
+    def __str__(self):
+        subject = self.target or self.role
+        return f"{self.get_action_display()} for {subject} ({self.status})"
+
+
+class ChairmanChangeApproval(AppendOnlyModel):
+    """One approval of a ChairmanChange (append-only). The request itself is the requester's approval."""
+
+    change = models.ForeignKey(ChairmanChange, on_delete=models.PROTECT, related_name="approvals")
+    approver = models.ForeignKey(User, on_delete=models.PROTECT, related_name="+")
+    roles = models.JSONField(default=list, help_text="Dual-control roles the approver held when approving")
+    at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["change", "approver"], name="unique_chairman_change_approver")]

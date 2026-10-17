@@ -182,6 +182,9 @@ ERP_LOCKOUT_MINUTES = 15        # ... within this window lock password sign-in
 # Admin setup mode: superusers bypass entity scoping only while this is on (initial setup).
 ERP_ADMIN_SETUP_MODE = os.environ.get("ERP_ADMIN_SETUP_MODE", "0") == "1"
 
+# D21: dual-control requests to change a Chairman's account expire after this many days.
+ERP_CHAIRMAN_CHANGE_EXPIRY_DAYS = int(os.environ.get("ERP_CHAIRMAN_CHANGE_EXPIRY_DAYS", "7"))
+
 # Reverse proxies whose X-Forwarded-For header is trusted for the client IP (comma-separated IPs).
 ERP_TRUSTED_PROXIES = [p for p in os.environ.get("ERP_TRUSTED_PROXIES", "").split(",") if p.strip()]
 
