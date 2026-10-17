@@ -241,6 +241,12 @@ class BankAccount(ServiceWritten):
     active_from = models.DateField(bi("Active from", "نشط من"))
     active_to = models.DateField(bi("Active to", "نشط حتى"), null=True, blank=True)
     status = models.CharField(bi("Status", "الحالة"), max_length=6, choices=Status.choices, default=Status.DRAFT)
+    is_purification_account = models.BooleanField(
+        bi("Purification account", "حساب التطهير"), default=False,
+        help_text=bi("The entity's designated account for purification money (invoicing R54, D31b): Saudi IBAN, SAR, "
+                     "GL account 1140; set and changed only with the R7 approval",
+                     "الحساب المخصص لمبالغ التطهير: آيبان سعودي، بالريال، حساب الأستاذ 1140؛ يُحدد ويُغيَّر باعتماد فقط"),
+    )
     warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -263,6 +269,10 @@ class BankAccount(ServiceWritten):
             # R5: one active bank account per GL account, so the GL balance is that account's book balance.
             models.UniqueConstraint(fields=["gl_account"], condition=models.Q(status="active"),
                                     name="bank_account_one_active_per_gl"),
+            # D31b: one purification account (draft or active) per entity.
+            models.UniqueConstraint(fields=["entity"],
+                                    condition=models.Q(is_purification_account=True, status__in=["draft", "active"]),
+                                    name="bank_account_one_purification_per_entity"),
         ]
 
     @property
@@ -295,6 +305,9 @@ class BankAccountChange(ServiceWritten):
     currency = models.ForeignKey(Currency, to_field="code", null=True, blank=True, on_delete=models.PROTECT,
                                  related_name="+")
     gl_account = models.ForeignKey("ledger.Account", null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    purification_account = models.BooleanField(
+        bi("Purification account (designate / remove)", "حساب التطهير (تحديد / إلغاء)"), null=True, blank=True,
+        help_text=bi("Empty: unchanged (D31b)", "فارغ: دون تغيير"))
     reason = models.CharField(bi("Reason", "السبب"), max_length=300)
     status = models.CharField(max_length=8, choices=Status.choices, default=Status.DRAFT)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")

@@ -48,11 +48,13 @@ class BankAdmin(admin.ModelAdmin):
 
 @admin.register(BankAccount)
 class BankAccountAdmin(ReadOnlyBankingAdmin):
-    list_display = ["code", "entity", "name_en", "name_ar", "bank", "masked_number", "currency", "gl_account", "status"]
+    list_display = ["code", "entity", "name_en", "name_ar", "bank", "masked_number", "currency", "gl_account", "status",
+                    "is_purification_account"]
     list_filter = [("entity", admin.RelatedOnlyFieldListFilter), "status"]
     fields = ["entity", "code", "name_en", "name_ar", "bank", "masked_number", "currency", "gl_account",
               "sharia_basis", "statement_format", "opening_statement_date", "opening_statement_balance",
-              "active_from", "active_to", "status", "warnings", "created_by", "approved_by", "approved_at"]
+              "active_from", "active_to", "status", "is_purification_account", "warnings", "created_by", "approved_by",
+              "approved_at"]
     readonly_fields = fields
 
     @admin.display(description="IBAN / account (masked) / الآيبان أو الحساب (مخفي)")

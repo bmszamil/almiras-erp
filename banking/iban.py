@@ -69,3 +69,20 @@ def masked(country_or_iban, last_four):
     """``SA•• •••• … 1234`` (R4): never more than the country code and the last four characters."""
     prefix = (country_or_iban or "")[:2] if country_or_iban else "••"
     return f"{prefix}•• •••• … {last_four}" if last_four else ""
+
+
+_SAUDI_DIGITS = re.compile(r"^SA[0-9]{22}$")
+
+
+def saudi_problems(value):
+    """Bilingual problems of a **Saudi** IBAN for purification money (invoicing R54 amendment D31b): ``SA`` followed
+    by 22 digits, with a valid ISO 13616 mod-97 check. Stricter than :func:`problems` for ``SA`` (which allows
+    letters in the account part, R3): the purification account and charity recipients need the all-digit form."""
+    iban = normalise(value)
+    if not iban:
+        return ["A Saudi IBAN is required. / رقم آيبان سعودي مطلوب."]
+    if not _SAUDI_DIGITS.match(iban):
+        return ["A Saudi IBAN is SA followed by 22 digits. / الآيبان السعودي يتكون من SA متبوعة بـ 22 رقمًا."]
+    if not mod97_ok(iban) or not 2 <= int(iban[2:4]) <= 98:  # ISO 13616 check digits are 02 to 98
+        return ["The IBAN check digits are wrong (ISO 13616 mod-97). / خانتا التحقق في رقم الآيبان غير صحيحتين."]
+    return []

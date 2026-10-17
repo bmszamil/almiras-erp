@@ -60,6 +60,9 @@ from .parsers import parse as parse_statement_file
 ZERO = Decimal("0")
 BOOKED = (JournalEntry.Status.POSTED, JournalEntry.Status.REVERSED)
 BANK_GL_ROOT = "1100"
+# invoicing R54 amendment D31b: the designated purification account is a SAR account with a Saudi IBAN on GL 1140
+# (PROPOSED per D29); GL 1140 is used by that account only.
+PURIFICATION_GL, PURIFICATION_CURRENCY = "1140", "SAR"
 BANK_CHARGES, ISLAMIC_PROFIT, CHARITY_PAYABLE = "5700", "4600", "2600"
 # R28, R29: words by which a bank labels interest or penalties (English and Arabic). A credit so labelled is
 # conventional interest (never income); a debit so labelled is a Sharia exception (OQ-7).
@@ -344,9 +347,48 @@ def _set_identifiers(account, norm, number):
     account.account_number_last4 = number[-4:] if number else ""
 
 
+def _designation_problems(entity, *, designated, bank, currency, gl, iban, exclude=None):
+    """D31b (invoicing R54 amendment): a purification account is the entity's only one (draft or active), at a Saudi
+    bank, with a Saudi IBAN (``SA`` + 22 digits, valid mod-97), in SAR and on GL account 1140; GL 1140 is used by
+    the purification account only."""
+    out = []
+    if not designated:
+        if gl is not None and gl.code == PURIFICATION_GL:
+            out.append(f"GL account {PURIFICATION_GL} is kept for the purification account only (D31b). / "
+                       f"حساب الأستاذ {PURIFICATION_GL} مخصص لحساب التطهير فقط.")
+        return out
+    if bank.country != "SA":
+        out.append("The purification account is held at a Saudi bank (D31b). / يكون حساب التطهير لدى بنك سعودي.")
+    out += [f"Purification account: {p}" if " / " not in p else
+            "Purification account: " + p.replace(" / ", " / حساب التطهير: ", 1)
+            for p in iban_rules.saudi_problems(iban)]
+    if getattr(currency, "code", currency) != PURIFICATION_CURRENCY:
+        out.append("The purification account is in SAR (D31b). / يكون حساب التطهير بالريال السعودي.")
+    if gl is None or gl.code != PURIFICATION_GL:
+        out.append(f"The purification account is booked on GL account {PURIFICATION_GL} (D31b). / "
+                   f"يُقيد حساب التطهير على حساب الأستاذ {PURIFICATION_GL}.")
+    other = BankAccount.objects.filter(entity=entity, is_purification_account=True,
+                                       status__in=[BankAccount.Status.DRAFT, BankAccount.Status.ACTIVE])
+    other = (other.exclude(pk=exclude.pk) if exclude is not None and exclude.pk else other).first()
+    if other is not None:
+        out.append(f"{entity.code} already has purification account {other.code}; close it or change it through an "
+                   f"approved change first (D31b, R7). / لدى الكيان {entity.code} حساب تطهير {other.code}؛ "
+                   "أغلقه أو غيّره بطلب تعديل معتمد أولًا.")
+    return out
+
+
+def _check_designation(entity, account, *, designated=None, bank=None, currency=None, gl=None, iban=None):
+    problems = _designation_problems(
+        entity, designated=account.is_purification_account if designated is None else designated,
+        bank=bank or account.bank, currency=currency or account.currency, gl=gl or account.gl_account,
+        iban=account.iban if iban is None else iban, exclude=account)
+    if problems:
+        raise _problems(problems, "purification_account_invalid")
+
+
 ACCOUNT_FIELDS = ("code", "name_en", "name_ar", "bank", "currency", "gl_account", "sharia_basis", "statement_format",
                   "csv_layout", "opening_statement_date", "opening_statement_balance", "active_from", "active_to",
-                  "iban", "account_number")
+                  "iban", "account_number", "is_purification_account")
 
 
 def _account_problems(entity, account):
@@ -372,8 +414,11 @@ def _account_problems(entity, account):
 
 def create_bank_account(entity, *, user, code, name_en, name_ar, bank, currency, gl_account, sharia_basis,
                         statement_format, opening_statement_date, opening_statement_balance, active_from,
-                        active_to=None, iban="", account_number="", csv_layout=None):
-    """Draft a bank account (R3 to R7); it becomes active only when another person approves it."""
+                        active_to=None, iban="", account_number="", csv_layout=None, is_purification_account=False):
+    """Draft a bank account (R3 to R7); it becomes active only when another person approves it.
+
+    ``is_purification_account`` drafts the entity's purification account (D31b): Saudi IBAN, SAR, GL 1140; the
+    designation takes effect when another person approves the account (R7)."""
     access.require(user, entity, "banking.manage_bank_account")
     bank, cur, gl = _bank(bank), _currency(currency), _gl(entity, gl_account)
     _same_entity(entity, csv_layout, "CSV layout", "تنسيق CSV")
@@ -383,11 +428,12 @@ def create_bank_account(entity, *, user, code, name_en, name_ar, bank, currency,
         entity=entity, code=code, name_en=name_en, name_ar=name_ar, bank=bank, currency=cur, gl_account=gl,
         sharia_basis=sharia_basis, statement_format=statement_format, csv_layout=csv_layout,
         opening_statement_date=opening_statement_date, opening_statement_balance=balance, active_from=active_from,
-        active_to=active_to, created_by=user, warnings=warnings,
+        active_to=active_to, created_by=user, warnings=warnings, is_purification_account=bool(is_purification_account),
     )
     problems += _gl_problems(entity, gl, cur) + _account_problems(entity, account)
     if problems:
         raise _problems(problems, "bank_account_invalid")
+    _check_designation(entity, account, iban=norm)
     _set_identifiers(account, norm, number)
     with transaction.atomic():
         try:
@@ -398,13 +444,13 @@ def create_bank_account(entity, *, user, code, name_en, name_ar, bank, currency,
                         code="bank_account_invalid") from None
         _event(entity, user, Event.BANK_ACCOUNT_CREATED, account, {
             "code": code, "number": account.masked_number, "currency": cur.code, "gl_account": gl.code,
-            "bank": bank.code, "warnings": warnings,
+            "bank": bank.code, "warnings": warnings, "purification_account": account.is_purification_account,
         })
     return account
 
 
 DRAFT_ONLY_FIELDS = ("code", "bank", "currency", "gl_account", "sharia_basis", "opening_statement_date",
-                     "opening_statement_balance", "active_from", "iban", "account_number")
+                     "opening_statement_balance", "active_from", "iban", "account_number", "is_purification_account")
 ACTIVE_EDITABLE = ("name_en", "name_ar", "active_to", "statement_format", "csv_layout")
 
 
@@ -446,6 +492,8 @@ def update_bank_account(account, *, user, **changes):
                      "active_from", "active_to"):
             if name in changes:
                 setattr(account, name, changes[name])
+        if "is_purification_account" in changes:
+            account.is_purification_account = bool(changes["is_purification_account"])
         if "opening_statement_balance" in changes:
             account.opening_statement_balance = _money(changes["opening_statement_balance"], account.currency,
                                                        "opening statement balance", positive=False)
@@ -462,6 +510,7 @@ def update_bank_account(account, *, user, **changes):
                 account.warnings = warnings
         if problems:
             raise _problems(problems, "bank_account_invalid")
+        _check_designation(entity, account)
         account.modified_by, account.modified_at = user, timezone.now()
         _save(account)
         _event(entity, user, Event.BANK_ACCOUNT_CHANGED, account, {
@@ -487,6 +536,7 @@ def approve_bank_account(account, *, user):
         problems = _gl_problems(entity, account.gl_account, account.currency, exclude=account)
         if problems:
             raise _problems(problems, "bank_account_invalid")
+        _check_designation(entity, account)  # D31b: the purification account is designated on this approval
         gl = Account.objects.select_for_update().get(pk=account.gl_account_id)
         if gl.currency_id is None:  # R6: set at setup, before any posting
             gl.currency_id = account.currency_id
@@ -499,7 +549,9 @@ def approve_bank_account(account, *, user):
         except IntegrityError:
             raise error("Another active bank account uses this GL account or IBAN (R5).",
                         "يوجد حساب بنكي نشط آخر يستخدم حساب الأستاذ أو الآيبان نفسه.", code="bank_account_invalid") from None
-        _event(entity, user, Event.BANK_ACCOUNT_ACTIVATED, account, {"code": account.code, "number": account.masked_number})
+        _event(entity, user, Event.BANK_ACCOUNT_ACTIVATED, account, {
+            "code": account.code, "number": account.masked_number,
+            "purification_account": account.is_purification_account})
         return account
 
 
@@ -508,8 +560,12 @@ def _has_history(account):
 
 
 def propose_bank_account_change(account, *, user, reason, iban=None, account_number=None, currency=None,
-                                gl_account=None):
-    """R7: a new IBAN, account number, currency or GL account for an active account, to be approved."""
+                                gl_account=None, purification_account=None):
+    """R7: a new IBAN, account number, currency or GL account for an active account, to be approved.
+
+    ``purification_account`` (True / False) designates the account as the entity's purification account or
+    removes the designation (D31b); the result must keep the D31b rules (Saudi IBAN, SAR, GL 1140 only for it),
+    so a designation usually comes with a GL change to 1140, which R7 allows only before any history."""
     account = _account(account)
     entity = account.entity
     access.require(user, entity, "banking.manage_bank_account")
@@ -537,11 +593,19 @@ def propose_bank_account_change(account, *, user, reason, iban=None, account_num
             problems += more
             change.iban, change.account_number = norm, number
             change.iban_hash, change.iban_last4 = (keyed_hash(norm), iban_rules.last4(norm)) if norm else ("", "")
+        if purification_account is not None:
+            change.purification_account = bool(purification_account)
         if problems:
             raise _problems(problems, "bank_account_invalid")
+        _check_designation(entity, account, designated=change.purification_account, currency=cur,
+                           gl=change.gl_account or account.gl_account, iban=change.iban or account.iban)
+        if not any((change.currency_id, change.gl_account_id, change.iban, change.account_number,
+                    change.purification_account is not None)):
+            raise error("The change request changes nothing.", "طلب التعديل لا يغيّر شيئًا.", code="nothing_to_change")
         _save(change)
         _event(entity, user, Event.BANK_ACCOUNT_CHANGED, change, {"requested": True, "reason": reason,
-                                                                  "new_number_last4": change.iban_last4})
+                                                                  "new_number_last4": change.iban_last4,
+                                                                  "purification_account": change.purification_account})
         return change
 
 
@@ -564,6 +628,11 @@ def approve_bank_account_change(change, *, user):
             account.gl_account_id = change.gl_account_id
         if change.iban or change.account_number:
             _set_identifiers(account, change.iban, change.account_number)
+        if change.purification_account is not None:
+            account.is_purification_account = change.purification_account
+        _check_designation(entity, account, bank=Bank.objects.get(pk=account.bank_id),
+                           currency=Currency.objects.get(code=account.currency_id),
+                           gl=Account.objects.get(pk=account.gl_account_id))
         account.modified_by, account.modified_at = change.created_by, timezone.now()
         try:
             with transaction.atomic():
@@ -590,10 +659,30 @@ def close_bank_account(account, *, user, active_to, reason):
             raise error("Post or discard the account's open bank transactions first.",
                         "رحّل العمليات البنكية المفتوحة للحساب أو ألغها أولًا.", code="pending_documents")
         account = BankAccount.objects.select_for_update(of=("self",)).get(pk=account.pk)
+        if account.is_purification_account:
+            booked = JournalLine.objects.filter(account_id=account.gl_account_id, entry__status__in=BOOKED).aggregate(
+                d=Sum("debit"), c=Sum("credit"))
+            left = ((booked["d"] or ZERO) - (booked["c"] or ZERO)).quantize(Decimal("0.01"))  # SAR (D31b)
+            if left != ZERO:
+                raise error(f"The purification account still holds {left} on GL {PURIFICATION_GL}; pay it out or move "
+                            "it first (D31b).",
+                            f"لا يزال في حساب التطهير {left} على حساب الأستاذ {PURIFICATION_GL}؛ اصرفه أو انقله أولًا.",
+                            code="purification_balance")
         account.status, account.active_to = BankAccount.Status.CLOSED, active_to
         _save(account)
         _event(entity, user, Event.BANK_ACCOUNT_CLOSED, account, {"active_to": active_to, "reason": reason})
         return account
+
+
+def purification_account(entity, *, user, lock=False):
+    """The entity's active purification account (D31b), or None (``banking.view``). ``lock``: the row is locked
+    until the caller's transaction ends, so an approved change cannot slip in between check and posting."""
+    access.require(user, entity, "banking.view")
+    _agent_read(user, entity, "purification_account")
+    qs = BankAccount.objects.filter(entity=entity, is_purification_account=True, status=BankAccount.Status.ACTIVE)
+    if lock:
+        qs = qs.select_for_update(of=("self",), no_key=True)
+    return qs.select_related("entity", "bank", "currency", "gl_account").first()
 
 
 def bank_accounts(entity, *, user):
@@ -625,7 +714,8 @@ def account_row(account, *, user):
     access.require(user, account.entity, "banking.view")
     return {"id": account.pk, "code": account.code, "name_en": account.name_en, "name_ar": account.name_ar,
             "bank_en": account.bank.name_en, "bank_ar": account.bank.name_ar, "number": account.masked_number,
-            "currency": account.currency_id, "status": account.status}
+            "currency": account.currency_id, "status": account.status,
+            "purification_account": account.is_purification_account}
 
 
 def bank_account_detail(account, *, user):
