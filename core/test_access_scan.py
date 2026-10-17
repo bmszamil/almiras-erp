@@ -51,6 +51,8 @@ ALLOW = {
     "hr/services.py:deliver_assignment_events": "hr_deliver_assignment_events job (acts as the HR user who ended it)",
     "hr/services.py:send_document_alerts": "hr_document_alerts job only (hr R43)",
     "hr/services.py:refresh_statuses": "hr_refresh_status job only (dated status changes, hr R8, R23, R38)",
+    "migration/services.py:account_maps": "the scope mechanism for account maps (access.scope with migration.view)",
+    "migration/services.py:imported_entries": "the scope mechanism for imported entries (access.scope with migration.view)",
     "zatca/services.py:einvoices": "the scope mechanism for e-invoices (access.scope with zatca.view, R-3)",
     "zatca/services.py:einvoice_statuses": "the scope mechanism for statuses (access.scope with zatca.view_status, R-34)",
     "zatca/services.py:is_issued": "invoicing port read: may the buyer get this document (R-22, R-23); writes nothing",

@@ -17,7 +17,7 @@ whose exports can be described with a column map, and for every entity, which is
 
 | # | Decision | Who | Date |
 |---|---|---|---|
-| M1 | The legacy system is Falcon. Journal export structure: one xlsx sheet, Arabic headers, one row per line, columns مدين, دائن, رقم القيد (yy + 6-digit sequence), مسلسل القيد, اسم الحساب, بيان, نوع الحركه, التاريخ, مركز التكلفة, الحركة ("Journal" or "مستخلص عميل"), رقم الحركة, كود الحساب (3 to 5 digits; first digit 1 assets, 2 liabilities/equity, 4 income, 5 expense). Lines are debit-only or credit-only, ≤ 2 dp, SAR. | Project owner (via caller brief) | 2026-10-17 |
+| M1 | The legacy system is Falcon. Journal export structure: one xlsx sheet, Arabic headers, one row per line, columns مدين, دائن, رقم القيد (yy + 6-digit sequence), مسلسل القيد, اسم الحساب, بيان, نوع الحركه, التاريخ, مركز التكلفة, الحركة ("Journal" or "مستخلص عميل"), رقم الحركة, كود الحساب (3 to 5 digits; first digit 1 assets, 2 liabilities/equity, 4 income, 5 expense). Lines are debit-only or credit-only, ≤ 2 dp, SAR. | Project owner (via caller brief); decision pack A10 (`docs/approvals/owner-cfo-decision-pack-2026-10-17-answered.docx`, = invoicing D32(p)): Almiras does not use Daftra | 2026-10-17 |
 | M2 | Chart-of-accounts and trial-balance exports come later in an unknown format: readers take a configurable column map. | Project owner (via caller brief) | 2026-10-17 |
 | M3 | Agents never read real Almiras data; development and tests use synthetic fixtures only. | Project owner (via caller brief); CLAUDE.md | 2026-10-17 |
 | M4 | Opening balances: one entry per entity at the cut-over date, against 3900, drafted then posted by a second person, through `ledger.services` only. Account mapping approved by a second person before use. Commands dry-run by default; `--apply` and a human user are needed to write. | Project owner (via caller brief); migration-agent rules | 2026-10-17 |
@@ -76,7 +76,9 @@ The validation report and profiles are not stored: they are printed and optional
    code with an amount blocks loading. Codes whose first digit contradicts the ERP account type are refused when the
    map row is written (1 → asset, 2 → liability or equity, 4 → income, 5 → expense; other digits: warning).
 8. The mapped ERP account is postable, active, not report-only (3400), not Sharia-prohibited where the entity
-   enforces Sharia; an intercompany account needs the row's counterparty (another entity).
+   enforces Sharia; an intercompany account needs the row's counterparty (another entity). A code mapped to a
+   control account (1200, 2100, 1210, 2110, 2310, 2320; invoicing R97, policy A) is a warning: once R97 is built the
+   ledger refuses manual-journal lines on them, so their balances must come from invoicing import documents (OQ-11).
 9. Totals by Falcon account and by ERP account (debit, credit, net), entries by source (`Journal`,
    `مستخلص عميل`), date range, and entries already imported are part of the report.
 10. Trial balance: duplicate codes refused; rows whose code is a prefix of another row's code are treated as
@@ -95,7 +97,8 @@ The validation report and profiles are not stored: they are printed and optional
     validation against a draft map reports "map not approved" as blocking. Matches are never guessed.
 
 **Loading** (dry run unless applied; human users only; nothing is created when the report has an error)
-14. Opening entry: one per entity and source system, dated the cut-over date, drafted with
+14. Opening entry: one per entity and source system (a re-run with the same balances is skipped; other balances are
+    refused until the draft is discarded or the entry reversed), dated the cut-over date, drafted with
     `ledger.services.create_entry(..., source="import")`, reference `FALCON-OPENING`. One line per Falcon code with a
     balance (mapped account, description "Falcon <code> <name>"); zero balances skipped. The TB must balance. Balance
     basis: `closing` (default, no replay) or `opening` (when the year's journals are replayed after it). With
@@ -188,3 +191,16 @@ SUB; synthetic Falcon files with fake names and amounts, built in the test.
 | OQ-8 | Meaning of مسلسل القيد (line number or global serial). | Accountant | Informational only |
 | OQ-9 | One Falcon company per export file, and which Falcon company is which entity. | Owner | One entity per file |
 | OQ-10 | Legacy balances on accounts that are Sharia-prohibited in the ERP (e.g. conventional loans in a Sharia entity). | Sharia board / CFO | Blocked; human decision |
+| OQ-11 | Invoicing R97 (policy A) forbids manual journals on control accounts 1200, 2100, 1210, 2110, 2310, 2320, including opening-balance journals (invoicing AT-115). Opening balances and replayed Falcon entries on them then need invoicing import documents (open items per customer/vendor, invoicing OQ-24), or an allow-listed migration document type. | CFO + invoicing builder | **GL** when R97 is built; until then they load as manual drafts with a warning |
+
+## 10. Runbook (per entity; raw exports under `exports/`, which git ignores)
+
+1. `migration_map --entity E --user <accountant> --import docs/migration/<entity>-account-map.csv --apply`
+   (layout: `docs/migration/account-map-template.csv`); the approver runs `--approve <version> --apply`.
+2. `migration_validate --entity E --user <accountant> --journal exports/journal.xlsx --tb exports/tb.csv
+   --tb-columns docs/migration/falcon-tb-columns.example.json --cutover <date> --report exports/report.csv`
+   until it has no error; warnings are reviewed and decided by a person.
+3. `migration_load ... --cutover <date> --tb ... [--journal ...]` (dry run), then with `--apply` (drafts).
+4. `migration_tieout --entity E --user <approver> --tb ... --as-of <date>`: the accountant signs off this report.
+5. `migration_post --entity E --user <approver> --kind opening --apply`, then `--kind journal --apply`.
+6. `migration_tieout ... --posted-only` again: zero differences to the halala.

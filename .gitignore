@@ -3,3 +3,6 @@ __pycache__/
 db.sqlite3
 .env
 .pytest_cache/
+# Raw legacy exports (Falcon or other systems) never enter git (migration.md R20).
+exports/
+migration/exports/

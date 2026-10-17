@@ -1,0 +1,14 @@
+{
+  "_comment": "Example column map for a trial-balance export (migration.md R3). The real Falcon TB layout is not known yet (OQ-1): replace the header texts with the export's own. Values: header text, list of alternatives, or 1-based column number. Use either closing (signed, debit positive) or closing_debit + closing_credit; the same for opening.",
+  "columns": {
+    "code": ["كود الحساب", "رقم الحساب"],
+    "name": "اسم الحساب",
+    "opening_debit": "رصيد أول المدة مدين",
+    "opening_credit": "رصيد أول المدة دائن",
+    "movement_debit": "حركة مدين",
+    "movement_credit": "حركة دائن",
+    "closing_debit": "الرصيد الختامي مدين",
+    "closing_credit": "الرصيد الختامي دائن"
+  },
+  "header_row": null
+}

@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     "billing",
     "zatca",
     "banking",
+    "migration",
 ]
 
 # ZATCA hand-off (invoicing.zatca_port), implemented by the zatca app (docs/specs/zatca.md). An entity without a
