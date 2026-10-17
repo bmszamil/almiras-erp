@@ -3048,7 +3048,7 @@ def reverse_purification_transfer(transfer, *, user, reason, date=None):
             instruction.cancelled_by, instruction.cancelled_at = user, timezone.now()
             instruction.cancel_reason = doc.reversal_reason
             instruction._service_write = True
-            instruction.save()
+            instruction.save(update_fields=["status", "cancelled_by", "cancelled_at", "cancel_reason"])
     return doc
 
 
@@ -3136,7 +3136,7 @@ def approve_charity_recipient(recipient, *, user):
                         code="recipient_inactive")
         recipient.approved_by, recipient.approved_at = user, timezone.now()
         recipient._service_write = True
-        recipient.save()
+        recipient.save(update_fields=["approved_by", "approved_at"])  # never re-encrypts the IBAN
     return recipient
 
 
@@ -3157,7 +3157,7 @@ def deactivate_charity_recipient(recipient, *, user, reason):
         recipient.deactivated_by, recipient.deactivated_at = user, timezone.now()
         recipient.deactivation_reason = reason.strip()[:300]
         recipient._service_write = True
-        recipient.save()
+        recipient.save(update_fields=["is_active", "deactivated_by", "deactivated_at", "deactivation_reason"])
     return recipient
 
 
