@@ -57,6 +57,30 @@ def test_access_at49_recorder_posts_receipt_but_not_refund_bill_or_other_entity(
     assert services.post_receipt(receipt(w, "20.00"), user=w.clerk2).posted_by == w.clerk2
 
 
+@pytest.mark.parametrize("segregation", [True, False])
+def test_r46_recorder_cannot_self_post_a_receipt_with_a_bank_charge(w, segregation):
+    """Reviewer round 6: a clerk recorded 1,150.00 with bank charge 1,149.99 and posted it alone, writing off the
+    invoice to 5700. Only a receipt without bank charge is self-posted (R46); otherwise a second person posts."""
+    services.update_settings(w.alm, user=w.cfo, segregation_required=segregation)
+    inv = final(w, invoice(w))
+    r = receipt(w, "1150.00", bank_charge="1149.99", applications=[(inv, "1150.00")])
+    with pytest.raises(access.AccessDenied) as exc:
+        services.post_receipt(r, user=w.clerk)
+    assert exc.value.code == "self_approval"
+    r.refresh_from_db()
+    assert (r.status, r.number, r.journal_entry_id) == ("draft", "", None)
+    posted = services.post_receipt(r, user=w.clerk2)  # a second person may post it
+    assert (posted.status, posted.posted_by) == ("posted", w.clerk2)
+    lines = sorted((l.account.code, l.debit, l.credit) for l in posted.journal_entry.lines.select_related("account"))
+    assert lines == [("1100", D("0.01"), D("0")), ("1200", D("0"), D("1150.00")), ("5700", D("1149.99"), D("0"))]
+
+
+def test_r46_recorder_still_self_posts_a_receipt_with_zero_bank_charge(w):
+    inv = final(w, invoice(w))
+    r = receipt(w, "1150.00", bank_charge="0.00", applications=[(inv, "1150.00")])
+    assert services.post_receipt(r, user=w.clerk).posted_by == w.clerk
+
+
 def test_at73_recording_needs_allocate_and_post_receipt_then_the_recorder_posts(w):
     u = make_user("allocate_only")
     member(u, w.alm, "payables_clerk")  # invoicing.allocate, no invoicing.post_receipt

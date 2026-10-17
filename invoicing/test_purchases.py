@@ -107,13 +107,54 @@ def test_at96_unregistered_vendor_vat_refused_and_non_resident_still_reverse_cha
 
 
 def test_r92_vat_number_removed_from_the_document_makes_it_vat_free(w):
+    """Reviewer round 6: a vendor registered on its master never gets the R92 VAT-free treatment by blanking the
+    document's VAT number; only a vendor that is genuinely unregistered does."""
     doc = bill(w, submit=False)  # registered vendor: line S 15%
+    assert doc.lines.get().vat_category == "S"
+    services.update_purchase_document(doc, user=w.ap, vendor_vat_number="", vendor_total_vat="0",
+                                      vendor_total_gross="1000.00")
+    with pytest.raises(InvoicingError) as exc:
+        services.submit_purchase_document(doc, user=w.ap)
+    text = " ".join(exc.value.messages)
+    assert exc.value.code == "document_invalid"
+    assert "registered for VAT" in text and "V001" in text and "مسجل في ضريبة القيمة المضافة" in text
+    doc.refresh_from_db()
+    assert (doc.status, doc.lines.get().vat_category) == ("draft", "S")  # nothing turned VAT-free
+    # The vendor's own number back on the document: the bill books with recoverable VAT as usual.
+    services.update_purchase_document(doc, user=w.ap, vendor_vat_number="320000000000003", vendor_total_vat="150.00",
+                                      vendor_total_gross="1150.00")
+    posted = services.approve_purchase_document(services.submit_purchase_document(doc, user=w.ap), user=w.cfo)
+    assert je(posted) == [("1310", D("150.00"), D("0")), ("2100", D("0"), D("1150.00")), ("5300", D("1000.00"), D("0"))]
+
+
+@pytest.mark.parametrize("master", [{"is_vat_registered": True, "vat_number": "330000000000003"},
+                                    {"is_vat_registered": False, "vat_number": "330000000000003"}])
+def test_r92_registered_vendor_blank_document_number_refused_at_submit(w, master):
+    """Probe: registered vendor, ``vendor_vat_number=""`` on create, VAT 0 → booked VAT-free as category O."""
+    vendor = services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="V9", name_ar="مورد مسجل", **master)
+    doc = services.create_purchase_document(w.alm, user=w.ap, vendor=vendor, vendor_document_number="X1",
+                                            vendor_document_date=date(2027, 1, 15), accounting_date=date(2027, 1, 15),
+                                            vendor_vat_number="")
+    services.add_purchase_line(doc, user=w.ap, account="5300", quantity="1", unit_price="1150.00",
+                               description_ar="بند", vat_category="S")
+    assert doc.lines.get().vat_category == "S"  # not forced to O when the line is added
+    services.update_purchase_document(doc, user=w.ap, vendor_total_vat="0", vendor_total_gross="1150.00")
+    with pytest.raises(InvoicingError) as exc:
+        services.submit_purchase_document(doc, user=w.ap)
+    assert "registered for VAT" in " ".join(exc.value.messages)
+    doc.refresh_from_db()
+    assert doc.status == "draft" and doc.journal_entry_id is None
+
+
+def test_r92_genuinely_unregistered_vendor_document_number_removed_is_vat_free(w):
+    plain = services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="V2", name_ar="مورد غير مسجل")
+    doc = bill(w, vendor=plain, submit=False, vendor_vat_number="310000000000003")  # number typed by mistake
     assert doc.lines.get().vat_category == "S"
     services.update_purchase_document(doc, user=w.ap, vendor_vat_number="", vendor_total_vat="0",
                                       vendor_total_gross="1000.00")
     posted = services.approve_purchase_document(services.submit_purchase_document(doc, user=w.ap), user=w.cfo)
     assert je(posted) == [("2100", D("0"), D("1000.00")), ("5300", D("1000.00"), D("0"))]
-    assert posted.lines.get().vat_category == "O"
+    assert posted.lines.get().vat_category == "O" and posted.total_vat == D("0")
 
 
 def test_at39_attribution_taxable_exempt_mixed(w):

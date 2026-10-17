@@ -1422,23 +1422,31 @@ def _sum(qs):
     return qs.aggregate(t=Sum("amount"))["t"] or ZERO
 
 
+def _in_minor_units(amount, document):
+    """``amount`` with exactly the document currency's decimals (D27, R93): the columns hold 3 decimals, so a SAR
+    sum would otherwise come back as ``1150.000``."""
+    return amount.quantize(_quantum(_doc_places(document)))
+
+
 def _open_receivable(document):
     """Open amount of a final invoice or debit note: gross minus allocations to it."""
-    return document.total_gross - _sum(ReceivableAllocation.objects.filter(target=document))
+    return _in_minor_units(document.total_gross - _sum(ReceivableAllocation.objects.filter(target=document)), document)
 
 
 def _open_payable(document):
-    return document.total_gross - _sum(PayableAllocation.objects.filter(target=document))
+    return _in_minor_units(document.total_gross - _sum(PayableAllocation.objects.filter(target=document)), document)
 
 
 def _available(source):
     if isinstance(source, CustomerReceipt):
-        return source.amount - _sum(ReceivableAllocation.objects.filter(receipt=source))
-    if isinstance(source, SalesDocument):
-        return source.total_gross - _sum(ReceivableAllocation.objects.filter(credit_note=source))
-    if isinstance(source, VendorPayment):
-        return source.amount - _sum(PayableAllocation.objects.filter(payment=source))
-    return source.total_gross - _sum(PayableAllocation.objects.filter(vendor_credit_note=source))
+        amount = source.amount - _sum(ReceivableAllocation.objects.filter(receipt=source))
+    elif isinstance(source, SalesDocument):
+        amount = source.total_gross - _sum(ReceivableAllocation.objects.filter(credit_note=source))
+    elif isinstance(source, VendorPayment):
+        amount = source.amount - _sum(PayableAllocation.objects.filter(payment=source))
+    else:
+        amount = source.total_gross - _sum(PayableAllocation.objects.filter(vendor_credit_note=source))
+    return _in_minor_units(amount, source)
 
 
 def open_amount(document, *, user):
@@ -1525,12 +1533,13 @@ def allocate(source, target, amount, *, user):
     No GL effect (R35): both sides sit on the same control account. ``invoicing.allocate``.
     """
     access.require(user, target.entity, "invoicing.allocate")
-    amount = _money(amount, "allocation amount", positive=True, currency=target.currency_id)
     sales = isinstance(target, SalesDocument)
     with transaction.atomic():
         model_t = SalesDocument if sales else PurchaseDocument
         target = model_t.objects.select_for_update(of=("self",)).select_related("entity").get(pk=target.pk)
         source = type(source).objects.select_for_update(of=("self",)).select_related("entity").get(pk=source.pk)
+        # Checked against the locked target's currency, not the caller's copy (reviewer round 6, item 8).
+        amount = _money(amount, "allocation amount", positive=True, currency=target.currency_id)
         problems = _allocation_problems(source, target, amount)
         if problems:
             raise _problems_error(problems, "allocation_invalid")
@@ -1620,10 +1629,27 @@ def _draft_purchase(document, user):
     return doc
 
 
+def _vendor_master_registered(vendor):
+    """The vendor record says the vendor is registered for VAT (flag or VAT number on the master)."""
+    return bool(vendor.is_vat_registered or (vendor.vat_number or "").strip())
+
+
+def _registered_vendor_number_missing(doc):
+    """A resident vendor registered for VAT on its master, but the document's VAT number is blank (R92, R29).
+
+    Refused at submit and approval: blanking the number on the document must not turn a registered vendor's bill
+    into an R92 VAT-free bill (reviewer round 6)."""
+    return (doc.vendor.is_resident and _vendor_master_registered(doc.vendor)
+            and not (doc.vendor_vat_number or "").strip())
+
+
 def _unregistered_vendor(doc):
-    """D24 / R92: a resident vendor whose document carries no VAT number is not registered for VAT and charges
-    no VAT. Non-resident vendors have no KSA VAT number by nature and keep reverse charge (R30)."""
-    return doc.vendor.is_resident and not (doc.vendor_vat_number or "").strip()
+    """D24 / R92: a resident vendor that is not registered for VAT (no flag and no VAT number on the vendor
+    record, none on the document) charges no VAT. A vendor registered on its master never gets this treatment
+    (:func:`_registered_vendor_number_missing`). Non-resident vendors have no KSA VAT number by nature and keep
+    reverse charge (R30)."""
+    return (doc.vendor.is_resident and not _vendor_master_registered(doc.vendor)
+            and not (doc.vendor_vat_number or "").strip())
 
 
 def _vat_free_category(doc, line):
@@ -1756,6 +1782,11 @@ def _purchase_problems(doc, check_period=True):
         problems.append("A document needs at least one line. / يحتاج المستند إلى بند واحد على الأقل.")
     if doc.vendor.entity_id != entity.pk:
         problems.append("The vendor belongs to another entity. / المورد يخص كيانًا آخر.")
+    if _registered_vendor_number_missing(doc):  # R92 applies only to vendors not registered for VAT
+        problems.append(
+            f"Vendor {doc.vendor.code} is registered for VAT, so the bill needs the VAT number shown on the vendor "
+            f"document (R92, R29). / المورد {doc.vendor.code} مسجل في ضريبة القيمة المضافة، لذا يلزم إدخال الرقم "
+            "الضريبي الظاهر في مستند المورد.")
     try:
         _currency(doc.currency_id, entity)
     except InvoicingError as exc:
@@ -2095,8 +2126,13 @@ def post_receipt(receipt, *, user):
 
 
 def _receipt_creator_may_post(document):
-    """Registered ``creator_may_post`` (access R46, D26): only customer receipts, never refunds (OQ-26)."""
-    return document.kind == CustomerReceipt.Kind.RECEIPT
+    """Registered ``creator_may_post`` (access R46, D26): only customer receipts, never refunds (OQ-26).
+
+    Only a plain receipt with no bank charge: the charge is an expense (5700) that reduces the customer's
+    receivable, so a recorder who could also post it alone could write off any balance as a "bank charge"
+    (reviewer round 6). A receipt with a bank charge keeps creator ≠ poster (ledger R35).
+    """
+    return document.kind == CustomerReceipt.Kind.RECEIPT and (document.bank_charge or ZERO) == ZERO
 
 
 def _receipt_lines(document):

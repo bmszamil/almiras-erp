@@ -279,3 +279,37 @@ def test_d14_no_payment_to_a_non_resident_vendor_until_wht_is_built(w):
     with pytest.raises(InvoicingError) as exc:
         services.create_vendor_payment(w.alm, user=w.ap, vendor=nr, date=date(2027, 1, 25), amount="100.00")
     assert exc.value.code == "wht_not_built" and "ضريبة الاستقطاع" in " ".join(exc.value.messages)
+
+
+# --- reviewer round 6 (items 7, 8): minor units of open amounts; allocation checked on the locked target ------
+
+def test_open_amounts_have_the_currency_minor_units(w):
+    inv = final(w, invoice(w))  # SAR, gross 1,150.00 (column holds 3 decimals)
+    assert str(services.open_amount(inv, user=w.clerk)) == "1150.00"
+    posted = services.post_receipt(receipt(w, "2000.00"), user=w.clerk2)
+    assert str(services.open_amount(posted, user=w.clerk)) == "2000.00"
+    services.allocate(posted, inv, "1150.00", user=w.clerk)
+    assert str(services.open_amount(inv, user=w.clerk)) == "0.00"
+    assert str(services.open_amount(posted, user=w.clerk)) == "850.00"
+    b = services.approve_purchase_document(bill(w), user=w.cfo)
+    assert str(services.open_amount(b, user=w.ap)) == "1150.00"
+
+
+def test_open_amount_of_a_kwd_invoice_has_three_decimals(w):
+    from invoicing.test_owner_decisions import _rate
+
+    _rate(w, "KWD", "12.2000")
+    inv = final(w, invoice(w, [("rent_commercial", "2", "500.000")], currency="KWD"))
+    assert str(services.open_amount(inv, user=w.clerk)) == "1150.000"
+
+
+def test_allocation_amount_is_checked_against_the_locked_target_currency(w):
+    """A stale in-memory target claiming a 3-decimal currency must not let 3 decimals into a SAR allocation."""
+    inv = final(w, invoice(w))
+    posted = services.post_receipt(receipt(w, "2000.00"), user=w.clerk2)
+    inv.currency_id = "KWD"  # stale / tampered copy; the stored invoice is SAR
+    with pytest.raises(InvoicingError) as exc:
+        services.allocate(posted, inv, "10.005", user=w.clerk)
+    assert exc.value.code == "money_decimals" and "2 decimals" in str(exc.value)
+    assert not ReceivableAllocation.objects.filter(target_id=inv.pk).exists()
+    assert services.allocate(posted, inv, "10.00", user=w.clerk).amount == D("10.00")
