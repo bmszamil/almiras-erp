@@ -245,14 +245,18 @@ DROP FUNCTION IF EXISTS zatca_changed_keys(jsonb, jsonb);
 """
 
 
-def forward(apps, schema_editor):
+def _run(schema_editor, sql):
     if schema_editor.connection.vendor == "postgresql":
-        schema_editor.execute(FORWARD)
+        with schema_editor.connection.cursor() as cursor:
+            cursor.execute(sql)  # no parameters: the "%" in RAISE messages is not a placeholder
+
+
+def forward(apps, schema_editor):
+    _run(schema_editor, FORWARD)
 
 
 def reverse(apps, schema_editor):
-    if schema_editor.connection.vendor == "postgresql":
-        schema_editor.execute(REVERSE)
+    _run(schema_editor, REVERSE)
 
 
 class Migration(migrations.Migration):
