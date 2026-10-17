@@ -214,6 +214,46 @@ def test_r53_ledger_checks_the_named_approval_itself(bw):
     assert ledger._contract_approval(w.alm, w.c_b, doc, doc_type) is None
 
 
+def test_r53_approvals_record_their_grant_use(bw):
+    """billing R53 / review finding 3: approve_contract and approve_version record a GrantUse on their record."""
+    from core.access.models import GrantUse
+
+    w = bw
+    c = approved(w, start=date(2027, 3, 1))
+    (use,) = GrantUse.objects.filter(log__permission="billing.approve_contract")
+    assert (use.target_type, use.target_id, use.used_by) == ("billing.contract", c.pk, w.c)
+    w.clock.set(date(2027, 3, 10))
+    v = billing.approve_version(version(w, c, effective=date(2027, 4, 1), amount="11000.00"), user=w.c_b)
+    (use,) = GrantUse.objects.filter(log__permission="billing.approve_version")
+    assert (use.target_type, use.target_id, use.used_by) == ("billing.contractversion", v.pk, w.c_b)
+
+
+def test_r53_a_return_or_rejection_grant_is_not_an_approval(bw):
+    """The ledger counts only a used approval grant: the CFO's grant for returning a contract or rejecting a
+    version is logged with the same permission and record, but never used, so it is refused (review finding 3)."""
+    import dataclasses
+
+    from billing.conftest import contract, submitted
+
+    w = bw
+    c = approved(w, start=date(2027, 3, 1))
+    doc = _invoice(w, c, date(2027, 3, 1))
+    doc_type = documents.get("invoicing.salesdocument")
+    w.clock.set(date(2027, 3, 10))
+    rejected = billing.reject_version(version(w, c, effective=date(2027, 4, 1), amount="11000.00"), user=w.c_b,
+                                      reason_ar="مرفوض")
+    returned = billing.return_contract(submitted(contract(w, start=date(2027, 5, 1))), user=w.c_b, reason_ar="أعده")
+    from django.utils import timezone
+
+    later = timezone.now()
+    for ref in (documents.RecordedApproval("billing.approve_version", rejected, w.c_b.pk, later),
+                documents.RecordedApproval("billing.approve_contract", returned, w.c_b.pk, later)):
+        assert AccessLog.objects.filter(permission=ref.permission, actor=w.c_b, grant_use__isnull=True).exists()
+        fake = dataclasses.replace(doc_type, contract_approval=lambda d, ref=ref: ref)
+        assert ledger._contract_approval(w.alm, w.c_b, doc, fake) is None
+    assert ledger._contract_approval(w.alm, w.c, doc, doc_type) is not None  # the used approval still counts
+
+
 def test_r53_hook_is_only_for_sales_documents():
     from testdocs.models import Bill
 

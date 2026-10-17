@@ -465,8 +465,8 @@ def _ref(obj):
 def _contract_approval(entity, posted_by, document, doc_type):
     """billing R53: an invoice auto-issued from billing has no per-document approval; the approval that counts
     is ``posted_by``'s granted approval of the billed contract version, named by the type's registered
-    ``contract_approval`` hook and found in the access log for that very record, no later than the recorded
-    approval time. Returns the basis for the access log, or None."""
+    ``contract_approval`` hook and found in the access log for that very record, issued no later than the recorded
+    approval time and recorded as used (GrantUse). Returns the basis for the access log, or None."""
     if doc_type.contract_approval is None or doc_type.label not in documents.CONTRACT_APPROVAL_TYPES:
         return None
     ref = doc_type.contract_approval(document)
@@ -477,7 +477,9 @@ def _contract_approval(entity, posted_by, document, doc_type):
         return None
     if ref.approver_id != posted_by.pk or ref.approved_at is None:
         return None
-    approvers = access_services.recorded_approvers(entity, ref.permission, target, until=ref.approved_at)
+    # Only an approval that was actually used for that record (a GrantUse row, written by billing's approve_contract
+    # / approve_version): a grant issued for a return or a rejection of the same record never counts.
+    approvers = access_services.recorded_approvers(entity, ref.permission, target, used=True, until=ref.approved_at)
     if posted_by.pk not in approvers:
         return None
     return {"permission": ref.permission, "document": list(_ref(target))}

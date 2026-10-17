@@ -822,7 +822,7 @@ def approve_contract(contract, *, user):
     again (``update_contract`` clears the submission)."""
     c = Contract.objects.select_related("entity", "customer", "currency", "advance_terms").get(pk=contract.pk)
     v1 = c.versions.get(version_no=1)
-    access.require(user, c.entity, "billing.approve_contract", document=c)
+    grant = access.require(user, c.entity, "billing.approve_contract", document=c)
     if user.pk in (v1.created_by_id, v1.modified_by_id, c.created_by_id, c.modified_by_id, c.submitted_by_id):
         access.deny(user, c.entity, "billing.approve_contract", "self_approval")
     with transaction.atomic():
@@ -842,6 +842,9 @@ def approve_contract(contract, *, user):
         now = timezone.now()
         v1.status, v1.approved_by, v1.approved_at = VStatus.APPROVED, user, now
         _save(v1)
+        # R53: the access log records that this approval was used for this very contract (a GrantUse row); the
+        # ledger accepts only a used approval when it posts the auto-issued invoices on clearance.
+        access_services.use_grant(grant, target=c)
         c.number = _next_number(c.entity, today.year)
         c.status, c.approved_by, c.approved_at, c.current_version = CStatus.APPROVED, user, now, v1
         c.requires_purification = _purification(c, v1)
@@ -1096,9 +1099,9 @@ def approve_version(version, *, user):
     rebuilt (generated periods untouched) and the correction pass drafts credit / debit notes (R42 to R46, R51).
     Returns the version with ``adjustments`` (created) and ``warnings``."""
     v = ContractVersion.objects.select_related("contract__entity").get(pk=version.pk)
-    access.require(user, v.entity, "billing.approve_version", document=v)
+    grants = [access.require(user, v.entity, "billing.approve_version", document=v)]
     if v.kind in (ContractVersion.Kind.TERMINATION, ContractVersion.Kind.CANCELLATION):
-        access.require(user, v.entity, "billing.approve_termination", document=v)
+        grants.append(access.require(user, v.entity, "billing.approve_termination", document=v))
     sys = _system_user()
     with transaction.atomic():
         v = ContractVersion.objects.select_for_update(of=("self",)).get(pk=v.pk)
@@ -1116,6 +1119,8 @@ def approve_version(version, *, user):
         _sync_contract(c, sys)
         v.status, v.approved_by, v.approved_at = VStatus.APPROVED, user, timezone.now()
         _save(v)
+        for grant in grants:  # R53: recorded as used for this version (see approve_contract)
+            access_services.use_grant(grant, target=v)
         c.current_version = v
         if v.kind == ContractVersion.Kind.TERMINATION:
             c.status, c.termination_kind = CStatus.TERMINATED, Contract.TerminationKind.EARLY
