@@ -546,7 +546,12 @@ def _uuid5(text):
 def _sign_xml(data, icv, pih, key_ref, master, credential, signing_time):
     """Build, hash, sign and assemble one document (R-13 to R-15). Raises qr.QrValueTooLong / QrTooLong."""
     unsigned = ubl.build_unsigned(data, icv, pih)
-    invoice_hash = crypto.invoice_hash(unsigned)
+    if len(unsigned) > int(_setting("ZATCA_MAX_XML_BYTES", 10 * 1024 * 1024)):  # R-16 / AT-55, before parsing
+        raise _LocalProblems([local("xml_size")])
+    try:
+        invoice_hash = crypto.invoice_hash(unsigned)
+    except etree.XMLSyntaxError:  # e.g. an attachment beyond libxml2's text-node limit
+        raise _LocalProblems([local("xml_size")]) from None
     raw = base64.b64decode(invoice_hash)
     signature = keystore.get_store().sign(key_ref, master, raw)
     cert = crypto.cert_from_pem(credential.certificate_pem)
@@ -743,6 +748,7 @@ def record_vat_status_change(entity, *, user, change, reason=""):
 def refresh_credential_statuses(*, user, now=None):
     """R-10 / AT-7: daily job (ZATCA queue user). ``renewal_due`` N days (``ZATCA_RENEWAL_DAYS``, default 30)
     before ``valid_to``, admins alerted; an expired credential expires its unit (nothing signs with it)."""
+    _require_system(user)
     now = now or _now()
     days = int(_setting("ZATCA_RENEWAL_DAYS", 30))
     changed = []
@@ -1099,6 +1105,21 @@ def _secret_store_up(entity):
         _event(entity, None, Action.SECRET_STORE_AVAILABLE, _queue_user())
 
 
+def _probe_store(entity):
+    """R-47: each run checks the store and the entity's master key, so a sealed store is reported (and its
+    recovery logged) for every entity on ZATCA, whether or not it has work waiting."""
+    if not ZatcaProfile.objects.filter(entity=entity, is_enabled=True).exists():
+        return
+    try:
+        keystore.get_store().check(_master_ref(entity))
+    except SecretStoreUnavailable as exc:
+        _secret_store_down(entity, exc)
+    except (SecretStoreRefused, ZatcaError):
+        return
+    else:
+        _secret_store_up(entity)
+
+
 def _classify(api, response):
     status = response.status
     errors, warnings = _errors(response)
@@ -1300,14 +1321,22 @@ def _blocked_by_earlier(einv):
         Status.STAMPED, Status.QUEUED, Status.SUBMITTING, Status.FAILED_RETRYABLE)).exists()
 
 
+def _require_system(user):
+    """Scheduled jobs run as the ZATCA queue system user only (§7)."""
+    if access_services.kind_of(user) != Kind.SYSTEM:
+        access.deny(user, None, PROCESS, "system_only")
+
+
 def process_queue(*, user, now=None):
     """One worker run (ZATCA queue system user): stamp pending documents, requeue due retries, submit queued
     documents (not held back by earlier ICVs unless serialised, R-27), resend results to invoicing, and run
     the deadline checks. Returns counts."""
+    _require_system(user)
     now = now or _now()
     counts = {"stamped": 0, "sent": 0}
     for entity in access.entities_for(user, PROCESS):
         access.require(user, entity, PROCESS)
+        _probe_store(entity)
         due = Q(next_attempt_at__isnull=True) | Q(next_attempt_at__lte=now)
         for einv in EInvoice.objects.filter(due, entity=entity, status=Status.PENDING,
                                             hold_reason__in=RETRIED_HOLDS).order_by("created_at", "pk"):
@@ -1333,6 +1362,7 @@ def process_queue(*, user, now=None):
 
 def run_deadline_checks(*, user, now=None):
     """R-23 / R-35 scheduled job (also run by :func:`process_queue`)."""
+    _require_system(user)
     now = now or _now()
     for entity in access.entities_for(user, PROCESS):
         access.require(user, entity, PROCESS)

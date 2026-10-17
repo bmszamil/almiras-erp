@@ -89,7 +89,7 @@ class OpenBaoSecretStore:
         raise SecretStoreUnavailable("The OpenBao client is not deployed yet (zatca OQ-34).",
                                      "لم يُفعَّل الاتصال بمخزن OpenBao بعد.")
 
-    create_super_key = create_master_key = rotate_master_key = _unavailable
+    create_super_key = create_master_key = rotate_master_key = check = _unavailable
     write_private_key = sign = public_key_der = write_secret = read_secret = _unavailable
 
 
@@ -179,6 +179,12 @@ class LocalSecretStore:
             return make_ref(path, version)
 
     rotate_master_key = create_master_key
+
+    def check(self, master_ref):
+        """Raise SecretStoreUnavailable if the store is sealed or this master key is unavailable (R-47)."""
+        with self._lock:
+            self._check_open()
+            self._master_key(master_ref)
 
     # -- EGS keys and CSID secrets --
     def write_private_key(self, path, pem: bytes, master_ref):
