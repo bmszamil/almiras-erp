@@ -331,10 +331,12 @@ def test_r48_switch_off_decision_uses_the_locked_row():
     from django.db import connections
 
     from core.access.models import RolePermission
-
     from core.access.seed import apply_seed
+    from core.currency_seed import apply_currency_seed
+    from core.models import Currency
 
-    apply_seed(Role, RolePermission)
+    apply_seed(Role, RolePermission)  # a transactional test starts from an empty database
+    apply_currency_seed(Currency)
     alm = entity("ALM", "parent")
     sub = entity("SUB", "full", alm)
     Entity.objects.filter(pk=sub.pk).update(sharia_enforced=False)
