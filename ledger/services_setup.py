@@ -10,10 +10,12 @@ from .models import Account, FiscalPeriod
 
 @transaction.atomic
 def install_chart_of_accounts(entity):
-    headers = {}
+    headers, by_code = {}, {}
     created = 0
     for code, en, ar, typ, flags in TEMPLATE:
         parent = None if flags.get("header") else headers.get(code[0])
+        if flags.get("parent"):
+            parent = by_code.get(flags["parent"]) or Account.objects.get(entity=entity, code=flags["parent"])
         acc, was_created = Account.objects.get_or_create(
             entity=entity,
             code=code,
@@ -29,6 +31,7 @@ def install_chart_of_accounts(entity):
                 is_monetary=flags.get("monetary", False),
             ),
         )
+        by_code[code] = acc
         if flags.get("header"):
             headers[code[0]] = acc
         created += was_created
