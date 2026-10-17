@@ -2,13 +2,14 @@ from django.apps import AppConfig
 
 
 class TestDocsConfig(AppConfig):
-    """Test-only stand-ins for sub-ledger documents (invoicing is not built yet).
+    """Test-only stand-ins for sub-ledger documents, used by the ledger's own tests.
 
     Installed only by ``config.settings_test``. Registers its models with the
-    ledger document registry the way a real sub-ledger app would in its own
-    ``ready()``, with a ``validate_lines`` hook that checks the entry against
-    the document's amount. ``Unregistered`` is deliberately left out of the
-    registry.
+    ledger document registry the way a real sub-ledger app (``invoicing``)
+    does in its own ``ready()``. Every registered type needs a line hook;
+    these register ``validate_lines``, which checks the entry against the
+    document's amount (invoicing registers ``build_lines``). ``Unregistered``
+    is deliberately left out of the registry.
     """
 
     name = "testdocs"

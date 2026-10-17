@@ -38,7 +38,7 @@ def setup_entity(code, consolidation="full", parent=None, **extra):
 
 
 def doc(model, entity, created_by):
-    """A stored test document (testdocs; invoicing is not built yet), registered in ledger.documents."""
+    """A stored test document (testdocs stand-in, independent of invoicing), registered in ledger.documents."""
     return model.objects.create(entity=entity, created_by=created_by)
 
 
