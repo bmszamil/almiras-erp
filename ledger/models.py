@@ -335,6 +335,9 @@ class JournalEntryEditorQuerySet(models.QuerySet):
     def delete(self):
         raise LedgerError("Editor records cannot be deleted.")
 
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise LedgerError("Editor records cannot be changed.")
+
 
 class JournalEntryEditor(models.Model):
     """Every user who created or edited a draft entry (review A). Editors count as creators for

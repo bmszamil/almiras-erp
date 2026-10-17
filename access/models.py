@@ -8,7 +8,7 @@ Rules (spec docs/specs/approvals-and-web-ui.md):
 """
 import uuid
 
-from django.contrib.auth.models import AbstractUser
+from django.contrib.auth.models import AbstractUser, UserManager as BaseUserManager
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
@@ -16,6 +16,49 @@ from django.utils import timezone
 from core.models import Entity
 
 from .errors import BilingualError
+
+
+SYSTEM_USERNAME = "system"
+
+
+def _refuse_system(message_en, message_ar):
+    raise BilingualError("system_user", message_en, message_ar)
+
+
+class UserQuerySet(models.QuerySet):
+    """Bulk changes skip User.save/delete, so they are refused when the rows include the reserved
+    ERP system user (follow-up 2a). bulk_update goes through update()."""
+
+    def update(self, **kwargs):
+        if self.filter(username=SYSTEM_USERNAME).exists():
+            _refuse_system("The ERP system user cannot be changed.", "لا يمكن تعديل مستخدم النظام.")
+        if kwargs.get("username") == SYSTEM_USERNAME:
+            _refuse_system("The username 'system' is reserved.", "اسم المستخدم 'system' محجوز.")
+        return super().update(**kwargs)
+
+    update.alters_data = True
+
+    def delete(self):
+        if self.filter(username=SYSTEM_USERNAME).exists():
+            _refuse_system("The ERP system user cannot be deleted.", "لا يمكن حذف مستخدم النظام.")
+        return super().delete()
+
+    delete.alters_data = True
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        # Checked before Django opens its atomic block, so a refusal does not break the caller's transaction.
+        objs = list(objs)
+        if "username" in fields and any(o.username == SYSTEM_USERNAME for o in objs):
+            _refuse_system("The username 'system' is reserved.", "اسم المستخدم 'system' محجوز.")
+        if self.model._default_manager.filter(pk__in=[o.pk for o in objs], username=SYSTEM_USERNAME).exists():
+            _refuse_system("The ERP system user cannot be changed.", "لا يمكن تعديل مستخدم النظام.")
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+    bulk_update.alters_data = True
+
+
+class UserManager(BaseUserManager.from_queryset(UserQuerySet)):
+    pass
 
 
 class User(AbstractUser):
@@ -44,6 +87,8 @@ class User(AbstractUser):
     default_entity = models.ForeignKey(Entity, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
 
     REQUIRED_FIELDS = ["email", "full_name_en", "full_name_ar"]
+
+    objects = UserManager()
 
     class Meta:
         constraints = [
@@ -89,15 +134,17 @@ class User(AbstractUser):
         # other account can take its name.
         if not self._state.adding and self.pk:
             stored = User.objects.filter(pk=self.pk).values_list("username", flat=True).first()
-            if stored == "system" and getattr(self, "_allow_system_save", False) is not True:
+            if stored == SYSTEM_USERNAME and getattr(self, "_allow_system_save", False) is not True:
                 raise BilingualError("system_user", "The ERP system user cannot be changed.",
                                      "لا يمكن تعديل مستخدم النظام.")
-            if stored != "system" and self.username == "system":
+            if stored != SYSTEM_USERNAME and self.username == SYSTEM_USERNAME:
                 raise BilingualError("system_user", "The username 'system' is reserved.",
                                      "اسم المستخدم 'system' محجوز.")
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
+        if self.pk and User.objects.filter(pk=self.pk, username=SYSTEM_USERNAME).exists():
+            _refuse_system("The ERP system user cannot be deleted.", "لا يمكن حذف مستخدم النظام.")
         about_me = models.Q(object_type="access.user", object_id=str(self.pk))
         if AuditLog.objects.filter(models.Q(actor=self) | models.Q(on_behalf_of=self) | about_me).exists():
             raise BilingualError(
@@ -177,6 +224,9 @@ class AppendOnlyQuerySet(models.QuerySet):
 
     def delete(self):
         raise BilingualError("append_only", "Audit records cannot be deleted.", "لا يمكن حذف سجلات التدقيق.")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise BilingualError("append_only", "Audit records cannot be changed.", "لا يمكن تعديل سجلات التدقيق.")
 
 
 class AppendOnlyModel(models.Model):
