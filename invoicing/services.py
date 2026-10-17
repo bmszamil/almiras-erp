@@ -34,9 +34,15 @@ from ledger import fx
 from ledger import services as ledger
 from ledger.models import Account, FiscalPeriod, JournalEntry, JournalLine, LedgerError
 
+from banking import iban as iban_rules
+from banking import services as banking
+from banking.crypto import keyed_hash
+from banking.models import Bank
+
 from . import zatca_port
 from .models import (
     BUYER_ID_PRIORITY,
+    CharityRecipient,
     CustomerReceipt,
     Customer,
     CustomerIdentifier,
@@ -50,6 +56,7 @@ from .models import (
     PaymentMeans,
     PurchaseDocument,
     PurchaseDocumentLine,
+    PurificationInstruction,
     PurificationTransfer,
     ReceiptApplication,
     ReceivableAllocation,
@@ -82,7 +89,8 @@ AR, AR_GROUP, AP, AP_GROUP = "1200", "1210", "2100", "2110"
 VAT_OUTPUT, VAT_INPUT, BANK, BANK_CHARGES = "2200", "1310", "1100", "5700"
 WHT_PAYABLE, WHT_BORNE = "2220", "5920"  # PROPOSED accounts (§5, E20 to E22; D29)
 NON_COMPLIANT_INCOME, CHARITY_PAYABLE = "4900", "2600"  # E14, E15
-CONTROL_ACCOUNTS = frozenset({AR, AR_GROUP, AP, AP_GROUP, VAT_OUTPUT, VAT_INPUT, WHT_PAYABLE})
+PURIFICATION_BANK = "1140"  # PROPOSED (D31b, D29): the purification account's GL; only purification rows use it
+CONTROL_ACCOUNTS = frozenset({AR, AR_GROUP, AP, AP_GROUP, VAT_OUTPUT, VAT_INPUT, WHT_PAYABLE, PURIFICATION_BANK})
 
 Status = SalesDocument.Status
 PStatus = PurchaseDocument.Status
@@ -2685,65 +2693,167 @@ def wht_return_data(entity, month, *, user):
             "ledger_2220_sar": ledger_total, "difference": total - ledger_total}
 
 
-# --- purification (R54, E14, E15; OQ-30 amount, timing and recipient pending Sharia board sign-off) ----------
+# --- purification (R54, E14, E15; D31b purification account and charity recipients; OQ-30 amount, timing and the
+# recipient list pending Sharia board sign-off) ------------------------------------------------------------------
 
 PURIFICATION_PERMISSION = {
     PurificationTransfer.Kind.TRANSFER: "invoicing.post_purification_transfer",
+    PurificationTransfer.Kind.FUNDING: "invoicing.post_purification_transfer",
     PurificationTransfer.Kind.PAYOUT: "invoicing.approve_purification_payout",
 }
+PKind = PurificationTransfer.Kind
+_ROOM_INDEX = {PKind.TRANSFER: 1, PKind.PAYOUT: 2, PKind.FUNDING: 3}
+
+
+def _require_person(user, entity, permission):
+    """R54, D31b: purification records are handled by people only; never an agent or a system job."""
+    if access_services.kind_of(user) != Kind.HUMAN:
+        access.deny(user, entity, permission, "agent_forbidden")
 
 
 def _posted_purification(entity, kind, as_of=None, exclude_pk=None):
-    """Posted (not reversed) transfers or payouts of ``kind`` up to ``as_of``; reversed rows never count (R54)."""
+    """Posted (not reversed) transfers, fundings or payouts of ``kind`` up to ``as_of``; reversed rows never count."""
     qs = PurificationTransfer.objects.filter(entity=entity, kind=kind, status=PurificationTransfer.Status.POSTED)
     if as_of is not None:
         qs = qs.filter(date__lte=as_of)
     if exclude_pk:
         qs = qs.exclude(pk=exclude_pk)
-    return qs.aggregate(t=Sum("amount"))["t"] or ZERO
+    return _round(qs.aggregate(t=Sum("amount"))["t"] or ZERO, 2)
 
 
 def _purification_room(entity, kind, on, exclude_pk=None):
-    """R6, R54: the room left for a ``kind`` row dated ``on``, as (amount, date): the smallest of flagged less
-    transferred (a transfer) or transferred less paid out (a payout) on ``on`` **and on every later date** on
-    which a flagged line or a posted row is booked, so the last one is the all-time position. A backdated row can
-    therefore never push a later date over its limit (review finding 1). Reversed rows do not count.
+    """R6, R54, D31b: the room left for a ``kind`` row dated ``on``, as (amount, date): the smallest of flagged less
+    transferred (a transfer), transferred less paid out (a payout: what is on 2600) or transferred less funded (a
+    funding of the purification account) on ``on`` **and on every later date** on which a flagged line or a posted
+    row is booked, so the last one is the all-time position. A backdated row can therefore never push a later date
+    over its limit (review finding 1). Reversed rows do not count.
     """
     deltas = {}
     flagged = (JournalLine.objects.filter(entry__entity=entity, entry__status__in=ledger.BOOKED,
                                           requires_purification=True)
                .values("entry__date").annotate(c=Sum("credit"), d=Sum("debit")))
     for row in flagged:
-        deltas.setdefault(row["entry__date"], [ZERO, ZERO, ZERO])[0] += (row["c"] or ZERO) - (row["d"] or ZERO)
+        deltas.setdefault(row["entry__date"], [ZERO, ZERO, ZERO, ZERO])[0] += (row["c"] or ZERO) - (row["d"] or ZERO)
     rows = (PurificationTransfer.objects.filter(entity=entity, status=PurificationTransfer.Status.POSTED)
             .exclude(pk=exclude_pk).values("date", "kind").annotate(t=Sum("amount")))
     for row in rows:
-        i = 1 if row["kind"] == PurificationTransfer.Kind.TRANSFER else 2
-        deltas.setdefault(row["date"], [ZERO, ZERO, ZERO])[i] += row["t"] or ZERO
-    deltas.setdefault(on, [ZERO, ZERO, ZERO])
-    flagged_sum = transferred = paid = ZERO
+        deltas.setdefault(row["date"], [ZERO, ZERO, ZERO, ZERO])[_ROOM_INDEX[row["kind"]]] += row["t"] or ZERO
+    deltas.setdefault(on, [ZERO, ZERO, ZERO, ZERO])
+    flagged_sum = transferred = paid = funded = ZERO
     room = at = None
     for day in sorted(deltas):
-        f, t, p = deltas[day]
-        flagged_sum, transferred, paid = flagged_sum + f, transferred + t, paid + p
+        f, t, p, fu = deltas[day]
+        flagged_sum, transferred, paid, funded = flagged_sum + f, transferred + t, paid + p, funded + fu
         if day < on:
             continue
-        left = flagged_sum - transferred if kind == PurificationTransfer.Kind.TRANSFER else transferred - paid
+        left = {PKind.TRANSFER: flagged_sum - transferred, PKind.PAYOUT: transferred - paid,
+                PKind.FUNDING: transferred - funded}[kind]
         if room is None or left < room:
             room, at = left, day
     return _round(room, 2), at  # SQLite sums lose the scale; amounts are SAR with 2 decimals
 
 
+def _purification_cash_room(entity, gl, on):
+    """D31b: the purification account's GL (1140) balance on ``on`` and on every later booking date, as the
+    smallest (amount, date): a payout never takes more than the account holds then or later."""
+    deltas = {}
+    lines = (JournalLine.objects.filter(entry__entity=entity, entry__status__in=ledger.BOOKED, account=gl)
+             .values("entry__date").annotate(d=Sum("debit"), c=Sum("credit")))
+    for row in lines:
+        deltas[row["entry__date"]] = (row["d"] or ZERO) - (row["c"] or ZERO)
+    deltas.setdefault(on, ZERO)
+    balance, room, at = ZERO, None, None
+    for day in sorted(deltas):
+        balance += deltas[day]
+        if day >= on and (room is None or balance < room):
+            room, at = balance, day
+    return _round(room, 2), at
+
+
 def purification_position(entity, *, user, as_of=None):
     """R6, R54 / AT-45, AT-71: non-compliant income flagged in the ledger (``ledger.purification_amount``), what was
-    transferred to 2600 (E14) and paid out (E15), and what is left to transfer and to pay. ``invoicing.view`` and
-    ``ledger.view``. Reversed transfers and payouts do not count."""
+    transferred to 2600 (E14), funded into the purification account (D31b) and paid out (E15), and what is left to
+    transfer, to fund and to pay. ``invoicing.view`` and ``ledger.view``. Reversed rows do not count."""
     access.require(user, entity, "invoicing.view")
     flagged = ledger.purification_amount(entity, user=user, as_of=as_of)
-    transferred = _posted_purification(entity, PurificationTransfer.Kind.TRANSFER, as_of)
-    paid = _posted_purification(entity, PurificationTransfer.Kind.PAYOUT, as_of)
-    return {"flagged": flagged, "transferred": transferred, "paid_out": paid, "to_transfer": flagged - transferred,
-            "payable": transferred - paid}
+    transferred = _posted_purification(entity, PKind.TRANSFER, as_of)
+    funded = _posted_purification(entity, PKind.FUNDING, as_of)
+    paid = _posted_purification(entity, PKind.PAYOUT, as_of)
+    return {"flagged": flagged, "transferred": transferred, "funded": funded, "paid_out": paid,
+            "to_transfer": flagged - transferred, "to_fund": transferred - funded, "payable": transferred - paid}
+
+
+def _purification_account(entity, user, *, lock=False, recorded=None):
+    """D31b: the entity's active purification account (banking), or ``purification_account_required``."""
+    if entity.base_currency_id != SAR:
+        raise error(f"{entity.code} keeps its books in {entity.base_currency_id}; purification money is kept and paid "
+                    "in SAR from a Saudi purification account (D31b).",
+                    f"يمسك الكيان {entity.code} دفاتره بعملة {entity.base_currency_id}؛ تُحفظ مبالغ التطهير وتُصرف "
+                    "بالريال من حساب تطهير سعودي.", code="purification_account_required")
+    account = banking.purification_account(entity, user=user, lock=lock)
+    if account is None:
+        raise error(f"{entity.code} has no active purification account; designate one in banking first (D31b).",
+                    f"لا يوجد للكيان {entity.code} حساب تطهير نشط؛ حدده في وحدة البنوك أولًا.",
+                    code="purification_account_required")
+    if recorded is not None and recorded != account.pk:
+        raise error("The purification account changed after this row was recorded; record it again (D31b).",
+                    "تغيّر حساب التطهير بعد تسجيل هذا القيد؛ سجّله من جديد.", code="purification_account_required")
+    if account.gl_account.code != PURIFICATION_BANK or account.gl_account.entity_id != entity.pk:
+        raise error(f"The purification account is not booked on {PURIFICATION_BANK} of {entity.code} (D31b).",
+                    f"حساب التطهير غير مقيد على الحساب {PURIFICATION_BANK} للكيان {entity.code}.",
+                    code="purification_account_required")
+    return account
+
+
+def _purification_recipient(entity, value, *, lock=False):
+    """D31b: one approved, active charity recipient of ``entity``, or ``purification_recipient_not_approved``."""
+    pk = getattr(value, "pk", value)
+    qs = CharityRecipient.objects.filter(pk=pk) if pk else CharityRecipient.objects.none()
+    if lock:
+        qs = qs.select_for_update(of=("self",), no_key=True)
+    recipient = qs.first()
+    if recipient is None or recipient.entity_id != entity.pk or not recipient.is_approved or not recipient.is_active:
+        raise error("Payouts go only to an approved, active charity recipient of this entity (D31b).",
+                    "يُصرف فقط لجهة خيرية مستفيدة معتمدة ونشطة لهذا الكيان.", code="purification_recipient_not_approved")
+    return recipient
+
+
+def _funding_source(entity, value):
+    """D31b: the operating bank GL a funding is paid from: the entity's own SAR bank GL (1100 or a sub-account of
+    1100), never the purification account itself."""
+    if value in (None, ""):
+        raise error("A funding needs the operating bank account it is paid from.",
+                    "يحتاج التمويل إلى الحساب البنكي التشغيلي الذي يُدفع منه.", code="bank_account")
+    account = _account(entity, value)
+    parent_code = account.parent.code if account.parent_id else None
+    if account.entity_id != entity.pk or account.type != Account.Type.ASSET or not account.is_postable \
+            or not account.is_active or account.code == PURIFICATION_BANK or account.sharia_prohibited \
+            or not (account.code == BANK or parent_code == BANK) \
+            or account.currency_id not in (None, entity.base_currency_id):
+        raise error(f"Account {account.code} is not an operating SAR bank account of {entity.code} (1100 or a "
+                    f"sub-account of 1100, not {PURIFICATION_BANK}).",
+                    f"الحساب {account.code} ليس حسابًا بنكيًا تشغيليًا بالريال للكيان {entity.code}.", code="bank_account")
+    return account
+
+
+def _prepare_purification(doc, user, *, lock=False):
+    """D31b: set the purification account, bank GL and recipient of a funding or payout, or refuse it."""
+    entity = doc.entity
+    if doc.kind == PKind.TRANSFER:
+        return
+    account = _purification_account(entity, user, lock=lock, recorded=doc.purification_account_id)
+    doc.purification_account = account
+    if doc.kind == PKind.FUNDING:
+        doc.bank_account = _funding_source(entity, doc.bank_account)
+        return
+    if doc.bank_account_id is not None and doc.bank_account_id != account.gl_account_id:
+        raise error(f"Payouts are paid only from the purification account ({PURIFICATION_BANK}), not from "
+                    f"{doc.bank_account.code} (D31b).",
+                    f"يُصرف فقط من حساب التطهير ({PURIFICATION_BANK}) وليس من {doc.bank_account.code}.",
+                    code="purification_account_required")
+    doc.bank_account = account.gl_account
+    recipient = _purification_recipient(entity, doc.recipient_id, lock=lock)
+    doc.recipient, doc.recipient_en, doc.recipient_ar = recipient, recipient.name_en, recipient.name_ar
 
 
 def _purification_problems(doc, user, exclude_self=True):
@@ -2752,20 +2862,27 @@ def _purification_problems(doc, user, exclude_self=True):
     pk = doc.pk if exclude_self else None
     access.require(user, entity, "ledger.view")  # the limits come from the ledger's flagged lines
     left, at = _purification_room(entity, doc.kind, doc.date, exclude_pk=pk)
-    if doc.kind == PurificationTransfer.Kind.TRANSFER:
+    if doc.kind == PKind.TRANSFER:
         if doc.amount > left:
             problems.append(f"Only {left} of non-compliant income is left to purify on {at} (R6, R54; checked on "
                             f"{doc.date} and every later date). / المتبقي من الإيرادات غير المتوافقة للتطهير {left} "
                             f"فقط بتاريخ {at} (يُتحقق في {doc.date} وفي كل تاريخ لاحق).")
+    elif doc.kind == PKind.FUNDING:
+        if doc.amount > left:
+            problems.append(f"Only {left} was transferred to 2600 and not yet funded on {at}; transfer first (D31b; "
+                            f"checked on {doc.date} and every later date). / المحوّل إلى 2600 وغير الممول {left} فقط "
+                            f"بتاريخ {at}؛ حوّل أولًا (يُتحقق في {doc.date} وفي كل تاريخ لاحق).")
     else:
         if doc.amount > left:
             problems.append(f"Only {left} is on the charity payable (2600) on {at}; transfer first (E14; checked on "
                             f"{doc.date} and every later date). / رصيد مستحقات التطهير {left} فقط بتاريخ {at}؛ "
                             f"حوّل أولًا (يُتحقق في {doc.date} وفي كل تاريخ لاحق).")
-        if not doc.recipient_ar.strip():
-            problems.append("The recipient charity is named in Arabic (OQ-30). / اسم الجهة الخيرية المستفيدة بالعربية مطلوب.")
-        if doc.bank_account_id is None:
-            problems.append("A payout needs the bank account it is paid from. / يحتاج الصرف إلى الحساب البنكي.")
+        cash, cash_at = _purification_cash_room(entity, doc.bank_account, doc.date)
+        if doc.amount > cash:
+            problems.append(f"Only {cash} is in the purification account ({PURIFICATION_BANK}) on {cash_at}; fund it "
+                            f"first (D31b; checked on {doc.date} and every later date). / رصيد حساب التطهير "
+                            f"({PURIFICATION_BANK}) {cash} فقط بتاريخ {cash_at}؛ موّله أولًا (يُتحقق في {doc.date} "
+                            "وفي كل تاريخ لاحق).")
     period = _open_period(entity, doc.date)
     if period:
         problems.append(period)
@@ -2779,26 +2896,42 @@ def _lock_purification(entity):
     Entity.objects.select_for_update(no_key=True).filter(pk=entity.pk).values_list("pk", flat=True).first()
 
 
-def create_purification_transfer(entity, *, user, kind, date, amount, bank_account=None, recipient_ar="",
-                                 recipient_en="", reference_ar="", reference_en=""):
-    """Record a purification transfer (E14) or payout (E15) as a draft (R54). A person holding
+def create_purification_transfer(entity, *, user, kind, date, amount, bank_account=None, recipient=None,
+                                 recipient_ar="", recipient_en="", reference_ar="", reference_en=""):
+    """Record a purification transfer (E14), funding (D31b) or payout (E15) as a draft (R54). A person holding
     ``invoicing.post_purification_transfer`` records it; agents and system users never (R54: a human user). A
-    second person posts it (:func:`post_purification_transfer`)."""
-    if access_services.kind_of(user) != Kind.HUMAN:  # R54: never an agent or a system job
-        access.deny(user, entity, "invoicing.post_purification_transfer", "agent_forbidden")
+    second person posts it (:func:`post_purification_transfer`).
+
+    ``bank_account``: for a funding, the operating bank GL it is paid from (1100 or a sub-account); for a payout
+    only the purification account's GL (1140) is accepted and it is set by default. ``recipient``: for a payout,
+    an approved, active :class:`CharityRecipient` of the entity (its names are copied to the row; ``recipient_en``
+    / ``recipient_ar`` are not used any more and must agree if given)."""
+    _require_person(user, entity, "invoicing.post_purification_transfer")
     if not access.has(user, entity, "invoicing.post_purification_transfer"):
         access.deny(user, entity, "invoicing.post_purification_transfer", "no_membership")
     access.require(user, entity, "ledger.view")  # the amounts come from the ledger's flagged lines
-    if kind not in PurificationTransfer.Kind.values:
+    if kind not in PKind.values:
         raise error("Unknown purification kind.", "نوع تطهير غير معروف.", code="kind")
+    if kind != PKind.PAYOUT and recipient is not None:
+        raise error("Only a payout has a charity recipient.", "الجهة الخيرية المستفيدة للصرف فقط.", code="kind")
+    if kind == PKind.TRANSFER and bank_account is not None:
+        raise error("A transfer (E14) books 4900 to 2600 only; it has no bank account.",
+                    "التحويل يقيد من 4900 إلى 2600 فقط؛ بلا حساب بنكي.", code="kind")
     doc = PurificationTransfer(
         entity=entity, kind=kind, date=date, amount=_money(amount, "amount", positive=True,
                                                            currency=entity.base_currency_id),
-        recipient_ar=(recipient_ar or "").strip(), recipient_en=(recipient_en or "").strip(),
         reference_ar=reference_ar or "", reference_en=reference_en or "", created_by=user, source=_source(user),
     )
-    if kind == PurificationTransfer.Kind.PAYOUT:
-        doc.bank_account = _bank_account(entity, bank_account)
+    if bank_account is not None:
+        doc.bank_account = _account(entity, bank_account)
+    if kind == PKind.PAYOUT:
+        doc.recipient_id = getattr(recipient, "pk", recipient)
+    _prepare_purification(doc, user)
+    if kind == PKind.PAYOUT:
+        given = {(recipient_en or "").strip(), (recipient_ar or "").strip()} - {""}
+        if given - {doc.recipient_en, doc.recipient_ar}:
+            raise error("The recipient's names come from the approved charity recipient (D31b).",
+                        "أسماء الجهة المستفيدة تؤخذ من سجل الجهة الخيرية المعتمدة.", code="purification_recipient_not_approved")
     problems = _purification_problems(doc, user)
     if problems:
         raise _problems_error(problems, "purification_invalid")
@@ -2806,12 +2939,19 @@ def create_purification_transfer(entity, *, user, kind, date, amount, bank_accou
     return doc
 
 
+def _instruction_reference(doc):
+    text = f"{doc.number} {doc.reference_en or doc.reference_ar}".strip()
+    return text[:140]
+
+
 def post_purification_transfer(transfer, *, user):
-    """Post a recorded transfer (``invoicing.post_purification_transfer``) or payout
-    (``invoicing.approve_purification_payout``, the CFO): E14 / E15 in one step, numbered ``PUR``. The recorder
-    cannot post it (ledger segregation, access R35); agents never (R54)."""
+    """Post a recorded transfer or funding (``invoicing.post_purification_transfer``) or payout
+    (``invoicing.approve_purification_payout``, the CFO): E14 / funding / E15 in one step, numbered ``PUR``. The
+    recorder cannot post it (ledger segregation, access R35); agents never (R54). A payout is checked again against
+    the purification account and the recipient (both locked until commit) and produces its bank instruction."""
     doc = PurificationTransfer.objects.select_related("entity").get(pk=transfer.pk)
     permission = PURIFICATION_PERMISSION[doc.kind]
+    _require_person(user, doc.entity, permission)
     grant = access.require(user, doc.entity, permission, document=doc)
     seen_version = doc.version
     with transaction.atomic():
@@ -2820,6 +2960,7 @@ def post_purification_transfer(transfer, *, user):
         if doc.status != PurificationTransfer.Status.DRAFT:
             raise error("Only recorded drafts are posted.", "تُرحَّل المسودات المسجلة فقط.", code="not_draft")
         _refuse_stale_grant(grant, doc, seen_version)
+        _prepare_purification(doc, user, lock=True)
         problems = _purification_problems(doc, user)
         if problems:
             raise _problems_error(problems, "purification_invalid")
@@ -2838,37 +2979,59 @@ def post_purification_transfer(transfer, *, user):
         doc.journal_entry = entry
         doc._service_write = True
         doc.save(update_fields=["journal_entry", "updated_at"])
+        if doc.kind == PKind.PAYOUT:
+            recipient = doc.recipient
+            instruction = PurificationInstruction(
+                entity=doc.entity, payout=doc, from_account=doc.purification_account, recipient=recipient,
+                beneficiary_name_en=recipient.name_en, beneficiary_name_ar=recipient.name_ar,
+                beneficiary_bank_id=recipient.bank_id, beneficiary_iban=recipient.iban,
+                beneficiary_iban_last4=recipient.iban_last4, amount=doc.amount, currency_id=SAR,
+                reference=_instruction_reference(doc), execution_date=doc.date, created_by=user,
+            )
+            instruction._service_write = True
+            instruction.save()
     return doc
 
 
 def reverse_purification_transfer(transfer, *, user, reason, date=None):
-    """Reverse a posted purification transfer (E14) or payout (E15) (R54, review finding 8): through
+    """Reverse a posted purification transfer (E14), funding (D31b) or payout (E15) (R54, review finding 8): through
     ``ledger.services.reverse_entry`` with ``invoicing.reverse_document`` (registered for the type), by a person,
     with a reason. The row becomes ``reversed`` and stops counting towards the limits. A transfer is not reversed
-    while the payouts after it would then exceed what is left on 2600 (reverse the payout first). The reversal is
-    dated on the original date if its period is open, else at the start of the first open period after it (R32).
+    while the payouts or fundings after it would then exceed what was transferred; a funding is not reversed while
+    the purification account would then hold less than nothing (reverse the payout first). A reversed payout's
+    bank instruction is cancelled. The reversal is dated on the original date if its period is open, else at the
+    start of the first open period after it (R32).
     """
     doc = PurificationTransfer.objects.select_related("entity").get(pk=transfer.pk)
-    if access_services.kind_of(user) != Kind.HUMAN:  # R54: never an agent or a system job
-        access.deny(user, doc.entity, "invoicing.reverse_document", "agent_forbidden")
+    _require_person(user, doc.entity, "invoicing.reverse_document")
     grant = access.require(user, doc.entity, "invoicing.reverse_document", document=doc)
     if not (reason or "").strip():
         raise error("The reason for the reversal is required.", "سبب العكس مطلوب.", code="reason_required")
     with transaction.atomic():
         _lock_purification(doc.entity)
         doc = PurificationTransfer.objects.select_for_update(of=("self",)).select_related(
-            "entity", "journal_entry").get(pk=doc.pk)
+            "entity", "journal_entry", "bank_account").get(pk=doc.pk)
         if doc.status != PurificationTransfer.Status.POSTED or doc.journal_entry_id is None:
             raise error("Only posted purification rows are reversed.", "تُعكس قيود التطهير المرحّلة فقط.",
                         code="not_posted")
-        if doc.kind == PurificationTransfer.Kind.TRANSFER:
-            left, at = _purification_room(doc.entity, PurificationTransfer.Kind.PAYOUT, doc.date, exclude_pk=doc.pk)
-            if left < ZERO:
-                raise error(f"Without this transfer the payouts would exceed the charity payable (2600) by {-left} "
-                            f"on {at}; reverse the payout first (R54).",
-                            f"بدون هذا التحويل تتجاوز المبالغ المصروفة رصيد مستحقات التطهير بمقدار {-left} بتاريخ "
-                            f"{at}؛ اعكس الصرف أولًا.", code="purification_invalid")
         on = _reversal_date(doc.entity, doc.journal_entry.date, date)
+        if doc.kind == PKind.TRANSFER:
+            for kind, en, ar in ((PKind.PAYOUT, "payouts", "المبالغ المصروفة"),
+                                 (PKind.FUNDING, "fundings of the purification account", "مبالغ تمويل حساب التطهير")):
+                left, at = _purification_room(doc.entity, kind, doc.date, exclude_pk=doc.pk)
+                if left < ZERO:
+                    raise error(f"Without this transfer the {en} would exceed what was transferred to 2600 by "
+                                f"{-left} on {at}; reverse them first (R54).",
+                                f"بدون هذا التحويل تتجاوز {ar} ما حُوّل إلى 2600 بمقدار {-left} بتاريخ {at}؛ "
+                                "اعكسها أولًا.", code="purification_invalid")
+        elif doc.kind == PKind.FUNDING:
+            gl = doc.purification_account.gl_account
+            cash, at = _purification_cash_room(doc.entity, gl, on)
+            if cash < doc.amount:
+                raise error(f"The purification account holds only {cash} on {at}; reversing this funding of "
+                            f"{doc.amount} would leave it below zero. Reverse the payout first (D31b).",
+                            f"رصيد حساب التطهير {cash} فقط بتاريخ {at}؛ عكس هذا التمويل البالغ {doc.amount} يجعله "
+                            "سالبًا. اعكس الصرف أولًا.", code="purification_invalid")
         try:
             reversal = ledger.reverse_entry(doc.journal_entry, grant, date=on, reason=reason.strip()[:200])
         except LedgerError as exc:
@@ -2879,19 +3042,182 @@ def reverse_purification_transfer(transfer, *, user, reason, date=None):
         doc._service_write = True
         doc.save(update_fields=["status", "reversal_entry", "reversed_by", "reversed_at", "reversal_reason",
                                 "updated_at"])
+        instruction = PurificationInstruction.objects.select_for_update().filter(payout=doc).first()
+        if instruction is not None and instruction.status == PurificationInstruction.Status.PENDING:
+            instruction.status = PurificationInstruction.Status.CANCELLED
+            instruction.cancelled_by, instruction.cancelled_at = user, timezone.now()
+            instruction.cancel_reason = doc.reversal_reason
+            instruction._service_write = True
+            instruction.save()
     return doc
 
 
 def _purification_lines(document):
-    """Registered ``build_lines`` for PurificationTransfer: E14 (Dr 4900 / Cr 2600) or E15 (Dr 2600 / Cr bank)."""
+    """Registered ``build_lines`` for PurificationTransfer: E14 (Dr 4900 / Cr 2600), funding (Dr 1140 / Cr operating
+    bank) or E15 (Dr 2600 / Cr 1140), D31b."""
     _require_posting_context(document, PurificationTransfer.Status.POSTED)
     label = f"{document.number} {document.reference_ar or document.reference_en}".strip()
-    if document.kind == PurificationTransfer.Kind.TRANSFER:
+    if document.kind == PKind.TRANSFER:
         return [{"account": NON_COMPLIANT_INCOME, "debit": document.amount, "description": label},
                 {"account": CHARITY_PAYABLE, "credit": document.amount, "description": label}]
+    purification_gl = document.purification_account.gl_account if document.purification_account_id else None
+    if purification_gl is None or purification_gl.code != PURIFICATION_BANK:
+        raise error("A funding or payout books against the purification account (1140) only (D31b).",
+                    "يُقيد التمويل أو الصرف على حساب التطهير (1140) فقط.", code="purification_account_required")
+    if document.kind == PKind.FUNDING:
+        return [{"account": purification_gl, "debit": document.amount, "description": label},
+                {"account": document.bank_account, "credit": document.amount, "description": label}]
+    if document.bank_account_id != purification_gl.pk:
+        raise error("A payout is paid from the purification account (1140) only (D31b).",
+                    "يُصرف من حساب التطهير (1140) فقط.", code="purification_account_required")
     return [{"account": CHARITY_PAYABLE, "debit": document.amount, "description": label},
-            {"account": document.bank_account, "credit": document.amount,
+            {"account": purification_gl, "credit": document.amount,
              "description": f"{label} {document.recipient_ar}"[:300]}]
+
+
+# --- charity recipients and bank instructions (R54 amendment D31b) ---------------------------------------------
+
+def _charity_bank(value):
+    bank = value if isinstance(value, Bank) else Bank.objects.filter(code=value).first()
+    if bank is None or not bank.is_active:
+        raise error(f"Bank {value} is unknown or inactive.", f"البنك {value} غير معروف أو غير نشط.",
+                    code="charity_recipient_invalid")
+    return bank
+
+
+def create_charity_recipient(entity, *, user, name_en, name_ar, bank, iban, platform_reference=""):
+    """Add a charity recipient for purification payouts (D31b; ``invoicing.manage_charity_recipient``, people
+    only). It can be paid only after a Managing Partner who did not add it approves it."""
+    _require_person(user, entity, "invoicing.manage_charity_recipient")
+    access.require(user, entity, "invoicing.manage_charity_recipient")
+    bank = _charity_bank(bank)
+    norm = iban_rules.normalise(iban)
+    name_en, name_ar = (name_en or "").strip(), (name_ar or "").strip()
+    problems = []
+    if not (name_en and name_ar):
+        problems.append("A charity recipient needs an English and an Arabic name. / "
+                        "تحتاج الجهة الخيرية المستفيدة إلى اسم بالإنجليزية والعربية.")
+    if bank.country != "SA":
+        problems.append("Charity recipients are paid at a Saudi bank (D31b). / يُصرف للجهات الخيرية لدى بنك سعودي.")
+    iban_problems = iban_rules.saudi_problems(norm)
+    problems += iban_problems
+    if not iban_problems and bank.sa_bank_code and bank.verified and norm[4:6] != bank.sa_bank_code:
+        problems.append(f"Positions 5-6 of this IBAN ({norm[4:6]}) are not {bank.code}'s code {bank.sa_bank_code}. / "
+                        f"الخانتان 5-6 في رقم الآيبان ({norm[4:6]}) لا تطابقان رمز البنك {bank.sa_bank_code}.")
+    if not iban_problems and CharityRecipient.objects.filter(entity=entity, iban_hash=keyed_hash(norm),
+                                                             is_active=True).exists():
+        problems.append("This IBAN is already an active charity recipient of this entity. / "
+                        "رقم الآيبان هذا مسجل لجهة خيرية نشطة لهذا الكيان.")
+    if len((platform_reference or "").strip()) > 100:
+        problems.append("The platform reference has at most 100 characters. / مرجع المنصة بحد أقصى 100 حرف.")
+    if problems:
+        raise _problems_error(problems, "charity_recipient_invalid")
+    recipient = CharityRecipient(entity=entity, name_en=name_en, name_ar=name_ar, bank=bank, iban=norm,
+                                 iban_hash=keyed_hash(norm), iban_last4=iban_rules.last4(norm),
+                                 platform_reference=(platform_reference or "").strip(), created_by=user)
+    recipient._service_write = True
+    recipient.save()
+    return recipient
+
+
+def approve_charity_recipient(recipient, *, user):
+    """D31b: a Managing Partner (``invoicing.approve_charity_recipient``, A + S!) who did not add the recipient
+    approves it; only then can payouts go to it. People only."""
+    recipient = CharityRecipient.objects.select_related("entity").get(pk=getattr(recipient, "pk", recipient))
+    _require_person(user, recipient.entity, "invoicing.approve_charity_recipient")
+    access.require(user, recipient.entity, "invoicing.approve_charity_recipient", document=recipient)
+    with transaction.atomic():
+        recipient = CharityRecipient.objects.select_for_update().get(pk=recipient.pk)
+        if recipient.is_approved:
+            raise error("This charity recipient is already approved.", "هذه الجهة الخيرية معتمدة مسبقًا.",
+                        code="already_approved")
+        if not recipient.is_active:
+            raise error("A deactivated charity recipient is not approved.", "لا تُعتمد جهة خيرية موقوفة.",
+                        code="recipient_inactive")
+        recipient.approved_by, recipient.approved_at = user, timezone.now()
+        recipient._service_write = True
+        recipient.save()
+    return recipient
+
+
+def deactivate_charity_recipient(recipient, *, user, reason):
+    """D31b: stop paying a charity recipient (``invoicing.manage_charity_recipient``). Final: add it again (and have
+    it approved) to pay it later. Payouts already posted keep it."""
+    recipient = CharityRecipient.objects.select_related("entity").get(pk=getattr(recipient, "pk", recipient))
+    _require_person(user, recipient.entity, "invoicing.manage_charity_recipient")
+    access.require(user, recipient.entity, "invoicing.manage_charity_recipient")
+    if not (reason or "").strip():
+        raise error("A reason is required.", "السبب مطلوب.", code="reason_required")
+    with transaction.atomic():
+        recipient = CharityRecipient.objects.select_for_update().get(pk=recipient.pk)
+        if not recipient.is_active:
+            raise error("This charity recipient is already inactive.", "هذه الجهة الخيرية موقوفة مسبقًا.",
+                        code="recipient_inactive")
+        recipient.is_active = False
+        recipient.deactivated_by, recipient.deactivated_at = user, timezone.now()
+        recipient.deactivation_reason = reason.strip()[:300]
+        recipient._service_write = True
+        recipient.save()
+    return recipient
+
+
+def charity_recipients(entity, *, user, usable_only=False):
+    """The entity's charity recipients (``invoicing.view``); show them with :func:`charity_recipient_row` (masked).
+    ``usable_only``: approved and active ones (the only ones a payout accepts)."""
+    access.require(user, entity, "invoicing.view")
+    qs = CharityRecipient.objects.filter(entity=entity).select_related("bank")
+    return qs.filter(is_active=True, approved_by__isnull=False) if usable_only else qs
+
+
+def charity_recipient_row(recipient, *, user):
+    """A list row: the IBAN is always masked (banking R4)."""
+    access.require(user, recipient.entity, "invoicing.view")
+    return {"id": recipient.pk, "name_en": recipient.name_en, "name_ar": recipient.name_ar,
+            "bank_en": recipient.bank.name_en, "bank_ar": recipient.bank.name_ar, "iban": recipient.masked_iban,
+            "platform_reference": recipient.platform_reference, "active": recipient.is_active,
+            "approved": recipient.is_approved}
+
+
+def _log_iban_view(user, entity, obj, last4):
+    access_services.log(AccessLog.Event.PERSONAL_DATA_VIEWED, actor=user, entity=entity,
+                        permission="banking.view_iban",
+                        details={"object": [obj._meta.label_lower, obj.pk], "last4": last4})
+
+
+def reveal_charity_recipient_iban(recipient, *, user):
+    """The unmasked IBAN of a charity recipient (``banking.view_iban``); each view writes an access-log row (R51,
+    banking R4)."""
+    recipient = CharityRecipient.objects.select_related("entity").get(pk=getattr(recipient, "pk", recipient))
+    access.require(user, recipient.entity, "banking.view_iban")
+    _log_iban_view(user, recipient.entity, recipient, recipient.iban_last4)
+    return {"iban": recipient.iban}
+
+
+def purification_instructions(entity, *, user):
+    """The entity's purification bank instructions (``invoicing.view``); rows via
+    :func:`purification_instruction_row` (masked)."""
+    access.require(user, entity, "invoicing.view")
+    return PurificationInstruction.objects.filter(entity=entity).select_related("from_account", "beneficiary_bank")
+
+
+def purification_instruction_row(instruction, *, user):
+    """A list row of a bank instruction: amount, masked IBANs, reference, status (banking R4)."""
+    access.require(user, instruction.entity, "invoicing.view")
+    return {"id": instruction.pk, "payout": instruction.payout_id, "amount": instruction.amount,
+            "currency": instruction.currency_id, "from_account": instruction.from_account.code,
+            "from_iban": instruction.from_account.masked_number, "beneficiary_en": instruction.beneficiary_name_en,
+            "beneficiary_ar": instruction.beneficiary_name_ar, "iban": instruction.masked_iban,
+            "reference": instruction.reference, "execution_date": instruction.execution_date,
+            "status": instruction.status}
+
+
+def reveal_purification_instruction(instruction, *, user):
+    """The unmasked beneficiary IBAN of a bank instruction (``banking.view_iban``), for the bank file; logged."""
+    instruction = PurificationInstruction.objects.select_related("entity").get(
+        pk=getattr(instruction, "pk", instruction))
+    access.require(user, instruction.entity, "banking.view_iban")
+    _log_iban_view(user, instruction.entity, instruction, instruction.beneficiary_iban_last4)
+    return {"beneficiary_iban": instruction.beneficiary_iban}
 
 
 # --- personal data (PDPL; R49 to R53, R86, R91) ---------------------------------------------------------------

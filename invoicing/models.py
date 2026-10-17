@@ -16,6 +16,8 @@ from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models
 
+from banking import iban as iban_rules
+from banking.crypto import EncryptedTextField
 from core.models import Currency, Entity, bi, validate_country_code, validate_vat_number
 
 ZERO = Decimal("0")
@@ -1398,14 +1400,18 @@ class PurificationTransfer(Tracked, Guarded):
     """Purification of non-compliant income (R54, E14, E15; CLAUDE.md rule 5).
 
     ``transfer`` (E14): Dr 4900 / Cr 2600 for flagged income still to purify (``ledger.purification_amount``).
-    ``payout`` (E15): Dr 2600 / Cr bank to the recipient charity. Recorded by a person and posted by a
-    **second** person (the ledger refuses the recorder): transfers with ``invoicing.post_purification_transfer``,
-    payouts with ``invoicing.approve_purification_payout`` (CFO). Never by an agent. Amount, timing and recipient
-    stay OQ-30 (Sharia board sign-off). Amounts are in the entity's functional currency.
+    ``funding`` (D31b): Dr 1140 / Cr operating bank: the cash behind 2600 moves into the entity's designated
+    purification account (``banking.BankAccount.is_purification_account``), up to what was transferred and not yet
+    funded. ``payout`` (E15, D31b): Dr 2600 / Cr 1140 from the purification account to one approved, active
+    :class:`CharityRecipient`; it produces a :class:`PurificationInstruction` for the bank. Recorded by a person and
+    posted by a **second** person (the ledger refuses the recorder): transfers and fundings with
+    ``invoicing.post_purification_transfer``, payouts with ``invoicing.approve_purification_payout`` (CFO). Never by
+    an agent. Amount, timing and the recipient list's Sharia sign-off stay OQ-30. Amounts are in SAR (functional).
     """
 
     class Kind(models.TextChoices):
         TRANSFER = "transfer", bi("Transfer to charity payable (E14)", "تحويل إلى مستحقات التطهير")
+        FUNDING = "funding", bi("Funding of the purification account (D31b)", "تمويل حساب التطهير")
         PAYOUT = "payout", bi("Payout to charity (E15)", "صرف للجهة الخيرية")
 
     class Status(models.TextChoices):
@@ -1419,8 +1425,16 @@ class PurificationTransfer(Tracked, Guarded):
     number = models.CharField(bi("Number", "الرقم"), max_length=40, blank=True)
     date = models.DateField(bi("Date", "التاريخ"))
     amount = models.DecimalField(bi("Amount", "المبلغ"), max_digits=18, decimal_places=2)
-    bank_account = models.ForeignKey("ledger.Account", null=True, blank=True, on_delete=models.PROTECT,
-                                     related_name="+", verbose_name=bi("Bank account (payout)", "الحساب البنكي (الصرف)"))
+    bank_account = models.ForeignKey(
+        "ledger.Account", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Bank GL account (funding: paid from; payout: 1140)",
+                        "حساب الأستاذ البنكي (التمويل: المصدر؛ الصرف: 1140)"))
+    purification_account = models.ForeignKey(
+        "banking.BankAccount", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Purification account (D31b)", "حساب التطهير"))
+    recipient = models.ForeignKey(
+        "invoicing.CharityRecipient", null=True, blank=True, on_delete=models.PROTECT, related_name="payouts",
+        verbose_name=bi("Charity recipient (payout)", "الجهة الخيرية المستفيدة (الصرف)"))
     recipient_en = models.CharField(bi("Recipient (English)", "الجهة المستفيدة (بالإنجليزية)"), max_length=200,
                                     blank=True)
     recipient_ar = models.CharField(bi("Recipient (Arabic)", "الجهة المستفيدة (بالعربية)"), max_length=200, blank=True)
@@ -1450,6 +1464,184 @@ class PurificationTransfer(Tracked, Guarded):
 
     def __str__(self):
         return f"{self.number or 'DRAFT'} {self.get_kind_display()} {self.amount} ({self.status})"
+
+
+class _ServiceOnlyQuerySet(models.QuerySet):
+    """Bulk writes skip save(): these rows change one by one through invoicing.services (D31b)."""
+
+    def update(self, **kwargs):
+        raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
+
+    def delete(self):
+        raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
+
+    def bulk_update(self, objs, fields, *args, **kwargs):
+        raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
+
+
+def _stored_values(obj):
+    if obj.pk is None:
+        return None
+    return type(obj)._base_manager.filter(pk=obj.pk).values(*[f.attname for f in obj._meta.concrete_fields]).first()
+
+
+class CharityRecipient(models.Model):
+    """An approved charity recipient of purification payouts (R54 amendment D31b), per entity.
+
+    Added by the accountant (``invoicing.manage_charity_recipient``) and approved by a Managing Partner who did not
+    add it (``invoicing.approve_charity_recipient``, A + S!). Only approved, active recipients are paid. The Saudi
+    IBAN (``SA`` + 22 digits, valid mod-97) is stored encrypted with a keyed hash and its last four characters
+    (banking R4); lists show it masked, unmasked views need ``banking.view_iban`` and are logged. Once approved, a
+    recipient never changes; it can only be deactivated (then it is never used again). Sharia board sign-off of the
+    list stays OQ-30. PostgreSQL trigger: migration 0022.
+    """
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    name_en = models.CharField(bi("Name (English)", "الاسم (بالإنجليزية)"), max_length=200)
+    name_ar = models.CharField(bi("Name (Arabic)", "الاسم (بالعربية)"), max_length=200)
+    bank = models.ForeignKey("banking.Bank", on_delete=models.PROTECT, related_name="+",
+                             verbose_name=bi("Bank", "البنك"))
+    iban = EncryptedTextField(bi("IBAN", "الآيبان"), plain_max_length=34)
+    iban_hash = models.CharField(max_length=64, editable=False)
+    iban_last4 = models.CharField(max_length=4, editable=False)
+    platform_reference = models.CharField(
+        bi("Platform reference", "مرجع المنصة"), max_length=100, blank=True,
+        help_text=bi("Optional, e.g. the Ihsan national platform reference", "اختياري، مثل مرجع منصة إحسان"))
+    is_active = models.BooleanField(bi("Active", "نشط"), default=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                   verbose_name=bi("Added by", "أضافه"))
+    created_at = models.DateTimeField(bi("Added at", "تاريخ الإضافة"), auto_now_add=True)
+    approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="+", verbose_name=bi("Approved by", "اعتمده"))
+    approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+    deactivated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                       related_name="+", verbose_name=bi("Deactivated by", "أوقفه"))
+    deactivated_at = models.DateTimeField(bi("Deactivated at", "تاريخ الإيقاف"), null=True, blank=True)
+    deactivation_reason = models.CharField(bi("Deactivation reason", "سبب الإيقاف"), max_length=300, blank=True)
+
+    objects = _ServiceOnlyQuerySet.as_manager()
+
+    APPROVAL_FIELDS = frozenset({"approved_by_id", "approved_at"})
+    DEACTIVATION_FIELDS = frozenset({"is_active", "deactivated_by_id", "deactivated_at", "deactivation_reason"})
+
+    class Meta:
+        verbose_name = bi("charity recipient", "جهة خيرية مستفيدة")
+        verbose_name_plural = bi("charity recipients", "الجهات الخيرية المستفيدة")
+        ordering = ["entity", "name_en"]
+        constraints = [
+            models.UniqueConstraint(fields=["entity", "iban_hash"], condition=models.Q(is_active=True),
+                                    name="charity_recipient_iban_once_per_entity"),
+            models.CheckConstraint(condition=models.Q(approved_by__isnull=True, approved_at__isnull=True)
+                                   | models.Q(approved_by__isnull=False, approved_at__isnull=False),
+                                   name="charity_recipient_approval_complete"),
+            models.CheckConstraint(condition=~models.Q(approved_by=models.F("created_by")),
+                                   name="charity_recipient_approver_not_creator"),
+        ]
+
+    @property
+    def is_approved(self):
+        return self.approved_by_id is not None
+
+    @property
+    def masked_iban(self):
+        return iban_rules.masked("SA", self.iban_last4)
+
+    def __str__(self):  # masked IBAN only (banking R4)
+        return f"{self.name_en} / {self.name_ar} {self.masked_iban}"
+
+    def save(self, *args, **kwargs):
+        allowed, self._service_write = getattr(self, "_service_write", False), False
+        if not allowed:
+            raise error("Charity recipients change only through invoicing.services.",
+                        "تتغير الجهات الخيرية المستفيدة من خلال خدمات الفوترة فقط.", code="service_only")
+        stored = _stored_values(self)
+        if stored is not None:
+            changed = {name for name, value in stored.items() if getattr(self, name) != value}
+            approving = (stored["approved_by_id"] is None and changed <= self.APPROVAL_FIELDS
+                         and self.approved_by_id is not None and stored["is_active"])
+            deactivating = stored["is_active"] and not self.is_active and changed <= self.DEACTIVATION_FIELDS
+            if changed and not (approving or deactivating):
+                raise error("A charity recipient never changes; it is approved once or deactivated (D31b).",
+                            "لا تتغير الجهة الخيرية المستفيدة؛ تُعتمد مرة واحدة أو تُوقف.", code="recipient_immutable")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error("Charity recipients are never deleted; deactivate them.", "لا تُحذف الجهات الخيرية المستفيدة؛ أوقفها.",
+                    code="recipient_immutable")
+
+
+class PurificationInstruction(models.Model):
+    """The bank instruction a posted purification payout produces (R54 amendment D31b): pay ``amount`` SAR from the
+    purification account to the recipient's IBAN with ``reference``. For the banking module and a future bank file
+    (banking OQ-2); nothing here connects to a bank. ``pending`` until the payout is reversed (``cancelled``). The
+    recipient's name, bank and IBAN are copied at posting; the IBAN is encrypted and shown masked (banking R4).
+    PostgreSQL trigger: migration 0022.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", bi("Pending (to send to the bank)", "معلقة (للإرسال إلى البنك)")
+        CANCELLED = "cancelled", bi("Cancelled (payout reversed)", "ملغاة (عُكس الصرف)")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    payout = models.OneToOneField(PurificationTransfer, on_delete=models.PROTECT, related_name="bank_instruction",
+                                  verbose_name=bi("Payout", "الصرف"))
+    from_account = models.ForeignKey("banking.BankAccount", on_delete=models.PROTECT, related_name="+",
+                                     verbose_name=bi("From (purification account)", "من (حساب التطهير)"))
+    recipient = models.ForeignKey(CharityRecipient, on_delete=models.PROTECT, related_name="instructions",
+                                  verbose_name=bi("Recipient", "المستفيد"))
+    beneficiary_name_en = models.CharField(bi("Beneficiary (English)", "المستفيد (بالإنجليزية)"), max_length=200)
+    beneficiary_name_ar = models.CharField(bi("Beneficiary (Arabic)", "المستفيد (بالعربية)"), max_length=200)
+    beneficiary_bank = models.ForeignKey("banking.Bank", on_delete=models.PROTECT, related_name="+",
+                                         verbose_name=bi("Beneficiary bank", "بنك المستفيد"))
+    beneficiary_iban = EncryptedTextField(bi("Beneficiary IBAN", "آيبان المستفيد"), plain_max_length=34)
+    beneficiary_iban_last4 = models.CharField(max_length=4)
+    amount = models.DecimalField(bi("Amount", "المبلغ"), max_digits=18, decimal_places=2)
+    currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Currency", "العملة"))
+    reference = models.CharField(bi("Reference", "المرجع"), max_length=140)
+    execution_date = models.DateField(bi("Requested execution date", "تاريخ التنفيذ المطلوب"))
+    status = models.CharField(bi("Status", "الحالة"), max_length=9, choices=Status.choices, default=Status.PENDING)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
+    created_at = models.DateTimeField(auto_now_add=True)
+    cancelled_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                     related_name="+")
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancel_reason = models.CharField(max_length=300, blank=True)
+
+    objects = _ServiceOnlyQuerySet.as_manager()
+
+    CANCEL_FIELDS = frozenset({"status", "cancelled_by_id", "cancelled_at", "cancel_reason"})
+
+    class Meta:
+        verbose_name = bi("purification bank instruction", "أمر بنكي لصرف التطهير")
+        verbose_name_plural = bi("purification bank instructions", "أوامر بنكية لصرف التطهير")
+        ordering = ["entity", "-execution_date", "pk"]
+        constraints = [models.CheckConstraint(condition=models.Q(amount__gt=0), name="purification_instruction_positive")]
+
+    @property
+    def masked_iban(self):
+        return iban_rules.masked("SA", self.beneficiary_iban_last4)
+
+    def __str__(self):
+        return f"{self.reference} {self.amount} {self.currency_id} -> {self.masked_iban} ({self.status})"
+
+    def save(self, *args, **kwargs):
+        allowed, self._service_write = getattr(self, "_service_write", False), False
+        if not allowed:
+            raise error("Bank instructions are written only when a payout posts or is reversed.",
+                        "تُكتب الأوامر البنكية عند ترحيل الصرف أو عكسه فقط.", code="service_only")
+        stored = _stored_values(self)
+        if stored is not None:
+            changed = {name for name, value in stored.items() if getattr(self, name) != value}
+            cancelling = (stored["status"] == self.Status.PENDING and self.status == self.Status.CANCELLED
+                          and changed <= self.CANCEL_FIELDS)
+            if changed and not cancelling:
+                raise error("A bank instruction never changes; it is only cancelled with its payout's reversal.",
+                            "لا يتغير الأمر البنكي؛ يُلغى فقط بعكس الصرف.", code="instruction_immutable")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error("Bank instructions are never deleted.", "لا تُحذف الأوامر البنكية.", code="instruction_immutable")
 
 
 class ApplicationQuerySet(models.QuerySet):

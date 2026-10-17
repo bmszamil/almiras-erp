@@ -21,6 +21,7 @@ from core.admin import EntityScopedAdmin
 
 from . import services
 from .models import (
+    CharityRecipient,
     CustomerReceipt,
     Customer,
     IncomeType,
@@ -29,6 +30,8 @@ from .models import (
     PayableAllocation,
     PurchaseDocument,
     PurchaseDocumentLine,
+    PurificationInstruction,
+    PurificationTransfer,
     ReceivableAllocation,
     SalesDocument,
     SalesDocumentLine,
@@ -290,6 +293,40 @@ class SettingsAdmin(ReadOnlyScopedAdmin):
     status_field = None
 
 
+class CharityRecipientAdmin(ReadOnlyScopedAdmin):
+    """D31b: IBANs masked here; ``invoicing.services.reveal_charity_recipient_iban`` shows them (logged)."""
+
+    list_display = ["entity", "name_en", "name_ar", "bank", "masked_iban", "platform_reference", "is_active",
+                    "created_by", "approved_by", "approved_at"]
+    list_filter = [("entity", admin.RelatedOnlyFieldListFilter), "is_active"]
+    fields = ["entity", "name_en", "name_ar", "bank", "masked_iban", "platform_reference", "is_active", "created_by",
+              "created_at", "approved_by", "approved_at", "deactivated_by", "deactivated_at", "deactivation_reason"]
+    readonly_fields = fields
+    status_field = None
+
+    @admin.display(description="IBAN (masked) / الآيبان (مخفي)")
+    def masked_iban(self, obj):
+        return obj.masked_iban
+
+
+class PurificationTransferAdmin(ReadOnlyScopedAdmin):
+    list_display = ["number", "entity", "kind", "date", "amount", "recipient", "status", "posted_by"]
+    list_filter = [("entity", admin.RelatedOnlyFieldListFilter), "kind", "status"]
+
+
+class PurificationInstructionAdmin(ReadOnlyScopedAdmin):
+    """D31b: beneficiary IBANs masked; ``reveal_purification_instruction`` shows them (logged)."""
+
+    list_display = ["reference", "entity", "amount", "currency", "beneficiary_name_en", "masked_iban",
+                    "execution_date", "status"]
+    list_filter = [("entity", admin.RelatedOnlyFieldListFilter), "status"]
+    exclude = ["beneficiary_iban"]
+
+    @admin.display(description="IBAN (masked) / الآيبان (مخفي)")
+    def masked_iban(self, obj):
+        return obj.masked_iban
+
+
 class ReferenceAdmin(admin.ModelAdmin):
     """Statutory reference data changes by migration only (rates are data with effective dates)."""
 
@@ -312,5 +349,8 @@ admin.site.register(VendorPayment, VendorPaymentAdmin)
 admin.site.register(ReceivableAllocation, AllocationAdmin)
 admin.site.register(PayableAllocation, AllocationAdmin)
 admin.site.register(InvoicingSettings, SettingsAdmin)
+admin.site.register(CharityRecipient, CharityRecipientAdmin)
+admin.site.register(PurificationTransfer, PurificationTransferAdmin)
+admin.site.register(PurificationInstruction, PurificationInstructionAdmin)
 for model in (VatRate, VatExemptionReason, NoteReason, IncomeType):
     admin.site.register(model, ReferenceAdmin)
