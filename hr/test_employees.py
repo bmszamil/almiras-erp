@@ -103,7 +103,8 @@ def test_at5_identity_rules(w):
     assert short.warnings and "unverified" in short.warnings[0]
     ok_saudi = employee(w, id_number="1000000003")
     ok_iqama = employee(w, saudi=False, id_number="2000000003")
-    assert ok_saudi.warnings == [] and ok_iqama.warnings == []
+    id_warnings = [x for e in (ok_saudi, ok_iqama) for x in e.warnings if "ID number" in x]
+    assert id_warnings == [] and ok_iqama.warnings == []
     with pytest.raises(HrError) as exc:
         employee(w, id_number="1000000003")
     assert exc.value.code == "id_duplicate"
@@ -366,3 +367,45 @@ def test_s7_counts_are_per_entity_and_need_a_right(w):
 
     assert "hr.view" not in ROLE_SEED["viewer"][5] and "hr.view_counts" in ROLE_SEED["viewer"][5]
     assert "hr.view" in ROLE_SEED["accountant"][5]  # AT-6: the accountant opens employees, masked
+
+
+# --- Finding 7 (probe P14): services hand out masked employees; GOSI data encrypted and masked (AT-41) ---------
+
+def test_p14_get_employee_and_lists_are_masked_for_everyone(w):
+    emp = hired(w, iban="GB82WEST12345698765432", gosi_number="123456789")
+    for user in (w.a, w.h, w.p):
+        e = services.get_employee(user, emp.pk)
+        assert e == emp and e.full_name_en == services.MASK and e.id_number == services.MASK
+        assert e.iban == services.MASK and e.gosi_number == services.MASK and e.date_of_birth is None
+        assert {x.id_number for x in services.employees(user)} == {services.MASK}
+    with pytest.raises(HrError):
+        services.employees(w.a).values_list("id_number", flat=True)
+    with pytest.raises(HrError):
+        services.employees(w.a).values()
+    assert list(services.employees(w.a).values_list("employee_code", flat=True)) == [emp.employee_code]
+    masked = services.get_employee(w.h, emp.pk)
+    masked._service_write = True
+    with pytest.raises(HrError):  # a masked instance is never written back
+        masked.save()
+    assert Employee.objects.get(pk=emp.pk).full_name_en == "Test Person"
+
+
+def test_at41_gosi_cohort_entered_never_derived_logged_and_masked(w):
+    e6 = employee(w, hire_date=date(2026, 5, 1))
+    assert e6.gosi_cohort == "" and any("payroll R56" in x for x in e6.warnings)
+    e6 = services.update_employee(e6, user=w.h, gosi_cohort="legacy_m33", gosi_first_coverage_date=date(2015, 3, 1),
+                                  gosi_number="987654321")
+    e6 = Employee.objects.get(pk=e6.pk)
+    assert e6.gosi_cohort == "legacy_m33" and e6.hire_date > date(2024, 7, 3)  # kept, not derived from hire_date
+    assert not any("payroll R56" in x for x in e6.warnings)
+    services.update_employee(e6, user=w.h, gosi_cohort="new_m273")
+    log = AccessLog.objects.filter(event="profile_changed", details__employee_code=e6.employee_code).latest("id")
+    assert log.details["before"]["gosi_cohort"] == "legacy_m33" and log.details["after"]["gosi_cohort"] == "new_m273"
+    assert log.details["message_ar"] and log.details["message_en"]
+    rec = services.employee_record(e6, user=w.a)
+    assert rec["gosi_cohort"] == rec["gosi_first_coverage_date"] == rec["gosi_number"] == services.MASK
+    with connection.cursor() as cur:
+        cur.execute("SELECT gosi_number, gosi_cohort, gosi_first_coverage_date FROM hr_employee WHERE id = %s", [e6.pk])
+        assert all(v.startswith("enc1:") for v in cur.fetchone())
+    with pytest.raises(HrError):
+        services.update_employee(e6, user=w.h, gosi_cohort="m33")

@@ -67,6 +67,53 @@ class ServiceOnlyQuerySet(models.QuerySet):
         raise error(*SERVICE_ONLY, code="service_only")
 
 
+MASK = "*** / مخفي"
+
+
+class EmployeeQuerySet(ServiceOnlyQuerySet):
+    """``masked()`` querysets (hr.services.employees / get_employee, R10, finding 7) hand out employees with every
+    personal-data field replaced by the mask; they refuse ``values()`` / ``values_list()`` of those fields. The
+    unmasked, logged view is ``hr.services.employee_record``."""
+
+    _masked = False
+
+    def masked(self):
+        clone = self._chain()
+        clone._masked = True
+        return clone
+
+    def _clone(self):
+        clone = super()._clone()
+        clone._masked = self._masked
+        return clone
+
+    def _fetch_all(self):
+        super()._fetch_all()
+        if self._masked:
+            for obj in self._result_cache:
+                if isinstance(obj, Employee):
+                    obj.mask()
+
+    def iterator(self, *args, **kwargs):
+        for obj in super().iterator(*args, **kwargs):
+            if self._masked and isinstance(obj, Employee):
+                obj.mask()
+            yield obj
+
+    def _refuse_personal(self, fields, expressions=()):
+        if self._masked and (expressions or not fields or set(fields) & set(Employee.PERSONAL_FIELDS)):
+            raise error("Personal data is read through hr.services.employee_record (masked, logged; R10).",
+                        "تُقرأ البيانات الشخصية عبر خدمة سجل الموظف (مخفية ومسجلة).", code="personal_data")
+
+    def values(self, *fields, **expressions):
+        self._refuse_personal(fields, expressions)
+        return super().values(*fields, **expressions)
+
+    def values_list(self, *fields, **kwargs):
+        self._refuse_personal(fields)
+        return super().values_list(*fields, **kwargs)
+
+
 class Source(models.TextChoices):
     """No ``agent`` value: agents never read or draft HR records (R13, OQ-12)."""
 
@@ -358,9 +405,17 @@ class Employee(Tracked):
         ON_NOTICE = "on_notice", bi("On notice", "في فترة الإشعار")
         TERMINATED = "terminated", bi("Terminated", "منتهية خدمته")
 
+    class GosiCohort(models.TextChoices):
+        # Entered from the GOSI record, never derived from hire_date (hr 3.2; SIL Royal Decree Clause Second(1)).
+        LEGACY_M33 = "legacy_m33", bi("Legacy (SIL M/33)", "النظام السابق (م/33)")
+        NEW_M273 = "new_m273", bi("New law (SIL M/273)", "النظام الجديد (م/273)")
+
+    # GOSI identifiers (3.2: "PD-light", masked like the GOSI number; finding 7: encrypted too).
+    GOSI_FIELDS = ("gosi_number", "gosi_cohort", "gosi_first_coverage_date")
     # Personal data (R10): encrypted, masked without hr.view_personal_data.
     PERSONAL_FIELDS = ("full_name_en", "full_name_ar", "id_number", "date_of_birth", "gender", "phone", "email",
-                       "address", "bank_name", "iban", "country_of_residence")
+                       "address", "bank_name", "iban", "country_of_residence") + GOSI_FIELDS
+    DATE_FIELDS = ("date_of_birth", "gosi_first_coverage_date")
     # What a payroll officer may see unmasked (§7: bank/IBAN and ID for WPS).
     PAYMENT_FIELDS = ("id_number", "bank_name", "iban")
 
@@ -379,8 +434,13 @@ class Employee(Tracked):
     address = EncryptedTextField(bi("Address", "العنوان"), plain_max_length=500, blank=True, default="")
     bank_name = EncryptedTextField(bi("Bank", "البنك"), plain_max_length=100, blank=True, default="")
     iban = EncryptedTextField(bi("IBAN", "رقم الآيبان"), plain_max_length=34, blank=True, default="")
-    gosi_number = models.CharField(bi("GOSI number", "رقم التأمينات"), max_length=20, blank=True)
+    gosi_number = EncryptedTextField(bi("GOSI number", "رقم التأمينات"), plain_max_length=20, blank=True, default="")
     gosi_registered_on = models.DateField(bi("GOSI registered on", "تاريخ التسجيل في التأمينات"), null=True, blank=True)
+    # Payroll R55, R56: required for a Saudi before payroll; entered from the GOSI record (AT-41).
+    gosi_cohort = EncryptedTextField(bi("GOSI cohort", "فئة التأمينات"), plain_max_length=10, choices=GosiCohort.choices,
+                                     blank=True, default="")
+    gosi_first_coverage_date = EncryptedDateField(bi("First subject to GOSI on", "تاريخ أول خضوع للتأمينات"),
+                                                  null=True, blank=True)
     hire_date = models.DateField(bi("Hire date", "تاريخ التعيين"))
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     user = models.OneToOneField(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
@@ -391,7 +451,7 @@ class Employee(Tracked):
                                               blank=True, default="")
     warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
 
-    objects = ServiceOnlyQuerySet.as_manager()
+    objects = EmployeeQuerySet.as_manager()
 
     class Meta:
         verbose_name = bi("employee", "موظف")
@@ -414,9 +474,16 @@ class Employee(Tracked):
         KSA and are outside WPS (H17); local entity employees are paid by their local payroll (H9)."""
         return self.employment_basis == EmploymentBasis.KSA_EMPLOYEE
 
+    def mask(self):
+        """Replace every personal-data value by the mask (R10). A masked instance is never saved."""
+        for name in self.PERSONAL_FIELDS:
+            setattr(self, name, None if name in self.DATE_FIELDS else MASK)
+        self._masked = True
+        return self
+
     def save(self, *args, **kwargs):
         allowed, self._service_write = getattr(self, "_service_write", False), False
-        if not allowed:
+        if not allowed or getattr(self, "_masked", False):
             raise error(*SERVICE_ONLY, code="service_only")
         super().save(*args, **kwargs)
 

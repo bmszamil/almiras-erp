@@ -41,6 +41,7 @@ from . import billing_port, crypto, payroll_port
 from .models import (
     ANNUAL_LEAVE_CEILING,
     ANNUAL_LEAVE_CONTRACT_DAYS,
+    MASK,
     ZERO,
     Assignment,
     AssignmentEvent,
@@ -69,7 +70,6 @@ from .models import (
     error,
 )
 
-MASK = "*** / مخفي"
 ALMIRAS_CODE = "ALM"  # R55: the managing-partner overtime route is seeded for Almiras only
 GCC = frozenset({"BH", "KW", "OM", "QA", "AE"})  # SA itself is "Saudi"
 DEFAULT_ALERT_DAYS = [90, 60, 30, 7, 0]  # OQ-10 default
@@ -543,8 +543,10 @@ def set_overtime_route(entity, route, *, user, reason):
 EMPLOYEE_FIELDS = frozenset({
     "full_name_en", "full_name_ar", "nationality", "id_type", "id_number", "date_of_birth", "gender", "phone", "email",
     "address", "bank_name", "iban", "gosi_number", "gosi_registered_on", "hire_date", "linked_user", "employment_basis",
-    "country_of_residence",
+    "country_of_residence", "gosi_cohort", "gosi_first_coverage_date",
 })
+# AT-41: changes of these GOSI record fields are logged (en/ar) with the employee code.
+GOSI_LOGGED = ("gosi_cohort", "gosi_first_coverage_date")
 
 
 def _employee_values(fields):
@@ -596,8 +598,8 @@ def _employee_problems(emp, hr_settings):
         problems.append("The ID number is required: letters and digits only (R9). / رقم الهوية مطلوب: أحرف وأرقام فقط.")
     elif id_type in (Employee.IdType.NATIONAL_ID, Employee.IdType.IQAMA):
         # Compliance 2026-10-17: no official digit format found; the format is an unverified parameter and a
-        # warning only [CC-verify].
-        row = param("SA", "id.format", emp.hire_date or _today(), required=False)
+        # warning only [CC-verify]. Nit 19: read in the entity's own jurisdiction (never SA for a local entity).
+        row = param(jurisdiction, "id.format", emp.hire_date or _today(), required=False)
         fmt = (row.value if row else {}).get(id_type)
         if fmt and not (number.isdigit() and len(number) == int(fmt["length"]) and number.startswith(fmt["prefix"])):
             warnings.append(f"ID number does not match the expected {id_type} format ({fmt['length']} digits starting "
@@ -605,6 +607,15 @@ def _employee_problems(emp, hr_settings):
                             f"({fmt['length']} أرقام تبدأ بـ {fmt['prefix']}؛ قاعدة غير متحقق منها).")
     if emp.gender not in Employee.Gender.values:
         problems.append("Gender is required (male or female). / الجنس مطلوب (ذكر أو أنثى).")
+    if (emp.gosi_cohort or "") not in ("", *Employee.GosiCohort.values):
+        problems.append(f"Unknown GOSI cohort {emp.gosi_cohort!r} (legacy_m33 or new_m273). / فئة التأمينات "
+                        f"{emp.gosi_cohort!r} غير معروفة.")
+    if nationality == "SA" and basis != Basis.LOCAL_ENTITY_EMPLOYEE and not (emp.gosi_cohort and
+                                                                            emp.gosi_first_coverage_date):
+        # hr 3.2 / payroll R55, R56: entered from the GOSI record, never derived from the hire date.
+        warnings.append("GOSI cohort and first coverage date are not recorded: payroll refuses this employee's "
+                        "payslip until they are entered from the GOSI record (payroll R56). / لم تُسجَّل فئة التأمينات "
+                        "وتاريخ أول خضوع: ترفض الرواتب مسير هذا الموظف حتى يُدخَلا من سجل التأمينات.")
     if emp.iban and not _iban_ok(emp.iban):
         problems.append("The IBAN checksum is wrong. / رقم الآيبان غير صحيح (خانة التحقق).")
     if emp.email:
@@ -636,8 +647,18 @@ def _save_employee(emp, hr_settings):
     emp.nationality = emp.nationality.upper()
     emp.country_of_residence = (emp.country_of_residence or "").upper()
     emp.id_number = "".join(emp.id_number.split()).upper()
-    emp.id_number_hash = crypto.keyed_hash(emp.id_number)
+    hashes = crypto.keyed_hashes(emp.id_number)
+    emp.id_number_hash = hashes[0]
     emp.warnings = warnings
+    # R9 across key rotations (finding 8): a current employee hashed under an older key is found too; the partial
+    # unique constraint covers rows hashed under the current key.
+    clash = Employee.objects.filter(entity=emp.entity, id_number_hash__in=hashes).exclude(
+        status=Employee.Status.TERMINATED)
+    if emp.pk:
+        clash = clash.exclude(pk=emp.pk)
+    if clash.exists():
+        raise error("Another current employee of this entity has the same ID number (R9).",
+                    "يوجد موظف حالي آخر في هذا الكيان بنفس رقم الهوية.", code="id_duplicate")
     try:
         with transaction.atomic():
             _save(emp)
@@ -662,7 +683,9 @@ def create_employee(entity, *, user, **fields):
     if problems:
         raise _problems(problems, "employee_invalid")
     emp.employee_code = f"{s.employee_code_prefix}-EMP-{_next_number(entity, 'EMP'):06d}"
-    return _save_employee(emp, s)
+    _save_employee(emp, s)
+    _log_gosi_changes(emp, {}, user)
+    return emp
 
 
 @transaction.atomic
@@ -683,10 +706,27 @@ def update_employee(employee, *, user, **fields):
         raise error("The employment basis cannot change once a contract is approved; terminate and create a new "
                     "employee (R49, OQ-27).",
                     "لا يتغير أساس التوظيف بعد اعتماد عقد؛ أنهِ الخدمة وأنشئ سجل موظف جديدًا.", code="basis_fixed")
+    before = {name: getattr(emp, name) for name in GOSI_LOGGED}
     for name, value in _employee_values(fields).items():
         setattr(emp, name, value)
     emp.modified_by, emp.modified_at = user, timezone.now()
-    return _save_employee(emp, _settings(emp.entity))
+    _save_employee(emp, _settings(emp.entity))
+    _log_gosi_changes(emp, before, user)
+    return emp
+
+
+def _log_gosi_changes(emp, before, user):
+    """AT-41: a change of the GOSI cohort or first coverage date is logged in AccessLog (en/ar) with the employee
+    code (never a name or ID number, R11)."""
+    changed = [name for name in GOSI_LOGGED if (before.get(name) or None) != (getattr(emp, name) or None)]
+    if changed:
+        access_services.log(AccessLog.Event.PROFILE_CHANGED, actor=user, entity=emp.entity,
+                            permission="hr.manage_employee",
+                            details={"employee_code": emp.employee_code, "fields": changed,
+                                     "before": {n: str(before.get(n) or "") for n in changed},
+                                     "after": {n: str(getattr(emp, n) or "") for n in changed},
+                                     "message_en": "GOSI record data of the employee changed",
+                                     "message_ar": "تغيّرت بيانات سجل التأمينات للموظف"})
 
 
 @transaction.atomic
@@ -710,8 +750,9 @@ def delete_draft_employee(employee, *, user):
 
 
 def employees(user, entity=None):
-    """Employees ``user`` may see (R2): scoped by ``hr.view``. Personal data is still masked (use employee_record)."""
-    qs = access.scope(Employee.objects.all(), user, "hr.view")
+    """Employees ``user`` may see (R2): scoped by ``hr.view``. Every personal-data field of the rows handed out is
+    masked, whatever the user's rights (finding 7, probe P14); the unmasked, logged view is ``employee_record``."""
+    qs = access.scope(Employee.objects.masked(), user, "hr.view")
     return qs.filter(entity=entity) if entity is not None else qs
 
 
@@ -730,7 +771,7 @@ def employee_counts(user, entity):
 
 def get_employee(user, pk):
     """One employee through scope: another entity's employee is 404 (R2, AT-1)."""
-    return access.get_scoped_or_404(Employee.objects.all(), user, "hr.view", pk=pk)
+    return access.get_scoped_or_404(Employee.objects.masked(), user, "hr.view", pk=pk)
 
 
 def _visible_fields(user, entity):
@@ -753,7 +794,7 @@ def employee_record(employee, *, user):
     record = {
         "employee_code": emp.employee_code, "entity": emp.entity.code, "status": emp.status,
         "employment_basis": emp.employment_basis, "nationality": emp.nationality, "id_type": emp.id_type,
-        "hire_date": emp.hire_date, "gosi_number": emp.gosi_number,
+        "hire_date": emp.hire_date, "gosi_registered_on": emp.gosi_registered_on,
     }
     for name in Employee.PERSONAL_FIELDS:
         record[name] = getattr(emp, name) if name in shown else MASK
@@ -771,6 +812,8 @@ EXPORT_LABELS = {
     "gender": ("Gender", "الجنس"), "phone": ("Phone", "الهاتف"), "email": ("Email", "البريد الإلكتروني"),
     "address": ("Address", "العنوان"), "bank_name": ("Bank", "البنك"), "iban": ("IBAN", "رقم الآيبان"),
     "country_of_residence": ("Country of residence", "بلد الإقامة"),
+    "gosi_number": ("GOSI number", "رقم التأمينات"), "gosi_cohort": ("GOSI cohort", "فئة التأمينات"),
+    "gosi_first_coverage_date": ("First subject to GOSI on", "تاريخ أول خضوع للتأمينات"),
 }
 
 
@@ -1788,12 +1831,29 @@ def _statutory_leave_problems(req, rule, use, jurisdiction, terms):
     return problems
 
 
+# Finding 7: the only declarations a leave request stores (True/False). PUBLIC ones may be shown to any hr.view
+# holder; the others are health data (R60 pregnancy-related illness) and need hr.view_personal_data.
+PUBLIC_DECLARATIONS = frozenset({"hajj_not_performed_before", "employer_approved_study", "repeated_year"})
+DECLARATIONS = PUBLIC_DECLARATIONS | {"pregnancy_related"}
+
+
+def _declarations(declarations):
+    declarations = dict(declarations or {})
+    unknown = set(declarations) - DECLARATIONS
+    if unknown or any(not isinstance(v, bool) for v in declarations.values()):
+        raise error(f"Declarations are True/False answers to: {', '.join(sorted(DECLARATIONS))} "
+                    f"(unknown: {', '.join(sorted(unknown)) or '-'}).",
+                    f"الإقرارات إجابات بنعم أو لا على: {', '.join(sorted(DECLARATIONS))}.", code="declarations")
+    return declarations
+
+
 @transaction.atomic
 def request_leave(employee, leave_type, *, user, start_date, end_date, event_date=None, document_ref="", reason_ar="",
                   reason_en="", declarations=None):
     """Record a leave request on the employee's behalf (``hr.request_leave``, OQ-4) and submit it."""
     emp = _lock(Employee, employee.pk)
     access.require(user, emp.entity, "hr.request_leave")
+    declarations = _declarations(declarations)
     req = LeaveRequest(entity=emp.entity, employee=emp, leave_type=_leave_type(emp.entity, leave_type),
                        start_date=start_date, end_date=end_date, event_date=event_date, document_ref=document_ref,
                        reason_ar=reason_ar, reason_en=reason_en, declarations=declarations or {}, created_by=user,

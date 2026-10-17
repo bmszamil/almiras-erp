@@ -543,3 +543,14 @@ def test_r33_late_birth_extension_never_overlaps_other_leave(w):
     assert exc.value.code == "leave_overlap"
     with pytest.raises(HrError):
         services.record_birth(req, date(2027, 10, 1), user=w.h)  # outside the leave
+
+
+def test_finding7_declarations_are_whitelisted_true_false_answers(w):
+    e = hired(w, hire_date=date(2024, 1, 1))
+    with pytest.raises(HrError) as exc:
+        services.request_leave(e, "HAJJ", user=w.h, start_date=date(2027, 6, 10), end_date=date(2027, 6, 19),
+                               declarations={"hajj_not_performed_before": True, "religion": "x"})
+    assert exc.value.code == "declarations"
+    with pytest.raises(HrError):
+        services.request_leave(e, "HAJJ", user=w.h, start_date=date(2027, 6, 10), end_date=date(2027, 6, 19),
+                               declarations={"hajj_not_performed_before": "yes"})

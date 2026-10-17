@@ -1,7 +1,7 @@
 """Thin, entity-scoped, read-only admin for HR (access R2, R24; hr R2, R10).
 
 Every change goes through ``hr.services``. Lists are scoped to the entities where the user holds ``hr.view``.
-Personal data (names, ID number, birth date, gender, contact, bank, residence; R10) is never a form field here:
+Personal data (names, ID number, birth date, gender, contact, bank, residence, GOSI data; R10) is never a form field here:
 the detail page shows it through ``hr.services.employee_record``, which masks it without
 ``hr.view_personal_data`` in that entity and logs every unmasked view (``personal_data_viewed``). Object labels are
 the employee code only (R11).
@@ -9,6 +9,9 @@ the employee code only (R11).
 from django.contrib import admin
 from django.utils.html import format_html_join
 
+from core import access
+from core.access import services as access_services
+from core.access.models import AccessLog
 from core.admin import EntityScopedAdmin
 
 from . import services
@@ -70,6 +73,71 @@ class EmployeeDocumentAdmin(ReadOnlyHrAdmin):
     exclude = ["number"]
 
 
+class SensitiveFieldsAdmin(ReadOnlyHrAdmin):
+    """Finding 7: fields that reveal health, family, disciplinary or pay details are left out of the page unless the
+    user holds ``hr.view_personal_data`` in the record's entity; when shown, the view is logged
+    (``personal_data_viewed``, R10)."""
+
+    sensitive_fields = ()
+
+    def _sees_personal(self, request, obj):
+        return obj is not None and access.has(request.user, obj.entity, "hr.view_personal_data")
+
+    def get_exclude(self, request, obj=None):
+        exclude = list(super().get_exclude(request, obj) or [])
+        if not self._sees_personal(request, obj):
+            exclude += [f for f in self.sensitive_fields if f not in exclude]
+        return exclude
+
+    def get_object(self, request, object_id, from_field=None):
+        obj = super().get_object(request, object_id, from_field)
+        if obj is not None and self.sensitive_fields and self._sees_personal(request, obj):
+            access_services.log(AccessLog.Event.PERSONAL_DATA_VIEWED, actor=request.user, entity=obj.entity,
+                                permission="hr.view_personal_data",
+                                details={"employee_code": obj.employee.employee_code, "model": obj._meta.label_lower,
+                                         "fields": list(self.sensitive_fields)})
+        return obj
+
+
+@admin.register(LeaveRequest)
+class LeaveRequestAdmin(SensitiveFieldsAdmin):
+    list_display = ["employee", "leave_type", "start_date", "end_date", "days", "status"]
+    sensitive_fields = ("document_ref",)
+    exclude = ["declarations"]
+
+    def get_readonly_fields(self, request, obj=None):
+        fields = list(super().get_readonly_fields(request, obj))
+        if obj is None:
+            return fields
+        everything = self._sees_personal(request, obj)
+
+        def declarations(req):  # whitelisted keys only; health-related ones (pregnancy) need the right
+            shown = {k: v for k, v in (req.declarations or {}).items()
+                     if everything or k in services.PUBLIC_DECLARATIONS}
+            return format_html_join("", "<div>{}: {}</div>", sorted(shown.items())) or "-"
+
+        declarations.short_description = "Declarations / الإقرارات"
+        return [*fields, declarations]
+
+
+@admin.register(Termination)
+class TerminationAdmin(SensitiveFieldsAdmin):
+    list_display = ["employee", "kind", "last_working_day", "status"]
+    sensitive_fields = ("marriage_contract_date", "delivery_date", "hearing_ref", "absence_warning_ref")
+
+
+@admin.register(EosbCalculation)
+class EosbCalculationAdmin(SensitiveFieldsAdmin):
+    list_display = ["employee", "kind", "as_of", "award", "currency"]
+    sensitive_fields = ("wage_basis", "wage_components")
+
+
+@admin.register(FinalSettlementInput)
+class FinalSettlementInputAdmin(SensitiveFieldsAdmin):
+    list_display = ["employee", "last_working_day", "eosb_award", "leave_balance_days", "status"]
+    sensitive_fields = ("outstanding_loans", "outstanding_bai_ajel", "bai_ajel_undertaking")
+
+
 for model, columns in (
     (Department, ["code", "name_en", "name_ar", "entity", "head", "is_active"]),
     (Grade, ["code", "name_en", "name_ar", "entity", "overtime_eligible", "is_active"]),
@@ -78,11 +146,7 @@ for model, columns in (
     (Assignment, ["reference", "employee", "kind", "status", "start_date", "end_date", "receiving_entity"]),
     (AssignmentEvent, ["assignment", "kind", "end_date", "delivery_status", "attempts"]),
     (LeaveType, ["code", "name_en", "name_ar", "entity", "statutory", "paid_rule"]),
-    (LeaveRequest, ["employee", "leave_type", "start_date", "end_date", "days", "status"]),
     (LeaveLedger, ["employee", "leave_type", "date", "kind", "days"]),
-    (Termination, ["employee", "kind", "last_working_day", "status"]),
-    (EosbCalculation, ["employee", "kind", "as_of", "award", "currency"]),
-    (FinalSettlementInput, ["employee", "last_working_day", "eosb_award", "leave_balance_days", "status"]),
     (HrSettings, ["entity", "jurisdiction", "overtime_approval_route", "has_employees"]),
 ):
     admin.site.register(model, type(f"{model.__name__}Admin", (ReadOnlyHrAdmin,), {"list_display": columns}))

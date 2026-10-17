@@ -2,11 +2,17 @@
 
 Fernet (AES-128-CBC + HMAC-SHA256) from the open-source ``cryptography`` package; the library choice is open
 (OQ-11, go-live). Keys come from ``settings.HR_PERSONAL_DATA_KEYS`` (environment, never the database). The
-first key encrypts; every key decrypts (rotation). Values that must be unique (the ID number, R9) are also
-stored as a keyed HMAC so a partial unique constraint can work on ciphertext columns.
+first key encrypts; every key decrypts (rotation).
 
-Note for rotation: the HMAC uses the first key, so replacing the first key needs a re-hash of
-``Employee.id_number_hash`` (operator task, not built).
+Values that must be unique (the ID number, R9) are also stored as a keyed HMAC so a partial unique constraint can
+work on ciphertext columns. The HMAC key is ``settings.HR_PERSONAL_DATA_HASH_KEY``, a separate, stable secret
+that does not change when the encryption keys rotate (review finding 8). Without it the HMAC falls back to the
+first encryption key; :func:`keyed_hashes` then also yields the hash under every older key, so a duplicate ID is
+still found across a rotation, and ``manage.py hr_rehash_personal_data`` re-hashes (and re-encrypts) every row
+under the current keys.
+
+There is no silent development key: a key derived from ``SECRET_KEY`` is used only when
+``settings.HR_ALLOW_DEV_KEY`` is True (explicit opt-in, refused with DEBUG off by check hr.E002).
 """
 import base64
 import hashlib
@@ -23,13 +29,27 @@ from django.db import models
 PREFIX = "enc1:"
 
 
+def dev_key_allowed():
+    return bool(getattr(settings, "HR_ALLOW_DEV_KEY", False))
+
+
 def _secrets():
     keys = tuple(getattr(settings, "HR_PERSONAL_DATA_KEYS", None) or ())
-    if not keys:
-        if not settings.DEBUG:
-            raise ImproperlyConfigured("HR_PERSONAL_DATA_KEYS is not set (hr R10).")
-        keys = (f"dev-only:{settings.SECRET_KEY}",)
-    return keys
+    if keys:
+        return keys
+    if dev_key_allowed():
+        return (f"dev-only:{settings.SECRET_KEY}",)
+    raise ImproperlyConfigured("HR_PERSONAL_DATA_KEYS is not set: personal data cannot be encrypted (hr R10); set it "
+                               "from the secret store, or HR_ALLOW_DEV_KEY=1 on a development machine. / لم يُضبط "
+                               "HR_PERSONAL_DATA_KEYS: لا يمكن تشفير البيانات الشخصية؛ اضبطه من مخزن الأسرار، أو "
+                               "HR_ALLOW_DEV_KEY=1 على جهاز تطوير.")
+
+
+def _hash_secrets():
+    """The HMAC secrets, current first: the stable hash key if set, then every encryption key (older hashes)."""
+    hash_key = getattr(settings, "HR_PERSONAL_DATA_HASH_KEY", "") or ""
+    keys = ([hash_key] if hash_key else []) + list(_secrets())
+    return tuple(dict.fromkeys(keys))
 
 
 def _derive(secret, purpose):
@@ -56,10 +76,25 @@ def decrypt(value):
         raise ImproperlyConfigured("Personal data cannot be decrypted with the configured keys (hr R10).") from None
 
 
-def keyed_hash(text):
-    """HMAC-SHA256 of a normalised value with a key derived from the current secret (R9 uniqueness)."""
+def _hmac(secret, text):
     norm = "".join(str(text or "").split()).upper()
-    return hmac.new(_derive(_secrets()[0], "hash"), norm.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.new(_derive(secret, "hash"), norm.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def keyed_hash(text):
+    """HMAC-SHA256 of a normalised value under the current hash secret (R9 uniqueness)."""
+    return _hmac(_hash_secrets()[0], text)
+
+
+def keyed_hashes(text):
+    """The value's HMAC under every configured secret, current first: what a row hashed before a rotation (or
+    before the hash key was set) may still hold."""
+    return [_hmac(secret, text) for secret in _hash_secrets()]
+
+
+def reencrypt(value):
+    """``value`` (plain text, or ciphertext under any configured key) encrypted under the current first key."""
+    return encrypt(decrypt(value))
 
 
 class EncryptedTextField(models.TextField):

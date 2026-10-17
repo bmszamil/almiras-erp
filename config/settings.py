@@ -91,9 +91,13 @@ ZATCA_MOVABLE_ADJUSTMENT_YEARS = None
 HR_REQUIRE_VERIFIED_PARAMETERS = os.environ.get("HR_REQUIRE_VERIFIED_PARAMETERS", "1") == "1"
 # R10: personal-data encryption keys (Fernet, from the open-source ``cryptography`` package; library choice OQ-11).
 # Kept outside the database: comma-separated secrets in the environment, first = current key (older ones decrypt
-# only, for rotation). Development falls back to a key derived from SECRET_KEY; the hr.E001 check refuses that
-# fallback when DEBUG is off.
+# only, for rotation; then run manage.py hr_rehash_personal_data). No key = no personal data (check hr.E001).
 HR_PERSONAL_DATA_KEYS = [k for k in os.environ.get("HR_PERSONAL_DATA_KEYS", "").split(",") if k]
+# R9: a separate, stable secret for the ID-number hash (uniqueness on ciphertext), unchanged by key rotation.
+HR_PERSONAL_DATA_HASH_KEY = os.environ.get("HR_PERSONAL_DATA_HASH_KEY", "")
+# Development only, explicit opt-in: derive an HR key from SECRET_KEY when HR_PERSONAL_DATA_KEYS is empty. Refused
+# with DEBUG off (hr.E002).
+HR_ALLOW_DEV_KEY = os.environ.get("HR_ALLOW_DEV_KEY", "0") == "1"
 # R24/R25: where ended secondments are delivered (billing.md 3.6, R57): billing's port, which ends linked billing
 # secondments through billing.services.end_secondment(..., source="hr_event").
 HR_BILLING_PORT = "billing.hr_port.BillingHrPort"
