@@ -8,8 +8,9 @@ stored data, never from lines a caller passes.
 
 Workflow (D17): staff create and submit drafts; the approver (CFO) approves.
 Bills and vendor payments post on approval; sales documents are issued on
-approval and post when ZATCA clears or reports them (R40, R41); receipts are
-posted by a second person (R33, OQ-49).
+approval and post when ZATCA clears or reports them (R40, R41); customer
+receipts may be posted by the person who recorded them (D26, access R46);
+refunds are posted by a second person (R33, OQ-26).
 """
 import calendar
 from contextlib import contextmanager
@@ -1835,7 +1836,8 @@ def _require_receipt_staff(user, entity):
 def create_receipt(entity, *, user, customer, date, amount, currency=None, bank_account=None, bank_charge="0",
                    kind=CustomerReceipt.Kind.RECEIPT, purpose=CustomerReceipt.Purpose.SETTLEMENT, reference_en="",
                    reference_ar="", bank_reference=""):
-    """Record a draft customer receipt or refund. A second person posts it (R33).
+    """Record a draft customer receipt or refund. The recorder may post a receipt; a refund needs a second person
+    (R33, D26, access R46).
 
     Recorded by holders of ``invoicing.post_receipt`` (checked with ``invoicing.allocate``, as a P permission is
     only granted for one stored document).
@@ -1973,12 +1975,21 @@ def _post_money(movement, *, user, grant, receivable, approved=False):
 
 
 def post_receipt(receipt, *, user):
-    """Post a draft receipt (``invoicing.post_receipt``) by someone other than its creator or last modifier:
-    the ledger refuses a document posting by them (access R35; OQ-49 default, also when segregation is off)."""
+    """Post a draft receipt or refund (``invoicing.post_receipt`` grant for that document).
+
+    D26 / access R46: the person who recorded a customer receipt (``kind = receipt``) may post it, whatever
+    ``segregation_required`` says. A refund to a customer keeps creator != poster: the ledger refuses a posting
+    by its creator, submitter or last modifier (access R35, OQ-26).
+    """
     receipt = CustomerReceipt.objects.select_related("entity").get(pk=receipt.pk)
     grant = access.require(user, receipt.entity, "invoicing.post_receipt", document=receipt)
     with transaction.atomic():
         return _post_money(receipt, user=user, grant=grant, receivable=True)
+
+
+def _receipt_creator_may_post(document):
+    """Registered ``creator_may_post`` (access R46, D26): only customer receipts, never refunds (OQ-26)."""
+    return document.kind == CustomerReceipt.Kind.RECEIPT
 
 
 def _receipt_lines(document):

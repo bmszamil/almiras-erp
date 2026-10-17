@@ -28,10 +28,12 @@ class InvoicingConfig(AppConfig):
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._purchase_document_lines, validate_lines=services._check_document_rate,
         )
+        # D26 / access R46: the person who records a customer receipt may post it; refunds keep a second person.
         documents.register(
             CustomerReceipt, post_permissions={"invoicing.post_receipt"},
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._receipt_lines, validate_lines=services._check_document_rate,
+            creator_may_post=services._receipt_creator_may_post,
         )
         documents.register(
             VendorPayment, post_permissions={"invoicing.approve_vendor_payment"},

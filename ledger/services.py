@@ -380,7 +380,8 @@ def _authorise_document_post(entity, grant, posted_by, document, created_by):
 
     ``document`` is a registered, stored document of ``entity`` (see
     :func:`_resolve_document`) whose type lists the grant's permission. Its
-    creator, submitter and last modifier cannot post it (access R14). A
+    creator, submitter and last modifier cannot post it (access R14, R35), unless its type's registered
+    ``creator_may_post`` allows it for that document (customer receipts, access R46). A
     document books once: a second (non-reversal) entry for it is refused.
     Only ``invoicing.post_on_clearance`` records a different ``posted_by``:
     the approver whose used approval for the document is recorded in the
@@ -398,7 +399,9 @@ def _authorise_document_post(entity, grant, posted_by, document, created_by):
     creator_id = doc_type.creator_id_of(stored)
     if creator_id is None:  # nobody recorded as creator: segregation could not keep the creator out (R35)
         access.deny(user, entity, grant.permission, "document_no_creator")
-    if user.pk in access_services._document_people(stored) | {creator_id}:
+    if user.pk in access_services._document_people(stored) | {creator_id} and not (
+        grant.permission != CLEARANCE_PERMISSION and doc_type.self_post_allowed(stored)
+    ):  # access R46: only a type's own creator_may_post (customer receipts) lets its makers post it
         access.deny(user, entity, grant.permission, "self_approval")
     if _document_booked(entity, stored):
         raise _document_booked_error((doc_type.label, stored.pk))

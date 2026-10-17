@@ -1,4 +1,4 @@
-"""Receipts, payments, allocation and tie-out (invoicing.md R33 to R39, R59, R74; AT-28 to AT-31, AT-70;
+"""Receipts, payments, allocation and tie-out (invoicing.md R33 to R39, R59, R74; AT-28 to AT-31, AT-97;
 ledger-fx R18 settlement in a foreign currency)."""
 from datetime import date
 
@@ -29,20 +29,25 @@ def je(doc):
     return sorted((l.account.code, l.debit, l.credit, l.line_kind) for l in doc.journal_entry.lines.select_related("account"))
 
 
-def test_at70_receipt_is_posted_by_a_second_person(w):
-    inv = final(w, invoice(w))
-    r = receipt(w, applications=[(inv, "1150.00")])
-    with pytest.raises(access.AccessDenied) as exc:  # K records R, K posts R: refused
-        services.post_receipt(r, user=w.clerk)
-    assert exc.value.code == "self_approval"
-    services.update_settings(w.alm, user=w.cfo, segregation_required=False)
-    with pytest.raises(access.AccessDenied) as exc2:  # also with segregation off (OQ-49, access OQ-19)
-        services.post_receipt(r, user=w.clerk)
-    assert exc2.value.code == "self_approval"
-    posted = services.post_receipt(r, user=w.clerk2)
-    assert (posted.status, posted.number, posted.posted_by) == ("posted", "ALM-RCPT-2027-000001", w.clerk2)
-    assert je(posted) == [("1100", D("1150.00"), D("0"), "normal"), ("1200", D("0"), D("1150.00"), "normal")]
-    assert services.payment_state(inv, user=w.clerk) == "paid"
+def test_at97_receipt_is_posted_by_its_recorder_refund_by_a_second_person(w):
+    """D26 / access R46 (replaces AT-70): the clerk who records a receipt posts it; a refund keeps segregation."""
+    for segregation in (True, False):
+        services.update_settings(w.alm, user=w.cfo, segregation_required=segregation)
+        inv = final(w, invoice(w))
+        r = receipt(w, applications=[(inv, "1150.00")])
+        posted = services.post_receipt(r, user=w.clerk)  # K records R, K posts R
+        assert (posted.status, posted.posted_by) == ("posted", w.clerk)
+        assert je(posted) == [("1100", D("1150.00"), D("0"), "normal"), ("1200", D("0"), D("1150.00"), "normal")]
+        assert posted.journal_entry.posted_by == w.clerk
+        assert services.payment_state(inv, user=w.clerk) == "paid"
+        refund = receipt(w, "100.00", kind="refund")
+        with pytest.raises(access.AccessDenied) as exc:  # K records F, K posts F: refused (access OQ-26)
+            services.post_receipt(refund, user=w.clerk)
+        assert exc.value.code == "self_approval"
+        refund.refresh_from_db()
+        assert (refund.status, refund.number) == ("draft", "")
+        assert je(services.post_receipt(refund, user=w.clerk2)) == [  # L posts F (E6)
+            ("1100", D("0"), D("100.00"), "normal"), ("1200", D("100.00"), D("0"), "normal")]
 
 
 def test_e5_bank_charge_booked_gross(w):

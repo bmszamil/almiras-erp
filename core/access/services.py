@@ -435,17 +435,22 @@ def require(user, entity, permission, *, document=None, allow_self_approval=Fals
         self_approval = True
     log_id = None
     if perm.is_approval or perm.posts or self_approval:
+        details = {
+            "self_approval": self_approval,
+            "document": list(_document_ref(document)) if _document_ref(document) else None,
+            "membership_ids": [m.pk for m in memberships],
+        }
+        if perm.posts and not perm.is_approval:
+            # R46: a posting grant held by the document's own creator, submitter or modifier. The ledger refuses
+            # it unless the document type allows its makers to post (customer receipts); recorded either way.
+            details["self_post"] = user.pk in _document_people(document)
         entry = log(
             AccessLog.Event.PERMISSION_GRANTED,
             actor=user,
             entity=entity,
             permission=permission,
             at=at,
-            details={
-                "self_approval": self_approval,
-                "document": list(_document_ref(document)) if _document_ref(document) else None,
-                "membership_ids": [m.pk for m in memberships],
-            },
+            details=details,
         )
         log_id = entry.pk
     return Grant(

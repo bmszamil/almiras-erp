@@ -215,3 +215,42 @@ def test_close_period_refuses_while_documents_wait_to_be_booked(w):
         assert FiscalPeriod.objects.get(pk=period.pk).status == "open"
         waiting.clear()
         assert services.close_period(period, user=closer).status == "closed"
+
+
+# --- access R46 (A16, D26): a per-type "creator may post" option, receipts only ---------------------------
+
+def test_r46_creator_may_post_is_refused_for_every_type_but_customer_receipts():
+    for model in (Unregistered, Bill, Receipt):  # testdocs stand-ins: not invoicing.customerreceipt
+        with pytest.raises(documents.DocumentRegistryError, match="creator_may_post"):
+            documents._register(model, post_permissions={"invoicing.post_receipt"},
+                                validate_lines=lambda d, l: [], creator_may_post=lambda d: True)
+    with pytest.raises(documents.DocumentRegistryError, match="callable"):
+        documents._register(Unregistered, post_permissions={"invoicing.post_receipt"},
+                            validate_lines=lambda d, l: [], creator_may_post=True)
+    assert documents.get("testdocs.unregistered") is None
+    assert documents.CREATOR_MAY_POST_TYPES == frozenset({"invoicing.customerreceipt"})
+    registered = documents.get("invoicing.customerreceipt")  # the one type that uses it (invoicing.apps)
+    assert registered.creator_may_post is not None
+    for label, doc_type in documents.registered().items():
+        if label != "invoicing.customerreceipt":
+            assert doc_type.creator_may_post is None, label
+
+
+def test_r46_the_hook_decides_per_document_and_never_a_caller_flag(w, monkeypatch):
+    monkeypatch.setattr(documents, "CREATOR_MAY_POST_TYPES", frozenset({"testdocs.unregistered"}))
+    with documents._registered_for_tests(Unregistered, post_permissions={"invoicing.post_receipt"},
+                                         validate_lines=lambda d, l: [],
+                                         creator_may_post=lambda d: d.number == "SELF"):
+        own = Unregistered.objects.create(entity=w.alm, created_by=w.clerk, number="SELF")
+        grant = access.require(w.clerk, w.alm, "invoicing.post_receipt", document=own)
+        from core.access.models import AccessLog
+        assert AccessLog.objects.get(pk=grant.log_id).details["self_post"] is True
+        entry = services.create_entry(w.alm, date(2027, 1, 5), "Self", CASH, user=w.clerk, post=True, grant=grant,
+                                      document=own)
+        assert entry.status == "posted" and entry.posted_by == w.clerk
+        other = Unregistered.objects.create(entity=w.alm, created_by=w.clerk, number="OTHER")
+        grant = access.require(w.clerk, w.alm, "invoicing.post_receipt", document=other)
+        with pytest.raises(access.AccessDenied) as exc:  # the hook says no for this document
+            services.create_entry(w.alm, date(2027, 1, 5), "Other", CASH, user=w.clerk, post=True, grant=grant,
+                                  document=other)
+        assert exc.value.code == "self_approval"

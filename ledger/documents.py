@@ -32,6 +32,14 @@ so no document can book lines that nothing ties to it):
   before anything is written, and returns a list of problems ("English /
   العربية"); any problem refuses the posting.
 
+Optional segregation exception (access R46, A16):
+
+- ``creator_may_post(document)`` returns True when the stored document may be
+  posted by its own creator, submitter or last modifier (customer receipts
+  with ``kind = receipt`` only). Accepted only for the types listed in
+  ``CREATOR_MAY_POST_TYPES``; every other type keeps creator != poster (R35).
+  The poster still needs a posting grant issued for that document.
+
 Optional period hook:
 
 - ``pending_documents(entity, start_date, end_date)`` returns descriptions of
@@ -74,6 +82,8 @@ class DocumentType:
     build_lines: Callable | None = None
     validate_lines: Callable | None = None
     pending_documents: Callable | None = None
+    # access R46: True for a stored document its creator / submitter / modifier may post (receipts only).
+    creator_may_post: Callable | None = None
 
     def entity_id_of(self, document):
         return getattr(document, f"{self.entity_field}_id")
@@ -84,12 +94,19 @@ class DocumentType:
     def creator_id_of(self, document):
         return getattr(document, f"{self.creator_field}_id", None)
 
+    def self_post_allowed(self, document):
+        """access R46: the people who made ``document`` may post it themselves (never for other types)."""
+        return self.creator_may_post is not None and self.creator_may_post(document) is True
+
 
 _REGISTRY = {}
 
 # Sub-ledger P permissions that post a document's entry; reversal grants only reverse (R30).
 POSTING_PERMISSIONS = catalogue.DOCUMENT_POST_PERMISSIONS
 REVERSING_PERMISSIONS = catalogue.REVERSE_PERMISSIONS - {"ledger.reverse_entry"}
+# access R46 / A16: the only document types whose creator may post them (customer receipts; the kind is
+# decided by the type's own creator_may_post hook). Refunds, bills, payments and sales documents are not here.
+CREATOR_MAY_POST_TYPES = frozenset({"invoicing.customerreceipt"})
 
 
 def _frozen():
@@ -111,7 +128,8 @@ def _check_caller(model, module_name):
 
 
 def register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
-             creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None):
+             creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None,
+             creator_may_post=None):
     """Register ``model`` as a document type that books journal entries. Idempotent for the same arguments.
 
     Call it from the ``AppConfig.ready()`` of the app that defines ``model``.
@@ -124,7 +142,7 @@ def register(model, *, post_permissions, reverse_permissions=(), entity_field="e
     return _register(
         model, post_permissions=post_permissions, reverse_permissions=reverse_permissions, entity_field=entity_field,
         changed_at_field=changed_at_field, creator_field=creator_field, build_lines=build_lines,
-        validate_lines=validate_lines, pending_documents=pending_documents,
+        validate_lines=validate_lines, pending_documents=pending_documents, creator_may_post=creator_may_post,
     )
 
 
@@ -136,7 +154,8 @@ def _field(model, name, label):
 
 
 def _register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
-              creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None):
+              creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None,
+              creator_may_post=None):
     """Validate and store one registration (no caller or freeze check; tests use it through the helpers below)."""
     if not (isinstance(model, type) and issubclass(model, models.Model)) or model._meta.abstract:
         raise DocumentRegistryError(f"{model!r} is not a concrete Django model.")
@@ -161,14 +180,17 @@ def _register(model, *, post_permissions, reverse_permissions=(), entity_field="
     if changed_at_field is not None:
         _field(model, changed_at_field, label)
     for name, hook in (("build_lines", build_lines), ("validate_lines", validate_lines),
-                       ("pending_documents", pending_documents)):
+                       ("pending_documents", pending_documents), ("creator_may_post", creator_may_post)):
         if hook is not None and not callable(hook):
             raise DocumentRegistryError(f"{label}: {name} must be callable.")
     if build_lines is None and validate_lines is None:
         # Without a hook any lines could be booked for the document (nothing ties them to it).
         raise DocumentRegistryError(f"{label}: register build_lines or validate_lines (or both).")
+    if creator_may_post is not None and label not in CREATOR_MAY_POST_TYPES:
+        # access R46: the exception is for customer receipts only; every other type keeps creator != poster (R35).
+        raise DocumentRegistryError(f"{label}: creator_may_post is allowed only for {sorted(CREATOR_MAY_POST_TYPES)}.")
     doc_type = DocumentType(label, model, post, reverse, entity_field, changed_at_field, creator_field, build_lines,
-                            validate_lines, pending_documents)
+                            validate_lines, pending_documents, creator_may_post)
     existing = _REGISTRY.get(label)
     if existing is not None and existing != doc_type:
         raise DocumentRegistryError(f"{label} is already registered with other settings.")
