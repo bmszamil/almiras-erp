@@ -125,7 +125,7 @@ Enforcement: **svc** = `payroll/services.py`; **M** = model; **DB** = constraint
 ### GOSI (all figures **[CC-verify]**)
 20. Contribution wage = Σ components with `counts_for_gosi` (basic + housing **[CC-verify]**; housing deemed at 25% of basic when not paid in cash **[CC-verify]**), as registered at the start of the month **[CC-verify]**, bounded by floor SAR 1,500 and cap SAR 45,000 per month **[CC-verify]**. **[svc; AT-14]**
 21. Rates from parameter `gosi.rates` by nationality class, cohort and branch. Seed (unverified): Saudi annuities 9% employer + 9% employee for employees insured before the new Social Insurance Law date (2024-07-03 **[CC-verify]**), with stepped higher annuity rates for new entrants **[CC-verify]**; SANED 0.75% employer + 0.75% employee (Saudi only) **[CC-verify]**; occupational hazards 2% employer (Saudi and non-Saudi) **[CC-verify]**; non-Saudi: occupational hazards only, no employee share **[CC-verify]**. GCC nationals: OQ-9. **[svc + parameter; AT-14]**
-22. Each branch and party is a separate line per employee, rounded per R5; employee share is a deduction, employer share an expense. Both credit 2320 (proposed). **[svc; AT-14]**
+22. Each branch and party is a separate line per employee, rounded per R5; employee share is a deduction, employer share an expense. Both credit 2340 (proposed). **[svc; AT-14]**
 23. `GosiReconciliation` compares ERP contributions with the GOSI monthly invoice entered by the payroll officer; differences are reported, never posted automatically (OQ-9). **[svc; AT-15]**
 
 ### EOSB provision (account 2500)
@@ -159,15 +159,17 @@ Enforcement: **svc** = `payroll/services.py`; **M** = model; **DB** = constraint
 
 ## 5. Accounting
 
-Codes from `ledger/coa_template.py`. Existing: 1100 Cash and bank, 2300 Accrued expenses, 2500 End-of-service provision, 5100 Salaries and benefits, 5110 GOSI, 5700 Bank charges. **Proposed, CFO to approve (not added to the template until approved; P6, OQ-12):**
+Codes from `ledger/coa_template.py`. Existing: 1100 Cash and bank, 2300 Accrued expenses, 2500 End-of-service provision, 5100 Salaries and benefits, 5110 GOSI, 5700 Bank charges. **Proposed, CFO to approve (not added to the template until approved; P6, OQ-12).** Codes chosen to avoid every code in `ledger/coa_template.py` and those already proposed in invoicing.md §5 (1330, 2220, 2310 deferred income, 2320 security deposits, 4120 to 4310, 5910, 5920) and ledger-fx.md (3400, 4700, 4710, 5750, 5760, 5770; 1101 example sub-account):
 
 | Code | name_en | name_ar [AR-review] | Type | Flags | Used for |
 |---|---|---|---|---|---|
 | 1230 | Employee loans and advances | قروض وسلف الموظفين | asset | monetary | Loans (E4) |
-| 2310 | Salaries payable | رواتب مستحقة الدفع | liability | monetary | Net pay (E1, E5). Alternative if rejected: 2300 |
-| 2320 | GOSI payable | اشتراكات التأمينات الاجتماعية المستحقة | liability | monetary | Employer + employee GOSI (E1) |
+| 2330 | Salaries payable | رواتب مستحقة الدفع | liability | monetary | Net pay (E1, E5). Alternative if rejected: 2300 |
+| 2340 | GOSI payable | اشتراكات التأمينات الاجتماعية المستحقة | liability | monetary | Employer + employee GOSI (E1) |
 | 5120 | End-of-service benefit expense | مصروف مكافأة نهاية الخدمة | expense | | EOSB accrual (E1, E5). Alternative: 5100 |
-| 2330 / 5130 | Accrued leave / Leave expense | مخصص الإجازات / مصروف الإجازات | liability / expense | | Only if hr OQ-6 decides leave is accrued |
+| 2350 / 5130 | Accrued leave / Leave expense | مخصص الإجازات / مصروف الإجازات | liability / expense | | Only if hr OQ-6 decides leave is accrued |
+
+1230, 2330 and 2340 should carry the `is_control` flag proposed in invoicing.md §5 (payroll documents only, no manual journals), if that flag is adopted.
 
 Registered types (`PayrollConfig.ready()`): `PayrollRun` (post `payroll.approve_run`, reverse `payroll.reverse_run`), `PayrollPayment` (`payroll.approve_payment`), `EmployeeLoan` (`payroll.approve_loan`), `FinalSettlement` (`payroll.approve_final_settlement`); each with `build_lines`, `creator_field="created_by"`, and `pending_documents` for submitted runs. Figures below use the **unverified** seed GOSI rates and EOSB table **[CC-verify]**; amounts change when parameters are verified.
 
@@ -178,17 +180,17 @@ Registered types (`PayrollConfig.ready()`): `PayrollRun` (post `payroll.approve_
 | 5100 Salaries and benefits | 21,500.00 | |
 | 5110 GOSI (employer) | 1,618.75 | |
 | 5120 EOSB expense (proposed) | 895.83 | |
-| 2320 GOSI payable (proposed) | | 2,837.50 |
+| 2340 GOSI payable (proposed) | | 2,837.50 |
 | 1230 Employee loans and advances (proposed) | | 500.00 |
-| 2310 Salaries payable (proposed) | | 19,781.25 |
+| 2330 Salaries payable (proposed) | | 19,781.25 |
 | 2500 End-of-service provision | | 895.83 |
 | **Total** | **24,014.58** | **24,014.58** |
 
 A negative EOSB accrual swaps 5120 and 2500. Retro, overtime and one-off earnings add to the 5100 (or component account) line; unpaid-leave and sick reductions lower it.
 
-**E2. GOSI payment** (2,837.50): Dr 2320 2,837.50 / Cr 1100 2,837.50.
+**E2. GOSI payment** (2,837.50): Dr 2340 2,837.50 / Cr 1100 2,837.50.
 
-**E3. Net salary payment** (19,781.25): Dr 2310 19,781.25 / Cr 1100 (settings bank account) 19,781.25. Bank charges, if any, are a separate bank document (Dr 5700).
+**E3. Net salary payment** (19,781.25): Dr 2330 19,781.25 / Cr 1100 (settings bank account) 19,781.25. Bank charges, if any, are a separate bank document (Dr 5700).
 
 **E4. Loan disbursement** (3,000.00, interest-free): Dr 1230 3,000.00 / Cr 1100 3,000.00. Repayment through E1 (Cr 1230). No interest or fee line ever exists.
 
@@ -200,7 +202,7 @@ A negative EOSB accrual swaps 5120 and 2500. Retro, overtime and one-off earning
 | 5100 Salaries and benefits (leave encashment) | 2,666.67 | |
 | 5120 EOSB expense (release of excess provision) | | 10,666.67 |
 | 1230 Employee loans and advances | | 1,000.00 |
-| 2310 Salaries payable | | 7,000.00 |
+| 2330 Salaries payable | | 7,000.00 |
 | **Total** | **18,666.67** | **18,666.67** |
 
 Payment as E3 (kind `final_settlement`). If the award exceeds the provision, the shortfall is Dr 5120.
@@ -256,11 +258,11 @@ Roles `payroll_officer` and `hr_officer` are **proposed** (hr OQ-2). No permissi
 
 ## 8. Acceptance tests
 
-Fixtures: ALM (SA, SAR, Sharia enforced), SUB (SA, SAR), EGY (EG, EGP); template chart plus proposed accounts 1230, 2310, 2320, 5120 (test fixture only); 2027 periods open unless stated; hr employees S1 (Saudi, as E1) and N1 (non-Saudi, as E1) in ALM, S2 in SUB; unverified seed parameters with `HR_REQUIRE_VERIFIED_PARAMETERS=False` unless stated. Users: P (payroll_officer ALM), P2 (payroll_officer ALM), C (approver ALM), C2 (approver SUB), A (accountant ALM), V (viewer), MP, agent. Anonymised data only.
+Fixtures: ALM (SA, SAR, Sharia enforced), SUB (SA, SAR), EGY (EG, EGP); template chart plus proposed accounts 1230, 2330, 2340, 5120 (test fixture only); 2027 periods open unless stated; hr employees S1 (Saudi, as E1) and N1 (non-Saudi, as E1) in ALM, S2 in SUB; unverified seed parameters with `HR_REQUIRE_VERIFIED_PARAMETERS=False` unless stated. Users: P (payroll_officer ALM), P2 (payroll_officer ALM), C (approver ALM), C2 (approver SUB), A (accountant ALM), V (viewer), MP, agent. Anonymised data only.
 
 | # | Given | When | Then |
 |---|---|---|---|
-| AT-1 | Runs in ALM and SUB | P lists runs; opens SUB run; a build_lines variant targets SUB's 2310; ALM run tries to include S2 | ALM only; SUB → 404; ledger refuses other-entity account; S2 refused (R1, R2, R30) |
+| AT-1 | Runs in ALM and SUB | P lists runs; opens SUB run; a build_lines variant targets SUB's 2330; ALM run tries to include S2 | ALM only; SUB → 404; ledger refuses other-entity account; S2 refused (R1, R2, R30) |
 | AT-2 | NEW entity set up as data with payroll enabled; EGY enabled | Run March for NEW; for EGY | NEW runs with no code change; EGY refused "jurisdiction not configured" (en/ar) (R3, R4) |
 | AT-3 | Input amount as float; S1 contract in USD (fixture forced) | Save input; calculate | Float refused; calculation refused naming the currency (R5) |
 | AT-4 | March regular run approved | Create a second regular March run; off-cycle without `reason_ar`; set `status="approved"` directly on a draft | Refused; refused; refused (model, and DB trigger on PostgreSQL) (R6, R7) |
@@ -302,7 +304,7 @@ Fixtures: ALM (SA, SAR, Sharia enforced), SUB (SA, SAR), EGY (EG, EGP); template
 | OQ-9 | GOSI details **[CC-verify]**: annuity rates by cohort under the new Social Insurance Law, GCC nationals, cap/floor, wage composition and reference date, housing deemed value, late-payment fines, reconciliation import format. | compliance-checker | **GL** (real runs); build on parameters | Seed per R20, R21; manual reconciliation |
 | OQ-10 | WPS / Mudad **[CC-verify]**: file format(s) per bank, fields, encoding, Mudad upload vs API, which banks each entity uses, file retention. | compliance-checker + CFO | **B** for WPS file generation | No file until a format is configured; manual upload; 30 days retention |
 | OQ-11 | EOSB provision measurement (IFRS for SMEs s28 **[CC-verify]**): vested amount on termination basis, resignation basis, or actuarial. | Accountant | D | Termination basis (fraction 1) |
-| OQ-12 | Approve proposed accounts 1230, 2310, 2320, 5120 (and 2330/5130 if leave is accrued); or use 2300 / 5100 instead. | CFO / accountant | **GL** | Build with the proposed codes in fixtures; template unchanged until approved |
+| OQ-12 | Approve proposed accounts 1230, 2330, 2340, 5120 (and 2350/5130 if leave is accrued); or use 2300 / 5100 instead. | CFO / accountant | **GL** | Build with the proposed codes in fixtures; template unchanged until approved |
 | OQ-13 | Payment recording: may the payroll officer post payments alone (like receipts, access A16)? Link to future bank reconciliation. | Managing Partner | D | No: approver approves payments |
 | OQ-14 | Approver who is an employee in the run (own pay). | Managing Partner | D | R39 |
 | OQ-15 | Secondment recharge basis: billing contract price (fixed) or actual payroll cost (cost-plus, monthly variable); does payroll feed billing automatically? | Managing Partner + CFO | D | Billing contract price; payroll gives a report only |
