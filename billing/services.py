@@ -1253,6 +1253,8 @@ def _correction_pass(contract, sys, *, trigger, version, affected, supersede, in
                    **_invoice_line_attrs(p, key, line_terms)}
             sides["credit" if delta < ZERO else "debit"].append(row)
         first, last = affected
+        if not trigger.startswith("secondment"):
+            first = _first_changed_day(p, versions, first)
         start = max(p.period_start, first) if first else p.period_start
         stop = min(p.period_end, last) if last else p.period_end
         if start > stop:
@@ -1279,6 +1281,20 @@ def _correction_pass(contract, sys, *, trigger, version, affected, supersede, in
     _event(c, Event.CORRECTIONS_COMPUTED, sys, trigger=trigger, version=version.version_no, created=len(created),
            superseded=superseded)
     return {"created": created, "superseded": superseded}
+
+
+def _first_changed_day(p, versions, default):
+    """Review nit 12: the supply period of a correction starts on the effective date of the earliest version the
+    period's billed position does not reflect yet: versions after the one billed on the invoice and after those of
+    its counted corrections. (Before, it started on the triggering version's date, or covered the whole period
+    when that date was later than the period, e.g. AT-26 (c), or on a recompute.)"""
+    numbers = {v.version_id: v.version_no for v in versions}
+    reflected = numbers.get(p.billed_version_id, 0)
+    for version_id in BillingAdjustment.objects.filter(billing_period=p, status__in=BillingAdjustment.COUNTED) \
+            .values_list("version_id", flat=True):
+        reflected = max(reflected, numbers.get(version_id, 0))
+    later = [v.effective_date for v in versions if v.version_no > reflected]
+    return min(later) if later else default
 
 
 def _notify_corrections(c, result):

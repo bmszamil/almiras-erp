@@ -204,6 +204,9 @@ def test_at26_no_double_billing_through_recompute_reruns_and_superseding(w):
     new = _adjs(c, status__in=BillingAdjustment.PENDING)
     assert [(a.billing_period.period_start, a.kind, _net(a)) for a in new] == [
         (date(2027, 3, 1), "debit", D("1032.26")), (date(2027, 4, 1), "credit", D("-2000.00"))]
+    # supply periods from the effective dates not yet reflected (review nit 12): March from version 2's 16 March
+    assert [(a.supply_start, a.supply_end) for a in new] == [(date(2027, 3, 16), date(2027, 3, 31)),
+                                                             (date(2027, 4, 1), date(2027, 4, 30))]
     for adj in new:
         approve_note(w, adj.document, day=date(2027, 5, 16))
     assert [_position(period(c, date(2027, m, 1))) for m in (3, 4, 5)] == [D("11032.26"), D("10000.00"),
@@ -378,3 +381,14 @@ def test_at36_sharia_checks_on_version_lines(w):
     assert final.requires_purification
     assert ContractVersion.Status("approved").label.endswith("معتمدة")
     assert BillingAdjustment.Status(feb.status).label.split(" / ")[1]
+
+
+def test_recompute_supply_period_starts_on_the_effective_date(w):
+    """Review nit 12: a recomputed correction keeps the supply period from the version's effective date."""
+    c, v2 = _at25(w)
+    mar = _adjs(c)[0]
+    assert (mar.supply_start, mar.supply_end) == (date(2027, 3, 16), date(2027, 3, 31))
+    services.discard_adjustment(mar, user=w.s, reason_ar="مراجعة")
+    (again,) = services.recompute_corrections(c, user=w.s, include_discarded=True)
+    assert again.billing_period.period_start == date(2027, 3, 1)
+    assert (again.supply_start, again.supply_end) == (date(2027, 3, 16), date(2027, 3, 31))
