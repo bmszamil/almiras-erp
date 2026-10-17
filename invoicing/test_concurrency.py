@@ -25,7 +25,7 @@ def test_at6_concurrent_approvals_get_consecutive_numbers():
     apply_seed(Role, RolePermission)
     apply_currency_seed(Currency)
     apply_system_users(get_user_model(), UserProfile)
-    reference_seed.apply(apps)
+    reference_seed.apply_all(apps)
     from types import SimpleNamespace
 
     from core.access.testing import make_user, member
@@ -81,7 +81,7 @@ def _seeded_world():
     apply_seed(Role, RolePermission)
     apply_currency_seed(Currency)
     apply_system_users(get_user_model(), UserProfile)
-    reference_seed.apply(apps)
+    reference_seed.apply_all(apps)
     alm = make_entity("ALM", "parent", vat="300000000000003", cr="1010000001")
     w = SimpleNamespace(alm=alm, clerk=make_user("clerk"), ap=make_user("ap"), cfo=make_user("cfo"),
                         cfo2=make_user("cfo2"), queue=access.system_user("zatca_queue"))

@@ -71,9 +71,9 @@ def test_at35_category_vat_differs_from_sum_of_line_vat(w):
 def test_at15_exempt_line_needs_a_reason_and_books_no_vat(w):
     doc = services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10),
                                          supply_date=date(2027, 1, 10))
-    with pytest.raises(InvoicingError) as exc:
-        services.add_sales_line(doc, user=w.clerk, income_type="rent_residential", quantity="1", unit_price="1000",
-                                description_ar="إيجار سكني")
+    with pytest.raises(InvoicingError) as exc:  # an exempt line without a reason (no default for this type)
+        services.add_sales_line(doc, user=w.clerk, income_type="management_fee", quantity="1", unit_price="1000",
+                                description_ar="رسوم إدارة", vat_category="E")
     assert "exemption reason" in messages(exc) and "سبب إعفاء" in messages(exc)
     with pytest.raises(InvoicingError):  # a zero-rated reason is not an exempt reason
         services.add_sales_line(doc, user=w.clerk, income_type="rent_residential", quantity="1", unit_price="1000",
