@@ -2,12 +2,16 @@
 
 Every change goes through ``invoicing.services``, which check rights and rules;
 the admin only shows records, scoped to the entities where the user holds
-``invoicing.view``. Personal data of individual customers (address, IDs, VAT
-number) and vendor IBANs are hidden unless the user holds
-``invoicing.view_personal_data`` in that entity (R51, PDPL; masking and access
-logging per view are not built in slice 1).
+``invoicing.view``. Personal data of individual customers (names, address, IDs,
+VAT number, also as the buyer snapshot on documents and in list columns) and
+vendor IBANs are hidden or masked unless the user holds
+``invoicing.view_personal_data`` in that entity (R51, PDPL; review item 11).
+Names of individuals are searchable only by users with that right; others
+find individuals by code or number. Access logging per view is not built in
+slice 1.
 """
 from django.contrib import admin
+from django.db.models import Q
 
 from core import access
 from core.admin import EntityScopedAdmin
@@ -30,12 +34,13 @@ from .models import (
     VendorPayment,
 )
 
+MASK = "*** / مخفي"
 PERSONAL_CUSTOMER_FIELDS = (
-    "vat_number", "street_en", "street_ar", "building_no", "additional_no", "district_en", "district_ar",
+    "name_en", "name_ar", "vat_number", "street_en", "street_ar", "building_no", "additional_no", "district_en", "district_ar",
     "city_en", "city_ar", "postal_code",
 )
 PERSONAL_BUYER_FIELDS = (
-    "buyer_vat_number", "buyer_other_id_scheme", "buyer_other_id", "buyer_building_no", "buyer_street_en",
+    "customer", "buyer_name_en", "buyer_name_ar", "buyer_vat_number", "buyer_other_id_scheme", "buyer_other_id", "buyer_building_no", "buyer_street_en",
     "buyer_street_ar", "buyer_district_en", "buyer_district_ar", "buyer_additional_no", "buyer_postal_code",
     "buyer_city_en", "buyer_city_ar",
 )
@@ -56,13 +61,52 @@ def _may_see_personal(request, entity):
     return access.has(request.user, entity, "invoicing.view_personal_data")
 
 
-class CustomerAdmin(ReadOnlyScopedAdmin):
-    list_display = ["code", "name_ar", "name_en", "entity", "customer_kind", "is_vat_registered", "is_active"]
+def _masked_customer(request, customer):
+    """True when ``customer`` is an individual whose personal data the user may not see (R51)."""
+    return customer.customer_kind == Customer.Kind.INDIVIDUAL and not _may_see_personal(request, customer.entity)
+
+
+def _customer_column(request, path, field, label):
+    """A list column showing ``field`` of the customer at ``path`` (""=the object), masked for individuals."""
+    def column(obj):
+        customer = getattr(obj, path) if path else obj
+        if _masked_customer(request, customer):
+            return MASK
+        return getattr(customer, field) if field else str(customer)
+    column.short_description = label
+    return column
+
+
+class PersonalSearchMixin:
+    """Search by name finds individual customers only in entities where the user may see personal data."""
+
+    customer_path = ""  # "" for Customer itself, "customer" for documents and receipts
+    code_lookups = ("code",)
+
+    def get_search_results(self, request, queryset, search_term):
+        qs, duplicates = super().get_search_results(request, queryset, search_term)
+        if search_term:
+            prefix = f"{self.customer_path}__" if self.customer_path else ""
+            allowed = access.entities_for(request.user, "invoicing.view_personal_data")
+            by_code = Q()
+            for lookup in self.code_lookups:
+                by_code |= Q(**{f"{lookup}__icontains": search_term})
+            qs = qs.exclude(Q(**{f"{prefix}customer_kind": Customer.Kind.INDIVIDUAL})
+                            & ~Q(**{f"{prefix}entity__in": allowed}) & ~by_code)
+        return qs, duplicates
+
+
+class CustomerAdmin(PersonalSearchMixin, ReadOnlyScopedAdmin):
     list_filter = ["customer_kind", "is_active"]
     search_fields = ["code", "name_en", "name_ar"]
 
+    def get_list_display(self, request):
+        return ["code", _customer_column(request, "", "name_ar", "Name (Arabic) / الاسم (بالعربية)"),
+                _customer_column(request, "", "name_en", "Name (English) / الاسم (بالإنجليزية)"), "entity",
+                "customer_kind", "is_vat_registered", "is_active"]
+
     def get_exclude(self, request, obj=None):
-        if obj is not None and obj.customer_kind == Customer.Kind.INDIVIDUAL and not _may_see_personal(request, obj.entity):
+        if obj is not None and _masked_customer(request, obj):
             return PERSONAL_CUSTOMER_FIELDS
         return ()
 
@@ -90,16 +134,19 @@ class SalesLineInline(admin.TabularInline):
         return False
 
 
-class SalesDocumentAdmin(ReadOnlyScopedAdmin):
-    list_display = ["number", "doc_type", "entity", "customer", "issue_date", "currency", "total_gross", "status",
-                    "zatca_status"]
+class SalesDocumentAdmin(PersonalSearchMixin, ReadOnlyScopedAdmin):
     list_filter = ["doc_type", "status", "zatca_status", "zatca_profile"]
-    search_fields = ["number", "customer__name_ar", "customer__name_en"]
+    search_fields = ["number", "customer__code", "customer__name_ar", "customer__name_en"]
+    customer_path = "customer"
+    code_lookups = ("number", "customer__code")
     inlines = [SalesLineInline]
 
+    def get_list_display(self, request):
+        return ["number", "doc_type", "entity", _customer_column(request, "customer", "", "Customer / العميل"),
+                "issue_date", "currency", "total_gross", "status", "zatca_status"]
+
     def get_exclude(self, request, obj=None):
-        if obj is not None and obj.customer.customer_kind == Customer.Kind.INDIVIDUAL and not _may_see_personal(
-                request, obj.entity):
+        if obj is not None and _masked_customer(request, obj.customer):
             return PERSONAL_BUYER_FIELDS
         return ()
 
@@ -117,7 +164,12 @@ class PurchaseDocumentAdmin(ReadOnlyScopedAdmin):
 
 
 class ReceiptAdmin(ReadOnlyScopedAdmin):
-    list_display = ["number", "kind", "entity", "customer", "date", "amount", "currency", "status"]
+    def get_list_display(self, request):
+        return ["number", "kind", "entity", _customer_column(request, "customer", "", "Customer / العميل"), "date",
+                "amount", "currency", "status"]
+
+    def get_exclude(self, request, obj=None):
+        return ("customer",) if obj is not None and _masked_customer(request, obj.customer) else ()
 
 
 class VendorPaymentAdmin(ReadOnlyScopedAdmin):

@@ -154,3 +154,32 @@ def test_admin_hides_personal_data_without_the_right(w):
     assert model_admin.get_exclude(_request(w.viewer), w.customer) == ()  # a business is not personal data
     vendor_admin = admin.site._registry[w.vendor.__class__]
     assert "bank_iban" in vendor_admin.get_exclude(_request(w.viewer), w.vendor)
+
+
+def test_item11_admin_masks_names_of_individuals_without_the_right(w):
+    from django.contrib import admin
+
+    from invoicing.conftest import approve, invoice
+    from invoicing.models import SalesDocument
+
+    person = services.create_customer(w.alm, user=w.clerk, code="P1", name_ar="فرد معين", name_en="Some Person",
+                                      customer_kind="individual", **ADDRESS)
+    doc = approve(w, invoice(w, customer=person))
+    viewer, clerk = _request(w.viewer), _request(w.clerk)
+    customer_admin, sales_admin = admin.site._registry[Customer], admin.site._registry[SalesDocument]
+    assert {"name_en", "name_ar"} <= set(customer_admin.get_exclude(viewer, person))
+    assert {"buyer_name_en", "buyer_name_ar", "customer"} <= set(sales_admin.get_exclude(viewer, doc))
+    assert sales_admin.get_exclude(clerk, doc) == ()
+    columns = [c for c in customer_admin.get_list_display(viewer) if callable(c)]
+    assert [c(person) for c in columns] == ["*** / مخفي"] * 2
+    assert [c(w.customer) for c in columns] == [w.customer.name_ar, w.customer.name_en]  # a business: shown
+    assert [c(person) for c in customer_admin.get_list_display(clerk) if callable(c)] == ["فرد معين", "Some Person"]
+    doc_column = next(c for c in sales_admin.get_list_display(viewer) if callable(c))
+    assert doc_column(doc) == "*** / مخفي"
+    for model_admin, model, term in ((customer_admin, Customer, "فرد"), (sales_admin, SalesDocument, "Person")):
+        qs, _ = model_admin.get_search_results(viewer, model_admin.get_queryset(viewer), term)
+        assert not qs.exists()  # the viewer cannot find the individual by name
+        qs, _ = model_admin.get_search_results(clerk, model_admin.get_queryset(clerk), term)
+        assert qs.exists()
+    qs, _ = customer_admin.get_search_results(viewer, customer_admin.get_queryset(viewer), "P1")
+    assert list(qs) == [person]  # found by code, shown masked
