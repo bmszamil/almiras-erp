@@ -3108,7 +3108,7 @@ def _plus_years(d, years):
 WHT_RECORD_YEARS = 10  # R52 / OQ-8: WHT payment records kept at least 10 years after payment (WHT p.31)
 
 
-def vendor_retention_until(vendor):
+def _vendor_retention_until(vendor):
     """R52 (review finding 2): the last day an individual vendor's personal data must be kept, or None while it
     cannot be anonymised (no bill or payment yet, or one still a draft or submitted).
 
@@ -3142,7 +3142,7 @@ def anonymisation_candidates(today):
 
     - ``documents``: final or rejected sales documents of individual customers whose ``retention_until`` passed;
     - ``customers``: individual customers whose every document is (or is about to be) anonymised;
-    - ``vendors``: individual vendors whose :func:`vendor_retention_until` passed (review finding 2);
+    - ``vendors``: individual vendors whose :func:`_vendor_retention_until` passed (review finding 2);
     - ``purchase_documents``: the posted or reversed bills of those vendors (their ``vendor_vat_number``).
 
     Parties without documents have no retention date and are left alone.
@@ -3161,7 +3161,7 @@ def anonymisation_candidates(today):
     vendors = []
     for v in Vendor.objects.filter(vendor_kind=Vendor.Kind.INDIVIDUAL, anonymised_at__isnull=True).select_related(
             "entity").order_by("pk"):
-        until = vendor_retention_until(v)
+        until = _vendor_retention_until(v)
         if until is not None and until < today:
             vendors.append(v.pk)
     bills = list(PurchaseDocument.objects.filter(vendor_id__in=vendors, status__in=[PStatus.POSTED, PStatus.REVERSED],

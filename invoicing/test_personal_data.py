@@ -186,10 +186,10 @@ def _paid_bill(w, vendor, number="VI-1", on=date(2027, 1, 15)):
 
 def test_at43_vendor_retention_follows_its_bills_and_payments(w):
     v = _individual_vendor(w)
-    assert services.vendor_retention_until(v) is None  # no bill yet: left alone
+    assert services._vendor_retention_until(v) is None  # no bill yet: left alone
     b = _paid_bill(w, v)
     # quarterly returns: Q1 2027 ends 2027-03-31; standard retention 6 years after it
-    assert services.vendor_retention_until(v) == date(2033, 3, 31)
+    assert services._vendor_retention_until(v) == date(2033, 3, 31)
     assert services.anonymise_expired_personal_data(today=date(2033, 3, 31))["vendors"] == []
     result = services.anonymise_expired_personal_data(today=date(2033, 4, 1))
     assert (result["vendors"], result["purchase_documents"], result["applied"]) == ([v.pk], [b.pk], False)
@@ -197,7 +197,7 @@ def test_at43_vendor_retention_follows_its_bills_and_payments(w):
     from invoicing.test_purchases import bill
 
     bill(w, vendor=v, number="VI-2", submit=False)  # a draft in progress: not anonymised yet
-    assert services.vendor_retention_until(v) is None
+    assert services._vendor_retention_until(v) is None
     assert services.anonymise_expired_personal_data(today=date(2050, 1, 1))["vendors"] == []
 
 
@@ -232,7 +232,7 @@ def test_at43_wht_records_keep_a_non_resident_individual_for_ten_years(w):
                                 wht_category="technical_services", bank_iban="GB00TEST0000000000000001")
     b = nr_bill(w, nr, "1000.00", number="NRI-1")
     pay(w, nr, "950.00", [(b, "1000.00")], on=date(2027, 1, 25))
-    assert services.vendor_retention_until(nr) == date(2037, 1, 25)  # 10 years after the WHT payment
+    assert services._vendor_retention_until(nr) == date(2037, 1, 25)  # 10 years after the WHT payment
     assert services.anonymise_expired_personal_data(today=date(2033, 4, 1))["vendors"] == []
     with approval_day(date(2037, 1, 26)):
         result = services.anonymise_expired_personal_data(today=date(2037, 1, 26), apply=True)
