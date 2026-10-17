@@ -47,3 +47,24 @@ def create_monthly_periods(entity, year):
         )
         created += was_created
     return created
+
+
+@transaction.atomic
+def install_bank_sub_account(entity, code, name_en, name_ar, currency):
+    """One GL sub-account under 1100 for one bank account (banking R5, R6; OQ-5 default), as setup data.
+
+    Asset, postable, monetary (revalued when foreign, ledger-fx R21), restricted to the bank account's currency.
+    Idempotent for the same code and currency; an existing account with that code that is not such a sub-account
+    is refused rather than changed.
+    """
+    parent = Account.objects.get(entity=entity, code="1100")
+    currency_code = getattr(currency, "code", currency)
+    account, created = Account.objects.get_or_create(
+        entity=entity, code=code,
+        defaults=dict(name_en=name_en, name_ar=name_ar, type=Account.Type.ASSET, parent=parent, is_postable=True,
+                      is_monetary=True, currency_id=currency_code),
+    )
+    if not created and (account.parent_id != parent.pk or account.currency_id != currency_code):
+        raise ValueError(f"Account {code} of {entity.code} exists and is not a {currency_code} sub-account of 1100. / "
+                         f"الحساب {code} للكيان {entity.code} موجود وليس حسابًا فرعيًا للحساب 1100 بعملة {currency_code}.")
+    return account

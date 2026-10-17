@@ -197,6 +197,25 @@ _PERMS = [
     _p("hr.receive_alerts", "Receive HR alerts", "استلام تنبيهات الموارد البشرية"),
     _p("hr.manage_org", "Manage departments and grades", "إدارة الأقسام والدرجات الوظيفية"),
     _p("hr.set_overtime_route", "Change the overtime approval route", "تغيير مسار اعتماد العمل الإضافي"),
+    # banking (banking.md §7). Agents may view (masked), suggest matches and draft bank transactions only (R43).
+    _p("banking.view", "View banking (account numbers masked)", "عرض البيانات البنكية (أرقام الحسابات مخفية)", AGENT_OK),
+    _p("banking.view_iban", "View full IBANs and account numbers", "عرض أرقام الآيبان والحسابات كاملة"),
+    _p("banking.manage_bank_account", "Draft and edit bank accounts", "إعداد الحسابات البنكية وتعديلها"),
+    _p("banking.approve_bank_account", "Approve bank accounts and their changes", "اعتماد الحسابات البنكية وتعديلاتها",
+       APPROVAL, SEGREGATED),
+    _p("banking.import_statement", "Import bank statements", "استيراد كشوف الحسابات البنكية"),
+    _p("banking.suggest_match", "Suggest bank matches", "اقتراح مطابقات بنكية", AGENT_OK),
+    _p("banking.match", "Confirm, reject, build and undo bank matches", "تأكيد المطابقات البنكية ورفضها وإنشاؤها وإلغاؤها"),
+    _p("banking.create_bank_transaction", "Draft bank transactions", "إعداد مسودات العمليات البنكية", AGENT_OK),
+    _p("banking.submit_bank_transaction", "Submit bank transactions", "تقديم العمليات البنكية"),
+    _p("banking.approve_bank_transaction", "Approve and post bank transactions", "اعتماد العمليات البنكية وترحيلها",
+       APPROVAL, POSTS),
+    _p("banking.reverse_bank_transaction", "Reverse bank transactions", "عكس العمليات البنكية", POSTS),
+    _p("banking.prepare_reconciliation", "Prepare and submit bank reconciliations", "إعداد التسويات البنكية وتقديمها"),
+    _p("banking.approve_reconciliation", "Approve bank reconciliations", "اعتماد التسويات البنكية", APPROVAL),
+    _p("banking.reopen_reconciliation", "Reopen an approved bank reconciliation", "إعادة فتح تسوية بنكية معتمدة",
+       SEGREGATED),
+    _p("banking.manage_settings", "Manage banking settings and CSV layouts", "إدارة إعدادات البنوك وتنسيقات ملفات CSV"),
 ]
 
 CATALOGUE = {p.codename: p for p in _PERMS}
@@ -236,9 +255,11 @@ SYSTEM_EXTRA = {
 # - post_entry (an existing draft): only ledger.post_entry, issued for that draft.
 # - create_entry(post=True, document=...): a sub-ledger P grant issued for that document, for a
 #   document type registered in ledger.documents with that permission.
-# - reverse_entry: ledger.reverse_entry for that entry, or invoicing.reverse_document for its document.
+# - reverse_entry: ledger.reverse_entry for that entry, or invoicing.reverse_document /
+#   banking.reverse_bank_transaction for its document.
 #   Reversal grants only reverse: they never post a new entry.
-REVERSE_PERMISSIONS = frozenset({"ledger.reverse_entry", "invoicing.reverse_document"})
+REVERSE_PERMISSIONS = frozenset({"ledger.reverse_entry", "invoicing.reverse_document",
+                                 "banking.reverse_bank_transaction"})
 DRAFT_POST_PERMISSIONS = frozenset({"ledger.post_entry"})
 DOCUMENT_POST_PERMISSIONS = frozenset(c for c, p in CATALOGUE.items() if p.posts) - DRAFT_POST_PERMISSIONS - REVERSE_PERMISSIONS
 POST_PERMISSIONS = DRAFT_POST_PERMISSIONS | DOCUMENT_POST_PERMISSIONS

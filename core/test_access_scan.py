@@ -56,6 +56,7 @@ ALLOW = {
     # Setup run by operators (setup_almiras, new-entity setup); no user action.
     "ledger/services_setup.py:install_chart_of_accounts": "operator setup of a new entity (CLAUDE.md: entities are data)",
     "ledger/services_setup.py:create_monthly_periods": "operator setup of a new entity",
+    "ledger/services_setup.py:install_bank_sub_account": "operator setup: a 1100 sub-account per bank account (banking R5)",
     # Pure arithmetic and validation on values the caller passes; no records read or written.
     "ledger/fx.py:error": "pure helper",
     "ledger/fx.py:to_decimal": "pure helper",

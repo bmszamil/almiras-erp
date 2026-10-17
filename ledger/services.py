@@ -1637,6 +1637,26 @@ def record_currency_exchange(entity, on, from_account, from_amount, to_account, 
     from_acc, to_acc = _account(entity, from_account), _account(entity, to_account)
     f_cur = _currency(from_currency or from_acc.currency_id or functional)
     t_cur = _currency(to_currency or to_acc.currency_id or functional)
+    legs = _exchange_legs(entity, on, from_acc, f_cur.code, from_amount, to_acc, t_cur.code, to_amount, description)
+    return create_entry(
+        entity, on, description or f"Currency exchange {f_cur.code}->{t_cur.code} / صرف عملة {f_cur.code}->{t_cur.code}",
+        legs, user=user,
+    )
+
+
+def _exchange_legs(entity, on, from_account, from_currency, from_amount, to_account, to_currency, to_amount,
+                   description=""):
+    """R20 pricing of a spot currency exchange: the line dicts ``[to_leg, from_leg]`` for create_entry. Writes nothing.
+
+    The foreign leg carries the actual bank rate (functional paid / foreign received, ``rate_source=manual``,
+    reason ACTUAL_BANK_RATE), so no FX gain or loss arises; when neither leg is functional the sold leg is at
+    the day's table rate and the bought leg at the implied rate. No rights check: used by
+    :func:`record_currency_exchange` after its check, and by a registered document's ``build_lines`` (banking
+    own transfers, banking R31) inside an authorised posting, where the ledger checks the manual-rate right of
+    the entry's creator (R16).
+    """
+    functional = entity.base_currency_id
+    f_cur, t_cur = _currency(from_currency), _currency(to_currency)
     if f_cur.code == t_cur.code:
         raise error("An exchange is between two different currencies.", "الصرف يكون بين عملتين مختلفتين.")
     f_amount, t_amount = fx.to_decimal(from_amount, "from amount"), fx.to_decimal(to_amount, "to amount")
@@ -1644,8 +1664,8 @@ def record_currency_exchange(entity, on, from_account, from_amount, to_account, 
         raise error("Both amounts must be above zero.", "يجب أن يكون المبلغان أكبر من صفر.")
     fx.check_txn_decimals(f_amount, f_cur)
     fx.check_txn_decimals(t_amount, t_cur)
-    to_leg = {"account": to_acc, "currency": t_cur.code, "txn_debit": t_amount, "description": description}
-    from_leg = {"account": from_acc, "currency": f_cur.code, "txn_credit": f_amount, "description": description}
+    to_leg = {"account": to_account, "currency": t_cur.code, "txn_debit": t_amount, "description": description}
+    from_leg = {"account": from_account, "currency": f_cur.code, "txn_credit": f_amount, "description": description}
     if t_cur.code == functional:
         value = t_amount
         from_leg.update(rate=fx.implied_rate(value, f_amount), rate_reason=ACTUAL_BANK_RATE, credit=value)
@@ -1662,10 +1682,7 @@ def record_currency_exchange(entity, on, from_account, from_amount, to_account, 
                 "The amounts are too large to express as one rate with 10 decimals; split the exchange.",
                 "المبالغ أكبر من أن يُعبَّر عنها بسعر واحد بعشر خانات؛ قسّم العملية.",
             )
-    return create_entry(
-        entity, on, description or f"Currency exchange {f_cur.code}->{t_cur.code} / صرف عملة {f_cur.code}->{t_cur.code}",
-        [to_leg, from_leg], user=user,
-    )
+    return [to_leg, from_leg]
 
 
 # --- period-end revaluation (R19, R21 to R26) -----------------------------------

@@ -1,6 +1,7 @@
 """Seeded role catalogue (access.md 3.1, holders column of 3.6).
 
-``ROLE_SEED_V1`` is applied by migration ``core.0004_seed_access``, V2 by ``core.0009``, V3 by ``core.0012``. Seeded
+``ROLE_SEED_V1`` is applied by migration ``core.0004_seed_access``, V2 by ``core.0009``, V3 by ``core.0012`` (later
+versions: see the comment above each). Seeded
 roles' permission sets change only by migration: to change them, add a
 ``ROLE_SEED_V2`` (or a delta) and a new data migration; never edit V1 after
 it has been applied anywhere.
@@ -202,8 +203,29 @@ def _billing_v6(seed):
 
 
 ROLE_SEED_V6 = _billing_v6(ROLE_SEED_V5)
+# V7 (migration core.0016, banking.md §7): bank accounts, statements, matching, bank transactions and
+# reconciliations. accountant and group_treasury prepare (OQ-14); the approver approves, reverses (OQ-19), reopens
+# (OQ-11) and manages settings; managing_partner is the fallback approver (every A permission, OQ-1) and may reopen;
+# viewers see masked banking data. No agent role is seeded: agents get banking.view, banking.suggest_match and
+# banking.create_bank_transaction through roles created as data (R43).
+_BANKING_STAFF = (
+    "banking.view", "banking.view_iban", "banking.manage_bank_account", "banking.import_statement",
+    "banking.suggest_match", "banking.match", "banking.create_bank_transaction", "banking.submit_bank_transaction",
+    "banking.prepare_reconciliation",
+)
+_BANKING_APPROVALS = ("banking.approve_bank_account", "banking.approve_bank_transaction", "banking.approve_reconciliation")
+ROLE_SEED_V7 = {
+    **ROLE_SEED_V6,
+    "accountant": _plus(ROLE_SEED_V6, "accountant", *_BANKING_STAFF),
+    "group_treasury": _plus(ROLE_SEED_V6, "group_treasury", *_BANKING_STAFF),
+    "approver": _plus(ROLE_SEED_V6, "approver", "banking.view", "banking.view_iban", *_BANKING_APPROVALS,
+                      "banking.reverse_bank_transaction", "banking.reopen_reconciliation", "banking.manage_settings"),
+    "viewer": _plus(ROLE_SEED_V6, "viewer", "banking.view"),
+    "managing_partner": _plus(ROLE_SEED_V6, "managing_partner", "banking.view", "banking.view_iban",
+                              *_BANKING_APPROVALS, "banking.reopen_reconciliation"),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V6
+ROLE_SEED = ROLE_SEED_V7
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
