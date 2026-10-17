@@ -182,30 +182,21 @@ def test_p2_receipt_posting_refused_when_an_application_was_added_after_the_gran
 @pytest.mark.parametrize("kind", ["bill", "payment"])
 def test_p2_bill_and_payment_approval_refused_with_a_grant_older_than_the_last_change(w, kind):
     """No service changes a submitted bill or payment (and the database refuses raw writes on PostgreSQL), so the
-    race is simulated with a grant checked before the document's submission."""
-    import dataclasses
-    from datetime import timedelta
-
+    race is the submission itself: the grant is checked against the draft, which is submitted before the lock."""
     if kind == "bill":
-        doc, permission, approve_ = bill(w), "invoicing.approve_bill", services.approve_purchase_document
+        doc, permission, approve_ = bill(w, submit=False), "invoicing.approve_bill", services.approve_purchase_document
+        submit = services.submit_purchase_document
     else:
         doc = services.create_vendor_payment(w.alm, user=w.ap, vendor=w.vendor, date=date(2027, 1, 25), amount="100")
-        doc = services.submit_vendor_payment(doc, user=w.ap)
-        permission, approve_ = "invoicing.approve_vendor_payment", services.approve_vendor_payment
-    real = access.require
+        permission, approve_, submit = "invoicing.approve_vendor_payment", services.approve_vendor_payment, \
+            services.submit_vendor_payment
 
-    def older_grant(user, entity, perm, **kw):
-        grant = real(user, entity, perm, **kw)
-        if perm == permission:
-            return dataclasses.replace(grant, checked_at=doc.submitted_at - timedelta(seconds=1))
-        return grant
-
-    with mock.patch.object(services.access, "require", side_effect=older_grant), \
-            pytest.raises(access.AccessDenied) as exc:
+    with _race(permission, lambda: submit(doc, user=w.ap)), pytest.raises(access.AccessDenied) as exc:
         approve_(doc, user=w.cfo)
     assert exc.value.code == "grant_document_changed"
     doc.refresh_from_db()
     assert (doc.status, doc.number) == ("submitted", "")
+    assert approve_(doc, user=w.cfo).status == "posted"  # a fresh approval of the submitted version posts it
 
 
 # --- 2. FX: a document books at the rate pinned at approval ----------------------------------------

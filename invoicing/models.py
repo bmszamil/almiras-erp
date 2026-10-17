@@ -416,6 +416,12 @@ class Guarded(models.Model):
     """
 
     objects = GuardedQuerySet.as_manager()
+    version = models.PositiveIntegerField(
+        bi("Version", "رقم النسخة"), default=0, editable=False,
+        help_text=bi("Bumped by every edit, line change, submission and return to draft: an approval or posting "
+                     "checked against an older version is refused (access R14, R42)",
+                     "يزداد مع كل تعديل أو تغيير بند أو تقديم أو إعادة إلى مسودة: يُرفض الاعتماد المبني على نسخة أقدم"),
+    )
 
     class Meta:
         abstract = True

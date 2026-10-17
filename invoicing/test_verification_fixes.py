@@ -1,5 +1,5 @@
 """Regression tests for the verification review (round 5): the reviewer's confirmed exploits stay closed."""
-from datetime import date
+from datetime import date, timedelta
 from unittest import mock
 
 import pytest
@@ -8,7 +8,7 @@ from django.db import DatabaseError, connection, transaction
 from core import access
 from invoicing import admin as invoicing_admin
 from invoicing import services
-from invoicing.conftest import ADDRESS, approve, invoice
+from invoicing.conftest import ADDRESS, approve, final, invoice
 from invoicing.models import Customer, PurchaseDocument
 from invoicing.test_purchases import bill
 
@@ -144,3 +144,115 @@ def test_item3_purification_flag_is_written_with_the_entry_and_equals_its_lines(
         with pytest.raises(DatabaseError, match="entry's lines"):
             services.approve_purchase_document(doc, user=w.cfo)
     assert PurchaseDocument.objects.get(pk=doc.pk).status == "submitted"
+
+
+# --- item 2: stale approvals are found by the document version, not by two servers' clocks -----------
+
+def _race_on_slow_clock(permission, action, behind=timedelta(seconds=2)):
+    """Run ``action`` right after the ``permission`` grant is taken, on a server whose clock is ``behind``
+    the approving one (reviewer probe p2b): its modified_at / submitted_at are older than the grant."""
+    real_require, real_now = access.require, services.timezone.now
+
+    def require_then_race(user, entity, perm, **kw):
+        grant = real_require(user, entity, perm, **kw)
+        if perm == permission:
+            with mock.patch.object(services.timezone, "now", lambda: real_now() - behind):
+                action()
+        return grant
+
+    return mock.patch.object(services.access, "require", side_effect=require_then_race)
+
+
+def test_item2_sales_approval_refused_after_an_edit_on_a_server_with_a_slow_clock(w):
+    doc = invoice(w)
+
+    def edit():
+        services.return_to_draft(doc, user=w.clerk2)
+        services.update_sales_document(doc, user=w.clerk2, notes_en="changed", notes_ar="تغير")
+        services.submit_sales_document(doc, user=w.clerk2)
+
+    with _race_on_slow_clock("invoicing.approve_sales_document", edit), pytest.raises(access.AccessDenied) as exc:
+        approve(w, doc)
+    assert exc.value.code == "grant_document_changed"
+    doc.refresh_from_db()
+    assert (doc.status, doc.number) == ("submitted", "")
+    assert final(w, doc).status == "final"  # a fresh approval of the new version issues and posts it
+
+
+def test_item2_return_to_draft_alone_makes_the_approval_stale(w):
+    """The approver's own return to draft and resubmission by staff: no modifier changes, the version does."""
+    doc = invoice(w)
+
+    def back_and_forth():
+        services.return_to_draft(doc, user=w.clerk)
+        services.submit_sales_document(doc, user=w.clerk)
+
+    with _race_on_slow_clock("invoicing.approve_sales_document", back_and_forth), \
+            pytest.raises(access.AccessDenied) as exc:
+        approve(w, doc)
+    assert exc.value.code == "grant_document_changed"
+
+
+def test_item2_receipt_posting_refused_after_an_application_on_a_slow_clock(w):
+    inv = final(w, invoice(w))
+    r = services.create_receipt(w.alm, user=w.clerk, customer=w.customer, date=date(2027, 1, 20), amount="1150.00")
+    with _race_on_slow_clock("invoicing.post_receipt",
+                             lambda: services.add_receipt_application(r, inv, "1150.00", user=w.clerk)), \
+            pytest.raises(access.AccessDenied) as exc:
+        services.post_receipt(r, user=w.clerk2)
+    assert exc.value.code == "grant_document_changed"
+    r.refresh_from_db()
+    assert (r.status, r.number) == ("draft", "")
+    assert services.post_receipt(r, user=w.clerk2).status == "posted"
+
+
+@pytest.mark.parametrize("kind", ["bill", "payment"])
+def test_item2_bill_and_payment_approval_refused_after_submission_on_a_slow_clock(w, kind):
+    if kind == "bill":
+        doc, permission, approve_ = bill(w, submit=False), "invoicing.approve_bill", services.approve_purchase_document
+        submit = services.submit_purchase_document
+    else:
+        doc = services.create_vendor_payment(w.alm, user=w.ap, vendor=w.vendor, date=date(2027, 1, 25), amount="100")
+        permission, approve_, submit = ("invoicing.approve_vendor_payment", services.approve_vendor_payment,
+                                        services.submit_vendor_payment)
+    with _race_on_slow_clock(permission, lambda: submit(doc, user=w.ap)), pytest.raises(access.AccessDenied) as exc:
+        approve_(doc, user=w.cfo)
+    assert exc.value.code == "grant_document_changed"
+    doc.refresh_from_db()
+    assert (doc.status, doc.number, doc.journal_entry_id) == ("submitted", "", None)
+
+
+def test_item2_every_change_of_a_draft_bumps_the_version(w):
+    doc = services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10),
+                                         supply_date=date(2027, 1, 10))
+    versions = [doc.version]
+
+    def seen():
+        versions.append(type(doc).objects.get(pk=doc.pk).version)
+
+    line = services.add_sales_line(doc, user=w.clerk, income_type="rent_commercial", quantity="1", unit_price="10",
+                                   description_ar="بند")
+    seen()
+    services.add_sales_line(doc, user=w.clerk, income_type="rent_commercial", quantity="1", unit_price="20",
+                            description_ar="بند")
+    seen()
+    services.delete_sales_line(line, user=w.clerk)
+    seen()
+    services.update_sales_document(doc, user=w.clerk, notes_en="x", notes_ar="س")
+    seen()
+    services.submit_sales_document(doc, user=w.clerk)
+    seen()
+    services.return_to_draft(doc, user=w.clerk)
+    seen()
+    assert versions == sorted(set(versions)) and len(versions) == 7  # strictly increasing
+
+
+@postgres_only
+def test_item2_the_database_refuses_a_version_that_goes_down(w):
+    doc = invoice(w)
+    assert doc.version > 0
+    with pytest.raises(DatabaseError, match="version only goes up"):
+        _raw("UPDATE invoicing_salesdocument SET status = 'draft', version = 0 WHERE id = %s", [doc.pk])
+    b = bill(w, submit=False)
+    with pytest.raises(DatabaseError, match="version only goes up"):
+        _raw("UPDATE invoicing_purchasedocument SET version = 0 WHERE id = %s", [b.pk])

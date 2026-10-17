@@ -499,9 +499,16 @@ def _draft_sales(document, user, permission="invoicing.create_sales_document"):
     return doc
 
 
+def _bump(doc):
+    """A new version of the document: approvals and postings checked against an earlier one are refused
+    (:func:`_refuse_stale_grant`). Called by every change of a draft, by submission and by return to draft."""
+    doc.version = (doc.version or 0) + 1
+
+
 def _touch(doc, user):
     """The user changed the draft: they cannot approve it, and earlier approvals no longer count (access R14, R42)."""
     doc.modified_by, doc.modified_at = user, timezone.now()
+    _bump(doc)
 
 
 @transaction.atomic
@@ -612,7 +619,7 @@ def add_sales_line(document, *, user, income_type, quantity, unit_price, descrip
                        exemption_text_en=exemption_text_en)
     line.save()
     _touch(doc, user)
-    doc.save(update_fields=["modified_by", "modified_at", "updated_at"])
+    doc.save(update_fields=["modified_by", "modified_at", "version", "updated_at"])
     return line
 
 
@@ -624,7 +631,7 @@ def delete_sales_line(line, *, user):
         raise error("The line is not on this document.", "البند ليس في هذا المستند.", code="line_missing")
     found.delete()
     _touch(doc, user)
-    doc.save(update_fields=["modified_by", "modified_at", "updated_at"])
+    doc.save(update_fields=["modified_by", "modified_at", "version", "updated_at"])
 
 
 @transaction.atomic
@@ -649,6 +656,7 @@ def submit_sales_document(document, *, user):
         raise _problems_error(problems, "document_invalid")
     doc.status = Status.SUBMITTED
     doc.submitted_by, doc.submitted_at = user, timezone.now()
+    _bump(doc)
     doc._service_write = True
     doc.save()
     return doc
@@ -667,6 +675,7 @@ def return_to_draft(document, *, user):
     # Earlier approvals no longer count (access R42), but returning it does not make the user a modifier:
     # the approver who sends it back for edits may still approve it later.
     doc.modified_at = timezone.now()
+    _bump(doc)
     doc._service_write = True
     doc.save()
     return doc
@@ -958,13 +967,14 @@ def _note_warnings(doc):
     return []
 
 
-def _refuse_stale_grant(grant, doc):
-    """Review item 3 (access R14, R42): an approval checked before the locked document last changed does not count.
+def _refuse_stale_grant(grant, doc, seen_version):
+    """Review item 3 (access R14, R42): an approval checked against another version of the document does not count.
 
-    The grant is taken before the row lock; a return to draft, edit or resubmission in between makes it stale.
+    The grant is taken before the row lock, for the document as read then (``seen_version``); a return to draft,
+    edit or resubmission in between bumps the locked row's version and makes the grant stale. A version counter,
+    not timestamps: the editing and approving servers' clocks may differ (verification review item 2).
     """
-    changed = [t for t in (doc.modified_at, getattr(doc, "submitted_at", None)) if t is not None]
-    if any(t > grant.checked_at for t in changed):
+    if doc.version != seen_version:
         access.deny(grant.user, doc.entity, grant.permission, "grant_document_changed")
 
 
@@ -985,11 +995,12 @@ def approve_sales_document(document, *, user):
     """
     doc = SalesDocument.objects.select_related("entity", "customer").get(pk=document.pk)
     grant = access.require(user, doc.entity, "invoicing.approve_sales_document", document=doc)
+    seen_version = doc.version  # the version the grant was checked against (segregation, R14)
     with transaction.atomic():
         doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity", "customer").get(pk=doc.pk)
         if doc.status != Status.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
-        _refuse_stale_grant(grant, doc)
+        _refuse_stale_grant(grant, doc, seen_version)
         if doc.original_document_id:  # R18 cap: one note at a time per original (review item 4)
             doc.original_document = SalesDocument.objects.select_for_update(of=("self",)).get(
                 pk=doc.original_document_id)
@@ -1584,7 +1595,7 @@ def add_purchase_line(document, *, user, account, quantity, unit_price, vat_cate
     _price_line(line, doc.accounting_date)
     line.save()
     _touch(doc, user)
-    doc.save(update_fields=["modified_by", "modified_at", "updated_at"])
+    doc.save(update_fields=["modified_by", "modified_at", "version", "updated_at"])
     return line
 
 
@@ -1693,6 +1704,7 @@ def submit_purchase_document(document, *, user):
         raise _problems_error(problems, "document_invalid")
     doc.status = PStatus.SUBMITTED
     doc.submitted_by, doc.submitted_at = user, timezone.now()
+    _bump(doc)
     doc._service_write = True
     doc.save()
     return doc
@@ -1706,11 +1718,12 @@ def approve_purchase_document(document, *, user):
     """
     doc = PurchaseDocument.objects.select_related("entity").get(pk=document.pk)
     grant = access.require(user, doc.entity, "invoicing.approve_bill", document=doc)
+    seen_version = doc.version
     with transaction.atomic():
         doc = PurchaseDocument.objects.select_for_update(of=("self",)).select_related("entity", "vendor").get(pk=doc.pk)
         if doc.status != PStatus.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
-        _refuse_stale_grant(grant, doc)
+        _refuse_stale_grant(grant, doc, seen_version)
         targets = []
         if doc.original_document_id:  # the credit cap counts other notes: one note at a time per bill (item 4)
             targets = list(PurchaseDocument.objects.select_for_update(of=("self",)).filter(pk=doc.original_document_id))
@@ -1888,12 +1901,16 @@ def add_receipt_application(receipt, target, amount, *, user):
     app.save()
     _touch(receipt, user)
     receipt._service_write = True
-    receipt.save(update_fields=["modified_by", "modified_at", "updated_at"])
+    receipt.save(update_fields=["modified_by", "modified_at", "version", "updated_at"])
     return app
 
 
 def _post_money(movement, *, user, grant, receivable, approved=False):
-    """Shared posting of a receipt or payment: lock, check, number, book, allocate (R26, R28, R33, R59)."""
+    """Shared posting of a receipt or payment: lock, check, number, book, allocate (R26, R28, R33, R59).
+
+    ``movement`` is the row the grant was checked against; its version must still be the locked row's.
+    """
+    seen_version = movement.version
     model = CustomerReceipt if receivable else VendorPayment
     target_model = SalesDocument if receivable else PurchaseDocument
     movement = model.objects.select_for_update(of=("self",)).select_related("entity").get(pk=movement.pk)
@@ -1902,7 +1919,7 @@ def _post_money(movement, *, user, grant, receivable, approved=False):
     if movement.status != expected:
         raise error(f"Only {expected} documents are posted here.", "لا يُرحَّل هذا المستند في حالته الحالية.",
                     code="wrong_status")
-    _refuse_stale_grant(grant, movement)
+    _refuse_stale_grant(grant, movement, seen_version)
     apps = list(movement.applications.select_related("target").order_by("pk"))
     targets = {t.pk: t for t in target_model.objects.select_for_update(of=("self",)).filter(pk__in=[a.target_id for a in apps])}
     problems, per_target = [], {}
@@ -2025,7 +2042,7 @@ def add_payment_application(payment, target, amount, *, user):
     app.save()
     _touch(payment, user)
     payment._service_write = True
-    payment.save(update_fields=["modified_by", "modified_at", "updated_at"])
+    payment.save(update_fields=["modified_by", "modified_at", "version", "updated_at"])
     return app
 
 
@@ -2037,6 +2054,7 @@ def submit_vendor_payment(payment, *, user):
         raise error("Only drafts can be submitted.", "يمكن تقديم المسودات فقط.", code="not_draft")
     payment.status = "submitted"
     payment.submitted_by, payment.submitted_at = user, timezone.now()
+    _bump(payment)
     payment._service_write = True
     payment.save()
     return payment
