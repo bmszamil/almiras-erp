@@ -1,4 +1,5 @@
 """Regression tests for the verification review (round 5): the reviewer's confirmed exploits stay closed."""
+from contextlib import contextmanager
 from datetime import date, timedelta
 from unittest import mock
 
@@ -358,3 +359,101 @@ def test_item7_a_failing_port_after_commit_keeps_the_logged_resubmission(w, djan
                 services.resubmit_to_zatca(doc, user=w.queue)
     assert _resubmit_logs(w.queue) == 1
     assert SalesDocument.objects.get(pk=doc.pk).zatca_status == "not_submitted"  # can be resubmitted again
+
+
+# --- AT-89 / R87: the posting on clearance relies on the approved version, not on clocks --------------
+
+def _bump_issued_version(doc):
+    """Fixture only (AT-89): an issued document's version goes up with ``modified_at`` set before the approval.
+
+    No service can do this (issued documents never change); on PostgreSQL the lock trigger is disabled for it
+    inside the test transaction."""
+    from django.db.models import F
+
+    def bump():
+        SalesDocument._base_manager.filter(pk=doc.pk).update(version=F("version") + 1,
+                                                              modified_at=doc.approved_at - timedelta(hours=1))
+
+    if connection.vendor == "postgresql":
+        with _lock_trigger_disabled():
+            bump()
+    else:
+        bump()
+    return SalesDocument.objects.get(pk=doc.pk)
+
+
+@contextmanager
+def _lock_trigger_disabled():
+    """PostgreSQL, inside the test transaction: the sales document lock trigger is off (fixtures only)."""
+    with connection.cursor() as cursor:
+        cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")  # ALTER TABLE refuses pending deferred checks
+        cursor.execute("ALTER TABLE invoicing_salesdocument DISABLE TRIGGER invoicing_salesdocument_lock")
+    try:
+        yield
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE invoicing_salesdocument ENABLE TRIGGER invoicing_salesdocument_lock")
+            cursor.execute("SET CONSTRAINTS ALL DEFERRED")
+
+
+def test_at89_approval_records_the_version_it_approved(w):
+    doc = invoice(w)
+    submitted_version = SalesDocument.objects.get(pk=doc.pk).version
+    issued = approve(w, doc)
+    assert issued.approved_version == issued.version == submitted_version
+
+
+def test_at89_clearance_posting_refused_for_another_version_despite_the_clock_order(w):
+    issued = approve(w, invoice(w))
+    tampered = _bump_issued_version(issued)
+    assert tampered.version == issued.approved_version + 1 and tampered.modified_at < tampered.approved_at
+    with pytest.raises(access.AccessDenied) as exc:
+        w.zatca.clear(tampered)  # the queue posts with posted_by = the approving CFO
+    assert exc.value.code == "grant_document_changed"
+    stored = SalesDocument.objects.get(pk=issued.pk)
+    assert (stored.status, stored.journal_entry_id) == ("issued", None)
+    # A document posting at the version its CFO approved goes through.
+    assert w.zatca.clear(approve(w, invoice(w))).status == "final"
+
+
+postgres_trigger = pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL triggers")
+
+
+@postgres_trigger
+def test_at89_the_database_writes_the_approved_version_only_at_approval(w):
+    issued = approve(w, invoice(w))
+    draft = services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10),
+                                           supply_date=date(2027, 1, 10))
+    for sql, pk in (("UPDATE invoicing_salesdocument SET approved_version = approved_version + 1 WHERE id = %s",
+                     issued.pk),
+                    ("UPDATE invoicing_salesdocument SET approved_version = NULL WHERE id = %s", issued.pk),
+                    ("UPDATE invoicing_salesdocument SET approved_version = version WHERE id = %s", draft.pk)):
+        with pytest.raises(DatabaseError, match="approved version"):
+            _raw(sql, [pk])
+    assert SalesDocument.objects.get(pk=issued.pk).approved_version == issued.approved_version
+
+
+@postgres_trigger
+def test_at89_the_migration_backfills_documents_approved_before_it(w):
+    """Migration 0010 on a database with issued, final and draft documents (and deferred checks pending)."""
+    import importlib
+
+    backfill = importlib.import_module("invoicing.migrations.0010_approved_version").backfill_postgresql
+    issued, done = approve(w, invoice(w)), final(w, invoice(w))
+    draft = services.create_sales_document(w.alm, user=w.clerk, customer=w.customer, issue_date=date(2027, 1, 10),
+                                           supply_date=date(2027, 1, 10))
+    new_trigger = "invoicing_salesdocument_approved_version"  # created after the backfill by the migration
+    with connection.cursor() as cursor:
+        cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+        cursor.execute("ALTER TABLE invoicing_salesdocument DISABLE TRIGGER USER")
+        cursor.execute("UPDATE invoicing_salesdocument SET approved_version = NULL")  # as before the migration
+        cursor.execute("ALTER TABLE invoicing_salesdocument ENABLE TRIGGER invoicing_salesdocument_lock")
+        cursor.execute("SET CONSTRAINTS ALL DEFERRED")
+        backfill(cursor)  # with deferred checks pending again, as in a migration after other writes
+        cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+        cursor.execute(f"ALTER TABLE invoicing_salesdocument ENABLE TRIGGER {new_trigger}")
+        cursor.execute("SET CONSTRAINTS ALL DEFERRED")
+    stored = {d.pk: (d.version, d.approved_version) for d in SalesDocument.objects.all()}
+    assert stored[issued.pk][1] == stored[issued.pk][0] and stored[done.pk][1] == stored[done.pk][0]
+    assert stored[draft.pk][1] is None
+    assert w.zatca.clear(issued).status == "final"  # the backfilled approval still posts

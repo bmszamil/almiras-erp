@@ -1051,6 +1051,7 @@ def approve_sales_document(document, *, user):
         doc.number = _next_number(entity, doc.doc_type, doc.issue_date.year)
         doc.status = Status.ISSUED
         doc.approved_by, doc.approved_at = user, timezone.now()
+        doc.approved_version = doc.version  # R87: the clearance posting relies on this very version
         doc._service_write = True
         doc.save()
         access.use_grant(grant, target=doc)  # a used, current approval: the clearance posting checks it (access R42)
@@ -1142,6 +1143,10 @@ def post_cleared_document(document, *, user):
         if doc.status != Status.ISSUED or doc.zatca_status not in zatca_port.POSTING_STATUSES:
             raise error("Only issued documents cleared or reported by ZATCA are posted.",
                         "تُرحَّل المستندات الصادرة التي اعتمدتها الهيئة أو أُبلغت بها فقط.", code="not_cleared")
+        if doc.approved_version is None or doc.version != doc.approved_version:
+            # R87: the approval this posting relies on was given for another version of the document. A version
+            # counter, not modified_at against the grant time: those come from two servers' clocks.
+            access.deny(user, doc.entity, grant.permission, "grant_document_changed")
         targets = _lock_note_target(doc)
         with _posting_as(doc.approved_by):
             entry = ledger.create_entry(

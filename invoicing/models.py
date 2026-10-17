@@ -634,6 +634,11 @@ class SalesDocument(Tracked, Snapshot, Guarded):
     approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                     related_name="+", verbose_name=bi("Approved by", "اعتمده"))
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+    approved_version = models.PositiveIntegerField(
+        bi("Version approved", "النسخة المعتمدة"), null=True, blank=True, editable=False,
+        help_text=bi("The version the approval was checked against; the posting on clearance needs the same (R87)",
+                     "النسخة التي فُحص الاعتماد عليها؛ لا يُرحَّل المستند عند اعتماد الهيئة إلا بالنسخة نفسها"),
+    )
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="documents",
         verbose_name=bi("Customer", "العميل"))
     issue_date = models.DateField(bi("Issue date", "تاريخ الإصدار"))
