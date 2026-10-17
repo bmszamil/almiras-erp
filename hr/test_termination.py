@@ -381,3 +381,18 @@ def test_r41_withdrawal_reverses_the_partial_month_accrual(w):
     assert services.leave_balance(emp, "ANNUAL", user=w.h) == D("8.75")  # the June part is reversed
     services.accrue_leave(2027, 6)  # the job accrues June in full again
     assert services.leave_balance(emp, "ANNUAL", user=w.h) == D("10.50")
+
+
+def test_nit16_withdrawal_follows_the_termination_events_and_voids_the_snapshot(w):
+    emp, a, _ = _seconded_with_leave(w)
+    later = services.create_assignment(emp, user=w.h, kind="assignment", receiving_entity=w.sub, role_title_en="B",
+                                       role_title_ar="ب", start_date=date(2027, 8, 1))
+    later = services.approve_assignment(services.submit_assignment(later, user=w.h), user=w.c)
+    t = _approve(w, emp)
+    emitted = set(AssignmentEvent.objects.filter(termination=t).values_list("assignment_id", "kind"))
+    assert emitted == {(a.pk, "ended"), (later.pk, "cancelled")}
+    t, _ = services.withdraw_termination(t, user=w.c, reason_ar="تراجع")
+    later.refresh_from_db()
+    assert later.status == "approved"  # the cancellation by the termination is undone
+    snaps = list(EosbCalculation.objects.filter(termination=t).order_by("id"))
+    assert len(snaps) == 2 and snaps[1].voided and snaps[1].supersedes == snaps[0] and not snaps[0].voided

@@ -45,6 +45,7 @@ from .models import (
     ZERO,
     Assignment,
     AssignmentEvent,
+    AssignmentEventAction,
     ContractComponent,
     Department,
     Employee,
@@ -1507,14 +1508,72 @@ def approve_assignment(assignment, *, user):
     return _save(a)
 
 
-def _emit(a, kind, end_date, previous, user):
+def _emit(a, kind, end_date, previous, user, termination=None):
     event = AssignmentEvent.objects.create(entity=a.entity, assignment=a, kind=kind, end_date=end_date,
-                                           previous_end_date=previous, actor=user)
+                                           previous_end_date=previous, actor=user, termination=termination)
+    failed = AssignmentEvent.objects.filter(assignment=a, pk__lt=event.pk,
+                                            delivery_status=AssignmentEvent.Delivery.FAILED).order_by("pk").first()
+    if failed is not None:  # finding 10: say at once that the new event waits behind a failed one
+        _alert(a.entity, _recipients(a.entity, "hr.receive_alerts", roles=("accountant",)),
+               HrAlert.Kind.BILLING_DELIVERY_BLOCKED,
+               f"{a.reference}: the new {kind} event #{event.pk} (end date {end_date}) waits behind failed event "
+               f"#{failed.pk}; re-queue or supersede #{failed.pk} in HR.",
+               f"{a.reference}: الحدث الجديد #{event.pk} (تاريخ النهاية {end_date}) ينتظر خلف الحدث المتعثر #{failed.pk}؛ "
+               f"أعد الحدث #{failed.pk} إلى الانتظار أو استبدله في الموارد البشرية.")
     transaction.on_commit(lambda: _deliver_after_commit(event.pk))
     return event
 
 
-def _end_assignment(a, end_date, reason_ar, reason_en, user):
+def _blocked_text(event):
+    later = list(AssignmentEvent.objects.filter(assignment_id=event.assignment_id, pk__gt=event.pk).exclude(
+        delivery_status__in=AssignmentEvent.DONE).order_by("pk"))
+    if not later:
+        return "", ""
+    items = ", ".join(f"#{e.pk} {e.kind} {e.end_date}" for e in later)
+    return (f" Blocked behind it: {items}.", f" الأحداث المتوقفة خلفه: {items}.")
+
+
+def _event_action(user, event, action, reason_ar, reason_en):
+    if not reason_ar:
+        raise error("The reason in Arabic is required.", "السبب بالعربية مطلوب.", code="reason_required")
+    ev = AssignmentEvent.objects.select_for_update(of=("self",)).select_related("assignment").get(pk=event.pk)
+    access.require(user, ev.entity, "hr.end_assignment")
+    if ev.delivery_status != AssignmentEvent.Delivery.FAILED:
+        raise error("Only a failed event is re-queued or superseded (R25).",
+                    "لا يُعاد إلى الانتظار أو يُستبدل إلا الحدث المتعثر.", code="event_status")
+    AssignmentEventAction.objects.create(entity=ev.entity, event=ev, action=action, attempts_before=ev.attempts,
+                                         last_error_en=ev.last_error_en, last_error_ar=ev.last_error_ar,
+                                         reason_ar=reason_ar, reason_en=reason_en, actor=user)
+    return ev
+
+
+@transaction.atomic
+def requeue_assignment_event(event, *, user, reason_ar, reason_en=""):
+    """Finding 10: put a ``failed`` outbox event back to ``pending`` with its attempts reset, e.g. once billing is
+    fixed (``hr.end_assignment``). Logged (``AssignmentEventAction``: who, why, the attempts and last error)."""
+    ev = _event_action(user, event, AssignmentEventAction.Action.REQUEUE, reason_ar, reason_en)
+    ev.delivery_status, ev.attempts = AssignmentEvent.Delivery.PENDING, 0
+    ev.save(update_fields=["delivery_status", "attempts"])
+    transaction.on_commit(lambda: _deliver_after_commit(ev.pk))
+    return ev
+
+
+@transaction.atomic
+def supersede_assignment_event(event, *, user, reason_ar, reason_en=""):
+    """Finding 10: give up a ``failed`` event (its end date was recorded in billing by hand, or a later event
+    replaces it); it stops blocking the assignment's later events. Logged like a re-queue."""
+    ev = _event_action(user, event, AssignmentEventAction.Action.SUPERSEDE, reason_ar, reason_en)
+    ev.delivery_status = AssignmentEvent.Delivery.SUPERSEDED
+    ev.save(update_fields=["delivery_status"])
+    later = AssignmentEvent.objects.filter(assignment_id=ev.assignment_id, pk__gt=ev.pk,
+                                           delivery_status=AssignmentEvent.Delivery.PENDING).values_list("pk", flat=True)
+    ids = list(later)
+    if ids:
+        transaction.on_commit(lambda: deliver_assignment_events(event_ids=ids))
+    return ev
+
+
+def _end_assignment(a, end_date, reason_ar, reason_en, user, termination=None):
     if a.status not in (ASt.APPROVED, ASt.ACTIVE, ASt.ENDED):
         raise error("Only approved, active or ended assignments are ended.", "تُنهى التكليفات المعتمدة أو السارية أو المنتهية فقط.",
                     code="assignment_status")
@@ -1530,7 +1589,7 @@ def _end_assignment(a, end_date, reason_ar, reason_en, user):
     a.end_date, a.status, a.end_reason_ar, a.end_reason_en = end_date, ASt.ENDED, reason_ar, reason_en
     a.ended_by, a.ended_at = user, timezone.now()
     _save(a)
-    return a, _emit(a, kind, end_date, previous, user)
+    return a, _emit(a, kind, end_date, previous, user, termination)
 
 
 @transaction.atomic
@@ -2777,7 +2836,7 @@ def approve_termination(termination, *, user, acknowledge_protection=False):
         if a.start_date > lwd:
             _cancel_assignment_for_termination(a, t, user)
         elif a.end_date is None or a.end_date > lwd:
-            _end_assignment(a, lwd, t.reason_ar, t.reason_en, user)
+            _end_assignment(a, lwd, t.reason_ar, t.reason_en, user, termination=t)
     for r in LeaveRequest.objects.filter(employee=emp, status=LR.APPROVED, end_date__gt=lwd).order_by("start_date"):
         _cancel_leave(_lock(LeaveRequest, r.pk), user, lwd + timedelta(days=1), use)
     for r in LeaveRequest.objects.filter(employee=emp, status__in=(LR.DRAFT, LR.SUBMITTED), end_date__gt=lwd):
@@ -2796,7 +2855,7 @@ def _cancel_assignment_for_termination(a, t, user):
     a.status, a.end_reason_ar, a.ended_by, a.ended_at = ASt.CANCELLED, t.reason_ar, user, timezone.now()
     a.end_date = a.start_date - timedelta(days=1)
     _save(a)
-    _emit(a, AssignmentEvent.Kind.CANCELLED, a.end_date, previous, user)
+    _emit(a, AssignmentEvent.Kind.CANCELLED, a.end_date, previous, user, termination=t)
 
 
 @transaction.atomic
@@ -2844,8 +2903,8 @@ def withdraw_termination(termination, *, user, reason_ar):
         c.ended_on = None
         _save(c, update_fields=["ended_on"])
     warnings = []
-    for ev in AssignmentEvent.objects.filter(assignment__employee=emp, actor=t.approved_by,
-                                             created_at__gte=t.approved_at).select_related("assignment").order_by("-id"):
+    # Nit 16: the events this termination's approval emitted, by their link (not by actor and time).
+    for ev in list(AssignmentEvent.objects.filter(termination=t).select_related("assignment").order_by("-id")):
         a = _lock(Assignment, ev.assignment_id)
         if ev.kind == AssignmentEvent.Kind.CANCELLED:
             a.status, a.end_date = ASt.APPROVED, ev.previous_end_date
@@ -2855,7 +2914,7 @@ def withdraw_termination(termination, *, user, reason_ar):
         elif ev.previous_end_date is not None:
             a.end_date = ev.previous_end_date
             _save(a)
-            _emit(a, AssignmentEvent.Kind.END_CHANGED, ev.previous_end_date, ev.end_date, user)
+            _emit(a, AssignmentEvent.Kind.END_CHANGED, ev.previous_end_date, ev.end_date, user, termination=t)
         else:
             a.status, a.end_date = (ASt.ACTIVE if a.start_date <= _today() else ASt.APPROVED), None
             _save(a)
@@ -2867,8 +2926,20 @@ def withdraw_termination(termination, *, user, reason_ar):
         si._service_write = True
         si.save(update_fields=["status"])
     _reverse_termination_accruals(t, user)
+    _void_snapshot(t, user)
     payroll_port.get_port().discard_draft(t, user)
     return t, warnings
+
+
+def _void_snapshot(t, user):
+    """R41 / nit 16: a withdrawal supersedes the termination's latest EOSB snapshot by a voided copy, so no current
+    snapshot of a withdrawn termination is left for payroll."""
+    latest = EosbCalculation.objects.filter(termination=t, superseded_by__isnull=True).order_by("-id").first()
+    if latest is None:
+        return None
+    fields = {f.name: getattr(latest, f.name) for f in EosbCalculation._meta.concrete_fields
+              if f.name not in ("id", "computed_by", "computed_at", "supersedes", "voided")}
+    return EosbCalculation.objects.create(**fields, computed_by=user, supersedes=latest, voided=True)
 
 
 @transaction.atomic
@@ -3053,7 +3124,7 @@ def deliver_assignment_events(*, entity=None, event_ids=None):
             if ev is None:
                 continue
             earlier = AssignmentEvent.objects.filter(assignment=ev.assignment, pk__lt=ev.pk).exclude(
-                delivery_status=AssignmentEvent.Delivery.DELIVERED)
+                delivery_status__in=AssignmentEvent.DONE)
             if earlier.exists():
                 continue  # keep the order per assignment
             port = billing_port.get_port()
@@ -3072,12 +3143,15 @@ def deliver_assignment_events(*, entity=None, event_ids=None):
                 if ev.attempts >= max_attempts:
                     ev.delivery_status = AssignmentEvent.Delivery.FAILED
                     ref = ev.assignment.reference
+                    blocked_en, blocked_ar = _blocked_text(ev)
                     _alert(ev.entity, _recipients(ev.entity, "hr.receive_alerts", roles=("accountant",)),
                            HrAlert.Kind.BILLING_DELIVERY_FAILED,
-                           f"{ref}: the secondment end date {ev.end_date} could not be delivered to billing after "
-                           f"{ev.attempts} attempts; record it in billing.",
-                           f"{ref}: تعذر تسليم تاريخ نهاية الإعارة {ev.end_date} إلى الفوترة بعد {ev.attempts} "
-                           "محاولات؛ سجّله في الفوترة.")
+                           f"{ref}: event #{ev.pk}, the secondment end date {ev.end_date}, could not be delivered to "
+                           f"billing after {ev.attempts} attempts; fix billing and re-queue it, or record it in billing "
+                           f"and supersede it.{blocked_en}",
+                           f"{ref}: تعذر تسليم الحدث #{ev.pk} (تاريخ نهاية الإعارة {ev.end_date}) إلى الفوترة بعد "
+                           f"{ev.attempts} محاولات؛ أصلح الفوترة وأعده إلى الانتظار، أو سجّله في الفوترة واستبدله."
+                           f"{blocked_ar}")
                 ev.save(update_fields=fields)
                 continue
             ev.attempts += 1

@@ -745,6 +745,11 @@ class AssignmentEvent(models.Model):
         PENDING = "pending", bi("Pending", "قيد الانتظار")
         DELIVERED = "delivered", bi("Delivered", "تم التسليم")
         FAILED = "failed", bi("Failed", "فشل")
+        # Finding 10: a failed event a person decided not to deliver (a later event or a manual billing entry
+        # replaces it); it no longer blocks the assignment's later events.
+        SUPERSEDED = "superseded", bi("Superseded", "مستبدل")
+
+    DONE = ("delivered", "superseded")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     assignment = models.ForeignKey(Assignment, on_delete=models.PROTECT, related_name="events",
@@ -762,6 +767,9 @@ class AssignmentEvent(models.Model):
     last_error_ar = models.TextField(bi("Last error (Arabic)", "آخر خطأ (بالعربية)"), blank=True)
     billing_assignment_id = models.CharField(bi("Billing assignment", "إعارة الفوترة"), max_length=60, blank=True)
     delivered_at = models.DateTimeField(bi("Delivered at", "تاريخ التسليم"), null=True, blank=True)
+    # Nit 16: the termination whose approval (or withdrawal) emitted the event (R27, R41).
+    termination = models.ForeignKey("Termination", null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="assignment_events", verbose_name=bi("Termination", "إنهاء الخدمة"))
 
     DELIVERY_FIELDS = ("delivery_status", "attempts", "last_error_en", "last_error_ar", "billing_assignment_id",
                        "delivered_at")
@@ -778,6 +786,42 @@ class AssignmentEvent(models.Model):
             update_fields = kwargs.get("update_fields")
             if not update_fields or set(update_fields) - set(self.DELIVERY_FIELDS):
                 raise error(*APPEND_ONLY, code="append_only")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error(*APPEND_ONLY, code="append_only")
+
+
+class AssignmentEventAction(models.Model):
+    """Append-only log of a person re-queueing or superseding a failed outbox event (finding 10)."""
+
+    class Action(models.TextChoices):
+        REQUEUE = "requeue", bi("Re-queued", "أعيد إلى الانتظار")
+        SUPERSEDE = "supersede", bi("Superseded", "استُبدل")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    event = models.ForeignKey(AssignmentEvent, on_delete=models.PROTECT, related_name="actions",
+                              verbose_name=bi("Event", "الحدث"))
+    action = models.CharField(bi("Action", "الإجراء"), max_length=10, choices=Action.choices)
+    attempts_before = models.PositiveSmallIntegerField(bi("Attempts before", "المحاولات قبل الإجراء"))
+    last_error_en = models.TextField(bi("Last error (English)", "آخر خطأ (بالإنجليزية)"), blank=True)
+    last_error_ar = models.TextField(bi("Last error (Arabic)", "آخر خطأ (بالعربية)"), blank=True)
+    reason_en = models.TextField(bi("Reason (English)", "السبب (بالإنجليزية)"), blank=True)
+    reason_ar = models.TextField(bi("Reason (Arabic)", "السبب (بالعربية)"))
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                              verbose_name=bi("Actor", "المنفّذ"))
+    created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
+
+    objects = AppendOnlyQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = bi("assignment event action", "إجراء على حدث تكليف")
+        verbose_name_plural = bi("assignment event actions", "إجراءات أحداث التكليفات")
+        ordering = ["id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise error(*APPEND_ONLY, code="append_only")
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
@@ -1038,6 +1082,9 @@ class HrAlert(models.Model):
     class Kind(models.TextChoices):
         DOCUMENT_EXPIRY = "document_expiry", bi("Document expiry", "انتهاء مستند")
         BILLING_DELIVERY_FAILED = "billing_delivery_failed", bi("Billing delivery failed", "تعذر التسليم للفوترة")
+        BILLING_DELIVERY_BLOCKED = "billing_delivery_blocked", bi("Billing delivery blocked", "تسليم للفوترة متوقف")
+        RESIGNATION_DEADLINE = "resignation_deadline", bi("Resignation reply due", "موعد الرد على الاستقالة")
+        GOSI_EXCLUSION = "gosi_exclusion", bi("GOSI exclusion due", "موعد الاستبعاد من التأمينات")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="hr_alerts",
@@ -1193,6 +1240,8 @@ class EosbCalculation(models.Model):
     computed_at = models.DateTimeField(bi("Computed at", "تاريخ الحساب"), auto_now_add=True)
     supersedes = models.OneToOneField("self", null=True, blank=True, on_delete=models.PROTECT,
                                       related_name="superseded_by", verbose_name=bi("Supersedes", "يحل محل"))
+    # R41: the termination was withdrawn; this snapshot only closes the chain and is never paid.
+    voided = models.BooleanField(bi("Voided (termination withdrawn)", "ملغاة (سُحب إنهاء الخدمة)"), default=False)
 
     objects = AppendOnlyQuerySet.as_manager()
 

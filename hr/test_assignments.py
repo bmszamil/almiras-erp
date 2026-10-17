@@ -6,7 +6,7 @@ import pytest
 from core import access
 from hr import services
 from hr.conftest import hired, make_entity
-from hr.models import Assignment, AssignmentEvent, HrAlert, HrError
+from hr.models import Assignment, AssignmentEvent, AssignmentEventAction, HrAlert, HrError
 
 SECONDMENT = dict(kind="secondment", role_title_en="Analyst", role_title_ar="محلل", start_date=date(2027, 2, 1))
 
@@ -152,3 +152,57 @@ def test_at7_billing_receives_no_personal_data(w):
     _, ev = services.end_assignment(a, date(2027, 4, 30), user=w.h, reason_ar="انتهاء")
     fields = {f.name for f in AssignmentEvent._meta.get_fields()}
     assert not fields & {"full_name_en", "id_number", "salary"}
+
+
+# --- Finding 10 (review probe P7): a failed event is re-queued or superseded, and blocked events are named ---------
+
+def _failed_with_follow_up(w, settings):
+    settings.HR_ASSIGNMENT_EVENT_MAX_ATTEMPTS = 1
+    a = _approved(w, hired(w))
+    w.billing.link(a.reference)
+    w.billing.fail_times = 1
+    _, first = services.end_assignment(a, date(2027, 7, 10), user=w.h, reason_ar="انتهاء")
+    services.deliver_assignment_events()
+    _, second = services.end_assignment(a, date(2027, 7, 20), user=w.h, reason_ar="تغيير")
+    for _ in range(3):
+        services.deliver_assignment_events()
+    first.refresh_from_db()
+    second.refresh_from_db()
+    return a, first, second
+
+
+def test_p7_a_failed_event_blocks_and_the_alerts_name_the_blocked_events(w, settings):
+    a, first, second = _failed_with_follow_up(w, settings)
+    assert (first.delivery_status, second.delivery_status) == ("failed", "pending") and w.billing.calls == []
+    blocked = HrAlert.objects.filter(kind="billing_delivery_blocked").first()
+    assert f"#{second.pk}" in blocked.text_en and f"#{first.pk}" in blocked.text_ar
+
+
+def test_p7_requeue_delivers_the_failed_event_then_the_blocked_one_and_is_logged(w, settings):
+    a, first, second = _failed_with_follow_up(w, settings)
+    with pytest.raises(access.AccessDenied):
+        services.requeue_assignment_event(first, user=w.p, reason_ar="أُصلحت الفوترة")
+    with pytest.raises(HrError):
+        services.requeue_assignment_event(first, user=w.h, reason_ar="")
+    with pytest.raises(HrError) as exc:
+        services.requeue_assignment_event(second, user=w.h, reason_ar="ليس متعثرًا")
+    assert exc.value.code == "event_status"
+    ev = services.requeue_assignment_event(first, user=w.h, reason_ar="أُصلحت الفوترة")
+    assert ev.delivery_status == "pending" and ev.attempts == 0
+    action = AssignmentEventAction.objects.get(event=first)
+    assert action.action == "requeue" and action.actor == w.h and action.attempts_before == 1 and action.last_error_en
+    services.deliver_assignment_events()
+    assert [c[2] for c in w.billing.calls] == [date(2027, 7, 10), date(2027, 7, 20)]
+
+
+def test_p7_superseding_a_failed_event_lets_the_later_one_through(w, settings):
+    a, first, second = _failed_with_follow_up(w, settings)
+    services.supersede_assignment_event(first, user=w.h, reason_ar="سُجل يدويًا في الفوترة")
+    services.deliver_assignment_events()
+    first.refresh_from_db()
+    second.refresh_from_db()
+    assert first.delivery_status == "superseded" and second.delivery_status == "delivered"
+    assert [c[2] for c in w.billing.calls] == [date(2027, 7, 20)]
+    assert AssignmentEventAction.objects.get(event=first).action == "supersede"
+    with pytest.raises(HrError):
+        services.requeue_assignment_event(first, user=w.h, reason_ar="مرة أخرى")
