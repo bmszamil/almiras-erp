@@ -24,6 +24,18 @@ except ImportError:  # pragma: no cover
 PRIVILEGE_FIELDS = {"user_type", "is_superuser", "is_staff", "is_active", "agent_name"}
 
 
+def _mp_held(role):
+    """D19: editing a role held by any Managing Partner changes that MP's privileges."""
+    from .services import mp_entities
+
+    holders = User.objects.filter(entity_access__role=role, entity_access__revoked_at__isnull=True).distinct()
+    return role.code == access.MP_ROLE_CODE or any(mp_entities(u) for u in holders)
+
+
+def _is_chairman(request):
+    return access.active_grants(request.user).filter(role__code=access.CHAIRMAN_ROLE_CODE).exists()
+
+
 def _manages_users(request):
     return access.entities_with_perm(request.user, "access.user.manage").exists()
 
@@ -63,7 +75,8 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
     actions = ["unlock_selected"]
 
     def _may_manage(self, request, obj):
-        return setup_mode(request) and obj.pk != request.user.pk or access.can_manage_user(request.user, obj)
+        # Review B + D19 (Managing Partners: Chairman only) + 2a (system user never); setup mode excepted.
+        return access.can_manage_user(request.user, obj, setup=setup_mode(request))
 
     def get_readonly_fields(self, request, obj=None):
         ro = ["last_login", "date_joined"]
@@ -122,7 +135,7 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
     def unlock_selected(self, request, queryset):
         for user in queryset:
             try:
-                access.unlock_user(request.user, user, ctx=admin_ctx(request))
+                access.unlock_user(request.user, user, ctx=admin_ctx(request), setup=setup_mode(request))
                 self.message_user(request, f"Unlocked {user.username}.")
             except Exception as exc:
                 self.message_user(request, f"{user.username}: {exc}", messages.ERROR)
@@ -145,10 +158,19 @@ class RoleAdmin(ScopedAdmin):
         return setup_mode(request) or _manages_globally(request)
 
     def has_change_permission(self, request, obj=None):
-        return setup_mode(request) or _manages_globally(request)
+        if setup_mode(request):
+            return True
+        if not _manages_globally(request):
+            return False
+        return obj is None or not _mp_held(obj) or _is_chairman(request)
 
     def has_delete_permission(self, request, obj=None):
-        return (obj is None or not obj.is_system) and (setup_mode(request) or _manages_globally(request))
+        return (obj is None or not obj.is_system) and self.has_change_permission(request, obj)
+
+    def save_model(self, request, obj, form, change):
+        if change and not setup_mode(request) and _mp_held(obj) and not _is_chairman(request):
+            raise PermissionDenied("Roles held by a Managing Partner change only through the Chairman (D19).")
+        super().save_model(request, obj, form, change)
 
     def audit_extra(self, obj):
         return {"permissions": sorted(obj.permissions.values_list("code", flat=True))} if obj and obj.pk else {}
@@ -216,6 +238,6 @@ class ServiceTokenAdmin(ReadOnlyScopedAdmin):
     def revoke_selected(self, request, queryset):
         for token in queryset:
             try:
-                access.revoke_service_token(request.user, token, ctx=admin_ctx(request))
+                access.revoke_service_token(request.user, token, ctx=admin_ctx(request), setup=setup_mode(request))
             except Exception as exc:
                 self.message_user(request, f"{token}: {exc}", messages.ERROR)

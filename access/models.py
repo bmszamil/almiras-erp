@@ -84,6 +84,19 @@ class User(AbstractUser):
         if self.user_type == self.UserType.SERVICE_AGENT and not self.agent_name:
             raise ValidationError({"agent_name": "Service agents need an agent name."})
 
+    def save(self, *args, **kwargs):
+        # Follow-up 2a: the reserved ERP system user is never renamed or otherwise changed, and no
+        # other account can take its name.
+        if not self._state.adding and self.pk:
+            stored = User.objects.filter(pk=self.pk).values_list("username", flat=True).first()
+            if stored == "system" and getattr(self, "_allow_system_save", False) is not True:
+                raise BilingualError("system_user", "The ERP system user cannot be changed.",
+                                     "لا يمكن تعديل مستخدم النظام.")
+            if stored != "system" and self.username == "system":
+                raise BilingualError("system_user", "The username 'system' is reserved.",
+                                     "اسم المستخدم 'system' محجوز.")
+        super().save(*args, **kwargs)
+
     def delete(self, *args, **kwargs):
         about_me = models.Q(object_type="access.user", object_id=str(self.pk))
         if AuditLog.objects.filter(models.Q(actor=self) | models.Q(on_behalf_of=self) | about_me).exists():

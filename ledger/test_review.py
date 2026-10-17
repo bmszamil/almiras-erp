@@ -241,7 +241,7 @@ def test_reopen_with_explicit_permission_needs_reason_and_is_audited(alm, mp):
     role.permissions.add(Permission.objects.get(code="ledger.period.reopen"))
     from access import services as access
 
-    access.grant_access(mp, mp, alm, role)
+    access.grant_access(None, mp, alm, role)  # operator bootstrap; nobody grants themselves (D19)
     p = services.close_period(FiscalPeriod.objects.get(entity=alm, name="2027-02"), user=mp)
     with pytest.raises(LedgerError):
         services.reopen_period(p, mp, reason="")

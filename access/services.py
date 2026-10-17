@@ -73,7 +73,9 @@ def system_user():
     )
     if created:
         user.set_unusable_password()
+        user._allow_system_save = True
         user.save(update_fields=["password"])
+        user._allow_system_save = False
     return user
 
 
@@ -237,9 +239,12 @@ def can_view_security(user, row):
 
 
 @transaction.atomic
-def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ctx=None):
-    if granter is not None:
-        require_perm(granter, entity, "access.entity_access.manage")
+def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ctx=None, setup=False):
+    """Grant a role. granter=None is the operator bootstrap (`grant_access` command).
+    D19: roles of a Managing Partner change only through a Chairman (or setup mode)."""
+    if is_system_user(user):
+        raise RuleError("system_user", "The ERP system user cannot be given roles.",
+                        "لا يمكن منح أدوار لمستخدم النظام.")
     if isinstance(role, str):
         role = Role.objects.get(code=role)
     if not user.is_human and role.permissions.filter(code__in=SERVICE_FORBIDDEN).exists():
@@ -249,6 +254,11 @@ def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ct
             f"Service agents cannot hold role {role.code}.",
             f"لا يمكن لوكلاء الخدمة حمل الدور {role.code}.",
         )
+    if granter is not None:
+        if is_protected_mp(user):
+            require_manage_user(granter, user, setup=setup)  # D19
+        else:
+            require_perm(granter, entity, "access.entity_access.manage")
     grant, created = EntityAccess.objects.get_or_create(
         user=user, entity=entity, role=role,
         defaults={"valid_from": valid_from or timezone.localdate(), "valid_to": valid_to, "granted_by": granter},
@@ -266,8 +276,11 @@ def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ct
 
 
 @transaction.atomic
-def revoke_access(revoker, grant, ctx=None):
-    require_perm(revoker, grant.entity, "access.entity_access.manage")
+def revoke_access(revoker, grant, ctx=None, setup=False):
+    if is_protected_mp(grant.user):
+        require_manage_user(revoker, grant.user, setup=setup)  # D19
+    else:
+        require_perm(revoker, grant.entity, "access.entity_access.manage")
     before = snapshot(grant)
     grant.revoked_at = timezone.now()
     grant.save(update_fields=["revoked_at"])
@@ -279,14 +292,46 @@ def _can_manage_users(actor):
     return entities_with_perm(actor, "access.user.manage").exists()
 
 
-def can_manage_user(actor, target):
-    """Review B: privilege, active-status, password, token and unlock changes to `target` need
-    access.user.manage in EVERY entity where the target holds a grant. Nobody manages themselves.
-    Superusers are managed only in admin setup mode (checked by the admin)."""
+MP_ROLE_CODE = "managing_partner"
+CHAIRMAN_ROLE_CODE = "chairman"
+
+
+def is_system_user(user):
+    """The reserved ERP system user (created by migration). It can never be managed (follow-up 2a)."""
+    return user is not None and user.username == SYSTEM_USERNAME
+
+
+def mp_entities(user):
+    """Entities where `user` holds the Managing Partner role (any non-revoked grant, even future or expired)."""
+    return set(EntityAccess.objects.filter(user=user, role__code=MP_ROLE_CODE, revoked_at__isnull=True)
+               .values_list("entity_id", flat=True))
+
+
+def is_protected_mp(user):
+    return bool(mp_entities(user))
+
+
+def can_manage_user(actor, target, setup=False):
+    """Who may change `target`'s privileges, active status, password, roles, tokens, TOTP or lockout.
+
+    - Nobody manages themselves; the ERP system user is never managed (2a).
+    - D19: a Managing Partner is managed only by a user holding the Chairman role (an active grant)
+      in every entity where the target is MP. Other MPs and user managers cannot. Setup mode excepted.
+    - Everyone else (review B): access.user.manage in every entity where the target holds a grant.
+    - Superusers are managed only in setup mode.
+    """
     if actor is None or not actor.is_active or not actor.is_human or actor.pk == target.pk:
         return False
+    if is_system_user(target):
+        return False
+    if setup:
+        return True
     if target.is_superuser:
         return False
+    protected = mp_entities(target)
+    if protected:
+        chair = set(active_grants(actor).filter(role__code=CHAIRMAN_ROLE_CODE).values_list("entity_id", flat=True))
+        return protected <= chair
     managed = set(entities_with_perm(actor, "access.user.manage").values_list("pk", flat=True))
     if not managed:
         return False
@@ -296,8 +341,14 @@ def can_manage_user(actor, target):
     return target_entities <= managed
 
 
-def require_manage_user(actor, target):
-    if not can_manage_user(actor, target):
+def require_manage_user(actor, target, setup=False):
+    if not can_manage_user(actor, target, setup=setup):
+        if is_protected_mp(target) and actor is not None and actor.pk != target.pk:
+            raise AccessDenied(
+                "mp_protected",
+                "Only the Chairman can change, lock or disable a Managing Partner (D19).",
+                "لا يحق إلا لرئيس مجلس الإدارة تعديل الشريك المدير أو قفله أو تعطيله (D19).",
+            )
         raise AccessDenied(
             "cannot_manage_user",
             "You cannot change this user: you need user-management rights in every entity they belong to, "
@@ -326,14 +377,16 @@ def create_user(actor, *, username, full_name_en, full_name_ar, email="", langua
 
 
 @transaction.atomic
-def deactivate_user(actor, user, ctx=None):
-    """R3: users are deactivated, never deleted."""
-    require_manage_user(actor, user)
+def deactivate_user(actor, user, ctx=None, setup=False):
+    """R3: users are deactivated, never deleted. D19 applies to Managing Partners."""
+    if actor is None or is_system_user(user):
+        raise AccessDenied("cannot_manage_user", "This user cannot be deactivated here.", "لا يمكن تعطيل هذا المستخدم هنا.")
+    require_manage_user(actor, user, setup=setup)
     before = snapshot(user, ["is_active"])
     user.is_active = False
     user.save(update_fields=["is_active"])
     for token in user.service_tokens.filter(revoked_at__isnull=True):
-        revoke_service_token(actor, token, ctx=ctx)
+        revoke_service_token(actor, token, ctx=ctx, setup=setup)
     audit(actor, "access.user.deactivate", user, before=before, after=snapshot(user, ["is_active"]), ctx=ctx)
     return user
 
@@ -364,14 +417,17 @@ def _token_hash(key):
 
 
 @transaction.atomic
-def issue_service_token(actor, user, *, expires_at, label="", ctx=None):
+def issue_service_token(actor, user, *, expires_at, label="", ctx=None, setup=False):
     """Return the plain token once; only its hash is stored. Expiry is mandatory."""
     import secrets
 
     from .models import ServiceToken
 
+    if is_system_user(user):
+        raise RuleError("system_user", "Tokens cannot be issued for the ERP system user.",
+                        "لا يمكن إصدار رموز لمستخدم النظام.")
     if actor is not None:
-        require_manage_user(actor, user)
+        require_manage_user(actor, user, setup=setup)
     if user.is_human:
         raise RuleError("token_for_human", "Tokens are for service users only.", "الرموز لمستخدمي الخدمة فقط.")
     if not user.is_active:
@@ -387,9 +443,9 @@ def issue_service_token(actor, user, *, expires_at, label="", ctx=None):
 
 
 @transaction.atomic
-def revoke_service_token(actor, token, ctx=None):
+def revoke_service_token(actor, token, ctx=None, setup=False):
     if actor is not None and actor.pk != token.user_id:
-        require_manage_user(actor, token.user)
+        require_manage_user(actor, token.user, setup=setup)
     if token.revoked_at is None:
         token.revoked_at = timezone.now()
         token.save(update_fields=["revoked_at"])
@@ -399,12 +455,14 @@ def revoke_service_token(actor, token, ctx=None):
 
 
 @transaction.atomic
-def enroll_totp(actor, user, name="Authenticator app", ctx=None):
+def enroll_totp(actor, user, name="Authenticator app", ctx=None, setup=False):
     """Create a confirmed TOTP device (D14). Replaces a device of the same name. Returns the device."""
     from django_otp.plugins.otp_totp.models import TOTPDevice
 
+    if is_system_user(user):
+        raise RuleError("system_user", "The ERP system user cannot sign in.", "لا يمكن لمستخدم النظام تسجيل الدخول.")
     if actor is not None and actor.pk != user.pk:
-        require_manage_user(actor, user)
+        require_manage_user(actor, user, setup=setup)
     if not user.is_human or not user.is_active:
         raise RuleError("totp_for_human", "Authenticator apps are for active human users.",
                         "تطبيقات المصادقة للمستخدمين البشريين النشطين فقط.")
@@ -462,9 +520,11 @@ def access_review_report(viewer, on=None, ctx=None):
 
 
 @transaction.atomic
-def unlock_user(actor, user, ctx=None):
+def unlock_user(actor, user, ctx=None, setup=False):
     """Clear a sign-in lockout for `user` (failures before this point stop counting). Audited.
     actor=None is the `unlock_user` management command (server operator)."""
+    if is_system_user(user):
+        raise RuleError("system_user", "The ERP system user cannot sign in.", "لا يمكن لمستخدم النظام تسجيل الدخول.")
     if actor is not None:
-        require_manage_user(actor, user)
+        require_manage_user(actor, user, setup=setup)
     return audit(actor or system_user(), "access.unlock", user, after={"username": user.username}, ctx=ctx)
