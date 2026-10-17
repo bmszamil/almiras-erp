@@ -433,13 +433,21 @@ def submit_by_code(code, object_id, user, ctx=None):
     entity = adapter.entity(doc)
     if not user.is_active:
         raise AccessDenied("inactive", "Your user is inactive.", "المستخدم غير نشط.")
+    if not user.is_human:
+        # D20: AI agents and integrations create drafts only; a human must submit them.
+        raise AccessDenied("service_user_cannot_submit",
+                           "AI agents and integrations cannot submit for approval; a person must submit the draft.",
+                           "لا يمكن للوكلاء والتكاملات تقديم طلبات الموافقة؛ يجب أن يقدّم شخص المسودة.")
     # R1/R2/T2: permission in the document's own entity only.
     access.require_perm(user, entity, "approvals.request.submit")
     if adapter.submit_permission:
         access.require_perm(user, entity, adapter.submit_permission)
     creator = adapter.created_by(doc)
-    if creator is None or creator.pk != user.pk:
+    agent_draft = creator is not None and not creator.is_human
+    if creator is None or (creator.pk != user.pk and not agent_draft):
         # Conservative build choice: users submit their own drafts only (spec §7.1 "own drafts").
+        # D20: drafts made by an AI agent or integration are submitted by a person holding the
+        # submit rights in the document's entity (that person then cannot approve it, R8).
         raise AccessDenied("not_own_draft", "You can only submit drafts you created.",
                            "يمكنك تقديم المسودات التي أنشأتها فقط.")
     if not adapter.is_submittable(doc):

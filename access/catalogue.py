@@ -110,17 +110,17 @@ ROLES = {
         _READ_FINANCE + ["access.audit.view"] + _IC_READ,
     ),
     "viewer": ("Viewer", "مشاهد", ["core.entity.view", "approvals.request.view", "ledger.entry.view"]),
-    # R18: drafts only, never act.
+    # R18, D20: drafts only; never submits or acts (a human submits the agent's draft).
     "agent_drafter": (
         "AI agent (drafts only)", "وكيل ذكاء اصطناعي (مسودات فقط)",
-        ["core.entity.view", "approvals.request.view_own", "approvals.request.submit", "ledger.entry.create"]
-        + _IC_DRAFT,
+        ["core.entity.view", "approvals.request.view_own", "ledger.entry.create"] + _IC_DRAFT,
     ),
 }
 
 # Permissions a service user (AI agent or integration) may never hold, whatever its roles
-# (R18, D17). Checked in has_perm. Service users are drafts-only.
+# (R18, D17, D20). Checked in has_perm. Service users are drafts-only and never submit.
 SERVICE_FORBIDDEN = {
+    "approvals.request.submit",  # D20: a human must submit
     "approvals.request.act",
     "approvals.request.cancel_any",
     "approvals.policy.manage",

@@ -28,9 +28,10 @@ All by Badr Alzamil, Managing Partner (MP), 16 Oct 2026.
 | D12 | **Access is per entity:** a role at Almiras gives no access to subsidiaries; each entity is granted separately through `EntityAccess`. |
 | D15 | (17 Oct 2026) **Reversals without approval:** an accountant, or anyone holding `ledger.entry.post` or `ledger.entry.reverse` in that entity, may reverse a posted entry without approval. The permission is required, the reason is mandatory, and every reversal is audit-logged with its reason. |
 | D16 | (17 Oct 2026) **Delegation beats self-approval:** if the MP has an active delegation covering the document, the delegate approves; MP self-approval (D10) is not allowed while that delegation exists. |
-| D17 | (17 Oct 2026) **Integrations are drafts-only:** `service_integration` users are treated exactly like AI agents: they may create and submit drafts, never post or approve. |
+| D17 | (17 Oct 2026) **Integrations are drafts-only:** `service_integration` users are treated exactly like AI agents: they may create drafts, never post or approve. (Submitting is removed by D20.) |
 | D18 | (17 Oct 2026) **Retention:** all accounting records, approval records and audit logs are kept forever. No purge code. PDPL storage-limitation review is pending legal sign-off. |
 | D19 | (17 Oct 2026) **Managing Partner protection:** only a user holding the Chairman role may deactivate, lock, reset the password of, change roles/privileges of, revoke tokens/TOTP of, or otherwise disable a user holding the Managing Partner role (in any entity). Nobody else may, including other MPs and user managers; setup mode is excepted. This applies in services, admin and API, and every such action is audited. |
+| D20 | (17 Oct 2026) **Agents and integrations do not submit:** AI agents (`service_agent`) and integrations (`service_integration`) may create drafts only; they can not submit for approval. A human must submit. Replaces "create and submit" in D8, D17, R18 and §6. |
 
 ## 3. Data model
 
@@ -165,7 +166,7 @@ Note: `ledger.JournalEntry` today has no `source` field and no `pending_approval
 | R15 | If a step is not decided within `escalate_after_hours`, it is escalated to the escalation role/user (logged as `escalate`). If there is no escalation target, the request expires after the policy timeout (OQ8). | Scheduled job every 15 min (Celery or cron, OQ10); test with frozen time |
 | R16 | A delegate can act for a delegator only inside the delegation's dates, entity, document types and amount limit; actions record both `actor` and `on_behalf_of`. A delegate needs at least view access to the entity. | `act` + `Delegation` lookup |
 | R17 | Reject and return require a comment. | Serializer + service validation |
-| R18 | Service agents (`user_type=service_agent`) can create and submit drafts only; they can never approve, reject, cancel others' requests, or post. Their records carry `source="agent:<agent_name>"`. | Role `agent_drafter` has no act permissions; hard check in `act` on `user_type`; gateway layer |
+| R18 | Service agents (`user_type=service_agent`) and integrations can create drafts only (D20); they can never submit, approve, reject, cancel others' requests, or post. Their records carry `source="agent:<agent_name>"` (integrations: `import`). | Role `agent_drafter` has no submit or act permissions; hard checks in `submit` and `act` on `user_type`; gateway layer |
 | R19 | Every create, update, submit, approve, reject, return, cancel, escalate, delegation change, role/access change and sign-in writes an `AuditLog` row with before/after. Audit rows cannot be updated or deleted by any app user. | `access.services.audit()` called from services; DB role without UPDATE/DELETE on table; model `save` guard |
 | R20 | Approval does not bypass module rules: after approval, posting still goes through `ledger.services.post_entry` (balance, period, Sharia, entity checks). Approval of a document that would fail those checks is still allowed to fail at posting and the error is shown. | Module `on_approved` calls its service; test |
 | R21 | Notifications are sent in the recipient's language; in-app always, email if the user has an email, push only if a `PushDevice` exists (later wave). Failure of email/push never blocks the approval. | `approvals.notify` with queue; tests |
@@ -213,7 +214,7 @@ This module produces no journal entries. Approving a document only changes its a
 | | ERP → Keycloak | None in this wave (roles and entity access are kept in the ERP, not Keycloak groups) — confirm in OQ14 |
 | Email (SMTP) | ERP → user | Notification email with bilingual summary and link; no attachments |
 | Push (APNs/FCM) — hook only | ERP → mobile | Later wave; `PushDevice` model and `notify` channel defined, not active |
-| AI agent gateway (`/api/agents/v1/`) | Agent → ERP | Draft create + submit via the same services; never act on approvals |
+| AI agent gateway (`/api/agents/v1/`) | Agent → ERP | Draft create via the same services; never submit (D20) or act on approvals |
 | ZATCA, banks, GOSI, Mudad, SAP B1 | — | Not touched by this module |
 
 ### 6.1 Approvals REST API (`/api/v1/`)
@@ -269,7 +270,7 @@ Errors: `403` no permission, `409` state conflict or stale `document_version`, `
 | entity_access.manage | Y | — | — | — | — |
 | audit.view | Y | Y | — | — | — |
 | request.view | Y | Y | Y | Y | own only |
-| request.submit | Y | — | Y | — | Y |
+| request.submit | Y | — | Y | — | **never** (D20) |
 | request.act | Y | Y (when policy names chairman) | — | — | **never** |
 | request.cancel_any | Y | — | — | — | — |
 | policy.manage | Y | — | — | — | — |
@@ -298,7 +299,7 @@ The Chairman role exists from day one for escalation, but no policy routes to it
 | T12 | Pending request | Submitter edits the draft document | Approve call returns 409; request set to `returned` |
 | T13 | Pending request | MP rejects without comment | 422; status unchanged |
 | T14 | Pending request | MP returns with comment | Status `returned`; document back to `draft`; resubmission creates a new request |
-| T15 | Agent user `agent:invoice-reader` | Agent creates and submits a bill draft | Bill and request carry `source="agent:invoice-reader"` |
+| T15 | Agent user `agent:invoice-reader` | Agent creates a bill draft and tries to submit it; then an accountant submits it | Agent's submit refused 403 (D20); bill and the request submitted by the accountant carry `source="agent:invoice-reader"` |
 | T16 | Same agent | Agent calls approve | Refused 403 regardless of roles |
 | T17 | Approved manual journal entry that is unbalanced after a data change attempt | Final approval triggers posting (D11) | Posting refused by `post_entry`; whole approval rolled back; approver sees the reason; entry stays unposted and pending |
 | T18 | Any audit row | App user tries update/delete | Refused |
@@ -375,6 +376,14 @@ Backend build on branch `module/approvals` (16 Oct 2026). Where the spec and D1�
 22. **Follow-ups, 17 Oct 2026 (branch `fix/approvals-followups`):**
     - **D19:** `access.services.can_manage_user` is the single check used by deactivate, unlock, TOTP enrolment, token issue/revoke, grant/revoke of roles, and the admin user form, password change and unlock action. For a target holding `managing_partner` in any entity (any non-revoked grant), the actor must hold an active `chairman` grant in every entity where the target is MP. Other MPs and `access.user.manage` holders cannot act, and nobody acts on themselves. Setup mode (`ERP_ADMIN_SETUP_MODE` superuser) is excepted through the admin; operator commands with no acting user (`grant_access`, `unlock_user`, `setup_totp`, `issue_service_token`) also bypass it, as server-side bootstrap. Editing a role held by any MP (including `managing_partner` itself) needs the Chairman role in addition to the normal role-edit right, or setup mode. Successful actions are audited as before. Refused attempts raise `mp_protected` and are not written to the audit log, because the refusal rolls back. The API has no endpoint that changes another user (only `/me`, limited to language and default entity).
     - **System user (2a):** the reserved `system` user cannot be renamed, changed, given a password, roles, tokens or TOTP, unlocked or deactivated, even in setup mode. No other account can take the name.
+    - **Review fixes (same branch):**
+      - **Grants:** nobody grants or revokes their own roles, in any mode. The `chairman` role is granted or revoked only by a user holding an active `chairman` grant in that entity (setup mode and operator commands excepted); this replaces the `access.entity_access.manage` check for that role, since the Chairman role does not hold it. So neither an MP nor a user manager can create a Chairman to get around D19.
+      - **Role edits:** `access.services.can_edit_role` requires the editor to pass `can_manage_user` for every MP holding the role (Chairman in each of their MP entities); `managing_partner` itself always needs a Chairman.
+      - **Admin for the Chairman:** a Chairman sees the user list and can open and change (including password) the Managing Partners of the entities where he is Chairman, without `access.user.manage`. He does not see other users.
+      - **Identity:** outside setup mode nobody changes their own `username` or `keycloak_id` (admin read-only plus a save check). User managers may still rename other users.
+      - **System user:** bulk `update()`, `bulk_update()` and `delete()` on users are refused when the rows include `system` or would rename a user to `system`.
+      - **Editor table:** migration 0004 renames the unique constraint on (request, user) to `unique_request_editor` (PostgreSQL `RENAME CONSTRAINT`; SQLite drop and re-create the unique index), so the database matches the migration state. Append-only querysets also refuse `bulk_update()`.
+      - **D20:** `approvals.request.submit` is in `SERVICE_FORBIDDEN`, removed from `agent_drafter` by data migration, and `submit` refuses any non-human with `service_user_cannot_submit` (403). Because users otherwise submit only their own drafts, a person holding the submit rights in the entity may submit a draft created by an agent or integration; that person then cannot approve it (R8). Drafts of other people stay own-drafts-only.
     - **Append-only editors (2b):** `ledger.JournalEntryEditor` and the new `approvals.RequestEditor` (explicit through table of `document_editors`, mapped onto the existing table by a state-only migration) refuse update and delete. Editor rows of a deleted draft go with it by database cascade.
 23. **Retention (D18):** there is no purge or anonymisation code. Accounting records, approval records, notifications and audit logs are kept forever. **PDPL storage-limitation review is pending legal sign-off;** nothing is anonymised until then.
 
