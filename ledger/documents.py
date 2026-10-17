@@ -10,7 +10,7 @@ document that
   permissions allowed to post it,
 - exists in the database, belongs to the entity being posted, and has a
   recorded creator (so segregation can be checked on it), and
-- passes the type's own line hooks, if it registered any.
+- passes the type's own line hooks (every type registers at least one).
 
 A sub-ledger app registers its document models in its own
 ``AppConfig.ready()``; only the app that defines a model may register it,
@@ -19,9 +19,10 @@ and the registry is frozen once all apps are ready::
     from ledger import documents
     documents.register(Bill, post_permissions={"invoicing.approve_bill"},
                        reverse_permissions={"invoicing.reverse_document"},
-                       validate_lines=check_bill_lines)
+                       build_lines=bill_lines)
 
-Line hooks (optional; a type may register either or both):
+Line hooks (required: a type registers ``build_lines``, ``validate_lines`` or both,
+so no document can book lines that nothing ties to it):
 
 - ``build_lines(document)`` returns the line dicts (as for ``create_entry``)
   that book the document. The ledger then builds the entry from them and the
@@ -30,6 +31,13 @@ Line hooks (optional; a type may register either or both):
   unsaved, fully priced ``JournalLine`` objects (rounding line included)
   before anything is written, and returns a list of problems ("English /
   العربية"); any problem refuses the posting.
+
+Optional period hook:
+
+- ``pending_documents(entity, start_date, end_date)`` returns descriptions of
+  documents of that entity dated in the range that are approved but wait to
+  be booked (e.g. sales documents awaiting ZATCA clearance). ``close_period``
+  refuses to close a period while any exist (invoicing R43).
 
 Until a module registers a type, ``create_entry(post=True)`` with a sub-ledger
 grant is refused. Nothing is registered by the ledger itself.
@@ -65,6 +73,7 @@ class DocumentType:
     creator_field: str = "created_by"
     build_lines: Callable | None = None
     validate_lines: Callable | None = None
+    pending_documents: Callable | None = None
 
     def entity_id_of(self, document):
         return getattr(document, f"{self.entity_field}_id")
@@ -102,7 +111,7 @@ def _check_caller(model, module_name):
 
 
 def register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
-             creator_field="created_by", build_lines=None, validate_lines=None):
+             creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None):
     """Register ``model`` as a document type that books journal entries. Idempotent for the same arguments.
 
     Call it from the ``AppConfig.ready()`` of the app that defines ``model``.
@@ -115,7 +124,7 @@ def register(model, *, post_permissions, reverse_permissions=(), entity_field="e
     return _register(
         model, post_permissions=post_permissions, reverse_permissions=reverse_permissions, entity_field=entity_field,
         changed_at_field=changed_at_field, creator_field=creator_field, build_lines=build_lines,
-        validate_lines=validate_lines,
+        validate_lines=validate_lines, pending_documents=pending_documents,
     )
 
 
@@ -127,7 +136,7 @@ def _field(model, name, label):
 
 
 def _register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
-              creator_field="created_by", build_lines=None, validate_lines=None):
+              creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None):
     """Validate and store one registration (no caller or freeze check; tests use it through the helpers below)."""
     if not (isinstance(model, type) and issubclass(model, models.Model)) or model._meta.abstract:
         raise DocumentRegistryError(f"{model!r} is not a concrete Django model.")
@@ -151,11 +160,15 @@ def _register(model, *, post_permissions, reverse_permissions=(), entity_field="
         raise DocumentRegistryError(f"{label}.{creator_field} must be a non-null foreign key to the user model.")
     if changed_at_field is not None:
         _field(model, changed_at_field, label)
-    for name, hook in (("build_lines", build_lines), ("validate_lines", validate_lines)):
+    for name, hook in (("build_lines", build_lines), ("validate_lines", validate_lines),
+                       ("pending_documents", pending_documents)):
         if hook is not None and not callable(hook):
             raise DocumentRegistryError(f"{label}: {name} must be callable.")
+    if build_lines is None and validate_lines is None:
+        # Without a hook any lines could be booked for the document (nothing ties them to it).
+        raise DocumentRegistryError(f"{label}: register build_lines or validate_lines (or both).")
     doc_type = DocumentType(label, model, post, reverse, entity_field, changed_at_field, creator_field, build_lines,
-                            validate_lines)
+                            validate_lines, pending_documents)
     existing = _REGISTRY.get(label)
     if existing is not None and existing != doc_type:
         raise DocumentRegistryError(f"{label} is already registered with other settings.")
@@ -185,10 +198,18 @@ def _registered_for_tests(model, **options):
         _REGISTRY.update(snapshot)
 
 
+def pending_in_period(entity, start_date, end_date):
+    """Descriptions of approved documents of ``entity`` dated in the range that still wait to be booked."""
+    found = []
+    for doc_type in _REGISTRY.values():
+        if doc_type.pending_documents is not None:
+            found += [str(d) for d in doc_type.pending_documents(entity, start_date, end_date)]
+    return found
+
+
 def get(label):
     """The DocumentType registered under ``label`` (``app_label.model``), or None."""
     return _REGISTRY.get(label)
-
 
 
 def registered():

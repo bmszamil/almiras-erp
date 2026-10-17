@@ -168,3 +168,50 @@ def test_probe_f_only_the_models_own_app_registers_it(monkeypatch):
 def test_probe_f2_unregister_is_not_public():
     assert not hasattr(documents, "unregister")
     assert documents.get("testdocs.bill").post_permissions == {"invoicing.approve_bill"}
+
+
+# --- mandatory line hooks and the period hook (invoicing slice 1) -------------------------------------
+
+def test_registration_needs_a_line_hook():
+    """No document type books lines that nothing ties to it: build_lines or validate_lines is required."""
+    with pytest.raises(documents.DocumentRegistryError, match="build_lines or validate_lines"):
+        documents._register(Unregistered, post_permissions={"invoicing.post_receipt"})
+    assert documents.get("testdocs.unregistered") is None
+    with documents._registered_for_tests(Unregistered, post_permissions={"invoicing.post_receipt"},
+                                         build_lines=lambda d: []) as doc_type:
+        assert doc_type.build_lines is not None and doc_type.validate_lines is None
+
+
+def test_every_registered_type_has_a_line_hook():
+    for doc_type in documents.registered().values():
+        assert doc_type.build_lines is not None or doc_type.validate_lines is not None, doc_type.label
+
+
+def test_pending_documents_hook_must_be_callable():
+    with pytest.raises(documents.DocumentRegistryError, match="callable"):
+        documents._register(Unregistered, post_permissions={"invoicing.post_receipt"}, validate_lines=lambda d, l: [],
+                            pending_documents="nope")
+
+
+def test_close_period_refuses_while_documents_wait_to_be_booked(w):
+    from core.access.testing import make_user, member
+    from ledger.models import FiscalPeriod
+
+    closer = make_user("closer")
+    member(closer, w.alm, "approver")
+    waiting = []
+
+    def pending(entity, start, end):
+        return [f"WAIT-{entity.code}" for d in waiting if start <= d <= end]
+
+    period = FiscalPeriod.objects.get(entity=w.alm, name="2027-03")
+    with documents._registered_for_tests(Unregistered, post_permissions={"invoicing.post_receipt"},
+                                         validate_lines=lambda d, l: [], pending_documents=pending):
+        waiting.append(date(2027, 3, 5))
+        with pytest.raises(LedgerError) as exc:
+            services.close_period(period, user=closer)
+        assert exc.value.code == "documents_pending" and "WAIT-ALM" in exc.value.messages[0]
+        assert "لم تُرحَّل" in exc.value.messages[0]
+        assert FiscalPeriod.objects.get(pk=period.pk).status == "open"
+        waiting.clear()
+        assert services.close_period(period, user=closer).status == "closed"

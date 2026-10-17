@@ -22,7 +22,7 @@ from core.models import Entity
 from ledger import services
 from ledger.models import Account, FiscalPeriod, JournalEntry, JournalLine, LedgerError
 from ledger.services_setup import create_monthly_periods, install_chart_of_accounts
-from testdocs.models import Bill, Receipt, SalesDocument
+from testdocs.models import Bill, Receipt, SalesDocument, validate_lines
 
 pytestmark = pytest.mark.django_db
 postgres_only = pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL-only database guard")
@@ -227,10 +227,12 @@ def test_document_registry_validates_registrations():
     with pytest.raises(documents.DocumentRegistryError):
         documents._register(Unregistered, post_permissions={"invoicing.post_receipt"}, reverse_permissions={"ledger.reverse_entry"})
     with pytest.raises(documents.DocumentRegistryError):  # another registration for a registered type
-        documents._register(Bill, post_permissions={"invoicing.post_receipt"})
+        documents._register(Bill, post_permissions={"invoicing.post_receipt"}, validate_lines=validate_lines)
     assert documents.get("testdocs.unregistered") is None
-    assert all(label.startswith("testdocs.") for label in documents.registered())  # nothing else registers yet
-    with documents._registered_for_tests(Unregistered, post_permissions={"invoicing.post_receipt"}) as doc_type:
+    # The ledger registers nothing itself; only sub-ledger apps do (testdocs in tests, invoicing).
+    assert not any(label.startswith("ledger.") for label in documents.registered())
+    with documents._registered_for_tests(Unregistered, post_permissions={"invoicing.post_receipt"},
+                                         validate_lines=validate_lines) as doc_type:
         assert doc_type.post_permissions == {"invoicing.post_receipt"}
     assert documents.get("testdocs.unregistered") is None
 
@@ -303,7 +305,8 @@ def test_reverse_document_grant_needs_a_registered_reversal_right(w):
     receipt = doc(Receipt, w.alm, created_by=w.cfo)
     booked = services.create_entry(w.alm, date(2027, 1, 10), "Receipt", CASH, user=w.clerk, post=True, document=receipt,
                                    grant=access.require(w.clerk, w.alm, "invoicing.post_receipt", document=receipt))
-    with documents._registered_for_tests(Receipt, post_permissions={"invoicing.post_receipt"}):  # no reversal right
+    with documents._registered_for_tests(Receipt, post_permissions={"invoicing.post_receipt"},
+                                         validate_lines=validate_lines):  # no reversal right
         with pytest.raises(access.AccessDenied) as exc:
             services.reverse_entry(booked, access.require(w.clerk, w.alm, "invoicing.reverse_document", document=receipt))
         assert exc.value.code == "grant_wrong_permission"

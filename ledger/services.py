@@ -1021,6 +1021,13 @@ def close_period(period, *, user):
     )
     if drafts.exists():
         raise error("Draft entries exist in this period.", "توجد مسودات قيود في هذه الفترة.")
+    pending = documents.pending_in_period(entity, period.start_date, period.end_date)
+    if pending:  # e.g. sales documents awaiting ZATCA clearance (invoicing R43)
+        raise error(
+            f"Documents in this period still wait to be booked: {', '.join(pending[:10])}.",
+            f"توجد مستندات في هذه الفترة لم تُرحَّل بعد: {', '.join(pending[:10])}.",
+            code="documents_pending",
+        )
     period.status = FiscalPeriod.Status.CLOSED
     period.save(update_fields=["status"])
     return period
