@@ -1,6 +1,6 @@
 # Tax returns: VAT return, withholding tax returns, Zakat and income tax
 
-Django app: `tax`. Status: **draft spec**, written 2026-10-17. Not built.
+Django app: `tax`. Status: **draft spec**, written 2026-10-17. Not built. Amended 2026-10-17 (X12, project owner / CFO decision pack: SAMA tax-point rate, residential rent, 5% history, reverse charge on goods in KSA, Art. 51 ratio and true-up, WHT due date and rates, deposits, retention, approved accounts, legacy system Falcon; notes on R12, R13, R17 to R19, R21, R23, R32, R52; new R55, R56; §5, §6; AT-46 to AT-48; OQ-4, OQ-10, OQ-11, OQ-15, OQ-28, new OQ-31).
 Depends on: `ledger.services` (`create_entry(post=True, grant, document)`, `reverse_entry`, `close_period`, `trial_balance`, `ledger/documents.py` registry), `docs/specs/invoicing.md` (VAT categories, `vat_breakdown`, `total_vat_sar`, reverse charge R30, attribution R29, WHT R61 to R64), `docs/specs/payroll.md` (payroll WHT rows, OQ-30; GOSI fine 5930), `docs/specs/access.md` (`require`, segregation, grants), `docs/specs/reporting.md` (fiscal-year statements; Zakat and tax notes data), `docs/specs/banking.md` (payments matched to statements).
 
 **Tags.** **[CC-verify]** = regulatory figure or rule the compliance-checker must confirm against an official source before build; the value shown is the default. A citation in parentheses points to an official ZATCA document downloaded on 2026-10-16 (abbreviations as in the Sources table of `docs/compliance/zatca-verification-2026-10-16.md`: TIR, PSG, WHT, DTG, XML). The ZATCA VAT return guide, the Zakat Implementing Regulations and the Income Tax Regulations were **not** downloaded (list in OQ-2). **[AR-review]** = Arabic label to be checked by an Arabic reviewer.
@@ -26,6 +26,7 @@ Only recorded decisions. Items from the task brief are listed separately; they a
 | X9 | The tax date of a credit or debit note is the note's **own** date. Entities without a VAT number charge no VAT. | Project owner (invoicing D30a, D30b) | 2026-10-17 |
 | X10 | Proposed account codes stay proposed until the accountant/CFO review (Word document). | Project owner (invoicing D29, ledger-fx D10) | 2026-10-17 |
 | X11 | Payroll writes remuneration WHT as `WhtDeduction` rows (shape of invoicing). | Payroll spec P8 / OQ-30 default | 2026-10-17 |
+| X12 | **Project owner / CFO decision pack** (`docs/approvals/owner-cfo-decision-pack-2026-10-17-answered.docx`; invoicing D32). (a) Tax 1: VAT in SAR at SAMA's daily rate on the tax point (date of supply); fallback only over weekends and holidays (invoicing R100). (b) Tax 3: residential rent is exempt, category E, VATEX-SA-30, e-invoice with 0 VAT. (c) Tax 6: 5% applies only to notes on pre-July-2020 invoices; transitional relief (contracts before 11 May 2020, ended 30 June 2021) not modelled (invoicing R102). (d) Tax 7: reverse charge covers imported services and goods supplied inside KSA by a non-resident; booked as due and recoverable, recovery limited by Art. 51 (invoicing R103). (e) Tax 8: Art. 51 direct attribution, prior-year ratio, annual true-up "in the last return of the year"; other methods need ZATCA approval (invoicing R104; R55 here). (f) Tax 9: WHT due by the 10th of the following month; rates to verify (invoicing R105). (g) Tax 10: no VAT on a refundable deposit received; VAT follows the rent when applied (invoicing R106). (h) Tax 12: "Keeping everything indefinitely is fine" (R32). (i) CFO: invoicing and payroll accounts approved, incl. 2220 and 5930 (5930 named "GOSI late-payment fines"); 2250 and 5810 of this spec were **not** in the pack and stay proposed. (j) A10: Almiras's returns before go-live were prepared outside this ERP; its legacy system is Falcon, not Daftra (R12). | Project owner (Part A), CFO (Part C), CFO / tax adviser (Part D) | 2026-10-17 |
 
 **Task brief (caller, 2026-10-17; not a business decision):** return lifecycle prepared → reviewed → CFO-approved → locked; VAT payment Dr 2200 / Cr bank; corrections above a threshold by voluntary disclosure; deadline alerts; WHT monthly and annual; Zakat per entity with consolidated option; Zakat certificate tracking, "Almiras certificate valid until 2027-04-30" (to be entered as data and confirmed, OQ-24); income tax on foreign shares; Zakat kept apart from purification.
 
@@ -222,20 +223,24 @@ All models carry `entity` (FK `core.Entity`, PROTECT) unless marked *global*. "B
 9. Approval needs every `FiscalPeriod` of the entity that overlaps the return period to be `closed`, so no later posting can change the sources. For Zakat and income tax: every period of the fiscal year. **[svc; T AT-9]**
 10. On approval the service recomputes all boxes, freezes `VatReturnSourceLine` rows and stores `source_hash`. If the recomputed boxes differ from those reviewed, approval is refused (`sources_changed`, en/ar) and the return goes back to `draft`. **[svc; T AT-10]**
 11. Each box and column drills down to its source lines, and each source line to its journal entry and document, with the same entity and permission checks as `ledger.view`. **[svc; T AT-11]**
-12. Returns filed before go-live (e.g. Almiras since 2024-04-01 via Daftra) are loaded with `source=import`, status `filed`, box values and filing reference, no source lines; they serve as `original_return` for corrections and as the box 15 source. **[svc import; T AT-12]**
-13. Deadline alerts: for each return not `filed` (or payment not `posted`), the entity's accountant and approver see a bilingual alert at each `alert_days` before `due_date`, and daily once overdue with the late-penalty exposure estimate from `StatutoryTaxRate` (display only). Due dates: VAT `VatReturn.due_date`; WHT monthly 10th of the next month; WHT annual and Zakat FY end + 120 days **[CC-verify all]**. No weekend/holiday shift (default, OQ-8). Channel: in-app list (OQ-9). **[svc scheduled job, system user `system_tax_alerts`; T AT-13]**
+12. Returns filed before go-live (e.g. Almiras since 2024-04-01, prepared in the legacy system (Falcon), X12(j)) are loaded with `source=import`, status `filed`, box values and filing reference, no source lines; they serve as `original_return` for corrections and as the box 15 source. **[svc import; T AT-12]**
+13. Deadline alerts: for each return not `filed` (or payment not `posted`), the entity's accountant and approver see a bilingual alert at each `alert_days` before `due_date`, and daily once overdue with the late-penalty exposure estimate from `StatutoryTaxRate` (display only). Due dates: VAT `VatReturn.due_date`; WHT monthly 10th of the next month (*confirmed by the tax adviser 2026-10-17, X12(f)*); WHT annual and Zakat FY end + 120 days **[CC-verify all]**. No weekend/holiday shift (default, OQ-8). Channel: in-app list (OQ-9). **[svc scheduled job, system user `system_tax_alerts`; T AT-13]**
 14. Agents (gateway users) may call `compute_draft` (create or recompute a `draft`) and read; they never submit, review, approve, file or post. **[access Ag flags; T AT-14]**
 
 ### VAT return computation
 15. **Tie-out.** For the period, Σ output VAT in the boxes (incl. reverse-charge output, R23) must equal the net credits on 2200, and Σ recoverable input VAT the net debits on 1310, excluding entries of `tax` documents (T1 to T4) and entries listed in `VatCorrection.correcting_entries`. Each difference is a `tie_out_difference` exception; review cannot complete until every difference is explained by a `VatManualAdjustment` or acknowledged (`VatExceptionAck`) and the remaining difference is 0.00. **[svc; T AT-15]**
 16. **Exceptions.** (a) Manual journal lines on 2200 or 1310 not linked to an invoicing or tax document → `untagged_vat_journal`. (b) Sales documents of the entity with `status=rejected` and issue date in the period → `rejected_document`: VAT may still be due (DTG FAQ p.72); the reviewer records whether a replacement document exists or adds a `VatManualAdjustment`. Review cannot complete while an exception is unacknowledged. **[svc; T AT-16]**
 17. **Which period.** A document counts in the return whose period contains the date of its journal entry: `issue_date` for sales documents and notes (X9), `accounting_date` for bills, `declaration_date` for import records. A reversal counts negative in the period of the reversal entry. Only entries in `posted` / `reversed` status count. Tax-point rules other than these dates (earliest of supply, invoice, payment): OQ-10 **[CC-verify]**. **[svc; T AT-17]**
-18. **Box 1.** Amount = Σ taxable SAR of category S; VAT = Σ `vat_breakdown.vat_sar` of category S. Taxable SAR = round(category taxable × the SAR rate used for `vat_sar`, 2) (OQ-11). Intercompany documents count like any other (X3). A 388 that deducts a 386 counts net of the deducted amounts (invoicing E17) **[CC-verify]**. **[svc; T AT-18]**
+    *Note 2026-10-17 (X12(a)):* the tax point now fixes the **SAR rate** of a foreign-currency document (invoicing R100, `tax_point_date`); which **return period** a document falls in is still its JE date (this rule) until OQ-10 is answered.
+18. **Box 1.** Amount = Σ taxable SAR of category S; VAT = Σ `vat_breakdown.vat_sar` of category S. Taxable SAR = round(category taxable × the SAR rate used for `vat_sar`, 2) (OQ-11). *Amended 2026-10-17 (X12(a)):* that rate is the document's pinned SAMA row `vat_sar_exchange_rate` (invoicing 3.6, R100); no recomputation from the ledger table (resolves OQ-11 once built). Intercompany documents count like any other (X3). A 388 that deducts a 386 counts net of the deducted amounts (invoicing E17) **[CC-verify]**. **[svc; T AT-18]**
 19. **Boxes 2 to 5.** Lines are grouped by category and exemption reason (line `net_amount`, SAR at the document's SAR rate): Z + VATEX-SA-HEA/-EDU → box 2; Z + VATEX-SA-32/-33 → box 4; other Z reasons → box 3; E → box 5; O (VATEX-SA-OOS) → not reported. VAT column 0.00. **[CC-verify]** **[svc; T AT-19]**
+    *Note 2026-10-17 (X12(b)):* residential rent (E, VATEX-SA-30) in box 5 is consistent with the adviser's answer. Documents of entities without a VAT number never reach a return (R2).
 20. **Credit and debit notes.** A credit note goes to the **Adjustment** column of its original's box when the return of the original invoice's period was `filed` before the note's `issue_date`; otherwise it reduces the **Amount** column. A debit note always increases the Amount column of the period of its own date (TIR §7.1.1 p.38; X9). **[svc; T AT-20]**
 21. **Box 7.** Bills and vendor credit notes from resident vendors with VAT > 0, category S: Amount = net SAR; VAT = recoverable VAT only (lines with VAT on 1310 per invoicing R29). Non-recoverable (exempt / mixed default) VAT is not in the VAT column **[CC-verify]**. Bills from unregistered vendors (0 VAT, X8, invoicing R92) are not reported (default, OQ-12) **[CC-verify]**. **[svc; T AT-21]**
+    *Amended 2026-10-17 (X12(e)):* the VAT column includes the recoverable share of `mixed` VAT at the provisional ratio (invoicing R104); the year's true-up is R55.
 22. **Box 8.** Posted `ImportVatRecord` rows: Amount = `customs_value_sar`, VAT = recoverable `vat_paid_sar` (attribution `taxable`). **[CC-verify base]** **[svc; T AT-22]**
 23. **Box 9.** Reverse-charge bill lines (non-resident, services, invoicing R30): Amount = net SAR; the reverse-charge VAT counts as output VAT in box 13, and its recoverable part (1310 debit) as input VAT. How the form shows the two sides: **[CC-verify]** (PSG §4.6 p.20: "Input Tax shall be automatically offset"). Goods from non-residents are not in box 9 (customs, box 8). **[svc; T AT-23]**
+    *Amended 2026-10-17 (X12(d)):* reverse charge also covers goods supplied **inside KSA** by a non-resident (`supply_kind = goods_in_ksa`, invoicing R103); default: reported in box 9 with the services (the box 9 label says "imports") **[CC-verify]**; goods through customs (`goods_import`) stay in box 8. The recoverable part follows Art. 51 (R21 amendment).
 24. **Boxes 10, 11.** Resident and non-resident bill lines with category Z → box 10, E → box 11; VAT 0.00. **[CC-verify]** **[svc; T AT-21]**
 25. **Totals.** Box 6 = Σ 1–5 amounts and adjustments; box 12 = Σ 7–11; box 13 = Σ output VAT (1–5 and reverse-charge output) − Σ recoverable input VAT (7–11); box 15 = the latest earlier return's negative box 16 when `refund_requested` is False and no `TaxRefund` covers it; box 16 = 13 + 14 − 15. All in SAR, 2 dp, ROUND_HALF_UP. **[CC-verify formula]** **[svc; T AT-24]**
 26. A journal entry listed in a `VatCorrection.correcting_entries` is excluded from boxes 1 to 13 of every return and reported only through that correction. **[svc; T AT-25]**
@@ -247,6 +252,7 @@ All models carry `entity` (FK `core.Entity`, PROTECT) unless marked *global*. "B
 30. The annual statement is required when any `WhtDeduction` exists in the fiscal year, even if the total is 0.00 (WHT §5 p.30); its rows equal the sum of the year's monthly returns per beneficiary; the beneficiaries list holds name, address and registration number where available (WHT §5 p.31). **[svc; T AT-29]**
 31. One `WhtBeneficiaryCertificate` (PDF, en/ar) is produced per beneficiary per filed monthly return (WHT §5 p.30). **[svc; T AT-28]**
 32. WHT records (returns, certificates, deductions) are kept at least 10 years after payment (WHT §5 p.31); no purge job exists. **[svc: no delete path; DB trigger]**
+    *Amended 2026-10-17 (X12(h)):* every `tax` record (returns, source lines, filings, certificates, payments) is kept indefinitely; personal data of individual beneficiaries is only nominated for a human decision after 10 years and after these minimums (invoicing R108).
 
 ### Posting
 33. On VAT return approval the service posts **T1** (offset) in one step: `create_entry(..., post=True, grant=<tax.approve_return grant>, document=return)`, dated the approval date (must be in an open period), offset = min(output VAT, input VAT + box 15 credit). Zero offset → no entry. **[svc + L; T AT-30]**
@@ -275,8 +281,13 @@ All models carry `entity` (FK `core.Entity`, PROTECT) unless marked *global*. "B
 
 ### Sharia, language, privacy
 52. Penalties are fines, not interest: they post to 5930 (proposed, payroll OQ-12), never to 5600 / 5610, and carry no purification flag. Tax and Zakat deductibility of fines: payroll OQ-42. **[svc build_lines; T AT-43]**
+    *Note 2026-10-17 (X12(i)):* 5930 is approved, but as "GOSI late-payment fines / غرامات تأخير التأمينات الاجتماعية". Using it for VAT, WHT, Zakat and income-tax penalties needs the CFO's confirmation (OQ-31); default until then: `TaxPenalty.account` has no default, the accountant picks a non-prohibited expense account and the choice is shown on the penalty (en/ar).
 53. All labels, statuses, exception texts, alerts and exports (box labels, certificates) are bilingual; Arabic texts on WHT certificates and the beneficiaries list are required. **[svc + T AT-44]**
 54. Beneficiary names, IDs and addresses of individuals in WHT records are personal data: shown and exported only with `invoicing.view_personal_data` in that entity, each view or export logged (invoicing R51). **[svc + access log; T AT-45]**
+
+### Decision pack 2026-10-17 (X12; to build)
+55. **Art. 51 annual true-up.** The last VAT return of an entity's calendar year (the return whose period contains 31 December) includes the `Art51TrueUp` document of the year (invoicing R104, E25): its amount is the difference between the year's `mixed` VAT recovered at the provisional ratio and that recoverable at the final ratio. It is reported in that return, default in the box 7 **Adjustment** column (positive = more recoverable) **[CC-verify: box placement against the ZATCA VAT return guide, OQ-2]**. The return cannot be approved while the year's `final` ratio is not approved or the true-up document is not posted (en/ar `art51_true_up_missing`). **[svc; T AT-46]**
+56. **Deposits.** Refundable deposit receipts (invoicing R106, E18) carry no VAT and are in no box. When a deposit is applied to rent, the rent invoice is reported as any sales document (box 1 commercial, box 5 residential); the application itself (E24) is not reported. Forfeiture is not built (invoicing OQ-16). **[svc; T AT-47]**
 
 ## 5. Accounting
 
@@ -324,6 +335,8 @@ Hijri year at 2.5%: 100,000.00. Interim (monthly/quarterly) accruals: OQ-27 (def
 
 **T10. Penalty** (VAT late payment 5% of 18,750.00 = 937.50): Dr 5930 Government fines and penalties (proposed, payroll.md E14) / Cr 2300 Accrued expenses (default, OQ-28); payment Dr 2300 / Cr 1100.
 
+*Note 2026-10-17 (X12(i)):* 2220 (T5) is approved; 5930 (T10) is approved under the name "GOSI late-payment fines" (R52 note, OQ-31). The two codes below were not in the decision pack and **stay proposed**.
+
 **Proposed accounts** (X10; free codes checked in `coa_template.py` and all specs on 2026-10-17)
 | Code | English | Arabic [AR-review] | Type | Flags | Used by |
 |---|---|---|---|---|---|
@@ -343,7 +356,7 @@ Hijri year at 2.5%: 100,000.00. Interim (monthly/quarterly) accruals: OQ-27 (def
 | `ledger` | Both | TB, 2200/1310/2220/2210 movements; T1 to T10 entries | Registered document types |
 | `reporting` | Out | Zakat, VAT and income tax note data; profit before Zakat for R41 | reporting.md §6 |
 | GOSI / Mudad | none | GOSI fines are booked by payroll (5930) | Their Zakat/tax treatment: payroll OQ-42 |
-| SAP B1 / Daftra | In (one-off) | Filed VAT returns since 2024-04-01, WHT statements, last Zakat filing and certificate, credit carried forward | `source=import` (R12); migration-agent ties them to opening balances of 2200/1310/2210 |
+| Legacy system (Falcon) or another source system | In (one-off) | Filed VAT returns since 2024-04-01, WHT statements, last Zakat filing and certificate, credit carried forward | `source=import` (R12); migration-agent ties them to opening balances of 2200/1310/2210. *Amended 2026-10-17 (X12(j)):* Almiras's source is Falcon |
 | Agent gateway | In | `compute_draft` only | R14 |
 
 ## 7. Permissions
@@ -385,7 +398,7 @@ Fixtures: ALM (parent, quarterly, Sharia enforced, Gregorian year), SUB (100% AL
 | AT-9 | Q1 return reviewed; 2027-03 period open | Approve | Refused (`periods_open`, lists 2027-03) |
 | AT-10 | Reviewed return; a reversal is posted in 2027-03 before close, then periods closed | Approve | Refused `sources_changed`; return back to `draft` |
 | AT-11 | Approved return | Drill box 1 VAT | Lines sum to box; each opens its JE and invoice; V1 without SUB rights sees no SUB data |
-| AT-12 | Daftra export of 2026-Q4 return (box 16 −4,000.00, no refund) | Import; prepare 2027-Q1 | Imported `filed`, `source=import`; Q1 box 15 = 4,000.00 |
+| AT-12 | Legacy-system (Falcon) export of the 2026-Q4 return (box 16 −4,000.00, no refund) (*amended 2026-10-17, X12(j); was "Daftra export"*) | Import; prepare 2027-Q1 | Imported `filed`, `source=import`; Q1 box 15 = 4,000.00 |
 | AT-13 | Q1 due 2027-04-30, alert_days [15,5,1] | Run job on 04-15, 04-25, 04-29, 05-01 | Alerts on 04-15/25/29 to A1 and C1; 05-01 overdue alert with exposure; nothing after filing |
 | AT-14 | Agent G1 | `compute_draft`; then submit | Draft created (`source=agent`); submit refused |
 | AT-15 | Manual JE Cr 2200 100.00 in Q1 not tagged | Submit for review / review | Exception `untagged_vat_journal` and tie-out 100.00; review refused until tagged or acknowledged with reason |
@@ -419,6 +432,9 @@ Fixtures: ALM (parent, quarterly, Sharia enforced, Gregorian year), SUB (100% AL
 | AT-43 | VAT late penalty 937.50 | Post; try account 5610 | T10 on 5930; 5610 refused (Sharia) |
 | AT-44 | Any return | Export en, ar | All labels present in both; Arabic export RTL |
 | AT-45 | Individual beneficiary | V1 opens annual statement; export | Name masked; with right shown and logged |
+| AT-46 | *Added 2026-10-17 (X12(e), R55).* ALM 2027: `mixed` VAT 20,000.00, provisional 0.6000, final 0.6500, true-up 1,000.00 posted (invoicing E25) | Prepare Q4 2027; approve before the final ratio is approved; after | Refused `art51_true_up_missing` (en/ar); then box 7 Adjustment +1,000.00 and the tie-out (R15) holds |
+| AT-47 | *Added 2026-10-17 (X12(g), R56).* Deposit 5,000.00 received (no VAT) and applied to a commercial rent invoice net 10,000.00 | Prepare the return | Box 1: 10,000.00 / VAT 1,500.00; the deposit and the application in no box |
+| AT-48 | *Added 2026-10-17 (X12(d), R23).* Non-resident bills: services 10,000.00 and `goods_in_ksa` 5,000.00, both RC, `taxable`; `goods_import` 2,000.00 | Prepare | Box 9 amount 15,000.00 (default, flagged unverified); RC VAT 2,250.00 in output and input; `goods_import` not in box 9 |
 
 ## 9. Open questions
 
@@ -429,18 +445,18 @@ Fixtures: ALM (parent, quarterly, Sharia enforced, Gregorian year), SUB (100% AL
 | OQ-1 | Does the owner confirm building a VAT return module, superseding invoicing D19 / OQ-29 ("no VAT-return report for now")? | Project owner | **B** (whole VAT part) | Spec only; no build |
 | OQ-2 | Documents to fetch: ZATCA VAT return filing guide (box definitions, Arabic labels, box 2/9/14 rules); VAT Implementing Regulations (Arts. 40, 49–51, 59–63, 69); Input Tax Deduction guideline; RCM / imported services guidance; VAT on imports guide; Zakat Implementing Regulations (2024) and ZATCA Zakat guides (base, investments, consolidated return for wholly owned groups, certificates); Income Tax Law and Implementing Regulations (mixed ownership, rate, deadlines); WHT annual form spec; ZATCA penalties guideline. | compliance-checker | **B** for every [CC-verify] rule | Values as shown, unverified |
 | OQ-3 | Fiscal year end: field on `Entity` (shared with reporting) or `TaxSettings`? | Dev + accountant | D | `TaxSettings.fiscal_year_end` 12-31 |
-| OQ-4 | Is there a ZATCA requirement to keep any return data longer than the 6-year basic period (PSG §13.3 p.53: 6 / 11 / 15 years)? | compliance-checker | D | No purge job |
+| OQ-4 | Is there a ZATCA requirement to keep any return data longer than the 6-year basic period (PSG §13.3 p.53: 6 / 11 / 15 years)? | compliance-checker | D | No purge job. **Resolved by X12(h) (2026-10-17):** everything kept indefinitely (R32) |
 | OQ-5 | Are quarterly periods calendar quarters or assigned from the registration date? Almiras registered 2024-04-01. | Accountant | D | Calendar quarters, partial first period |
 | OQ-6 | May a return be approved while a rate or box definition is unverified? | CFO | D | Allowed with "unverified" mark |
 | OQ-7 | Segregation for one-accountant entities (preparer ≠ reviewer ≠ approver). | Managing Partner | D | Enforced: three different people, no exception |
 | OQ-8 | Due dates on weekends or holidays move to the next working day? | compliance-checker | D | No shift |
 | OQ-9 | Alert channel (e-mail, SMS) beyond in-app. | Managing Partner | D | In-app list only |
-| OQ-10 | Tax point: use earliest of supply, invoice, payment (and receipt date for advances) instead of the JE date? Linked: invoicing OQ-51. **[CC-verify]** | Tax adviser | D | JE date (R17) |
-| OQ-11 | SAR rate for taxable amounts: invoicing stores `total_vat_sar` but not the rate; store `vat_sar_rate` on documents? | Dev + invoicing owner | **B** for non-SAR documents | Recompute from the ledger rate on `issue_date` |
+| OQ-10 | Tax point: use earliest of supply, invoice, payment (and receipt date for advances) instead of the JE date? Linked: invoicing OQ-51. **[CC-verify]** | Tax adviser | D | JE date (R17). *Note 2026-10-17 (X12(a)):* the adviser's answer (date of supply) settles the SAR rate, not the return period; still open for the period |
+| OQ-11 | SAR rate for taxable amounts: invoicing stores `total_vat_sar` but not the rate; store `vat_sar_rate` on documents? | Dev + invoicing owner | **B** for non-SAR documents | Recompute from the ledger rate on `issue_date`. **Resolved 2026-10-17 (X12(a)):** invoicing stores `vat_sar_exchange_rate` (the SAMA row, invoicing 3.6, R100); no longer blocking once built |
 | OQ-12 | Unregistered-vendor bills (0 VAT, category O default, invoicing OQ-60): reported in box 11 or not at all? | Tax adviser | D | Not reported |
 | OQ-13 | Box 14 limit on the form (±5,000) vs PSG threshold 15,000; which threshold applies to self-correction? | Tax adviser | D | 15,000.00 threshold, box 14 any amount below it |
 | OQ-14 | Rejected sales documents: add `replaced_by` link in invoicing so R16 is automatic? | Invoicing owner | D | Manual acknowledgement |
-| OQ-15 | Art. 51 apportionment (`mixed`) and annual true-up: in which box and period does the true-up go? | Tax adviser | D | Mixed VAT to cost (invoicing R29); no true-up |
+| OQ-15 | Art. 51 apportionment (`mixed`) and annual true-up: in which box and period does the true-up go? | Tax adviser | D | Mixed VAT to cost (invoicing R29); no true-up. **Resolved by X12(e) (2026-10-17):** ratio and true-up in the last return of the year (R55); box placement **[CC-verify]** |
 | OQ-16 | Confirm `TaxPayment(kind=wht)` is the only WHT remittance path (invoicing R64 / E22). | Invoicing owner | D | Yes |
 | OQ-17 | WHT for non-residents paid by payroll: certificates and beneficiary list for individuals abroad (PDPL). | Legal | GL | Masked as R54 |
 | OQ-18 | Is a VAT refund request filed per return or separately; record its status? | Accountant | D | `refund_requested` + `TaxRefund` |
@@ -456,5 +472,8 @@ Fixtures: ALM (parent, quarterly, Sharia enforced, Gregorian year), SUB (100% AL
 | OQ-28 | Penalty credit account (2300, or a new tax penalties payable). | Accountant | D | 2300 |
 | OQ-29 | Does ZATCA offer a filing API for VAT/WHT/Zakat returns usable by in-house software? **[CC-verify]** | compliance-checker | D | Manual filing |
 | OQ-30 | Shareholder classes for Zakat/tax (GCC nationals, listed shares, government) **[CC-verify]**. | Tax adviser | D | `saudi`, `gcc`, `foreign`, `other_exempt` |
+| OQ-31 | *Added 2026-10-17 (X12(i)).* 5930 was approved as "GOSI late-payment fines". May VAT, WHT, Zakat and income-tax penalties (T10) use it too (renamed to a general fines account), or does the CFO want a separate tax penalties account? Also: 2250 and 5810 (income tax) were not in the decision pack. | CFO | D | No default account for tax penalties (R52 note); 2250 and 5810 stay proposed |
+
+**Update 2026-10-17 (X12).** Resolved: OQ-4, OQ-11 (once invoicing R100 is built), OQ-15 (method). New: OQ-31. OQ-1 (owner confirmation to build a VAT return module) was **not** in the decision pack and stays blocking.
 
 **Blocking summary.** Build: OQ-1 (owner confirmation), OQ-2 (documents for every [CC-verify]), OQ-11 (non-SAR documents), WHT part waits for invoicing R61 to R64 (stub). Go-live: OQ-20 (Zakat base), OQ-22 (group filing), OQ-26 (income tax), OQ-17 (PDPL). Review before merge: proposed accounts 2250, 5810 (X10).
