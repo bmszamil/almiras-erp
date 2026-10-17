@@ -3,10 +3,20 @@
 Almiras is entity 1. Subsidiaries and minority holdings are added as rows,
 not as new code.
 """
+import re
 from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.db import models
+
+
+VAT_NUMBER_RE = re.compile(r"^3\d{13}3$")
+ADDRESS_FIELDS = ("building_number", "street", "district", "city", "postal_code", "country_code")
+
+
+def valid_vat_number(value):
+    """KSA VAT registration number: 15 digits, starting and ending with 3."""
+    return bool(VAT_NUMBER_RE.match(value or ""))
 
 
 class Entity(models.Model):
@@ -25,6 +35,14 @@ class Entity(models.Model):
     name_ar = models.CharField(max_length=200)
     cr_number = models.CharField("Commercial registration", max_length=20, blank=True)
     vat_number = models.CharField(max_length=15, blank=True)
+    # Structured national address (ZATCA seller/buyer address). additional_number is optional.
+    building_number = models.CharField(max_length=4, blank=True)
+    street = models.CharField(max_length=200, blank=True)
+    district = models.CharField(max_length=100, blank=True)
+    city = models.CharField(max_length=100, blank=True)
+    postal_code = models.CharField(max_length=5, blank=True)
+    country_code = models.CharField(max_length=2, default="SA", help_text="ISO 3166-1 alpha-2")
+    additional_number = models.CharField(max_length=4, blank=True)
     base_currency = models.CharField(max_length=3, default="SAR")
     reporting_standard = models.CharField(max_length=10, choices=Standard.choices, default=Standard.IFRS_SME)
     parent = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT, related_name="children")
@@ -50,9 +68,19 @@ class Entity(models.Model):
             raise ValidationError("An entity without a parent must be the parent (reporting) entity.")
         if not (Decimal("0") < self.ownership_pct <= Decimal("100")):
             raise ValidationError("Ownership must be above 0% and at most 100%.")
+        if self.vat_number and not valid_vat_number(self.vat_number):
+            raise ValidationError({"vat_number": "A VAT number has 15 digits and starts and ends with 3. / "
+                                                 "الرقم الضريبي 15 خانة يبدأ وينتهي بالرقم 3."})
         if self.books_in_erp and self.books_in_erp_from is None:
             raise ValidationError({"books_in_erp_from": "Set the date from which the entity keeps its books here. / "
                                                         "حدد تاريخ بدء القيود في النظام."})
+
+    def missing_address_fields(self):
+        """ZATCA structured address: the required parts that are empty."""
+        return [f for f in ADDRESS_FIELDS if not (getattr(self, f) or "").strip()]
+
+    def address(self):
+        return {f: getattr(self, f) for f in (*ADDRESS_FIELDS, "additional_number")}
 
     def keeps_books_on(self, date):
         """D8/R15: the entity keeps its ledger in this ERP on `date`."""

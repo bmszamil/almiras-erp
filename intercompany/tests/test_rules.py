@@ -18,7 +18,7 @@ from intercompany.models import (
 from ledger import services as ledger
 from ledger.models import Account, FiscalPeriod, JournalEntry
 
-from .conftest import approve
+from .conftest import TODAY, approve
 
 pytestmark = pytest.mark.django_db
 D = Decimal
@@ -113,11 +113,11 @@ def test_r2_invalid_values_rejected(accountant, alm, lfn, fin):
                                   **{**kw, "end_date": datetime.date(2025, 1, 1)})
 
 
-def test_r2_fixed_allocations_of_a_pool_cannot_exceed_100(make_agreement, accountant, alm, lfn, mp, make_user):
+def test_r2_fixed_allocations_of_a_pool_cannot_exceed_100(make_agreement, accountant, alm, lfn, lfn_off, mp):
     pool = services.create_cost_pool(accountant, alm, code="P", name_en="P", name_ar="ب")
     make_agreement("cost_plus", cost_pool=pool, allocation_basis="fixed_pct", allocation_pct=D("70"), markup_pct=D("5"))
     second = make_agreement("cost_plus", cost_pool=pool, allocation_basis="fixed_pct", allocation_pct=D("40"),
-                            markup_pct=D("5"), activate=False)
+                            markup_pct=D("5"), activate=False, counterparty=lfn_off)
     with pytest.raises(RuleError, match="exceed 100"):
         approvals.submit(second, accountant)
 
@@ -127,8 +127,17 @@ def test_r2_vat_exempt_needs_bilingual_reason(accountant, alm, lfn, fin):
               **{**BASE, "vat_treatment": "exempt"})
     with pytest.raises(RuleError, match="vat_exemption_reason"):
         services.create_agreement(accountant, **kw)
-    a = services.create_agreement(accountant, vat_exemption_reason_en="Exempt supply", vat_exemption_reason_ar="توريد معفى", **kw)
+    with pytest.raises(RuleError, match="vat_exemption_code"):
+        services.create_agreement(accountant, vat_exemption_reason_en="Exempt", vat_exemption_reason_ar="معفى", **kw)
+    with pytest.raises(RuleError, match="vat_exemption_code"):  # a zero-rating code does not fit "exempt"
+        services.create_agreement(accountant, vat_exemption_reason_en="Exempt", vat_exemption_reason_ar="معفى",
+                                  vat_exemption_code="VATEX-SA-32", **kw)
+    a = services.create_agreement(accountant, vat_exemption_reason_en="Exempt supply", vat_exemption_reason_ar="توريد معفى",
+                                  vat_exemption_code="VATEX-SA-29", **kw)
     assert a.vat_treatment == "exempt"
+    with pytest.raises(RuleError, match="vat_exemption_code"):  # standard supplies carry no code
+        services.create_agreement(accountant, entity=alm, counterparty=lfn, service_type=fin, pricing_method="fixed_fee",
+                                  fixed_fee=D("1"), vat_exemption_code="VATEX-SA-29", **BASE)
 
 
 def test_r2_cost_plus_must_be_monthly_and_one_off_fixed_fee_only(accountant, alm, lfn, fin):
@@ -161,17 +170,18 @@ def test_r2_approved_agreement_locked(make_agreement):
 def test_r3_only_active_agreements_covering_the_period_are_billed(make_agreement, accountant, mp, alm, nov):
     draft = make_agreement(activate=False)
     ended_before = make_agreement(end_date=datetime.date(2026, 10, 31))
-    starts_mid = make_agreement(start_date=datetime.date(2026, 11, 15))
+    starts_mid = make_agreement(start_date=datetime.date(2026, 11, 15))  # D14: pro-rated, 16 of 30 days
     suspended = make_agreement()
     services.suspend_agreement(accountant, suspended, "Paused")
     later = make_agreement(start_date=datetime.date(2026, 12, 1))
     ok = make_agreement()
     run = services.run_billing(accountant, alm, nov)
-    assert run.invoices_created == 1 and ok.invoices.count() == 1
-    for a in (draft, ended_before, starts_mid, suspended, later):
+    assert run.invoices_created == 2 and ok.invoices.count() == 1
+    assert starts_mid.invoices.get().net_total == D("5333.33")
+    assert starts_mid.invoices.get().lines.get().pricing_basis == "fixed fee 10,000.00 x 16/30 days / 2026-11"
+    for a in (draft, ended_before, suspended, later):
         assert a.invoices.count() == 0
     results = {r["agreement"]: r for r in run.log}
-    assert results[starts_mid.number]["code"] == "partial_period"
     assert results[suspended.number]["code"] == "agreement_not_active"
     assert draft.number not in results and later.number not in results
 
@@ -186,25 +196,27 @@ def test_r3_quarterly_annual_and_one_off_windows(make_agreement, accountant, alm
     assert q.invoices.count() == 0 and y.invoices.count() == 0
     one = once.invoices.get()
     assert (one.supply_date_from, one.supply_date_to, one.issue_date) == (
-        datetime.date(2026, 11, 10), datetime.date(2026, 11, 12), datetime.date(2026, 11, 30))
+        datetime.date(2026, 11, 10), datetime.date(2026, 11, 12), datetime.date(2027, 1, 10))  # D13
+    assert one.net_total == D("10000.00")  # one-off fees are not pro-rated
     services.run_billing(accountant, alm, period(alm, "2026-12"))
     qi, yi = q.invoices.get(), y.invoices.get()
     assert qi.billing_period == "2026-Q4" and qi.supply_date_from == datetime.date(2026, 10, 1)
     assert yi.billing_period == "2026" and yi.supply_date_from == datetime.date(2026, 1, 1)
-    assert qi.issue_date == yi.issue_date == datetime.date(2026, 12, 31)  # D12: last day of the month
+    assert qi.supply_date_to == yi.supply_date_to == datetime.date(2026, 12, 31)
     assert once.invoices.count() == 1
 
 
-def test_r3_run_refuses_unfinished_closed_or_foreign_periods(make_agreement, accountant, alm, lfn):
+def test_r3_run_refuses_unfinished_or_foreign_periods_but_bills_closed_months(make_agreement, accountant, alm, lfn):
     with pytest.raises(RuleError, match="not ended"):
         services.run_billing(accountant, alm, period(alm, "2026-12"))
-    oct_ = period(alm, "2026-10")
-    ledger.close_period(oct_)
-    with pytest.raises(RuleError, match="closed"):
-        services.run_billing(accountant, alm, oct_)
     with pytest.raises(RuleError, match="another entity"):
         services.run_billing(accountant, alm, period(lfn, "2026-11"))
     assert not BillingRun.objects.exists()
+    a = make_agreement()
+    oct_ = period(alm, "2026-10")
+    ledger.close_period(oct_)  # D13: the invoice is dated and posted on its issue date, so this still bills
+    assert services.run_billing(accountant, alm, oct_).invoices_created == 1
+    assert a.invoices.get().supply_date_to == datetime.date(2026, 10, 31)
 
 
 # ---------------------------------------------------------------- R4
@@ -373,13 +385,13 @@ def test_r8_vat_from_tax_settings_at_supply_date_and_zero_rated(make_agreement, 
     VatRate.objects.create(country="SA", rate=D("20"), valid_from=datetime.date(2026, 11, 15))
     std = make_agreement()
     zero = make_agreement(vat_treatment="zero_rated", vat_exemption_reason_en="Export of services",
-                          vat_exemption_reason_ar="تصدير خدمات")
+                          vat_exemption_reason_ar="تصدير خدمات", vat_exemption_code="VATEX-SA-35")
     services.run_billing(accountant, alm, nov)
     s_inv, z_inv = std.invoices.get(), zero.invoices.get()
     assert s_inv.lines.get().vat_rate == D("20.00") and s_inv.vat_total == D("2000.00")
     zl = z_inv.lines.get()
     assert (zl.vat_rate, zl.vat_amount, zl.vat_category) == (D("0"), D("0"), "Z")
-    assert zl.vat_exemption_reason_en == "Export of services"
+    assert zl.vat_exemption_reason_en == "Export of services" and zl.vat_exemption_code == "VATEX-SA-35"
     z_inv = issue(z_inv, accountant, mp)
     codes = sorted(l.account.code for l in z_inv.journal_entry.lines.all())
     assert codes == ["1210", "4210"]  # 5.1: no 2200 line; 1210 = net
@@ -394,10 +406,10 @@ def test_r8_no_vat_rate_skips_with_reason(make_agreement, accountant, alm, nov):
 
 def test_r8_totals_equal_sum_of_lines_with_billable_items(make_agreement, accountant, alm, nov):
     a = make_agreement()
-    services.add_billable_item(accountant, a, period_start=datetime.date(2026, 11, 1),
+    services.add_billable_item(None, a, period_start=datetime.date(2026, 11, 1),
                                period_end=datetime.date(2026, 11, 30), description_en="Fuel recharge",
                                description_ar="إعادة تحميل الوقود", quantity="12.5", unit_price="2.333")
-    services.add_billable_item(accountant, a, period_start=datetime.date(2026, 12, 1),
+    services.add_billable_item(None, a, period_start=datetime.date(2026, 12, 1),
                                period_end=datetime.date(2026, 12, 31), description_en="Later", description_ar="لاحق",
                                quantity="1", unit_price="5")
     inv = bill_nov(accountant, alm, nov, a)
@@ -553,21 +565,22 @@ def test_r12_every_line_carries_the_counterparty_including_bills(issued_invoice,
 
 def test_r13_credit_note_checks(issued_invoice, make_agreement, accountant, mp, alm, nov):
     inv = issued_invoice()
+    kw = dict(reason_en="Fix", reason_ar="تصحيح", trigger_date=TODAY)
     with pytest.raises(RuleError, match="reason"):
-        services.create_credit_note(accountant, inv, reason_en="Fix", reason_ar="")
-    with pytest.raises(RuleError, match="before"):
-        services.create_credit_note(accountant, inv, reason_en="Fix", reason_ar="تصحيح",
-                                    issue_date=datetime.date(2026, 11, 1))
+        services.create_credit_note(accountant, inv, **{**kw, "reason_ar": ""})
+    with pytest.raises(RuleError, match="trigger date"):
+        services.create_credit_note(accountant, inv, **{**kw, "trigger_date": datetime.date(2026, 10, 31)})
+    with pytest.raises(RuleError, match="trigger date"):
+        services.create_credit_note(accountant, inv, **{**kw, "trigger_date": TODAY + datetime.timedelta(days=1)})
     with pytest.raises(RuleError, match="exceeds"):
-        services.create_credit_note(accountant, inv, reason_en="Fix", reason_ar="تصحيح",
-                                    lines=[{"line": inv.lines.get(), "net_amount": "10000.01"}])
-    cn = services.create_credit_note(accountant, inv, reason_en="Fix", reason_ar="تصحيح")
+        services.create_credit_note(accountant, inv, lines=[{"line": inv.lines.get(), "net_amount": "10000.01"}], **kw)
+    cn = services.create_credit_note(accountant, inv, **kw)
     with pytest.raises(Conflict):
-        services.create_credit_note(accountant, cn, reason_en="x", reason_ar="س")  # no credit of a credit
+        services.create_credit_note(accountant, cn, **kw)  # no credit of a credit
     draft = make_agreement()
     services.run_billing(accountant, alm, nov)
     with pytest.raises(Conflict, match="issued"):
-        services.create_credit_note(accountant, draft.invoices.get(), reason_en="x", reason_ar="س")
+        services.create_credit_note(accountant, draft.invoices.get(), **kw)
 
 
 def test_r14_cancel_draft_releases_everything_and_numbers_never_reused(make_agreement, accountant, mp, alm, nov):
@@ -581,7 +594,7 @@ def test_r14_cancel_draft_releases_everything_and_numbers_never_reused(make_agre
                                   description_en="Work", description_ar="عمل")
     services.submit_timesheet(accountant, e)
     services.approve_timesheet(mp, e)
-    item = services.add_billable_item(accountant, t, period_start=datetime.date(2026, 11, 1),
+    item = services.add_billable_item(None, t, period_start=datetime.date(2026, 11, 1),
                                       period_end=datetime.date(2026, 11, 30), description_en="Fuel",
                                       description_ar="وقود", quantity="1", unit_price="10")
     services.run_billing(accountant, alm, nov)
@@ -605,7 +618,7 @@ def test_r14_cancel_draft_releases_everything_and_numbers_never_reused(make_agre
 
 
 def test_r15_no_mirror_before_books_in_erp_from(issued_invoice, lfn):
-    lfn.books_in_erp_from = datetime.date(2026, 12, 1)
+    lfn.books_in_erp_from = TODAY + datetime.timedelta(days=1)  # D13: compared with the actual issue date
     lfn.save()
     inv = issued_invoice()
     assert inv.status == "issued" and not IntercompanyBill.objects.exists()
@@ -666,7 +679,7 @@ def test_r17_bill_credit_follows_original_coding_and_waits_for_it(issued_invoice
     inv = issued_invoice()
     bill = inv.mirror_bill
     services.update_bill_coding(lfn_acc, bill, {bill.lines.get().pk: {"expense_account": "5900"}})
-    cn = services.create_credit_note(accountant, inv, reason_en="Full credit", reason_ar="إشعار كامل")
+    cn = services.create_credit_note(accountant, inv, reason_en="Full credit", reason_ar="إشعار كامل", trigger_date=TODAY)
     issue(cn, accountant, mp)
     credit = cn.mirror_bill
     assert credit.kind == "credit" and credit.lines.get().expense_account.code == "5900"
@@ -685,7 +698,8 @@ def test_r17_bill_credit_follows_original_coding_and_waits_for_it(issued_invoice
 
 def test_r17_no_bill_credit_when_original_had_no_mirror(issued_invoice, lfn_off, accountant, mp):
     inv = issued_invoice(counterparty=lfn_off)
-    cn = issue(services.create_credit_note(accountant, inv, reason_en="Full", reason_ar="كامل"), accountant, mp)
+    cn = issue(services.create_credit_note(accountant, inv, reason_en="Full", reason_ar="كامل", trigger_date=TODAY),
+               accountant, mp)
     assert cn.status == "issued" and not IntercompanyBill.objects.exists()
 
 

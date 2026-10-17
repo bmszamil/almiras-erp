@@ -18,12 +18,13 @@ from ledger import services as ledger
 from ledger.models import Account, FiscalPeriod, JournalEntry, JournalLine
 from ledger.services_setup import create_monthly_periods, install_chart_of_accounts
 
-from .conftest import approve
+from .conftest import ADDRESS, TODAY, approve
 
 pytestmark = pytest.mark.django_db
 D = Decimal
 INV = IntercompanyInvoice
 NOV30 = datetime.date(2026, 11, 30)
+DEC31 = datetime.date(2026, 12, 31)
 
 
 def lines_of(entry):
@@ -41,9 +42,9 @@ def test_t1_fixed_fee_run_creates_one_draft_without_journal_entry(make_agreement
     inv = a.invoices.get()
     assert inv.status == INV.Status.DRAFT and inv.number == "" and inv.journal_entry is None
     assert (inv.net_total, inv.vat_total, inv.gross_total) == (D("10000.00"), D("1500.00"), D("11500.00"))
-    assert inv.issue_date == NOV30 and inv.billing_period == "2026-11"  # D12
+    assert inv.issue_date == TODAY and inv.billing_period == "2026-11"  # D13: provisional until issued
     assert (inv.supply_date_from, inv.supply_date_to) == (datetime.date(2026, 11, 1), NOV30)
-    assert inv.due_date == NOV30 + datetime.timedelta(days=30)
+    assert inv.due_date == TODAY + datetime.timedelta(days=30)
     assert JournalEntry.objects.count() == entries_before
 
 
@@ -169,7 +170,8 @@ def test_t8_mp_approval_issues_with_number_and_journal_entry(issued_invoice, mp,
     assert inv.status == INV.Status.ISSUED and inv.number == "ALM-ICI-2026-000001"
     assert inv.approved_by == mp and inv.zatca_ready and inv.zatca_uuid and inv.zatca_status == "not_submitted"
     je = inv.journal_entry
-    assert je.status == JournalEntry.Status.POSTED and je.entity == alm and je.date == NOV30
+    assert je.status == JournalEntry.Status.POSTED and je.entity == alm and je.date == TODAY == inv.issue_date  # D13
+    assert inv.supply_date_to == NOV30 and inv.due_date == TODAY + datetime.timedelta(days=30)
     assert not je.requires_approval and je.reference == inv.number
     assert lines_of(je) == [("1210", D("11500.00"), D("0"), "LFN"), ("2200", D("0"), D("1500.00"), "LFN"),
                             ("4210", D("0"), D("10000.00"), "LFN")]
@@ -197,7 +199,7 @@ def test_t10_counterparty_not_on_erp_gets_no_bill(issued_invoice, lfn_off, alm, 
     assert inv.status == "issued"
     assert not IntercompanyBill.objects.exists()
     assert not JournalEntry.objects.filter(entity=lfn_off).exists()
-    report = services.reconciliation_report(accountant, NOV30)
+    report = services.reconciliation_report(accountant, DEC31)
     row = report["rows"][0]
     assert row["counterparty"] == "LFX" and row["receiver_status"]["status"] == "not_on_erp"
     assert row["receiver_status"]["label_en"] == "Counterparty not on ERP"
@@ -251,7 +253,7 @@ def test_t12_issued_invoice_cannot_be_edited_or_deleted(issued_invoice, mp, acco
 
 
 def _credit(inv, user, net, reason="Overbilled hours"):
-    return services.create_credit_note(user, inv, reason_en=reason, reason_ar="ساعات زائدة",
+    return services.create_credit_note(user, inv, reason_en=reason, reason_ar="ساعات زائدة", trigger_date=TODAY,
                                        lines=[{"line": inv.lines.first(), "net_amount": D(net)}])
 
 
@@ -280,7 +282,7 @@ def test_t14_second_credit_note_over_balance_rejected(issued_invoice, accountant
     with pytest.raises(RuleError, match="R13"):
         _credit(inv, accountant, "5217.39")  # 6,000.00 gross > 5,750 uncredited
     assert INV.objects.filter(credit_of=inv).count() == 1
-    full = services.create_credit_note(accountant, inv, reason_en="Close out", reason_ar="إقفال")
+    full = services.create_credit_note(accountant, inv, reason_en="Close out", reason_ar="إقفال", trigger_date=TODAY)
     assert full.gross_total == D("5750.00")  # exactly the remainder, VAT not re-rounded
     with pytest.raises(RuleError):
         _credit(inv, accountant, "0.01")  # pending drafts count against the balance too
@@ -289,12 +291,25 @@ def test_t14_second_credit_note_over_balance_rejected(issued_invoice, accountant
 # ---------------------------------------------------------------- T15: closed period
 
 
-def test_t15_closed_period_rejects_issue_and_keeps_number(make_agreement, accountant, mp, alm, nov):
+def test_t15_closed_service_month_still_issues_into_the_open_issue_month(make_agreement, accountant, mp, alm, nov):
+    """Review 10 / D13: November closed before approval; the invoice is dated and posted on its issue date."""
     a = make_agreement()
     services.run_billing(accountant, alm, nov)
     inv = a.invoices.get()
     approvals.submit(inv, accountant)
     ledger.close_period(nov)
+    approve(inv, mp)
+    inv.refresh_from_db()
+    assert inv.status == "issued" and inv.issue_date == TODAY and inv.journal_entry.period.name == "2026-12"
+    assert inv.supply_date_from == datetime.date(2026, 11, 1)
+
+
+def test_t15_closed_issue_period_rejects_issue_and_keeps_number(make_agreement, accountant, mp, alm, nov):
+    a = make_agreement()
+    services.run_billing(accountant, alm, nov)
+    inv = a.invoices.get()
+    approvals.submit(inv, accountant)
+    ledger.close_period(FiscalPeriod.objects.get(entity=alm, name="2026-12"))
     with pytest.raises(PostingFailed, match="closed"):
         approve(inv, mp)
     inv.refresh_from_db()
@@ -327,16 +342,16 @@ def test_t17_agent_drafts_but_cannot_approve_or_issue(make_agreement, make_user,
     assert inv.source == "agent" and inv.source_agent == "billing-bot" and inv.status == "draft"
     with pytest.raises(AccessDenied):
         services.run_billing(bot, alm, nov)
-    r = approvals.submit(inv, bot)
-    assert r.source == "agent:billing-bot"
-    with pytest.raises(AccessDenied):
-        approvals.act(r, bot, "approve", document_version=r.document_version)
+    with pytest.raises(AccessDenied, match="D15"):
+        approvals.submit(inv, bot)  # D15: agents cannot submit, also not through the engine
+    with pytest.raises(AccessDenied, match="D15"):
+        services.submit_for_approval(bot, inv)
     with pytest.raises(AccessDenied):
         services.issue_invoice(inv, bot)
     assert AuditLog.objects.filter(action="intercompany.invoice.issue_refused", actor=bot).exists()
-    assert AuditLog.objects.filter(action="approval.submit", actor=bot, source="agent:billing-bot").exists()
+    assert not ApprovalRequest.objects.filter(document_type__code="intercompany.invoice").exists()
     inv.refresh_from_db()
-    assert inv.status == "pending_approval" and inv.number == ""
+    assert inv.status == "draft" and inv.number == ""
 
 
 # ---------------------------------------------------------------- T18: entity scoping
@@ -375,14 +390,14 @@ def test_t19_no_penalty_or_interest_can_be_configured_or_created(issued_invoice,
 def test_t20_equity_method_associate_balances_match(make_agreement, accountant, mp, make_user, alm, nov):
     assoc = Entity.objects.create(code="EXG", name_en="Associate", name_ar="زميلة", parent=alm,
                                   consolidation="equity", ownership_pct=D("30"), vat_number="300000000000033",
-                                  books_in_erp=True, books_in_erp_from=datetime.date(2026, 1, 1))
+                                  books_in_erp=True, books_in_erp_from=datetime.date(2026, 1, 1), **ADDRESS)
     install_chart_of_accounts(assoc)
     create_monthly_periods(assoc, 2026)
     from access import services as access
 
     access.grant_access(None, mp, assoc, "managing_partner", valid_from=datetime.date(2026, 1, 1))
     exg_acc = make_user("exgacc", (assoc, "accountant"))
-    a = make_agreement(counterparty=assoc)
+    a = make_agreement(counterparty=assoc, tp_method="cost_plus", tp_documentation_ref="TP-BENCH-2026-01")
     services.run_billing(accountant, alm, nov)
     inv = a.invoices.get()
     approvals.submit(inv, accountant)
@@ -390,7 +405,7 @@ def test_t20_equity_method_associate_balances_match(make_agreement, accountant, 
     inv.refresh_from_db()
     services.submit_bill(exg_acc, inv.mirror_bill)
     approve(inv.mirror_bill, mp)
-    report = services.reconciliation_report(mp, NOV30)
+    report = services.reconciliation_report(mp, DEC31)
     row = report["rows"][0]
     assert row["issuer_balance"] == row["receiver_balance"] == D("11500.00") and row["difference"] == D("0")
     assert "equity method 30%" in row["consolidation"]["label_en"].lower()
@@ -406,7 +421,7 @@ def test_t21_intercompany_balances_net_to_zero(issued_invoice, lfn_acc, mp, alm,
     assert bill.status == "posted"
     assert lines_of(bill.journal_entry) == [("1310", D("1500.00"), D("0"), "ALM"), ("2110", D("0"), D("11500.00"), "ALM"),
                                             ("5300", D("10000.00"), D("0"), "ALM")]
-    bal = ledger.intercompany_balances(NOV30)
+    bal = ledger.intercompany_balances(DEC31)
     assert bal[("ALM", "LFN")] == D("11500.00") and bal[("LFN", "ALM")] == D("-11500.00")
     assert bal[("ALM", "LFN")] + bal[("LFN", "ALM")] == 0
 

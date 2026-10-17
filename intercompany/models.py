@@ -32,6 +32,32 @@ class Source(models.TextChoices):
     HUMAN = "human", "Human"
     IMPORT = "import", "Import / system"
     AGENT = "agent", "AI agent"
+    INTEGRATION = "integration", "Integration"
+
+
+#: Sources that carry a name in source_agent (agent or integration name).
+NAMED_SOURCES = ("agent", "integration")
+
+#: ZATCA VAT exemption reason codes (VATEX) allowed per VAT category (Z / E / O).
+VATEX_CODES = {
+    "Z": {"VATEX-SA-32", "VATEX-SA-33", "VATEX-SA-34-1", "VATEX-SA-34-2", "VATEX-SA-34-3", "VATEX-SA-34-4",
+          "VATEX-SA-34-5", "VATEX-SA-35", "VATEX-SA-36", "VATEX-SA-EDU", "VATEX-SA-HEA", "VATEX-SA-MLTRY"},
+    "E": {"VATEX-SA-29", "VATEX-SA-29-7", "VATEX-SA-30"},
+    "O": {"VATEX-SA-OOS"},
+}
+TREATMENT_CATEGORY = {"standard": "S", "zero_rated": "Z", "exempt": "E", "out_of_scope": "O"}
+
+
+def vatex_problem(treatment, code):
+    """Return an error text when the VATEX code does not fit the VAT treatment, else None."""
+    category = TREATMENT_CATEGORY.get(treatment)
+    if category == "S":
+        return "Standard-rated supplies have no exemption code. / لا يوجد رمز إعفاء للتوريدات الخاضعة للنسبة الأساسية." \
+            if code else None
+    if category and code not in VATEX_CODES[category]:
+        return (f"A ZATCA exemption code (VATEX) for category {category} is required. / "
+                f"رمز الإعفاء من زاتكا مطلوب للفئة {category}.")
+    return None
 
 
 def locked_error(message_en, message_ar, detail=None):
@@ -65,8 +91,9 @@ class GuardedQuerySet(models.QuerySet):
 class Sourced(models.Model):
     """D10 provenance on every record: source (human / import / agent) and source_agent for agents."""
 
-    source = models.CharField(max_length=10, choices=Source.choices, default=Source.HUMAN)
-    source_agent = models.CharField(max_length=60, blank=True, help_text="Agent name; required when source is agent")
+    source = models.CharField(max_length=12, choices=Source.choices, default=Source.HUMAN)
+    source_agent = models.CharField(max_length=60, blank=True,
+                                    help_text="Agent or integration name; required when source is agent or integration")
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                    related_name="+", help_text="Empty for records the system creates (mirror bills)")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -77,16 +104,16 @@ class Sourced(models.Model):
         abstract = True
         constraints = [
             models.CheckConstraint(
-                condition=(models.Q(source="agent") & ~models.Q(source_agent=""))
-                | (~models.Q(source="agent") & models.Q(source_agent="")),
+                condition=(models.Q(source__in=NAMED_SOURCES) & ~models.Q(source_agent=""))
+                | (~models.Q(source__in=NAMED_SOURCES) & models.Q(source_agent="")),
                 name="%(app_label)s_%(class)s_source_agent",
             )
         ]
 
     @property
     def source_label(self):
-        """Approvals / audit format: human, import or agent:<name> (approvals spec D8)."""
-        return f"agent:{self.source_agent}" if self.source == Source.AGENT else self.source
+        """Approvals / audit format: human, import, agent:<name> or integration:<name> (approvals spec D8)."""
+        return f"{self.source}:{self.source_agent}" if self.source in NAMED_SOURCES else self.source
 
     def _stored(self):
         if self._state.adding or not self.pk:
@@ -289,6 +316,11 @@ class AllocationDriver(Sourced):
 # ---------------------------------------------------------------- agreements (3.3)
 
 
+def needs_transfer_pricing(counterparty):
+    """Counterparties outside the zakat consolidation group: associates, unconsolidated or partly owned."""
+    return counterparty.consolidation in ("equity", "none") or counterparty.ownership_pct < Decimal("100")
+
+
 class ServiceAgreement(Sourced):
     class Pricing(models.TextChoices):
         TIMESHEET = "timesheet", "Timesheet (hours x rate)"
@@ -332,7 +364,8 @@ class ServiceAgreement(Sourced):
         Pricing.COST_PLUS: {"markup_pct", "cost_pool", "allocation_basis"},
     }
     ALL_PRICING_FIELDS = {"hourly_rate", "fixed_fee", "markup_pct", "cost_pool", "allocation_basis", "allocation_pct"}
-    WORKFLOW_FIELDS = {"status", "activated_at", "end_date"}
+    #: income/expense codes are copied from the service type at approval (review 5).
+    WORKFLOW_FIELDS = {"status", "activated_at", "end_date", "income_account_code", "expense_account_code"}
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="ic_agreements_issued")
     counterparty = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="ic_agreements_received")
@@ -353,6 +386,8 @@ class ServiceAgreement(Sourced):
     vat_exemption_reason_en = models.CharField(max_length=300, blank=True,
                                                help_text="Required unless VAT is standard (ZATCA needs a reason)")
     vat_exemption_reason_ar = models.CharField(max_length=300, blank=True)
+    vat_exemption_code = models.CharField(max_length=20, blank=True,
+                                          help_text="ZATCA VATEX code; required unless VAT is standard")
     billing_frequency = models.CharField(max_length=10, choices=Frequency.choices)
     payment_terms_days = models.PositiveIntegerField()
     start_date = models.DateField()
@@ -412,6 +447,15 @@ class ServiceAgreement(Sourced):
             errors["billing_frequency"] = "One-off billing is for fixed fees only. / الفوترة لمرة واحدة للرسوم الثابتة."
         if self.vat_treatment and self.vat_treatment != self.VatTreatment.STANDARD:
             errors.update(_validate_bilingual(self, "vat_exemption_reason"))
+        if self.vat_treatment and (problem := vatex_problem(self.vat_treatment, self.vat_exemption_code)):
+            errors["vat_exemption_code"] = problem
+        if self.counterparty_id and needs_transfer_pricing(self.counterparty):
+            if not self.tp_method:
+                errors["tp_method"] = ("A transfer-pricing method is required for counterparties outside the zakat "
+                                       "consolidation group. / طريقة تسعير التحويل مطلوبة لهذا الطرف.")
+            if not (self.tp_documentation_ref or "").strip():
+                errors["tp_documentation_ref"] = ("A benchmark / TP file reference is required for this counterparty. / "
+                                                  "مرجع دراسة المقارنة مطلوب لهذا الطرف.")
         if self.end_date and self.start_date and self.end_date < self.start_date:
             errors["end_date"] = "The agreement ends before it starts. / تنتهي الاتفاقية قبل بدايتها."
         if errors:
@@ -669,7 +713,8 @@ class IntercompanyInvoice(Sourced):
 
     DEAD = (Status.CANCELLED_DRAFT, Status.REJECTED)
     WORKFLOW_FIELDS = {"status", "number", "journal_entry_id", "issued_at", "approved_by_id", "zatca_uuid",
-                       "zatca_ready", "seller_vat_number", "buyer_vat_number"}
+                       "zatca_ready", "seller_vat_number", "buyer_vat_number", "issue_date", "due_date",
+                       "deadline_alerted_at"}
     ZATCA_FIELDS = {"zatca_status", "zatca_hash", "zatca_updated_at"}
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="ic_invoices_issued")
@@ -679,8 +724,12 @@ class IntercompanyInvoice(Sourced):
     credit_of = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT, related_name="credit_notes")
     credit_reason_en = models.CharField(max_length=300, blank=True)
     credit_reason_ar = models.CharField(max_length=300, blank=True)
+    trigger_date = models.DateField(null=True, blank=True, help_text="Credit notes: date of the event (D13)")
+    late_credit_warning = models.BooleanField(
+        default=False, help_text="Credit note created after the 15th of the month following the trigger month")
+    deadline_alerted_at = models.DateTimeField(null=True, blank=True, help_text="15-day issue alert sent (D13)")
     number = models.CharField(max_length=40, blank=True, help_text="Assigned on issue; gap-free per entity and year")
-    issue_date = models.DateField()
+    issue_date = models.DateField(help_text="D13: provisional on drafts; set to the actual issue date on issue")
     supply_date_from = models.DateField()
     supply_date_to = models.DateField()
     due_date = models.DateField()
@@ -797,10 +846,16 @@ class InvoiceLine(models.Model):
     vat_amount = models.DecimalField(**MONEY)
     vat_exemption_reason_en = models.CharField(max_length=300, blank=True)
     vat_exemption_reason_ar = models.CharField(max_length=300, blank=True)
+    vat_exemption_code = models.CharField(max_length=20, blank=True)
     income_account = models.ForeignKey(Account, on_delete=models.PROTECT, related_name="+")
     pricing_basis = models.CharField(max_length=200, blank=True, help_text='e.g. "12.5 h x 450" or "cost 80,000 + 10%"')
     cost_pool_period = models.ForeignKey(CostPoolPeriod, null=True, blank=True, on_delete=models.PROTECT,
                                          related_name="invoice_lines")
+    pool_amount = models.DecimalField(**MONEY, null=True, blank=True, help_text="Pool cost this line is based on")
+    pool_share = models.DecimalField(max_digits=14, decimal_places=10, null=True, blank=True,
+                                     help_text="Share of the pool billed (after pro-rating, D14)")
+    adjustment_period = models.CharField(max_length=7, blank=True,
+                                         help_text="Adjustment line for an earlier month (late hours / late pool costs)")
     credits_line = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT, related_name="credited_by",
                                      help_text="Credit notes: the original invoice line")
 

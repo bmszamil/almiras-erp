@@ -38,4 +38,5 @@ urlpatterns = [
     path("bills/<int:pk>/dispute", views.BillActionView.as_view(action="dispute"), name="ic-bill-dispute"),
     path("bills/<int:pk>/undispute", views.BillActionView.as_view(action="undispute"), name="ic-bill-undispute"),
     path("reconciliation", views.ReconciliationView.as_view(), name="ic-reconciliation"),
+    path("related-party", views.RelatedPartyReportView.as_view(), name="ic-related-party"),
 ]

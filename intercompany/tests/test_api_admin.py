@@ -64,13 +64,13 @@ def test_api_full_cycle_agreement_run_approve_issue_bill(api, accountant, mp, lf
     assert len(bills) == 1 and bills[0]["gross_total"] == "11500.00" and bills[0]["entity"]["code"] == "LFN"
     bill_id, line_id = bills[0]["id"], bills[0]["lines"][0]["id"]
     r = rec.patch(f"{BASE}/bills/{bill_id}", {"lines": [{"id": line_id, "net_amount": "1"}]}, format="json")
-    assert r.status_code == 422
+    assert r.status_code == 400 and "net_amount" in str(r.json()["detail"])
     r = rec.patch(f"{BASE}/bills/{bill_id}", {"lines": [{"id": line_id, "expense_account": "5900"}]}, format="json")
     assert r.status_code == 200 and r.json()["lines"][0]["expense_account"] == "5900"
     assert rec.post(f"{BASE}/bills/{bill_id}/submit").status_code == 201
     assert approve_via_api(boss, "intercompany.bill", bill_id).status_code == 200
     assert rec.get(f"{BASE}/bills/{bill_id}").json()["status"] == "posted"
-    rep = boss.get(f"{BASE}/reconciliation?as_of=2026-11-30").json()
+    rep = boss.get(f"{BASE}/reconciliation?as_of=2026-12-31").json()
     row = rep["rows"][0]
     assert row["issuer_balance"] == row["receiver_balance"] == "11500.00" and row["difference"] == "0.00"
     assert rep["headings"]["issuer"] == {"en": "Issuer", "ar": "المُصدر"}
@@ -100,18 +100,20 @@ def test_api_credit_note_and_cancel(api, issued_invoice, accountant, make_agreem
     inv = issued_invoice()
     acc = api(accountant)
     r = acc.post(f"{BASE}/invoices/{inv.pk}/credit-notes",
-                 {"reason_en": "Partial", "reason_ar": "جزئي", "lines": [{"line": inv.lines.get().pk, "net_amount": "5000"}]},
+                 {"reason_en": "Partial", "reason_ar": "جزئي", "trigger_date": "2026-12-01",
+                  "lines": [{"line": inv.lines.get().pk, "net_amount": "5000"}]},
                  format="json")
     assert r.status_code == 201 and r.json()["gross_total"] == "5750.00" and r.json()["kind"] == "credit_note"
     assert r.json()["credit_of"] == inv.number
     r = acc.post(f"{BASE}/invoices/{inv.pk}/credit-notes", {"reason_en": "More", "reason_ar": "المزيد",
+                 "trigger_date": "2026-12-01",
                  "lines": [{"line": inv.lines.get().pk, "net_amount": "5217.39"}]}, format="json")
     assert r.status_code == 422 and r.json()["code"] in ("credit_exceeds_line", "credit_exceeds_balance")
     a2 = make_agreement()
     services.run_billing(accountant, alm, nov)
     draft = a2.invoices.get()
     r = acc.patch(f"{BASE}/invoices/{draft.pk}", {"net_total": "1"}, format="json")
-    assert r.status_code == 422
+    assert r.status_code == 400
     r = acc.patch(f"{BASE}/invoices/{draft.pk}", {"lines": [{"id": draft.lines.get().pk, "description_en": "Nov fee"}]},
                   format="json")
     assert r.status_code == 200 and r.json()["lines"][0]["description"]["en"] == "Nov fee"
@@ -126,6 +128,10 @@ def test_api_agent_token_drafts_only(api, make_agreement, make_user, alm, nov):
     assert r.status_code == 201 and r.json()["source"] == "agent" and r.json()["source_agent"] == "ic-bot"
     assert c.post(f"{BASE}/billing-runs", {"entity": "ALM", "period": "2026-11"}, format="json").status_code == 403
     assert c.post(f"{BASE}/invoices/{r.json()['id']}/issue").status_code == 403
+    assert c.post(f"{BASE}/invoices/{r.json()['id']}/submit").status_code == 403  # D15
+    gen = c.post("/api/v1/approvals/requests", {"document_type": "intercompany.invoice", "object_id": r.json()["id"]},
+                 format="json")
+    assert gen.status_code == 403 and gen.json()["code"] == "service_user_cannot_submit"
     assert c.get(f"{BASE}/invoices").json()[0]["id"] == r.json()["id"]  # own drafts only
 
 
@@ -156,7 +162,7 @@ def test_api_reconciliation_xlsx_bilingual(api, issued_invoice, accountant):
 
     issued_invoice()
     for lang, first in (("en", "Issuer"), ("ar", "المُصدر")):
-        r = api(accountant).get(f"{BASE}/reconciliation?as_of=2026-11-30&export=xlsx&lang={lang}")
+        r = api(accountant).get(f"{BASE}/reconciliation?as_of=2026-12-31&export=xlsx&lang={lang}")
         assert r.status_code == 200 and "spreadsheetml" in r["Content-Type"]
         ws = load_workbook(io.BytesIO(r.content)).active
         assert ws.cell(1, 1).value == first and ws.cell(2, 1).value == "ALM" and ws.cell(2, 4).value == 11500

@@ -138,7 +138,18 @@ def report_out(report):
 # ---------------------------------------------------------------- inputs
 
 
-class AgreementInput(serializers.Serializer):
+class _Strict(serializers.Serializer):
+    """Unknown keys are refused (400), so typos never pass silently."""
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            unknown = set(data) - set(self.fields)
+            if unknown:
+                raise serializers.ValidationError({k: ["Unknown field."] for k in sorted(unknown)})
+        return super().to_internal_value(data)
+
+
+class AgreementInput(_Strict):
     entity = serializers.CharField(required=False)
     counterparty = serializers.CharField(required=False)
     service_type = serializers.CharField(required=False)
@@ -155,6 +166,7 @@ class AgreementInput(serializers.Serializer):
     vat_treatment = serializers.ChoiceField(ServiceAgreement.VatTreatment.choices, required=False)
     vat_exemption_reason_en = serializers.CharField(required=False, allow_blank=True)
     vat_exemption_reason_ar = serializers.CharField(required=False, allow_blank=True)
+    vat_exemption_code = serializers.CharField(required=False, allow_blank=True)
     billing_frequency = serializers.ChoiceField(ServiceAgreement.Frequency.choices, required=False)
     payment_terms_days = serializers.IntegerField(required=False, min_value=0)
     start_date = serializers.DateField(required=False)
@@ -167,7 +179,7 @@ class AgreementInput(serializers.Serializer):
     source_ref = serializers.CharField(required=False, allow_blank=True)
 
 
-class TimesheetInput(serializers.Serializer):
+class TimesheetInput(_Strict):
     agreement = serializers.IntegerField(required=False)
     worker = serializers.CharField(required=False, help_text="username; default: yourself")
     rate = serializers.IntegerField(required=False, allow_null=True)
@@ -177,7 +189,7 @@ class TimesheetInput(serializers.Serializer):
     description_ar = serializers.CharField(required=False)
 
 
-class PoolInput(serializers.Serializer):
+class PoolInput(_Strict):
     entity = serializers.CharField()
     code = serializers.CharField()
     name_en = serializers.CharField()
@@ -185,7 +197,7 @@ class PoolInput(serializers.Serializer):
     accounts = serializers.ListField(child=serializers.CharField(), required=False, default=list)
 
 
-class ItemInput(serializers.Serializer):
+class ItemInput(_Strict):
     agreement = serializers.IntegerField()
     period_start = serializers.DateField()
     period_end = serializers.DateField()
@@ -197,8 +209,35 @@ class ItemInput(serializers.Serializer):
     source_ref = serializers.CharField(required=False, allow_blank=True, default="")
 
 
-class CreditNoteInput(serializers.Serializer):
+class CreditLineInput(_Strict):
+    line = serializers.IntegerField()
+    net_amount = serializers.DecimalField(**DEC)
+
+
+class CreditNoteInput(_Strict):
     reason_en = serializers.CharField()
     reason_ar = serializers.CharField()
-    issue_date = serializers.DateField(required=False)
-    lines = serializers.ListField(child=serializers.DictField(), required=False, allow_null=True, default=None)
+    trigger_date = serializers.DateField()
+    lines = CreditLineInput(many=True, required=False, allow_null=True, default=None)
+
+
+class InvoiceLinePatch(_Strict):
+    id = serializers.IntegerField()
+    description_en = serializers.CharField(required=False)
+    description_ar = serializers.CharField(required=False, allow_blank=True)
+
+
+class InvoicePatch(_Strict):
+    lines = InvoiceLinePatch(many=True, required=False, default=list)
+    credit_reason_en = serializers.CharField(required=False, allow_blank=True)
+    credit_reason_ar = serializers.CharField(required=False, allow_blank=True)
+
+
+class BillLinePatch(_Strict):
+    id = serializers.IntegerField()
+    expense_account = serializers.CharField(required=False)
+    cost_centre = serializers.CharField(required=False, allow_blank=True, max_length=40)
+
+
+class BillPatch(_Strict):
+    lines = BillLinePatch(many=True)

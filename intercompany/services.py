@@ -10,11 +10,13 @@ Entry points
   timesheets   create_timesheet, update_timesheet, submit_timesheet, approve_timesheet, reject_timesheet
   cost pools   create_cost_pool, set_pool_accounts, compute_pool_period, set_driver
   feed (D9)    add_billable_item
-  billing      run_billing, create_invoice_draft, update_invoice_draft, cancel_draft
+  billing      run_billing, create_invoice_draft, update_invoice_draft, cancel_draft, close_ended_agreements
+  deadlines    deadline_alerts (D13 15-day rule), credit_note_late
+  approval     submit_for_approval (humans only, D15)
   issue        issue_invoice (approved only; normally called by final approval)
   credit notes create_credit_note, uncredited_balance
   bills        update_bill_coding, dispute_bill, undispute_bill, submit_bill
-  reporting    reconciliation_report, reconciliation_xlsx
+  reporting    reconciliation_report, reconciliation_xlsx, related_party_report
   visibility   visible_agreements, visible_timesheets, visible_invoices, visible_bills, ...
 """
 import calendar
@@ -29,15 +31,16 @@ from django.db.models import Q, Sum
 from django.utils import timezone
 
 from access import services as access
-from access.errors import AccessDenied, BilingualError, Conflict, RuleError
+from access.errors import AccessDenied, BilingualError, Conflict, NotFound, RuleError
 from access.services import audit, snapshot
+from core.models import valid_vat_number
 from ledger import services as ledger
 from ledger.models import Account, FiscalPeriod, JournalEntry, JournalLine
 
 from .models import (
     AgreementRate, AllocationDriver, BillableItem, BillingRun, CostPool, CostPoolPeriod, DraftEditor,
     IntercompanyBill, IntercompanyBillLine, IntercompanyInvoice, InvoiceLine, NumberSequence, ServiceAgreement,
-    Source, TimesheetEntry, VatRate, workflow,
+    Source, TimesheetEntry, VatRate, vatex_problem, workflow,
 )
 
 ZERO = Decimal("0")
@@ -83,7 +86,9 @@ def source_fields(user):
     if user.user_type == "service_agent":
         return {"source": Source.AGENT, "source_agent": user.agent_name}
     if user.user_type == "service_integration":
-        return {"source": Source.IMPORT, "source_agent": ""}
+        if user.username == access.SYSTEM_USERNAME:
+            return {"source": Source.IMPORT, "source_agent": ""}  # the ERP itself
+        return {"source": Source.INTEGRATION, "source_agent": (user.agent_name or user.username)[:60]}  # review 9
     return {"source": Source.HUMAN, "source_agent": ""}
 
 
@@ -241,7 +246,7 @@ def expense_account_for(agreement):
 AGREEMENT_EDITABLE = {
     "counterparty", "service_type", "description_en", "description_ar", "pricing_method", "hourly_rate", "fixed_fee",
     "markup_pct", "cost_pool", "allocation_basis", "allocation_pct", "vat_treatment", "vat_exemption_reason_en",
-    "vat_exemption_reason_ar", "billing_frequency", "payment_terms_days", "start_date", "end_date",
+    "vat_exemption_reason_ar", "vat_exemption_code", "billing_frequency", "payment_terms_days", "start_date", "end_date",
     "income_account_code", "expense_account_code", "tp_method", "tp_documentation_ref", "source_type", "source_ref",
 }
 
@@ -264,6 +269,16 @@ def validate_agreement(agreement):
     if agreement.pricing_method == A.Pricing.COST_PLUS:
         if not agreement.cost_pool.is_active:
             raise RuleError("pool_inactive", "The cost pool is inactive.", "مجمع التكاليف غير نشط.")
+        live = (A.objects.filter(cost_pool=agreement.cost_pool,
+                                 status__in=[A.Status.PENDING_APPROVAL, A.Status.ACTIVE, A.Status.SUSPENDED])
+                .exclude(pk=agreement.pk))
+        if live.exclude(allocation_basis=agreement.allocation_basis).exists():  # review 1
+            raise RuleError("pool_basis_mixed", f"Pool {agreement.cost_pool.code} already uses another allocation basis.",
+                            f"المجمع {agreement.cost_pool.code} يستخدم أساس توزيع آخر.")
+        if live.filter(counterparty=agreement.counterparty).exists():
+            raise RuleError("pool_counterparty_twice",
+                            f"{agreement.counterparty.code} already has an agreement on pool {agreement.cost_pool.code}.",
+                            f"للمنشأة {agreement.counterparty.code} اتفاقية على هذا المجمع.")
         if agreement.allocation_basis == A.AllocationBasis.FIXED_PCT:
             others = (A.objects.filter(cost_pool=agreement.cost_pool, allocation_basis=A.AllocationBasis.FIXED_PCT,
                                        status__in=[A.Status.PENDING_APPROVAL, A.Status.ACTIVE, A.Status.SUSPENDED])
@@ -354,13 +369,14 @@ def end_agreement(user, agreement, end_date, reason, ctx=None):
     if end_date < agreement.start_date or (agreement.end_date and end_date > agreement.end_date):
         raise RuleError("end_date_invalid", "The end date must be within the agreement dates.",
                         "يجب أن يكون تاريخ الانتهاء ضمن مدة الاتفاقية.")
-    billed_after = agreement.invoices.filter(kind=INV.Kind.INVOICE, supply_date_from__gt=end_date) \
-        .exclude(status__in=INV.DEAD).exists()
+    billed_after = agreement.invoices.filter(kind=INV.Kind.INVOICE, supply_date_to__gt=end_date) \
+        .exclude(status__in=INV.DEAD).exists()  # review 6
     if billed_after:
         raise RuleError("billed_after_end", "Invoices exist after this end date; credit them first.",
                         "توجد فواتير بعد تاريخ الانتهاء؛ أصدر إشعارات دائنة أولاً.")
     before = snapshot(agreement)
-    _move(agreement, A.Status.ENDED, end_date=end_date)
+    # Review 2: a future end date keeps the agreement billable until then; close_ended_agreements ends it.
+    _move(agreement, A.Status.ENDED if end_date < today() else agreement.status, end_date=end_date)
     _audit(user, "intercompany.agreement.end", agreement, before=before,
            after=snapshot(agreement) | {"reason": reason}, ctx=ctx)
     return agreement
@@ -566,12 +582,15 @@ def allocation_share(agreement, period):
 @transaction.atomic
 def add_billable_item(user, agreement, *, period_start, period_end, description_en, description_ar, quantity,
                       unit_price, source_type="", source_ref="", ctx=None):
-    """Feeding modules (rental leases later) add lines for an agreement; billed by the next run."""
+    """Feeding modules (rental leases later) add lines for an agreement; billed by the next run.
+
+    Module code calls this with user=None. A user needs intercompany.billable_item.feed, which no role holds
+    by default (review 3). The creator is recorded as an editor of the invoice that bills the item."""
     agreement = A.objects.get(pk=agreement.pk)
-    if agreement.status not in (A.Status.ACTIVE, A.Status.SUSPENDED):
-        raise Conflict("agreement_not_active", "The agreement is not active.", "الاتفاقية غير نشطة.")
     if user is not None:
-        _require(user, agreement.entity, "intercompany.invoice.create")
+        _require(user, agreement.entity, "intercompany.billable_item.feed")
+    if not _billable_status(agreement):
+        raise Conflict("agreement_not_active", "The agreement is not active.", "الاتفاقية غير نشطة.")
     item = BillableItem(entity=agreement.entity, agreement=agreement, period_start=period_start,
                         period_end=period_end, description_en=description_en, description_ar=description_ar,
                         quantity=Decimal(quantity), unit_price=Decimal(unit_price), source_type=source_type,
@@ -582,7 +601,7 @@ def add_billable_item(user, agreement, *, period_start, period_end, description_
     return item
 
 
-# ---------------------------------------------------------------- VAT (R8)
+# ---------------------------------------------------------------- VAT (R8, D13, D16)
 
 
 def vat_rate_on(day, country="SA"):
@@ -593,12 +612,23 @@ def vat_rate_on(day, country="SA"):
     return rate.rate
 
 
-def _vat(treatment, supply_date):
-    rate = vat_rate_on(supply_date) if treatment == A.VatTreatment.STANDARD else ZERO
+def _vat(treatment, tax_point):
+    """D13: the rate at the tax point (issue date). Drafts use today, the expected issue date."""
+    rate = vat_rate_on(tax_point) if treatment == A.VatTreatment.STANDARD else ZERO
     return rate, VAT_CATEGORY[treatment]
 
 
-# ---------------------------------------------------------------- billing (R3-R9, D12)
+def document_vat(lines):
+    """Document VAT per category and rate: round_half_up(sum of nets x rate), not the sum of rounded
+    line VAT (compliance). Line VAT is kept for display."""
+    groups = OrderedDict()
+    for l in lines:
+        key = (l.vat_category, l.vat_rate)
+        groups[key] = groups.get(key, ZERO) + l.net_amount
+    return sum((money(net * rate / HUNDRED) for (_, rate), net in groups.items()), ZERO)
+
+
+# ---------------------------------------------------------------- billing (R3-R9, D12-D14)
 
 
 def _is_calendar_month(period):
@@ -607,92 +637,170 @@ def _is_calendar_month(period):
 
 
 def supply_window(agreement, period):
-    """(billing_period key, supply start, supply end) when the agreement bills in this fiscal month, else None."""
+    """(billing_period key, supply start, supply end) when the agreement bills in this fiscal month, else None.
+    The supply dates are clipped to the agreement dates (D14)."""
     F = A.Frequency
     end = period.end_date
     if agreement.billing_frequency == F.MONTHLY:
-        return f"{end:%Y-%m}", period.start_date, end
-    if agreement.billing_frequency == F.QUARTERLY:
+        key, start = f"{end:%Y-%m}", period.start_date
+    elif agreement.billing_frequency == F.QUARTERLY:
         if end.month % 3:
             return None
-        return f"{end.year}-Q{end.month // 3}", datetime.date(end.year, end.month - 2, 1), end
-    if agreement.billing_frequency == F.ANNUAL:
+        key, start = f"{end.year}-Q{end.month // 3}", datetime.date(end.year, end.month - 2, 1)
+    elif agreement.billing_frequency == F.ANNUAL:
         if end.month != 12:
             return None
-        return f"{end.year}", datetime.date(end.year, 1, 1), end
-    if not (period.start_date <= agreement.start_date <= end):  # one-off: the month it starts
+        key, start = f"{end.year}", datetime.date(end.year, 1, 1)
+    else:  # one-off: the month it starts
+        if not (period.start_date <= agreement.start_date <= end):
+            return None
+        return f"{end:%Y-%m}", agreement.start_date, agreement.end_date or agreement.start_date, (1, 1)
+    full_days = (end - start).days + 1
+    start = max(start, agreement.start_date)
+    if agreement.end_date:
+        end = min(end, agreement.end_date)
+    if end < start:
         return None
-    return f"{end:%Y-%m}", agreement.start_date, agreement.end_date or agreement.start_date
+    return key, start, end, ((end - start).days + 1, full_days)  # (active days, days in period), D14
 
 
-def _coverage(agreement, start, end):
-    full = agreement.start_date <= start and (agreement.end_date is None or agreement.end_date >= end)
-    overlap = agreement.start_date <= end and (agreement.end_date is None or agreement.end_date >= start)
-    return full, overlap
+def _billable_status(agreement):
+    """Active agreements, and agreements ended by their end date (billed up to it). Suspended, draft,
+    pending and rejected (never activated) agreements are not billed (R3, review 2)."""
+    return agreement.status == A.Status.ACTIVE or (
+        agreement.status == A.Status.ENDED and agreement.activated_at is not None and agreement.end_date is not None)
 
 
-def _line(agreement, en, ar, quantity, unit_price, net, basis, supply_to):
-    rate, category = _vat(agreement.vat_treatment, supply_to)
-    return {
+def _line(agreement, en, ar, quantity, unit_price, net, basis, **extra):
+    rate, category = _vat(agreement.vat_treatment, today())
+    data = {
         "description_en": en[:300], "description_ar": ar[:300], "quantity": Decimal(quantity),
         "unit_price": Decimal(unit_price), "net_amount": money(net), "vat_treatment": agreement.vat_treatment,
         "vat_category": category, "vat_rate": rate, "vat_amount": money(money(net) * rate / HUNDRED),
         "vat_exemption_reason_en": agreement.vat_exemption_reason_en,
-        "vat_exemption_reason_ar": agreement.vat_exemption_reason_ar, "pricing_basis": basis[:200],
+        "vat_exemption_reason_ar": agreement.vat_exemption_reason_ar,
+        "vat_exemption_code": agreement.vat_exemption_code, "pricing_basis": basis[:200],
     }
+    data.update(extra)
+    return data
 
 
-def _build_lines(agreement, period, key, start, end):
+def _month_key(day):
+    return f"{day:%Y-%m}"
+
+
+def _live_lines():
+    return InvoiceLine.objects.exclude(invoice__status__in=INV.DEAD)
+
+
+def _timesheet_lines(agreement, start, end, adjustment):
+    """Approved unbilled hours in the window, or (adjustment=True) late-approved hours dated before it."""
+    qs = TS.objects.select_for_update().filter(agreement=agreement, status=TS.Status.APPROVED, invoice_line__isnull=True)
+    qs = qs.filter(date__lt=start, date__gte=agreement.start_date) if adjustment else qs.filter(date__gte=start,
+                                                                                                date__lte=end)
+    groups = OrderedDict()
+    for e in qs.select_related("rate").order_by("date", "id"):
+        groups.setdefault((_month_key(e.date) if adjustment else "", e.rate_id), []).append(e)
+    out = []
+    desc_en, desc_ar = agreement.description_en, agreement.description_ar
+    for (month, _), group in groups.items():
+        rate = group[0].rate
+        unit = rate.hourly_rate if rate else agreement.hourly_rate
+        hours = sum((e.hours for e in group), ZERO)
+        role_en = f" - {rate.role_en}" if rate else ""
+        role_ar = f" - {rate.role_ar}" if rate else ""
+        basis = f"{hours.normalize():f} h x {unit:,.2f}"
+        if adjustment:
+            en, ar, basis = (f"Adjustment {month}: {desc_en}{role_en}", f"تسوية {month}: {desc_ar}{role_ar}",
+                             f"adjustment {month}: {basis}")
+        else:
+            en, ar = f"{desc_en}{role_en} ({start} to {end})", f"{desc_ar}{role_ar} ({start} - {end})"
+        out.append((_line(agreement, en, ar, hours, unit, hours * unit, basis, adjustment_period=month),
+                    {"timesheets": group}))
+    return out
+
+
+def _check_pool_capacity(cpp, share, exclude_agreement=None):
+    """Review 1: shares billed per pool period can never exceed 100%."""
+    billed = (_live_lines().filter(cost_pool_period=cpp, adjustment_period="").exclude(agreement=exclude_agreement)
+              .aggregate(s=Sum("pool_share"))["s"] or ZERO)
+    if billed + share > 1:
+        raise RuleError("pool_over_allocated",
+                        f"Pool {cpp.cost_pool.code} {cpp.period.name} would be billed above 100% "
+                        f"({(billed + share) * HUNDRED:.2f}%).",
+                        f"ستتجاوز فوترة المجمع {cpp.cost_pool.code} نسبة 100%.")
+
+
+def _pool_adjustments(agreement, period, notes):
+    """Late-posted costs of earlier, already billed pool periods: bill this agreement's share of the
+    increase once, as adjustment lines referencing the original month. Decreases are credit-note cases."""
+    out = []
+    markup = agreement.markup_pct
+    earlier = (CostPoolPeriod.objects.filter(cost_pool=agreement.cost_pool, period__end_date__lt=period.start_date,
+                                             invoice_lines__agreement=agreement)
+               .distinct().select_related("period"))
+    for cpp in earlier:
+        lines = _live_lines().filter(agreement=agreement, cost_pool_period=cpp)
+        original = lines.filter(adjustment_period="").first()
+        if original is None or original.pool_share is None:
+            continue
+        billed_base = lines.aggregate(b=Sum("pool_amount"))["b"] or ZERO
+        delta = pool_cost(agreement.cost_pool, cpp.period) - billed_base
+        if delta < ZERO:
+            notes.append(f"Pool cost of {cpp.period.name} fell by {-delta}; raise a credit note.")
+        if delta <= ZERO:
+            continue
+        net = money(delta * original.pool_share * (1 + markup / HUNDRED))
+        if net <= ZERO:
+            continue
+        month = cpp.period.name
+        out.append((_line(agreement, f"Adjustment {month}: {agreement.description_en}",
+                          f"تسوية {month}: {agreement.description_ar}", 1, net, net,
+                          f"adjustment {month}: late cost {delta:,.2f} x {original.pool_share.normalize():f} "
+                          f"+ {markup.normalize():f}%", pool_amount=delta, pool_share=original.pool_share,
+                          adjustment_period=month), {"adjust_pool": cpp}))
+    return out
+
+
+def _build_lines(agreement, period, key, start, end, days, notes):
     """Return [(line dict, links)] for the agreement and supply window. links: what the line bills."""
     P = A.Pricing
     out = []
-    full, overlap = _coverage(agreement, start, end)
-    if agreement.pricing_method in (P.FIXED_FEE, P.COST_PLUS) and agreement.billing_frequency != A.Frequency.ONE_OFF \
-            and not full:
-        raise RuleError("partial_period",
-                        "The agreement does not cover the whole supply period; pro-rating is not decided (R3).",
-                        "لا تغطي الاتفاقية فترة التوريد كاملة؛ التناسب الزمني غير مقرر.")
-    if not overlap:
-        raise RuleError("outside_dates", "The agreement dates do not cover the supply period (R3).",
-                        "تواريخ الاتفاقية لا تغطي فترة التوريد.")
+    active, total = days
+    prorated = active < total and agreement.billing_frequency != A.Frequency.ONE_OFF
+    fraction = Decimal(active) / Decimal(total) if prorated else Decimal("1")
+    days_text = f" x {active}/{total} days" if prorated else ""
     desc_en, desc_ar = agreement.description_en, agreement.description_ar
     if agreement.pricing_method == P.FIXED_FEE:
         fee = agreement.fixed_fee
-        out.append((_line(agreement, f"{desc_en} ({key})", f"{desc_ar} ({key})", 1, fee, fee,
-                          f"fixed fee {fee:,.2f} / {key}", end), {}))
+        net = money(fee * fraction)  # D14
+        out.append((_line(agreement, f"{desc_en} ({key})", f"{desc_ar} ({key})", 1, net, net,
+                          f"fixed fee {fee:,.2f}{days_text} / {key}"), {}))
     elif agreement.pricing_method == P.TIMESHEET:
-        entries = list(TS.objects.select_for_update().filter(
-            agreement=agreement, status=TS.Status.APPROVED, invoice_line__isnull=True, date__gte=start, date__lte=end,
-        ).select_related("rate").order_by("date", "id"))
-        groups = OrderedDict()
-        for e in entries:
-            groups.setdefault(e.rate_id, []).append(e)
-        for rate_id, group in groups.items():
-            rate = group[0].rate
-            unit = rate.hourly_rate if rate else agreement.hourly_rate
-            hours = sum((e.hours for e in group), ZERO)
-            role_en = f" - {rate.role_en}" if rate else ""
-            role_ar = f" - {rate.role_ar}" if rate else ""
-            out.append((_line(agreement, f"{desc_en}{role_en} ({start} to {end})", f"{desc_ar}{role_ar} ({start} - {end})",
-                              hours, unit, hours * unit, f"{hours.normalize():f} h x {unit:,.2f}", end),
-                        {"timesheets": group}))
+        out += _timesheet_lines(agreement, start, end, adjustment=False)
+        out += _timesheet_lines(agreement, start, end, adjustment=True)
     elif agreement.pricing_method == P.COST_PLUS:
         cpp = compute_pool_period(agreement.cost_pool, period)
-        cpp = CostPoolPeriod.objects.select_for_update().get(pk=cpp.pk)
-        if cpp.amount <= ZERO:
+        cpp = CostPoolPeriod.objects.select_for_update().select_related("cost_pool", "period").get(pk=cpp.pk)
+        if cpp.amount > ZERO:
+            share, share_text = allocation_share(agreement, period)
+            share = share * fraction  # D14: pool share pro-rated by active days
+            _check_pool_capacity(cpp, share, exclude_agreement=agreement)
+            markup = agreement.markup_pct
+            net = money(cpp.amount * share * (1 + markup / HUNDRED))  # R6, one rounding at the end
+            out.append((_line(agreement, f"{desc_en} ({key})", f"{desc_ar} ({key})", 1, net, net,
+                              f"cost {cpp.amount:,.2f} x {share_text}{days_text} + {markup.normalize():f}%",
+                              pool_amount=cpp.amount, pool_share=share), {"pool": cpp}))
+        out += _pool_adjustments(agreement, period, notes)
+        if not out:
             raise RuleError("pool_empty", f"Cost pool {agreement.cost_pool.code} has no cost in {period.name}.",
                             f"لا توجد تكاليف في المجمع {agreement.cost_pool.code} للفترة {period.name}.")
-        share, share_text = allocation_share(agreement, period)
-        markup = agreement.markup_pct
-        net = money(cpp.amount * share * (1 + markup / HUNDRED))  # R6, one rounding at the end
-        out.append((_line(agreement, f"{desc_en} ({key})", f"{desc_ar} ({key})", 1, net, net,
-                          f"cost {cpp.amount:,.2f} x {share_text} + {markup.normalize():f}%", end), {"pool": cpp}))
     items = BillableItem.objects.select_for_update().filter(
         agreement=agreement, status=BillableItem.Status.OPEN, period_end__lte=end).order_by("period_start", "id")
     for item in items:
         out.append((_line(agreement, item.description_en, item.description_ar, item.quantity, item.unit_price,
                           item.quantity * item.unit_price,
-                          f"{item.quantity.normalize():f} x {item.unit_price.normalize():f}", end), {"item": item}))
+                          f"{item.quantity.normalize():f} x {item.unit_price.normalize():f}"), {"item": item}))
     return out
 
 
@@ -701,24 +809,25 @@ def _live_invoice(agreement, key):
         .exclude(status__in=INV.DEAD).first()
 
 
-def _draft_invoice(agreement, period, user, run=None):
+def _draft_invoice(agreement, period, user, run=None, notes=None):
     """Build one draft invoice (R9: drafts only, nothing posted). Raises RuleError when nothing to bill."""
-    if agreement.status != A.Status.ACTIVE:
+    notes = [] if notes is None else notes
+    if not _billable_status(agreement):
         raise RuleError("agreement_not_active", f"Agreement {agreement.number} is {agreement.status}.",
                         f"الاتفاقية {agreement.number} غير نشطة.")
     window = supply_window(agreement, period)
     if window is None:
         raise RuleError("not_due", f"Not billed in {period.name} ({agreement.billing_frequency}).",
                         f"لا تُفوتر في {period.name}.")
-    key, start, end = window
+    key, start, end, days = window
     if _live_invoice(agreement, key):
         raise Conflict("already_billed", f"{agreement.number} already billed for {key} (R4).",
                        f"تمت فوترة {agreement.number} للفترة {key}.")
-    lines = _build_lines(agreement, period, key, start, end)
+    lines = _build_lines(agreement, period, key, start, end, days, notes)
     if not lines:
         raise RuleError("nothing_to_bill", "Nothing to bill for the period.", "لا يوجد ما يُفوتر لهذه الفترة.")
     income = income_account_for(agreement)
-    issue_date = period.end_date  # D12: dated the last day of the service month
+    issue_date = today()  # D13: provisional; the actual issue date is set when the invoice is issued
     inv = INV(
         entity=agreement.entity, counterparty=agreement.counterparty, agreement=agreement, kind=INV.Kind.INVOICE,
         issue_date=issue_date, supply_date_from=start, supply_date_to=end,
@@ -733,14 +842,17 @@ def _draft_invoice(agreement, period, user, run=None):
     except IntegrityError:
         raise Conflict("already_billed", f"{agreement.number} already billed for {key} (R4).",
                        f"تمت فوترة {agreement.number} للفترة {key}.")
+    feeders = []
     for data, links in lines:
+        pool = links.get("pool") or links.get("adjust_pool")
         line = InvoiceLine(entity=inv.entity, invoice=inv, agreement=agreement, income_account=income,
-                           cost_pool_period=links.get("pool"), **data)
+                           cost_pool_period=pool, **data)
         line.save()
         for e in links.get("timesheets", []):
             _move(e, TS.Status.BILLED, invoice_line=line)  # R5
         if "item" in links:
             _move(links["item"], BillableItem.Status.BILLED, invoice_line=line)
+            feeders.append(links["item"].created_by)
         if "pool" in links and not links["pool"].locked:
             links["pool"].locked = True  # R6
             with workflow(links["pool"]):
@@ -748,39 +860,56 @@ def _draft_invoice(agreement, period, user, run=None):
     _set_totals(inv)
     if user is not None:
         record_draft_editor(inv, user, "create")
+    for feeder in feeders:  # review 3: whoever fed a line cannot approve the invoice
+        record_draft_editor(inv, feeder, "edit")
     return inv
 
 
 def _set_totals(inv):
-    agg = inv.lines.aggregate(n=Sum("net_amount"), v=Sum("vat_amount"))
-    inv.net_total = money(agg["n"] or ZERO)
-    inv.vat_total = money(agg["v"] or ZERO)
+    lines = list(inv.lines.all())
+    inv.net_total = money(sum((l.net_amount for l in lines), ZERO))
+    inv.vat_total = _credit_vat(inv, lines) if inv.is_credit_note else document_vat(lines)
     inv.gross_total = money(inv.net_total + inv.vat_total)
     inv.save()
 
 
 def _check_run_period(entity, period):
-    period = FiscalPeriod.objects.get(pk=period.pk)  # never trust a caller's stale copy of the status
+    """D13: invoices are dated when issued, so a closed service month can still be billed (the entry goes to
+    the open period of the issue date)."""
+    period = FiscalPeriod.objects.get(pk=period.pk)  # never trust a caller's stale copy
     if period.entity_id != entity.pk:
         raise RuleError("period_entity", "The period belongs to another entity.", "الفترة تتبع منشأة أخرى.")
     if not _is_calendar_month(period):
         raise RuleError("period_not_month", "Billing runs are monthly (calendar months).", "الفوترة شهرية.")
     if period.end_date >= today():
         raise RuleError("period_not_finished", f"{period.name} has not ended yet.", f"لم تنتهِ الفترة {period.name} بعد.")
-    if period.status != FiscalPeriod.Status.OPEN:
-        raise RuleError("period_closed", f"Period {period.name} is closed for {entity.code}.",
-                        f"الفترة {period.name} مقفلة للمنشأة {entity.code}.")
     return period
 
 
+def close_ended_agreements(entity=None, on=None):
+    """Review 2: agreements whose end date has passed become ended (they stay billable up to that date)."""
+    on = on or today()
+    qs = A.objects.select_for_update().filter(status__in=[A.Status.ACTIVE, A.Status.SUSPENDED], end_date__lt=on)
+    if entity is not None:
+        qs = qs.filter(entity=entity)
+    closed = 0
+    for a in qs:
+        before = snapshot(a)
+        _move(a, A.Status.ENDED)
+        _audit(None, "intercompany.agreement.ended_by_date", a, before=before, after=snapshot(a))
+        closed += 1
+    return closed
+
+
 def run_billing(user, entity, period, ctx=None):
-    """Monthly billing run (R3, R4, R9, D12). Idempotent: already-billed agreements are logged and skipped.
+    """Monthly billing run (R3, R4, R9, D12-D14). Idempotent: already-billed agreements are logged and skipped.
     Creates drafts only; nothing is posted. An unexpected error rolls the run back and records it as failed."""
     _require(user, entity, "intercompany.billing.run")
     _require_human(user)
     period = _check_run_period(entity, period)
     try:
         with transaction.atomic():
+            close_ended_agreements(entity)
             return _run(user, entity, period, ctx)
     except BilingualError:
         raise
@@ -798,19 +927,24 @@ def _run(user, entity, period, ctx):
                                     **source_fields(user))
     log, created = [], 0
     agreements = (A.objects.select_for_update().filter(entity=entity, start_date__lte=period.end_date)
-                  .filter(Q(end_date__isnull=True) | Q(end_date__gte=period.start_date))
+                  .filter(Q(end_date__isnull=True) | Q(end_date__gte=_earliest_window_start(period)))
                   .exclude(status=A.Status.DRAFT).order_by("number"))
     for a in agreements:
+        if a.end_date and a.end_date < period.start_date and supply_window(a, period) is None:
+            continue
         row = {"agreement": a.number, "counterparty": a.counterparty.code}
+        notes = []
         try:
             with transaction.atomic():
-                inv = _draft_invoice(a, period, user, run)
+                inv = _draft_invoice(a, period, user, run, notes)
             created += 1
             row.update(result="created", invoice_id=inv.pk, gross=str(inv.gross_total))
         except Conflict as exc:
             row.update(result="already billed" if exc.code == "already_billed" else "skipped", reason=exc.message_en)
         except RuleError as exc:
             row.update(result="skipped", code=exc.code, reason=exc.message_en)
+        if notes:
+            row["notes"] = notes
         log.append(row)
     run.status = BillingRun.Status.COMPLETED
     run.invoices_created = created
@@ -821,9 +955,14 @@ def _run(user, entity, period, ctx):
     return run
 
 
+def _earliest_window_start(period):
+    """Quarterly and annual windows start before the run month."""
+    return datetime.date(period.end_date.year, 1, 1)
+
+
 @transaction.atomic
 def create_invoice_draft(user, agreement, period, ctx=None):
-    """One agreement, one period, outside a run (agents may do this: drafts only, R20)."""
+    """One agreement, one period, outside a run (agents may do this: drafts only, R20, D15)."""
     _require(user, agreement.entity, "intercompany.invoice.create")
     agreement = A.objects.select_for_update().get(pk=agreement.pk)
     period = _check_run_period(agreement.entity, period)
@@ -843,7 +982,9 @@ def update_invoice_draft(user, invoice, *, lines=None, credit_reason_en=None, cr
         raise Conflict("not_draft", "Only drafts can be edited.", "يمكن تعديل المسودات فقط.")
     before = invoice_snapshot(invoice)
     for line_id, text in (lines or {}).items():
-        line = invoice.lines.get(pk=line_id)
+        line = invoice.lines.filter(pk=line_id).first()
+        if line is None:
+            raise NotFound("line_not_found", "The line is not on this invoice.", "البند ليس في هذه الفاتورة.")
         line.description_en = text.get("description_en", line.description_en)
         line.description_ar = text.get("description_ar", line.description_ar)
         if not line.description_en.strip() or not line.description_ar.strip():
@@ -874,10 +1015,9 @@ def _release(inv):
         for item in BillableItem.objects.filter(invoice_line=line):
             _move(item, BillableItem.Status.OPEN, invoice_line=None)
         cpp = line.cost_pool_period
-        if cpp is not None:
-            still = InvoiceLine.objects.filter(cost_pool_period=cpp).exclude(invoice=inv) \
-                .exclude(invoice__status__in=INV.DEAD).exists()
-            if not still:
+        if cpp is not None and not line.adjustment_period:
+            still = _live_lines().filter(cost_pool_period=cpp, adjustment_period="").exclude(invoice=inv).exists()
+            if not still and cpp.locked:
                 cpp.locked = False
                 with workflow(cpp):
                     cpp.save()
@@ -899,7 +1039,54 @@ def cancel_draft(user, invoice, reason="", ctx=None):
     return invoice
 
 
-# ---------------------------------------------------------------- credit notes (R13, R17)
+# ---------------------------------------------------------------- 15-day issue rule (D13)
+
+
+def issue_deadline(invoice):
+    """ZATCA: issue within 15 days after the end of the supply month (the 15th of the next month)."""
+    end = invoice.supply_date_to
+    year, month = (end.year + 1, 1) if end.month == 12 else (end.year, end.month + 1)
+    return datetime.date(year, month, 15)
+
+
+def deadline_alerts(on=None):
+    """Alert the issuer's MP and billing users once for every invoice still not issued after its deadline.
+    Run daily (management command intercompany_deadline_alerts). Returns the invoices alerted."""
+    from approvals import notify
+    from approvals.models import Notification
+
+    on = on or today()
+    alerted = []
+    live = INV.objects.select_for_update().filter(
+        kind=INV.Kind.INVOICE, status__in=[INV.Status.DRAFT, INV.Status.PENDING_APPROVAL, INV.Status.APPROVED],
+        deadline_alerted_at__isnull=True).select_related("entity", "counterparty")
+    with transaction.atomic():
+        for inv in live:
+            deadline = issue_deadline(inv)
+            if on <= deadline:
+                continue
+            users = {u.pk: u for u in access.users_with_perm(inv.entity, "intercompany.billing.run")}
+            for g in access.active_grants_for_entity(inv.entity).filter(role__code="managing_partner"):
+                users[g.user_id] = g.user
+            for u in users.values():
+                notify.notify(
+                    u, Notification.Kind.ALERT, alert_code="ic_issue_deadline", entity=inv.entity,
+                    link=f"/intercompany/invoices/{inv.pk}",
+                    title_en=f"Intercompany invoice for {inv.billing_period} not issued by {deadline}"[:200],
+                    title_ar=f"فاتورة المجموعة للفترة {inv.billing_period} لم تصدر قبل {deadline}"[:200],
+                    body_en=f"{inv.entity.code} to {inv.counterparty.code}, {inv.gross_total} {inv.currency}. "
+                            "ZATCA requires issue within 15 days after the supply month.",
+                    body_ar=f"{inv.entity.code} إلى {inv.counterparty.code}، {inv.gross_total} {inv.currency}. "
+                            "تشترط زاتكا الإصدار خلال 15 يوماً بعد شهر التوريد.",
+                )
+            _move(inv, inv.status, deadline_alerted_at=timezone.now())
+            _audit(None, "intercompany.invoice.deadline_alert", inv, after={"deadline": deadline,
+                                                                           "recipients": sorted(users)})
+            alerted.append(inv)
+    return alerted
+
+
+# ---------------------------------------------------------------- credit notes (R13, R17, D13)
 
 
 def _live_credits(invoice):
@@ -920,10 +1107,33 @@ def _line_remaining(line, exclude_invoice=None):
     return line.net_amount - (agg["n"] or ZERO), line.vat_amount - (agg["v"] or ZERO)
 
 
+def _credit_vat(cn, lines):
+    """Document VAT of a credit note, never above the original's uncredited VAT. A credit that takes all the
+    remaining net takes exactly the remaining VAT."""
+    original = cn.credit_of
+    others = _live_credits(original).exclude(pk=cn.pk) if cn.pk else _live_credits(original)
+    remaining_vat = original.vat_total - (others.aggregate(v=Sum("vat_total"))["v"] or ZERO)
+    credited = {}
+    for l in lines:
+        credited[l.credits_line_id] = credited.get(l.credits_line_id, ZERO) + l.net_amount
+    full = all(_line_remaining(o, exclude_invoice=cn)[0] - credited.get(o.pk, ZERO) == ZERO
+               for o in original.lines.all())
+    if full:
+        return remaining_vat
+    return min(document_vat(lines), remaining_vat)
+
+
+def credit_note_late(trigger_date, created_on):
+    """D13: warn when a credit note is created after the 15th of the month following the trigger month."""
+    year, month = (trigger_date.year + 1, 1) if trigger_date.month == 12 else (trigger_date.year, trigger_date.month + 1)
+    return created_on > datetime.date(year, month, 15)
+
+
 @transaction.atomic
-def create_credit_note(user, invoice, *, reason_en, reason_ar, lines=None, issue_date=None, ctx=None):
+def create_credit_note(user, invoice, *, reason_en, reason_ar, trigger_date, lines=None, ctx=None):
     """Full (lines=None) or partial credit note. lines: [{"line": InvoiceLine or id, "net_amount": Decimal}].
-    A credit note can never exceed the original's uncredited balance (R13)."""
+    A credit note can never exceed the original's uncredited balance (R13). trigger_date: date of the event
+    that causes the credit (D13)."""
     invoice = INV.objects.select_for_update().get(pk=invoice.pk)
     _require(user, invoice.entity, "intercompany.invoice.create")
     if invoice.kind != INV.Kind.INVOICE or invoice.status != INV.Status.ISSUED:
@@ -932,6 +1142,11 @@ def create_credit_note(user, invoice, *, reason_en, reason_ar, lines=None, issue
     if not (reason_en or "").strip() or not (reason_ar or "").strip():
         raise RuleError("reason_required", "A credit reason in English and Arabic is required (ZATCA).",
                         "سبب الإشعار الدائن مطلوب بالعربية والإنجليزية.")
+    day = today()
+    if trigger_date is None or trigger_date > day or trigger_date < invoice.supply_date_from:
+        raise RuleError("trigger_date_invalid",
+                        "The trigger date is required, not in the future and not before the supply period.",
+                        "تاريخ سبب الإشعار مطلوب ولا يكون مستقبلياً ولا قبل فترة التوريد.")
     originals = {l.pk: l for l in invoice.lines.all()}
     if lines is None:
         wanted = [(l, _line_remaining(l)[0]) for l in originals.values()]
@@ -939,32 +1154,34 @@ def create_credit_note(user, invoice, *, reason_en, reason_ar, lines=None, issue
     else:
         wanted = []
         for spec in lines:
-            line_id = spec["line"].pk if isinstance(spec["line"], InvoiceLine) else int(spec["line"])
+            try:
+                line_id = spec["line"].pk if isinstance(spec["line"], InvoiceLine) else int(spec["line"])
+                net = money(Decimal(str(spec["net_amount"])))
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                raise RuleError("invalid_input", "Each line needs a line id and a net_amount.",
+                                "كل بند يحتاج رقم البند والمبلغ.")
             if line_id not in originals:
                 raise RuleError("line_not_on_invoice", "The line is not on this invoice.", "البند ليس في هذه الفاتورة.")
-            wanted.append((originals[line_id], money(Decimal(spec["net_amount"]))))
-    built, gross = [], ZERO
+            wanted.append((originals[line_id], net))
+    built = []
     for line, net in wanted:
         rem_net, rem_vat = _line_remaining(line)
         if net <= ZERO or net > rem_net:
             raise RuleError("credit_exceeds_line", f"Credit {net} exceeds the uncredited {rem_net} of the line (R13).",
                             f"المبلغ {net} يتجاوز الرصيد غير المُسترد للبند {rem_net}.")
         vat = rem_vat if net == rem_net else money(net * line.vat_rate / HUNDRED)
+        if vat > rem_vat:  # review 4
+            raise RuleError("credit_vat_exceeds_line",
+                            f"Credit VAT {vat} exceeds the uncredited VAT {rem_vat} of the line.",
+                            f"ضريبة الإشعار {vat} تتجاوز الضريبة غير المستردة للبند {rem_vat}.")
         built.append((line, net, vat))
-        gross += net + vat
     if not built:
         raise RuleError("nothing_to_credit", "Nothing left to credit.", "لا يوجد رصيد للإسترداد.")
-    if gross > uncredited_balance(invoice):
-        raise RuleError("credit_exceeds_balance",
-                        f"Credit {gross} exceeds the uncredited balance {uncredited_balance(invoice)} (R13).",
-                        f"الإشعار {gross} يتجاوز الرصيد غير المُسترد {uncredited_balance(invoice)}.")
-    day = issue_date or today()
-    if day < invoice.issue_date:
-        raise RuleError("credit_before_invoice", "A credit note cannot be dated before its invoice.",
-                        "لا يمكن أن يسبق تاريخ الإشعار تاريخ الفاتورة.")
+    late = credit_note_late(trigger_date, day)
     cn = INV(
         entity=invoice.entity, counterparty=invoice.counterparty, agreement=invoice.agreement,
         kind=INV.Kind.CREDIT_NOTE, credit_of=invoice, credit_reason_en=reason_en, credit_reason_ar=reason_ar,
+        trigger_date=trigger_date, late_credit_warning=late,
         issue_date=day, supply_date_from=invoice.supply_date_from, supply_date_to=invoice.supply_date_to,
         due_date=day, billing_period=invoice.billing_period, currency=invoice.currency, invoice_type_code="381",
         seller_vat_number=invoice.seller_vat_number, buyer_vat_number=invoice.buyer_vat_number,
@@ -977,19 +1194,76 @@ def create_credit_note(user, invoice, *, reason_en, reason_ar, lines=None, issue
             description_ar=line.description_ar, quantity=Decimal("1"), unit_price=net, net_amount=net,
             vat_treatment=line.vat_treatment, vat_category=line.vat_category, vat_rate=line.vat_rate, vat_amount=vat,
             vat_exemption_reason_en=line.vat_exemption_reason_en, vat_exemption_reason_ar=line.vat_exemption_reason_ar,
-            income_account=line.income_account, pricing_basis=f"credit of {invoice.number}"[:200], credits_line=line,
+            vat_exemption_code=line.vat_exemption_code, income_account=line.income_account,
+            pricing_basis=f"credit of {invoice.number}"[:200], credits_line=line,
         ).save()
-    _set_totals(cn)
+    _set_totals(cn)  # document VAT; checked exactly against the balance (the transaction rolls back on refusal)
+    others = _live_credits(invoice).exclude(pk=cn.pk).aggregate(g=Sum("gross_total"))["g"] or ZERO
+    if cn.gross_total > invoice.gross_total - others:
+        raise RuleError("credit_exceeds_balance",
+                        f"Credit {cn.gross_total} exceeds the uncredited balance {invoice.gross_total - others} (R13).",
+                        f"الإشعار {cn.gross_total} يتجاوز الرصيد غير المُسترد {invoice.gross_total - others}.")
     record_draft_editor(cn, user, "create")
     _audit(user, "intercompany.credit_note.create", cn, after=invoice_snapshot(cn), ctx=ctx)
+    if late:
+        _warn_late_credit(cn, user, ctx)
     return cn
+
+
+def _warn_late_credit(cn, user, ctx):
+    from approvals import notify
+    from approvals.models import Notification
+
+    _audit(user, "intercompany.credit_note.late_warning", cn, after={"trigger_date": cn.trigger_date}, ctx=ctx)
+    users = {user.pk: user} if user.is_human else {}
+    for g in access.active_grants_for_entity(cn.entity).filter(role__code="managing_partner"):
+        users[g.user_id] = g.user
+    for u in users.values():
+        notify.notify(
+            u, Notification.Kind.ALERT, alert_code="ic_late_credit_note", entity=cn.entity,
+            link=f"/intercompany/invoices/{cn.pk}",
+            title_en=f"Late credit note on {cn.credit_of.number} (trigger {cn.trigger_date})"[:200],
+            title_ar=f"إشعار دائن متأخر على {cn.credit_of.number} (السبب {cn.trigger_date})"[:200],
+            body_en="Created after the 15th of the month following the trigger month (ZATCA).",
+            body_ar="أُنشئ بعد اليوم 15 من الشهر التالي لشهر السبب (زاتكا).",
+        )
 
 
 # ---------------------------------------------------------------- submission checks and issue (R10, R11, R15, R17)
 
 
+def require_can_submit(user):
+    """D15: agents and integrations create drafts only; they never submit for approval."""
+    if user is None or not user.is_human:
+        raise AccessDenied("service_user_cannot_submit",
+                           "AI agents and integrations create drafts only; a person submits them (D15).",
+                           "الوكلاء والتكاملات ينشئون المسودات فقط؛ يقدّمها شخص (D15).")
+
+
+def submit_for_approval(user, doc, ctx=None):
+    from approvals import services as approvals
+
+    require_can_submit(user)
+    return approvals.submit(doc, user, ctx=ctx)
+
+
+def _party_problems(entity, role, need_vat):
+    problems = []
+    if need_vat:
+        if not valid_vat_number(entity.vat_number):
+            problems.append(f"The {role} {entity.code} needs a valid VAT number (15 digits, starting and ending with 3).")
+    elif entity.vat_number and not valid_vat_number(entity.vat_number):
+        problems.append(f"The {role} {entity.code} VAT number is not valid (15 digits, starting and ending with 3).")
+    elif not (entity.vat_number or (entity.cr_number or "").strip()):
+        problems.append(f"The {role} {entity.code} needs a VAT number or another identifier (CR number).")
+    missing = entity.missing_address_fields()
+    if missing:
+        problems.append(f"The {role} {entity.code} address is incomplete ({', '.join(missing)}).")
+    return problems
+
+
 def validate_for_issue(inv):
-    """Checks before submission and again at final approval (R13, R21, T22). Raises RuleError."""
+    """Checks before submission and again at final approval (R13, R21, T22, ZATCA data). Raises RuleError."""
     lines = list(inv.lines.all())
     problems = []
     if not lines:
@@ -997,23 +1271,27 @@ def validate_for_issue(inv):
     for l in lines:
         if not (l.description_en or "").strip() or not (l.description_ar or "").strip():
             problems.append(f"Line {l.pk} needs an English and an Arabic description (R21).")
+        if problem := vatex_problem(l.vat_treatment, l.vat_exemption_code):
+            problems.append(f"Line {l.pk}: {problem}")
+        if l.vat_category != InvoiceLine.VatCategory.STANDARD and (l.vat_rate != ZERO or l.vat_amount != ZERO):
+            problems.append(f"Line {l.pk}: zero-rated, exempt and out-of-scope lines have a 0% rate.")
     if inv.is_credit_note and (not inv.credit_reason_en.strip() or not inv.credit_reason_ar.strip()):
         problems.append("The credit note needs a reason in English and Arabic.")
     net = sum((l.net_amount for l in lines), ZERO)
-    vat = sum((l.vat_amount for l in lines), ZERO)
+    vat = _credit_vat(inv, lines) if inv.is_credit_note else document_vat(lines)
     if (net, vat, net + vat) != (inv.net_total, inv.vat_total, inv.gross_total) or inv.gross_total <= ZERO:
-        problems.append("Invoice totals do not equal the sum of the lines (R8).")
+        problems.append("Invoice totals do not equal the lines with VAT per category (R8).")
     if inv.entity_id == inv.counterparty_id or not inv.entity.is_active or not inv.counterparty.is_active:
         problems.append("Issuer and counterparty must be different active entities (R1).")
-    if inv.vat_total > ZERO and not inv.entity.vat_number:
-        problems.append(f"{inv.entity.code} has no VAT number; a VAT invoice cannot be issued.")
+    problems += _party_problems(inv.entity, "seller", need_vat=True)
+    problems += _party_problems(inv.counterparty, "buyer", need_vat=False)
     if inv.is_credit_note:
         original = INV.objects.select_for_update().get(pk=inv.credit_of_id)
         if original.status != INV.Status.ISSUED:
             problems.append("The original invoice is not issued.")
         for l in lines:
-            rem_net, _ = _line_remaining(l.credits_line, exclude_invoice=inv)
-            if l.net_amount > rem_net:
+            rem_net, rem_vat = _line_remaining(l.credits_line, exclude_invoice=inv)
+            if l.net_amount > rem_net or l.vat_amount > rem_vat:
                 problems.append(f"Line {l.pk} exceeds the uncredited balance of the original (R13).")
         others = _live_credits(original).exclude(pk=inv.pk).aggregate(g=Sum("gross_total"))["g"] or ZERO
         if inv.gross_total > original.gross_total - others:
@@ -1021,6 +1299,15 @@ def validate_for_issue(inv):
     if problems:
         raise RuleError("invoice_invalid", "The invoice cannot be approved: " + " ".join(problems),
                         "لا يمكن اعتماد الفاتورة: " + " ".join(problems), detail=problems)
+
+
+def _check_tax_point(inv, day):
+    """D13: the rate at the tax point (issue date) must be the rate on the lines; otherwise re-bill."""
+    for l in inv.lines.all():
+        if l.vat_category == InvoiceLine.VatCategory.STANDARD and l.vat_rate != vat_rate_on(day):
+            raise RuleError("vat_rate_changed",
+                            f"The VAT rate on {day} is {vat_rate_on(day)}%, not {l.vat_rate}%. Cancel and bill again.",
+                            f"نسبة الضريبة في {day} هي {vat_rate_on(day)}%. ألغِ المسودة وأعد الفوترة.")
 
 
 def _invoice_entry_lines(inv):
@@ -1066,27 +1353,31 @@ def issue_invoice(invoice, user, ctx=None):
 @transaction.atomic
 def _issue(invoice, approver=None, actor=None, ctx=None):
     """R11: number, journal entry (create_entry + post_entry, system entry) and status in one transaction.
-    A ledger refusal (e.g. closed period, T15) rolls everything back, including the number."""
+    D13: dated the actual issue date, so the entry goes to the open period of that date. A ledger refusal
+    (e.g. the issue month is closed) rolls everything back, including the number."""
     inv = INV.objects.select_for_update().select_related("entity", "counterparty", "agreement").get(pk=invoice.pk)
     if inv.status != INV.Status.APPROVED:
         raise Conflict("not_approved", "Only approved invoices can be issued.", "يمكن إصدار الفواتير المعتمدة فقط.")
     validate_for_issue(inv)
+    day = today()
+    _check_tax_point(inv, day)
     prefix = "ICC" if inv.is_credit_note else "ICI"
-    number = _next_number(inv.entity, prefix, inv.issue_date.year, 6)
+    number = _next_number(inv.entity, prefix, day.year, 6)
     inv.number = number
     kind_en = "credit note" if inv.is_credit_note else "invoice"
     entry = ledger.create_entry(
-        inv.entity, inv.issue_date, f"Intercompany {kind_en} {number} to {inv.counterparty.code}: "
+        inv.entity, day, f"Intercompany {kind_en} {number} to {inv.counterparty.code} ({inv.billing_period}): "
         f"{inv.agreement.description_en}"[:500], _invoice_entry_lines(inv), user=None, reference=number,
         system=True, post=True, source=inv.source_label,
     )
-    _move(inv, INV.Status.ISSUED, number=number, journal_entry=entry, issued_at=timezone.now(),
-          approved_by=approver, zatca_uuid=uuid.uuid4(), zatca_ready=True,
+    due = day if inv.is_credit_note else day + datetime.timedelta(days=inv.agreement.payment_terms_days)
+    _move(inv, INV.Status.ISSUED, number=number, journal_entry=entry, issued_at=timezone.now(), issue_date=day,
+          due_date=due, approved_by=approver, zatca_uuid=uuid.uuid4(), zatca_ready=True,
           seller_vat_number=inv.entity.vat_number, buyer_vat_number=inv.counterparty.vat_number)
     bill = _create_mirror(inv)
     _audit(actor or approver, "intercompany.invoice.issue", inv,
            before={"status": INV.Status.APPROVED},
-           after={"status": inv.status, "number": number, "journal_entry": entry.number,
+           after={"status": inv.status, "number": number, "issue_date": day, "journal_entry": entry.number,
                   "mirror_bill": bill.number if bill else None}, ctx=ctx)
     return inv
 
@@ -1150,7 +1441,9 @@ def update_bill_coding(user, bill, lines, ctx=None):
         if unknown:
             raise RuleError("field_not_editable", "Only the expense account and cost centre can change (R16).",
                             "يمكن تغيير حساب المصروف ومركز التكلفة فقط.", detail=sorted(unknown))
-        line = bill.lines.get(pk=line_id)
+        line = bill.lines.filter(pk=line_id).first()
+        if line is None:
+            raise NotFound("line_not_found", "The line is not on this bill.", "البند ليس في هذه الفاتورة.")
         if "expense_account" in change:
             acc = change["expense_account"]
             if not isinstance(acc, Account):
@@ -1369,3 +1662,44 @@ def reconciliation_xlsx(report, language="en"):
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------- related-party transactions (transfer pricing)
+
+RPT_HEADINGS = OrderedDict([
+    ("issuer", ("Issuer", "المُصدر")),
+    ("counterparty", ("Related party", "الطرف ذو العلاقة")),
+    ("consolidation", ("Relationship", "العلاقة")),
+    ("service_type", ("Service type", "نوع الخدمة")),
+    ("tp_method", ("Transfer-pricing method", "طريقة تسعير التحويل")),
+    ("net_amount", ("Net amount", "المبلغ الصافي")),
+    ("documents", ("Documents", "عدد المستندات")),
+])
+
+
+def related_party_report(user, year, entity=None):
+    """Yearly related-party transactions by counterparty, TP method and service type: issued invoices
+    less issued credit notes (net, issuer currency). Needs intercompany.report.view in the issuer."""
+    _active_user(user)
+    entities = access.entities_with_perm(user, "intercompany.report.view")
+    if not entities.exists():
+        raise AccessDenied("permission_denied", "You cannot view this report.", "لا يمكنك عرض هذا التقرير.")
+    qs = INV.objects.filter(status=INV.Status.ISSUED, issue_date__year=year, entity__in=entities) \
+        .select_related("entity", "counterparty", "agreement__service_type")
+    if entity is not None:
+        qs = qs.filter(entity=entity)
+    rows = OrderedDict()
+    for inv in qs.order_by("entity__code", "counterparty__code", "id"):
+        a = inv.agreement
+        key = (inv.entity.code, inv.counterparty.code, a.service_type.code, a.tp_method, inv.currency)
+        row = rows.setdefault(key, {
+            "issuer": inv.entity.code, "counterparty": inv.counterparty.code,
+            "consolidation": {"type": inv.counterparty.consolidation,
+                              "ownership_pct": str(inv.counterparty.ownership_pct)},
+            "service_type": a.service_type.code, "tp_method": a.tp_method or None, "currency": inv.currency,
+            "net_amount": ZERO, "documents": 0,
+        })
+        row["net_amount"] += -inv.net_total if inv.is_credit_note else inv.net_total
+        row["documents"] += 1
+    return {"year": year, "headings": {k: {"en": en, "ar": ar} for k, (en, ar) in RPT_HEADINGS.items()},
+            "rows": list(rows.values())}

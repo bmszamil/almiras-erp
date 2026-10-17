@@ -12,7 +12,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from access import services as access
-from access.errors import NotFound, RuleError
+from access.errors import AccessDenied, BilingualError, NotFound, RuleError
 from access.models import User
 from approvals import services as approvals
 from approvals.serializers import RequestDetailSerializer
@@ -25,10 +25,17 @@ from . import services
 from .models import ServiceAgreement, ServiceType
 
 
+class BadRequest(BilingualError):
+    status = 400
+
+
 def _valid(serializer_cls, data, partial=False):
+    """Malformed bodies are 400 (review 7); business rules stay 422 in the services."""
+    if not isinstance(data, dict):
+        raise BadRequest("invalid_input", "A JSON object is required.", "مطلوب كائن JSON.")
     s = serializer_cls(data=data, partial=partial)
     if not s.is_valid():
-        raise RuleError("invalid_input", "Invalid input.", "مدخلات غير صالحة.", detail=s.errors)
+        raise BadRequest("invalid_input", "Invalid input.", "مدخلات غير صالحة.", detail=s.errors)
     return dict(s.validated_data)
 
 
@@ -81,7 +88,7 @@ def _filter_entity(request, qs, field="entity"):
 
 
 def _submit(request, doc):
-    r = approvals.submit(doc, request.user, ctx=ctx_for(request))
+    r = services.submit_for_approval(request.user, doc, ctx=ctx_for(request))  # D15: people only
     return Response(RequestDetailSerializer(r, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
@@ -90,6 +97,9 @@ def _submit(request, doc):
 
 class ServiceTypeListView(APIView):
     def get(self, request):
+        if not any(access.entities_with_perm(request.user, p).exists() for p in (
+                "intercompany.agreement.view", "intercompany.agreement.create")):
+            raise AccessDenied("permission_denied", "You cannot view service types.", "لا يمكنك عرض أنواع الخدمات.")
         return Response([
             {"code": t.code, "name": out.bi(t.name_en, t.name_ar), "category": t.category,
              "income_account_code": t.income_account_code, "expense_account_code": t.expense_account_code,
@@ -162,11 +172,9 @@ class AgreementActionView(APIView):
 # ---------------------------------------------------------------- timesheets
 
 
-def _timesheet_fields(request, data):
+def _timesheet_fields(agreement, data):
     if data.get("rate") is not None:
-        from .models import AgreementRate
-
-        data["rate"] = _get(AgreementRate.objects.all(), data["rate"])
+        data["rate"] = _get(agreement.rates.all(), data["rate"])  # review 8: rates of this agreement only
     return data
 
 
@@ -179,11 +187,12 @@ class TimesheetListView(APIView):
         a = _agreement_for(request.user, data.pop("agreement", None), "intercompany.timesheet.create")
         worker = None
         if username := data.pop("worker", None):
-            worker = User.objects.filter(username=username, is_active=True).first()
+            members = access.active_grants_for_entity(a.entity).values("user_id")  # review 8
+            worker = User.objects.filter(username=username, is_active=True, pk__in=members).first()
             if worker is None:
                 raise NotFound("user_not_found", "User not found.", "المستخدم غير موجود.")
         e = services.create_timesheet(request.user, a, worker=worker, ctx=ctx_for(request),
-                                      **_timesheet_fields(request, data))
+                                      **_timesheet_fields(a, data))
         return Response(out.timesheet_out(e), status=status.HTTP_201_CREATED)
 
 
@@ -196,7 +205,7 @@ class TimesheetDetailView(APIView):
         data = _valid(out.TimesheetInput, request.data, partial=True)
         if {"agreement", "worker"} & set(data):
             raise RuleError("field_not_editable", "Agreement and worker cannot change.", "لا يمكن تغيير الاتفاقية أو الموظف.")
-        e = services.update_timesheet(request.user, e, ctx=ctx_for(request), **_timesheet_fields(request, data))
+        e = services.update_timesheet(request.user, e, ctx=ctx_for(request), **_timesheet_fields(e.agreement, data))
         return Response(out.timesheet_out(e))
 
 
@@ -251,7 +260,7 @@ class BillableItemListView(APIView):
 
     def post(self, request):
         data = _valid(out.ItemInput, request.data)
-        a = _agreement_for(request.user, data.pop("agreement"), "intercompany.invoice.create")
+        a = _agreement_for(request.user, data.pop("agreement"), "intercompany.billable_item.feed")
         item = services.add_billable_item(request.user, a, ctx=ctx_for(request), **data)
         return Response(out.item_out(item), status=status.HTTP_201_CREATED)
 
@@ -291,16 +300,14 @@ class InvoiceDetailView(APIView):
 
     def patch(self, request, pk):
         inv = _get(services.visible_invoices(request.user), pk)
-        allowed = {"lines", "credit_reason_en", "credit_reason_ar"}
-        if set(request.data) - allowed:
-            raise RuleError("field_not_editable", "Only line descriptions and credit reasons can change on a draft.",
-                            "يمكن تغيير وصف البنود وسبب الإشعار فقط.", detail=sorted(set(request.data) - allowed))
+        data = _valid(out.InvoicePatch, request.data)
         lines = {}
-        for row in request.data.get("lines", []) or []:
-            lines[int(row["id"])] = {k: row[k] for k in ("description_en", "description_ar") if k in row}
+        for row in data.get("lines", []):
+            row = dict(row)
+            lines[row.pop("id")] = row
         inv = services.update_invoice_draft(request.user, inv, lines=lines,
-                                            credit_reason_en=request.data.get("credit_reason_en"),
-                                            credit_reason_ar=request.data.get("credit_reason_ar"), ctx=ctx_for(request))
+                                            credit_reason_en=data.get("credit_reason_en"),
+                                            credit_reason_ar=data.get("credit_reason_ar"), ctx=ctx_for(request))
         return Response(out.invoice_out(inv, request.user))
 
 
@@ -318,9 +325,10 @@ class InvoiceActionView(APIView):
             inv = services.issue_invoice(inv, request.user, ctx=ctx)
         elif self.action == "credit-notes":
             data = _valid(out.CreditNoteInput, request.data)
+            lines = [dict(l) for l in data["lines"]] if data.get("lines") is not None else None
             cn = services.create_credit_note(request.user, inv, reason_en=data["reason_en"],
-                                             reason_ar=data["reason_ar"], lines=data["lines"],
-                                             issue_date=data.get("issue_date"), ctx=ctx)
+                                             reason_ar=data["reason_ar"], lines=lines,
+                                             trigger_date=data["trigger_date"], ctx=ctx)
             return Response(out.invoice_out(cn, request.user), status=status.HTTP_201_CREATED)
         return Response(out.invoice_out(inv, request.user))
 
@@ -340,10 +348,11 @@ class BillDetailView(APIView):
     def patch(self, request, pk):
         """Coding only (R16): {"lines": [{"id", "expense_account", "cost_centre"}]}."""
         bill = _get(services.visible_bills(request.user), pk)
-        if set(request.data) - {"lines"}:
-            raise RuleError("field_not_editable", "Only the expense account and cost centre can change (R16).",
-                            "يمكن تغيير حساب المصروف ومركز التكلفة فقط.", detail=sorted(set(request.data) - {"lines"}))
-        lines = {int(row.pop("id")): row for row in [dict(r) for r in request.data.get("lines", [])]}
+        data = _valid(out.BillPatch, request.data)  # only expense account and cost centre exist here (R16)
+        lines = {}
+        for row in data["lines"]:
+            row = dict(row)
+            lines[row.pop("id")] = row
         bill = services.update_bill_coding(request.user, bill, lines, ctx=ctx_for(request))
         return Response(out.bill_out(bill))
 
@@ -384,4 +393,18 @@ class ReconciliationView(APIView):
             resp["Content-Disposition"] = f'attachment; filename="intercompany-reconciliation-{as_of}.xlsx"'
             return resp
         return Response(out.report_out(report))
+
+
+class RelatedPartyReportView(APIView):
+    """Yearly related-party transactions (transfer pricing): GET ?year=&entity="""
+
+    def get(self, request):
+        try:
+            year = int(request.query_params.get("year", ""))
+        except ValueError:
+            raise BadRequest("invalid_input", "year is required.", "السنة مطلوبة.")
+        entity = None
+        if code := request.query_params.get("entity"):
+            entity = _entity(request.user, code, "intercompany.report.view")
+        return Response(out.report_out(services.related_party_report(request.user, year, entity=entity)))
 

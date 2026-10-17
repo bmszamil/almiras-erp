@@ -27,6 +27,10 @@ AS, IS, BS = ServiceAgreement.Status, IntercompanyInvoice.Status, IntercompanyBi
 
 
 class _Base(ApprovalAdapter):
+    def guard_submitter(self, request):
+        """D15: agents and integrations never submit (also through the generic approvals API)."""
+        services.require_can_submit(request.submitted_by)
+
     def source(self, doc):
         return doc.source_label
 
@@ -68,12 +72,16 @@ class AgreementApproval(_Base):
         return {"status": a.status, "number": a.number}
 
     def on_submitted(self, a, request):
+        self.guard_submitter(request)
         services.validate_agreement(a)
         services._move(a, AS.PENDING_APPROVAL)
 
     def on_approved(self, a, request, actor):
         services.validate_agreement(a)
-        services._move(a, AS.ACTIVE, activated_at=a.activated_at or timezone.now())
+        # Review 5: freeze the account codes on the agreement, so later service-type edits cannot move them.
+        services._move(a, AS.ACTIVE, activated_at=a.activated_at or timezone.now(),
+                       income_account_code=a.income_account_code or a.service_type.income_account_code,
+                       expense_account_code=a.expense_account_code or a.service_type.expense_account_code)
 
     def on_rejected(self, a, request):
         services._move(a, AS.SUSPENDED if a.activated_at else AS.ENDED)
@@ -87,7 +95,7 @@ class InvoiceApproval(_Base):
     submit_permission = "intercompany.invoice.create"
     fingerprint_exclude = {"status", "number", "journal_entry", "issued_at", "approved_by", "zatca_uuid",
                            "zatca_ready", "zatca_status", "zatca_hash", "zatca_updated_at", "created_at",
-                           "seller_vat_number", "buyer_vat_number"}
+                           "seller_vat_number", "buyer_vat_number", "deadline_alerted_at"}
 
     def approval_amount(self, inv):
         return inv.gross_total, inv.currency
@@ -120,6 +128,7 @@ class InvoiceApproval(_Base):
         return {"status": inv.status, "number": inv.number}
 
     def on_submitted(self, inv, request):
+        self.guard_submitter(request)
         services.validate_for_issue(inv)
         services._move(inv, IS.PENDING_APPROVAL)
 
@@ -166,6 +175,7 @@ class BillApproval(_Base):
         return {"status": bill.status, "number": bill.number}
 
     def on_submitted(self, bill, request):
+        self.guard_submitter(request)
         services.check_bill_postable(bill)
         services._move(bill, BS.PENDING_APPROVAL)
 

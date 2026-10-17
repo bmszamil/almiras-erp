@@ -14,6 +14,9 @@ from ledger.services_setup import create_monthly_periods, install_chart_of_accou
 
 D = Decimal
 TODAY = datetime.date(2026, 12, 5)
+#: Anonymised national address (ZATCA structured address).
+ADDRESS = dict(building_number="1234", street="Sample Street", district="Sample District", city="Jeddah",
+               postal_code="23456", country_code="SA", additional_number="5678")
 
 
 @pytest.fixture(autouse=True)
@@ -28,12 +31,14 @@ def alm(alm):
     create_monthly_periods(alm, 2026)
     alm.vat_number = "300000000000003"
     alm.books_in_erp, alm.books_in_erp_from = True, datetime.date(2026, 1, 1)
+    for k, v in ADDRESS.items():
+        setattr(alm, k, v)
     alm.save()
     return alm
 
 
 def _entity(code, name_en, name_ar, parent, **kw):
-    e = Entity.objects.create(code=code, name_en=name_en, name_ar=name_ar, parent=parent, **kw)
+    e = Entity.objects.create(code=code, name_en=name_en, name_ar=name_ar, parent=parent, **{**ADDRESS, **kw})
     install_chart_of_accounts(e)
     create_monthly_periods(e, 2026)
     create_monthly_periods(e, 2027)

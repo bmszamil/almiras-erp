@@ -50,12 +50,14 @@ PERMISSIONS = [
     ("intercompany.report.view", "View the intercompany reconciliation report", "عرض تقرير مطابقة أرصدة المجموعة"),
     ("intercompany.servicetype.manage", "Maintain intercompany service types (group data)",
      "إدارة أنواع خدمات المجموعة"),
+    ("intercompany.billable_item.feed", "Feed billable items into intercompany billing (integrations)",
+     "إدخال بنود قابلة للفوترة في فوترة المجموعة (التكاملات)"),
 ]
 
 ALL = [code for code, _, _ in PERMISSIONS]
 
 # Granted to no role by default (default deny); an access manager must add it to a role deliberately.
-NO_ROLE_BY_DEFAULT = {"ledger.period.reopen"}
+NO_ROLE_BY_DEFAULT = {"ledger.period.reopen", "intercompany.billable_item.feed"}
 
 _READ_FINANCE = ["core.entity.view", "approvals.request.view", "ledger.entry.view", "reports.report.view"]
 
