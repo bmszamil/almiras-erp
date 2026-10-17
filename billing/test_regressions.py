@@ -112,3 +112,45 @@ def test_p3_unexpected_error_in_one_period_fails_it_and_the_run_continues(w, mon
     nxt = run(w, date(2027, 1, 2))  # retried automatically
     assert nxt.generated_count == 1 and period(BillingPeriod.objects.get(pk=p.pk).contract,
                                                date(2027, 1, 1)).status == "generated"
+
+
+# --- P4 / finding 9: R57, R58 (hr_event only for linked assignments) -----------------------------------------------
+
+def test_p4_hr_event_refused_for_an_unlinked_assignment(w):
+    from core.access.models import AccessLog
+
+    from billing.test_secondments import secondment_contract
+
+    c, a = secondment_contract(w)
+    run(w, date(2027, 2, 1))
+    with pytest.raises(BillingError) as exc:  # w.h holds hr.end_assignment in ALM, but nothing is linked
+        services.end_secondment(w.alm, a, date(2027, 1, 20), w.h, source="hr_event")
+    assert exc.value.code == "not_linked" and "الموارد البشرية" in str(exc.value)
+    a.refresh_from_db()
+    assert (a.end_date, a.end_source, a.last_hr_end_date) == (None, "", None)
+    assert not BillingAdjustment.objects.filter(contract=c).exists()
+    assert AccessLog.objects.filter(event="permission_denied", actor=w.h,
+                                    details__reason="not_linked_to_hr").exists()
+    services.end_secondment(w.alm, a, date(2027, 1, 20), w.s, source="manual")  # D6: accounting staff record it
+    a.refresh_from_db()
+    assert (a.end_date, a.end_source) == (date(2027, 1, 20), "manual")
+
+
+def test_r57_end_during_a_run_is_refused_as_retryable_and_changes_nothing(w, monkeypatch):
+    """A run in progress holds the entity's billing lock (the real try-lock is tested in test_db_guards AT-27): the
+    end raises a retryable ``run_in_progress`` and billing is unchanged (R41, R57)."""
+    from billing.test_secondments import secondment_contract
+
+    c, a = secondment_contract(w)
+    run(w, date(2027, 2, 1))
+
+    def busy(entity):
+        raise services.error(*services._msg("run_in_progress", entity=entity.code), code="run_in_progress",
+                             retryable=True)
+
+    monkeypatch.setattr(services, "_entity_lock_now", busy)
+    with pytest.raises(BillingError) as exc:
+        services.end_secondment(w.alm, a, date(2027, 1, 20), w.s, source="manual")
+    assert exc.value.code == "run_in_progress" and exc.value.retryable
+    a.refresh_from_db()
+    assert a.end_date is None and not BillingAdjustment.objects.filter(contract=c).exists()

@@ -189,7 +189,7 @@ def _entity_lock_now(entity):
     with connection.cursor() as cursor:
         cursor.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", [LOCK_CLASS, entity.pk])
         if not cursor.fetchone()[0]:
-            raise error(*_msg("run_in_progress", entity=entity.code), code="run_in_progress")
+            raise error(*_msg("run_in_progress", entity=entity.code), code="run_in_progress", retryable=True)
 
 
 def _lock_timeout(name, default):
@@ -222,7 +222,8 @@ def _run_lock(entity):
             cursor.execute("SELECT pg_advisory_lock(%s, %s)", [LOCK_CLASS, entity.pk])
     except OperationalError as exc:
         if _lock_not_available(exc):
-            raise error(*_msg("run_in_progress", entity=entity.code), code="run_in_progress") from None
+            raise error(*_msg("run_in_progress", entity=entity.code), code="run_in_progress",
+                        retryable=True) from None
         raise
 
 
@@ -1768,7 +1769,9 @@ def end_secondment(entity, assignment, end_date, user, source="manual"):
 
     ``source="hr_event"``: HR's delivery (the HR user who ended it, ``hr.end_assignment``). ``source="manual"``:
     accounting staff (``billing.record_contract_event``), refused once the assignment is linked to HR (R59).
-    Agents and system users are refused. The same end date again is a no-op; ``start_date − 1`` (HR cancellation)
+    ``hr_event`` is refused for an assignment not linked to HR (``not_linked``). Agents and system users are
+    refused. While a billing run holds the entity's lock the call raises ``run_in_progress`` with
+    ``retryable=True`` and changes nothing (R41, R57). The same end date again is a no-op; ``start_date − 1`` (HR cancellation)
     means nothing is billable. Planned periods after the end are cancelled, a later end puts them back, and
     already-billed days become draft credit (or debit) corrections. One transaction: a refusal changes nothing."""
     if source not in SecondmentAssignment.EndSource.values:
@@ -1779,6 +1782,11 @@ def end_secondment(entity, assignment, end_date, user, source="manual"):
     permission = "hr.end_assignment" if source == "hr_event" else "billing.record_contract_event"
     access.require(user, a.entity, permission)
     _refuse_non_human(user, a.entity, permission)
+    if source == "hr_event" and not a.hr_assignment_ref:  # R57, R58: HR ends only what is linked to it
+        access_services.log_denial(actor=user, entity=a.entity, permission=permission,
+                                   details={"reason": "not_linked_to_hr", "secondment": a.pk})
+        _fail("This secondment is not linked to an HR assignment; accounting staff record its end (D6, R57).",
+              "هذه الإعارة غير مرتبطة بإعارة في الموارد البشرية؛ يسجل المحاسب نهايتها.", "not_linked")
     if source == "manual" and a.hr_assignment_ref:
         en, ar = _msg("linked_manual_end")
         access_services.log_denial(actor=user, entity=a.entity, permission=permission,

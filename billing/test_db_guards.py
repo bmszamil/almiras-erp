@@ -218,6 +218,7 @@ def test_at27_version_approval_waits_for_a_running_billing_run(monkeypatch):
     with pytest.raises(BillingError) as exc:
         services.approve_version(v, user=w.c)
     assert exc.value.code == "run_in_progress" and "قيد التنفيذ" in str(exc.value)
+    assert exc.value.retryable  # HR's delivery retries it (billing.hr_port)
     assert ContractVersion.objects.get(pk=v.pk).status == "submitted"
     release.set()
     t.join(10)

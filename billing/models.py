@@ -20,15 +20,20 @@ CONTRACT_MONEY = dict(max_digits=21, decimal_places=3)
 
 
 class BillingError(ValidationError):
-    """A broken billing rule; the message carries English and Arabic ("English / العربية")."""
+    """A broken billing rule; the message carries English and Arabic ("English / العربية").
 
-    def __init__(self, message, code=None, params=None):
+    ``retryable`` is True when nothing is wrong with the request and the same call will succeed later (today only
+    ``run_in_progress``: a billing run holds the entity's lock). Callers that retry with an attempt limit (the HR
+    delivery job) should not count such a refusal as a failed attempt."""
+
+    def __init__(self, message, code=None, params=None, retryable=False):
         super().__init__(message, code=code, params=params)
         self.code = code
+        self.retryable = retryable
 
 
-def error(en, ar, code=None):
-    return BillingError(f"{en} / {ar}", code=code)
+def error(en, ar, code=None, retryable=False):
+    return BillingError(f"{en} / {ar}", code=code, retryable=retryable)
 
 
 SERVICE_ONLY = ("This billing record changes only through billing.services.",
