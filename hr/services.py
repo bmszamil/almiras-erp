@@ -837,7 +837,7 @@ def overtime_approver(employee, on, *, user):
 CONTRACT_FIELDS = frozenset({
     "effective_date", "contract_type", "start_date", "end_date", "calendar_basis", "calendar_basis_ref", "probation_periods", "job_title_en",
     "job_title_ar", "occupation_code", "weekly_hours", "daily_hours", "annual_leave_days", "notice_days_employer",
-    "notice_days_employee", "currency", "department", "grade", "qiwa_contract_ref", "suspension_agreement_ref",
+    "notice_days_employee", "currency", "department", "grade", "qiwa_contract_ref", "suspension_agreement_ref", "paid_monthly",
 })
 
 
@@ -1906,8 +1906,63 @@ def _month_accrual(emp, month_start, month_end, use, jurisdiction):
 # =====================================================================================================
 
 TS = Termination.Status
-TERMINATION_FIELDS = frozenset({"kind", "last_working_day", "reason_ar", "reason_en", "notice_given_on", "submitted_on",
-                                "postponed_until", "postponement_reason_ar", "written_consent_ref", "article_ref"})
+TERMINATION_FIELDS = frozenset({
+    "kind", "last_working_day", "reason_ar", "reason_en", "notice_given_on", "submitted_on", "postponed_until",
+    "postponement_reason_ar", "written_consent_ref", "article_ref", "article_paragraph", "hearing_ref",
+    "absence_warning_ref", "marriage_contract_date", "delivery_date", "art77_compensation", "compensation_ref",
+    "agreed_fraction",
+})
+# R64 (Art. 88): kinds where the worker ends the contract (14-day settlement deadline, payroll R34).
+WORKER_INITIATED = frozenset({TKind.RESIGNATION, TKind.EMPLOYEE_NOTICE_ART75, TKind.ART81_EMPLOYEE_LEAVES,
+                              TKind.FEMALE_MARRIAGE_CHILDBIRTH})
+# R59, R60: employer-initiated terminations that get the Art. 82 / Art. 155 protection warnings.
+EMPLOYER_INITIATED = frozenset({TKind.EMPLOYER_TERMINATION, TKind.ART80_DISMISSAL})
+# R60: leave that records a pregnancy or maternity (iddah extension = declared pregnancy, Art. 160).
+MATERNITY_FAMILY = ("MATERNITY", "MATERNITY_UNPAID", "MATERNITY_CHILD", "MATERNITY_CHILD_UNPAID", "IDDAH_EXTENSION")
+ART82 = ("Art. 82", "The employee has sick leave in the current sick-leave year that is not used up: no dismissal for "
+         "illness before the sick-leave periods are used up (Art. 82). The approver must acknowledge this warning.",
+         "لدى الموظف إجازة مرضية في سنة الإجازة المرضية الحالية لم تُستنفد: لا يجوز الفصل بسبب المرض قبل استنفاد مدد "
+         "الإجازة المرضية (المادة 82). يجب أن يقر المعتمد بهذا التنبيه.")
+ART155 = ("Art. 155", "The employee is pregnant, on maternity leave or ill from pregnancy or delivery: no dismissal or "
+          "notice during that time (Art. 155). The approver must acknowledge this warning.",
+          "الموظفة حامل أو في إجازة وضع أو مريضة بسبب الحمل أو الوضع: لا يجوز فصلها أو إشعارها بالفصل خلال ذلك "
+          "(المادة 155). يجب أن يقر المعتمد بهذا التنبيه.")
+OQ33 = ("OQ-33: the Art. 85 resignation bands are applied to a worker's Art. 75 notice pending legal sign-off.",
+        "المسألة 33: طُبقت شرائح الاستقالة في المادة 85 على إشعار العامل وفق المادة 75 إلى حين الرأي القانوني.")
+
+
+def _actual_wage(contract):
+    """Monthly actual wage of a version for HR checks: the components counting for EOSB (Art. 2, 84; 3.3)."""
+    return sum((c.monthly_amount for c in contract.components.select_related("component") if c.component.counts_for_eosb),
+               ZERO)
+
+
+def _protection_warnings(term, use, jurisdiction):
+    """R59 (Art. 82) and R60 (Art. 155) for an employer-initiated termination: [(article, en, ar)]."""
+    if term.kind not in EMPLOYER_INITIATED:
+        return []
+    emp, lwd = term.employee, term.last_working_day
+    start = min(_today(), term.notice_given_on or _today(), lwd)
+    found = []
+    sick = use.get(jurisdiction, "leave.sick", start)
+    total = sum(int(t["days"]) for t in sick["tiers"])
+    days = list(SickLeaveDay.objects.filter(employee=emp, leave_request__status__in=(LR.APPROVED, LR.TAKEN),
+                                            date__lte=lwd).order_by("date").values_list("cycle_start", flat=True))
+    if days:
+        cycle = days[-1]
+        if _sick_window_end(cycle, term.contract.calendar_basis) >= start and days.count(cycle) < total:
+            found.append(ART82)
+    limit = int(use.get(jurisdiction, "termination.protection", start)["pregnancy_illness_days"])
+    maternity = LeaveRequest.objects.filter(employee=emp, status__in=LIVE, leave_type__code__in=MATERNITY_FAMILY,
+                                            end_date__gte=start).exists()
+    illness = [r for r in LeaveRequest.objects.filter(employee=emp, status__in=(LR.APPROVED, LR.TAKEN),
+                                                      leave_type__code="SICK").order_by("start_date")
+               if (r.declarations or {}).get("pregnancy_related")]
+    ill_days = sorted({d for r in illness for d in _days(r.start_date, r.end_date)})
+    protected = set(ill_days[:limit])  # the related illness is protected up to the parameter's days
+    if maternity or any(start <= d <= lwd for d in protected):
+        found.append(ART155)
+    return found
 
 
 def _resignation_dates(term, use, jurisdiction, accepted_on=None):
@@ -1931,6 +1986,8 @@ def _resignation_dates(term, use, jurisdiction, accepted_on=None):
 def _termination_problems(term, use):
     emp, problems, warnings = term.employee, [], []
     basis = emp.employment_basis
+    term.worker_initiated = term.kind in WORKER_INITIATED
+    term.protection_articles = []
     if not term.reason_ar:
         problems.append("The reason in Arabic is required (R36). / السبب بالعربية مطلوب.")
     if basis == Basis.REMUNERATION:
@@ -1943,6 +2000,7 @@ def _termination_problems(term, use):
         return problems + [f"Unknown termination kind {term.kind!r}. / نوع إنهاء غير معروف."], warnings
     jurisdiction = _jurisdiction(emp, "termination", "إنهاء الخدمة")
     contract = term.contract
+    lwd = term.last_working_day
     fixed = contract.contract_type == EmploymentContract.ContractType.FIXED
     if term.kind == TKind.RESIGNATION and not fixed:
         problems.append("A resignation ends a fixed-term contract; an open-ended contract is ended by the employee "
@@ -1951,39 +2009,89 @@ def _termination_problems(term, use):
     if term.kind == TKind.EMPLOYEE_NOTICE_ART75 and fixed:
         problems.append("Art. 75 notice ends an open-ended contract; use a resignation (Art. 79 bis). / "
                         "الإشعار وفق المادة 75 لإنهاء العقد غير محدد المدة؛ استخدم الاستقالة.")
+    if term.kind == TKind.EMPLOYEE_NOTICE_ART75:
+        warnings.append(f"{OQ33[0]} / {OQ33[1]}")
     if term.kind == TKind.MUTUAL_AGREEMENT and not term.written_consent_ref:
         problems.append("Mutual agreement needs a reference to the employee's written consent (Art. 74(1)). / "
                         "يلزم لاتفاق الطرفين مرجع الموافقة الكتابية للموظف.")
+    if term.agreed_fraction is not None and (term.kind != TKind.MUTUAL_AGREEMENT or term.agreed_fraction != 1):
+        problems.append("The end-of-service fraction is the full award: a lower agreed fraction waits for legal sign-off "
+                        "(Art. 8, OQ-34); a higher amount is entered as a final-settlement earning. / نسبة المكافأة هي "
+                        "المكافأة الكاملة: النسبة الأقل تنتظر الرأي القانوني (المادة 8)، والمبلغ الأعلى يُدخل استحقاقًا في "
+                        "المخالصة النهائية.")
     if term.kind == TKind.RESIGNATION:
         if term.submitted_on is None:
             problems.append("A resignation needs the date it was submitted (Art. 79 bis). / يلزم تاريخ تقديم الاستقالة.")
-    if term.last_working_day and term.last_working_day < contract.start_date:
+    if lwd and lwd < contract.start_date:
         problems.append("The last working day is on or after the contract start (R36). / آخر يوم عمل في تاريخ بداية العقد أو بعده.")
     if term.kind == TKind.PROBATION_TERMINATION:
         end = _probation_end(use, contract, jurisdiction)
-        if end is None or term.last_working_day > end:
+        if end is None or lwd > end:
             problems.append("The probation period has ended or there is none (Art. 54). / انتهت فترة التجربة أو لا توجد.")
-    # Notice (R37): open-ended contracts only; a shortfall is a warning and a payroll input.
+    # R37: Art. 80 cases and the worker's hearing; Art. 81 cases.
+    if term.kind in (TKind.ART80_DISMISSAL, TKind.ART81_EMPLOYEE_LEAVES):
+        paragraphs = use.get(jurisdiction, "termination.article_paragraphs", lwd)
+        article = "80" if term.kind == TKind.ART80_DISMISSAL else "81"
+        allowed = paragraphs[f"art{article}"]
+        if (term.article_paragraph or "").strip() not in allowed:
+            problems.append(f"Name the paragraph of Art. {article} that applies ({', '.join(allowed)}) (R37). / حدد فقرة "
+                            f"المادة {article} المنطبقة ({'، '.join(allowed)}).")
+        if term.kind == TKind.ART80_DISMISSAL:
+            if not (term.hearing_ref or "").strip():
+                problems.append("Art. 80 needs the record that the worker was given the chance to object (hearing "
+                                "reference) (R37). / تتطلب المادة 80 محضرًا يثبت إتاحة الفرصة للعامل لإبداء أسباب "
+                                "معارضته.")
+            if term.article_paragraph == paragraphs["art80_absence_paragraph"] and not (term.absence_warning_ref or "").strip():
+                problems.append(f"Art. 80({term.article_paragraph}) absence needs the written warning reference (R37). / "
+                                f"يتطلب الغياب وفق الفقرة ({term.article_paragraph}) من المادة 80 مرجع الإنذار الكتابي.")
+    # R37: Art. 87 windows from the marriage contract or the delivery.
+    if term.kind == TKind.FEMALE_MARRIAGE_CHILDBIRTH:
+        windows = use.get(jurisdiction, "termination.art87_windows", lwd)
+        ended = term.notice_given_on or term.submitted_on or lwd
+        inside = []
+        for day, months in ((term.marriage_contract_date, windows["marriage_months"]),
+                            (term.delivery_date, windows["delivery_months"])):
+            if day is not None:
+                inside.append(day <= ended <= _add_months(day, int(months)))
+        if emp.gender != Employee.Gender.FEMALE:
+            problems.append("This kind is for a female worker (Art. 87). / هذا النوع للعاملة (المادة 87).")
+        if not inside:
+            problems.append("Enter the marriage contract date or the delivery date (Art. 87). / أدخل تاريخ عقد الزواج "
+                            "أو تاريخ الوضع.")
+        elif not any(inside):
+            problems.append(f"The contract is ended outside {windows['marriage_months']} months of the marriage contract "
+                            f"or {windows['delivery_months']} months of the delivery (Art. 87). / أُنهي العقد خارج "
+                            f"{windows['marriage_months']} أشهر من عقد الزواج أو {windows['delivery_months']} أشهر من الوضع.")
+    # R37 (d): the manual Art. 77 amount.
+    if term.art77_compensation is not None:
+        if term.kind != TKind.EMPLOYER_TERMINATION:
+            problems.append("Art. 77 compensation is entered for an employer termination. / يُدخل التعويض وفق المادة 77 "
+                            "لإنهاء صاحب العمل.")
+        elif term.art77_compensation < 0:
+            problems.append("The Art. 77 compensation is not negative. / لا يكون التعويض سالبًا.")
+        else:
+            months = _frac(use.get(jurisdiction, "compensation.art77_min_months", lwd)["months"])
+            minimum = _frac_round(months * Fraction(_actual_wage(contract)))
+            if term.art77_compensation < minimum and not (term.compensation_ref or "").strip():
+                problems.append(f"Art. 77 compensation is never less than {months} months' wage ({minimum}) unless a "
+                                "court judgment or contract clause is referenced (R37). / لا يقل التعويض وفق المادة 77 عن "
+                                f"أجر {months} أشهر ({minimum}) ما لم يُذكر حكم محكمة أو بند في العقد.")
+    # Notice (R37): open-ended contracts only; 30 days either side when not paid monthly; a shortfall is a warning
+    # and a payroll input.
     if not fixed and term.kind in (TKind.EMPLOYER_TERMINATION, TKind.EMPLOYEE_NOTICE_ART75):
-        notice = use.get(jurisdiction, "notice.min_days", term.last_working_day)
-        required = int(notice["employer" if term.kind == TKind.EMPLOYER_TERMINATION else "employee"])
-        given = (term.last_working_day - term.notice_given_on).days if term.notice_given_on else 0
+        notice = use.get(jurisdiction, "notice.min_days", lwd)
+        side = "employer" if term.kind == TKind.EMPLOYER_TERMINATION else "employee"
+        required = int(notice[side] if contract.paid_monthly else notice["not_monthly"])
+        given = (lwd - term.notice_given_on).days if term.notice_given_on else 0
         term.notice_shortfall_days = max(0, required - given)
         if term.notice_shortfall_days:
             warnings.append(f"Notice is {term.notice_shortfall_days} day(s) short of {required} days: notice pay is a "
                             f"payroll input (Art. 75, 76). / مدة الإشعار تنقص {term.notice_shortfall_days} يومًا عن "
                             f"{required} يومًا: بدل الإشعار من مدخلات الرواتب.")
-    if term.kind in (TKind.EMPLOYER_TERMINATION, TKind.ART80_DISMISSAL):
-        lwd = term.last_working_day
-        if LeaveRequest.objects.filter(employee=emp, leave_type__code="SICK", status__in=(LR.APPROVED, LR.TAKEN),
-                                       start_date__lte=lwd, end_date__gte=lwd - timedelta(days=1)).exists():
-            warnings.append("The employee is on sick leave: no dismissal for illness before the sick-leave periods are "
-                            "used up (Art. 82). / الموظف في إجازة مرضية: لا يجوز الفصل بسبب المرض قبل استنفاد مدد الإجازة "
-                            "المرضية.")
-        if LeaveRequest.objects.filter(employee=emp, leave_type__code__startswith="MATERNITY",
-                                       status__in=(LR.APPROVED, LR.TAKEN), start_date__lte=lwd, end_date__gte=lwd).exists():
-            warnings.append("The employee is on maternity leave: no dismissal or notice during it (Art. 155). / "
-                            "الموظفة في إجازة وضع: لا يجوز فصلها أو إشعارها خلالها.")
+    # R59, R60.
+    for article, en, ar in _protection_warnings(term, use, jurisdiction):
+        term.protection_articles.append(article)
+        warnings.append(f"{en} / {ar}")
     return problems, warnings
 
 
@@ -2001,6 +2109,9 @@ def record_termination(employee, *, user, **fields):
     if Termination.objects.filter(employee=emp, status__in=(TS.DRAFT, TS.SUBMITTED, TS.APPROVED)).exists():
         raise error("This employee already has an open or approved termination.", "لهذا الموظف إنهاء خدمة قائم أو معتمد.",
                     code="termination_exists")
+    for name in ("art77_compensation", "agreed_fraction"):
+        if fields.get(name) is not None:
+            fields[name] = _decimal(fields[name], name)
     use = ParamUse()
     term = Termination(entity=emp.entity, employee=emp, created_by=user, source=_source(user), **fields)
     if term.kind == TKind.RESIGNATION:
@@ -2055,6 +2166,7 @@ class EosbResult:
     currency: str
     contract_version: int
     parameter_ids: tuple
+    legal_flags: tuple = ()
 
 
 def _band_fraction(bands, years):
@@ -2108,6 +2220,7 @@ def _compute_eosb(employee, as_of, kind, use, additional_wage=ZERO):
         wage_basis=_round(wage), wage_components={k: str(v) for k, v in components.items()},
         full_award=_frac_round(full), fraction=fraction, award=_frac_round(full * fraction),
         currency=terms.currency_id, contract_version=terms.version_no, parameter_ids=tuple(use.ids),
+        legal_flags=(f"{OQ33[0]} / {OQ33[1]}",) if kind == TKind.EMPLOYEE_NOTICE_ART75 else (),
     )
 
 
@@ -2130,39 +2243,51 @@ def _snapshot(result, termination, user, supersedes=None):
         service_years=years, wage_basis=result.wage_basis, wage_components=result.wage_components,
         full_award=result.full_award, fraction=approx, fraction_text=str(result.fraction), award=result.award,
         currency_id=result.currency, parameter_ids=list(result.parameter_ids), contract_version=result.contract_version,
-        computed_by=user, supersedes=supersedes)
+        legal_flags=list(result.legal_flags), computed_by=user, supersedes=supersedes)
 
 
 def _settlement_input(term, eosb, user, use):
-    """R35, payroll R34: annual balance at the last working day, daily wage of EOSB components / 30, notice
-    shortfall. Remuneration: no EOSB, leave or GOSI lines (R52)."""
+    """R35, R64, payroll R34: annual balance at the last working day, daily wage of EOSB components / 30, notice
+    shortfall, the Art. 77 amount, who ended the contract and the Art. 88 deadline (7 days, 14 when the worker ended
+    it), and the loan balances payroll recovers from the final dues without the monthly caps (H18). Remuneration:
+    no EOSB, leave or GOSI lines, no Labour Law deadline and outside WPS (R52, H17)."""
     emp = term.employee
     terms = term.contract
     statutory = emp.employment_basis != Basis.REMUNERATION
-    balance, daily, encash = ZERO, ZERO, ZERO
+    balance, daily, encash, due_by = ZERO, ZERO, ZERO, None
     if statutory:
         jurisdiction = _jurisdiction(emp)
         lt = LeaveType.objects.filter(entity=emp.entity, code="ANNUAL").first()
         balance = _balance(emp, lt, term.last_working_day) if lt else ZERO
         divisor = int(use.get(jurisdiction, "leave.encashment", term.last_working_day)["day_divisor"])
-        wage = sum((c.monthly_amount for c in terms.components.select_related("component") if c.component.counts_for_eosb), ZERO)
+        wage = _actual_wage(terms)
         daily = _round(Decimal(wage) / divisor)
         encash = _frac_round(Fraction(max(balance, ZERO)) * Fraction(wage) / divisor)
+        due = use.get(jurisdiction, "final_settlement.due_days", term.last_working_day)
+        due_by = term.last_working_day + timedelta(days=int(due["worker" if term.worker_initiated else "employer"]))
+    loans = payroll_port.get_port().outstanding_balances(emp, term.last_working_day)
     si = FinalSettlementInput.objects.create(
         entity=term.entity, employee=emp, termination=term, eosb_calculation=eosb, last_working_day=term.last_working_day,
         currency_id=terms.currency_id, eosb_award=eosb.award if eosb else ZERO, leave_balance_days=max(balance, ZERO),
         daily_wage=daily, leave_encashment=encash, notice_shortfall_days=term.notice_shortfall_days,
-        includes_statutory_lines=statutory, created_by=user)
+        includes_statutory_lines=statutory, worker_initiated=term.worker_initiated, due_by=due_by,
+        art77_compensation=term.art77_compensation or ZERO, outstanding_loans=_decimal(loans.loans, "loans"),
+        outstanding_bai_ajel=_decimal(loans.bai_ajel, "bai_ajel"), bai_ajel_undertaking=bool(loans.bai_ajel_undertaking),
+        wps_included=emp.wps_included, created_by=user)
     payroll_port.get_port().create_draft(si, user)
     return si
 
 
 @transaction.atomic
-def approve_termination(termination, *, user):
+def approve_termination(termination, *, user, acknowledge_protection=False):
     """R38: approval in one transaction: termination approved; employee terminated (or on notice until the last
     working day); contract ended; active assignments ended at the last working day (events, R27); leave after it
     cancelled and returned (R35); an EOSB snapshot (not for remuneration staff, R52); settlement inputs handed to
-    payroll. Any failure rolls everything back."""
+    payroll. Any failure rolls everything back.
+
+    R59, R60: when the Art. 82 or Art. 155 warning applies, the approver must pass ``acknowledge_protection=True``;
+    the acknowledgement (who, when, which articles) is stored on the termination. Without it the approval is
+    refused (OQ-23 default: warn and acknowledge, not refuse outright)."""
     t = _lock(Termination, termination.pk)
     access.require(user, t.entity, "hr.approve_termination", document=t)
     emp = _lock(Employee, t.employee_id)
@@ -2171,8 +2296,10 @@ def approve_termination(termination, *, user):
         raise error("Only submitted terminations are approved.", "يُعتمد إنهاء الخدمة المقدم فقط.", code="not_submitted")
     use = ParamUse()
     if t.kind == TKind.RESIGNATION and emp.employment_basis == Basis.KSA_EMPLOYEE:
-        t.accepted_on = min(_today(), t.submitted_on + timedelta(
-            days=int(use.get("SA", "termination.resignation", t.submitted_on)["deemed_acceptance_days"])))
+        deemed = t.submitted_on + timedelta(
+            days=int(use.get("SA", "termination.resignation", t.submitted_on)["deemed_acceptance_days"]))
+        t.accepted_on = min(_today(), deemed)
+        t.deemed_accepted = t.postponed_until is None and t.accepted_on == deemed
         t.last_working_day, problems = _resignation_dates(t, use, "SA", accepted_on=t.accepted_on)
         if problems:
             raise _problems(problems, "termination_invalid")
@@ -2180,6 +2307,14 @@ def approve_termination(termination, *, user):
     problems, warnings = _termination_problems(t, use)
     if problems:
         raise _problems(problems, "termination_invalid")
+    if t.protection_articles:
+        if not acknowledge_protection:
+            names = ", ".join(t.protection_articles)
+            raise error(f"Approval needs your acknowledgement of the protection warnings ({names}): no dismissal for "
+                        "illness before sick leave is used up (Art. 82); none during pregnancy or maternity (Art. 155).",
+                        f"يتطلب الاعتماد إقرارك بتنبيهات الحماية ({names}): لا فصل بسبب المرض قبل استنفاد الإجازة "
+                        "المرضية (المادة 82)، ولا فصل أثناء الحمل أو الوضع (المادة 155).", code="protection_ack_required")
+        t.protection_acknowledged_by, t.protection_acknowledged_at = user, timezone.now()
     eosb_result = None
     if emp.employment_basis != Basis.REMUNERATION:
         eosb_result = _compute_eosb(emp, t.last_working_day, t.kind, use)
@@ -2239,6 +2374,8 @@ def withdraw_termination(termination, *, user, reason_ar):
                             "agreement (Art. 79 bis).", f"تُسحب الاستقالة خلال {days} أيام من تقديمها؛ وبعدها تلزم "
                             "موافقة جديدة من الطرفين.", code="withdrawal_late")
         t.status, t.withdrawn_by, t.withdrawn_at = TS.WITHDRAWN, user, timezone.now()
+        if t.kind == TKind.RESIGNATION:
+            t.withdrawn_on = _today()  # Art. 79 bis statutory withdrawal
         return _save(t), []
     access.require(user, t.entity, "hr.approve_termination", document=t)
     if t.status != TS.APPROVED:

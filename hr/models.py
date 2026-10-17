@@ -362,6 +362,12 @@ class Employee(Tracked):
     def is_saudi(self):
         return self.nationality == "SA"
 
+    @property
+    def wps_included(self):
+        """Payroll R31, R51: only KSA employees are in the Saudi WPS salary file. Remuneration staff work outside
+        KSA and are outside WPS (H17); local entity employees are paid by their local payroll (H9)."""
+        return self.employment_basis == EmploymentBasis.KSA_EMPLOYEE
+
     def save(self, *args, **kwargs):
         allowed, self._service_write = getattr(self, "_service_write", False), False
         if not allowed:
@@ -462,6 +468,8 @@ class EmploymentContract(Tracked, ServiceGuarded):
     annual_leave_days = models.PositiveSmallIntegerField(bi("Annual leave days", "أيام الإجازة السنوية"))
     notice_days_employer = models.PositiveSmallIntegerField(bi("Notice days (employer)", "مدة الإشعار (صاحب العمل)"))
     notice_days_employee = models.PositiveSmallIntegerField(bi("Notice days (employee)", "مدة الإشعار (الموظف)"))
+    # R37 (Art. 75): monthly-paid workers' notice is 60 (employer) / 30 (worker); otherwise 30 either side.
+    paid_monthly = models.BooleanField(bi("Paid monthly", "يتقاضى أجره شهريًا"), default=True)
     currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Currency", "العملة"))
     department = models.ForeignKey(Department, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
@@ -954,6 +962,33 @@ class Termination(Tracked, ServiceGuarded):
     postponement_reason_ar = models.TextField(bi("Postponement reason (Arabic)", "سبب التأجيل (بالعربية)"), blank=True)
     written_consent_ref = models.CharField(bi("Written consent reference", "مرجع الموافقة الكتابية"), max_length=100,
                                            blank=True)
+    deemed_accepted = models.BooleanField(bi("Deemed accepted (no reply in 30 days)", "مقبولة حكمًا (دون رد خلال 30 يومًا)"),
+                                          default=False)
+    withdrawn_on = models.DateField(bi("Resignation withdrawn on", "تاريخ سحب الاستقالة"), null=True, blank=True)
+    # R37 (Art. 80, 81, 87, 77) [compliance 2026-10-17].
+    article_paragraph = models.CharField(bi("Article paragraph", "فقرة المادة"), max_length=10, blank=True)
+    hearing_ref = models.CharField(bi("Hearing record (worker could object)", "محضر سماع أقوال العامل"), max_length=200,
+                                   blank=True)
+    absence_warning_ref = models.CharField(bi("Written absence warning reference", "مرجع الإنذار الكتابي بالغياب"),
+                                           max_length=200, blank=True)
+    marriage_contract_date = models.DateField(bi("Marriage contract date", "تاريخ عقد الزواج"), null=True, blank=True)
+    delivery_date = models.DateField(bi("Delivery date", "تاريخ الوضع"), null=True, blank=True)
+    art77_compensation = models.DecimalField(bi("Art. 77 compensation (manual)", "التعويض وفق المادة 77 (يدوي)"),
+                                             max_digits=18, decimal_places=2, null=True, blank=True)
+    compensation_ref = models.CharField(bi("Court judgment or contract clause for the compensation",
+                                           "حكم المحكمة أو بند العقد للتعويض"), max_length=200, blank=True)
+    agreed_fraction = models.DecimalField(bi("Agreed end-of-service fraction", "نسبة المكافأة المتفق عليها"),
+                                          max_digits=5, decimal_places=4, null=True, blank=True)
+    # R64 (Art. 88): the worker ended the contract: final settlement within 14 days instead of 7 (payroll R34).
+    worker_initiated = models.BooleanField(bi("Ended by the worker", "أنهاه العامل"), default=False)
+    # R59, R60 (Art. 82, 155): the approver's stored acknowledgement of the protection warnings.
+    protection_articles = models.JSONField(bi("Protection warnings (articles)", "تنبيهات الحماية (المواد)"),
+                                           default=list, blank=True)
+    protection_acknowledged_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
+                                                   on_delete=models.PROTECT, related_name="+",
+                                                   verbose_name=bi("Warnings acknowledged by", "أقر بالتنبيهات"))
+    protection_acknowledged_at = models.DateTimeField(bi("Warnings acknowledged at", "تاريخ الإقرار بالتنبيهات"),
+                                                      null=True, blank=True)
     last_working_day = models.DateField(bi("Last working day", "آخر يوم عمل"))
     reason_en = models.TextField(bi("Reason (English)", "السبب (بالإنجليزية)"), blank=True)
     reason_ar = models.TextField(bi("Reason (Arabic)", "السبب (بالعربية)"))
@@ -1001,6 +1036,8 @@ class EosbCalculation(models.Model):
     fraction = models.DecimalField(bi("Fraction", "النسبة"), max_digits=5, decimal_places=4)
     fraction_text = models.CharField(bi("Fraction (exact)", "النسبة (بدقة)"), max_length=20)
     award = models.DecimalField(bi("Award", "المكافأة"), max_digits=18, decimal_places=2)
+    # Open legal points the figure depends on, e.g. OQ-33 for an Art. 75 worker notice (en/ar).
+    legal_flags = models.JSONField(bi("Legal sign-off flags", "مسائل تنتظر الرأي القانوني"), default=list, blank=True)
     currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Currency", "العملة"))
     parameter_ids = models.JSONField(bi("Parameters used", "المعايير المستخدمة"))
@@ -1056,6 +1093,21 @@ class FinalSettlementInput(models.Model):
                                                              default=0)
     includes_statutory_lines = models.BooleanField(bi("End-of-service, leave and GOSI lines", "بنود المكافأة والإجازة والتأمينات"),
                                                    default=True)
+    # R64 / Art. 88: who ended the contract and the statutory payment deadline (none for remuneration staff, H17).
+    worker_initiated = models.BooleanField(bi("Ended by the worker", "أنهاه العامل"), default=False)
+    due_by = models.DateField(bi("Settlement due by (Art. 88)", "موعد سداد المخالصة (المادة 88)"), null=True, blank=True)
+    art77_compensation = models.DecimalField(bi("Art. 77 compensation", "التعويض وفق المادة 77"), max_digits=18,
+                                             decimal_places=2, default=ZERO)
+    # H18: employee loans are recovered from the final dues (EOSB included) without the monthly 10% / 50% caps
+    # (Art. 92(1), 93 apply to monthly pay only). Bai' ajel balances only with the employee's signed undertaking
+    # in the bai' ajel contract (Sharia sign-off stays required, payroll OQ-33). Figures come from payroll.
+    outstanding_loans = models.DecimalField(bi("Outstanding employee loans", "رصيد قروض الموظف"), max_digits=18,
+                                            decimal_places=2, default=ZERO)
+    outstanding_bai_ajel = models.DecimalField(bi("Outstanding bai' ajel balance", "رصيد البيع الآجل"), max_digits=18,
+                                               decimal_places=2, default=ZERO)
+    bai_ajel_undertaking = models.BooleanField(bi("Bai' ajel undertaking signed", "تعهد البيع الآجل موقّع"), default=False)
+    # H17: remuneration staff are outside WPS (payroll R51); local entity staff use local payroll.
+    wps_included = models.BooleanField(bi("In the WPS salary file", "ضمن ملف حماية الأجور"), default=True)
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
                                    verbose_name=bi("Created by", "أنشأه"))

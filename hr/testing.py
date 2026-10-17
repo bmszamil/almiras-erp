@@ -33,6 +33,7 @@ class FakePayrollPort:
         self.drafts = []
         self.approved = set()
         self.discarded = []
+        self.balances = {}  # employee pk -> LoanBalances
 
     def create_draft(self, settlement_input, user):
         self.drafts.append(settlement_input.pk)
@@ -42,6 +43,9 @@ class FakePayrollPort:
 
     def discard_draft(self, termination, user):
         self.discarded.append(termination.pk)
+
+    def outstanding_balances(self, employee, as_of):
+        return self.balances.get(employee.pk, payroll_port.LoanBalances())
 
 
 @contextmanager
