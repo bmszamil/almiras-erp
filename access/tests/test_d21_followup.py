@@ -51,6 +51,7 @@ def cfo(make_user, alm):
 def chairman(make_user, alm):
     u = make_user("chairman", (alm, "chairman"))
     u.set_password(PW)
+    u.password_set_by_others = False  # he chose it himself (as after the enrolment flow)
     u.is_staff = True
     u.save()
     TOTPDevice.objects.create(user=u, name="old phone", confirmed=True)

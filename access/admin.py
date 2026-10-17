@@ -24,6 +24,21 @@ try:
 except ImportError:  # pragma: no cover
     pass
 
+def _wrap_own_password_change(site):
+    """/admin/password_change/ is always the signed-in user's own password: clear password_set_by_others."""
+    original = site.password_change
+
+    def password_change(request, extra_context=None):
+        response = original(request, extra_context)
+        if request.method == "POST" and getattr(response, "status_code", 200) == 302:
+            access.password_changed_by_self(User.objects.get(pk=request.user.pk), ctx=admin_ctx(request))
+        return response
+
+    site.password_change = password_change
+
+
+_wrap_own_password_change(admin.site)
+
 PRIVILEGE_FIELDS = {"user_type", "is_superuser", "is_staff", "is_active", "agent_name"}
 IDENTITY_FIELDS = {"username", "keycloak_id"}
 

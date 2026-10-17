@@ -89,8 +89,9 @@ class User(AbstractUser):
         default=False, help_text="Set by a dual-controlled 2FA reset (D21): the user enrols a new device himself "
                                  "at next sign-in (password + one-time enrolment).")
     password_set_by_others = models.BooleanField(
-        default=False, help_text="The current password was set by others (D21 dual control). Cleared when the "
-                                 "user changes it himself. While set, no 2FA reset or self-enrolment is allowed.")
+        default=True, help_text="The current password was set by someone other than the user (account creation, "
+                                "admin, commands, D21 dual control). Cleared only when the user changes it himself. "
+                                "While set, no 2FA reset or self-enrolment is allowed.")
 
     REQUIRED_FIELDS = ["email", "full_name_en", "full_name_ar"]
 
@@ -123,6 +124,23 @@ class User(AbstractUser):
         if self.user_type == self.UserType.SERVICE_INTEGRATION:
             return "import"
         return "human"
+
+    def set_password(self, raw_password):
+        """Every password set through here counts as set by others (D21); the self-service paths clear the
+        flag afterwards (access.services.password_changed_by_self)."""
+        super().set_password(raw_password)
+        self.password_set_by_others = True
+
+    def check_password(self, raw_password):
+        from django.contrib.auth.base_user import AbstractBaseUser
+        from django.contrib.auth.hashers import check_password
+
+        def setter(raw):
+            AbstractBaseUser.set_password(self, raw)  # hash upgrade only: not a new password
+            self._password = None
+            self.save(update_fields=["password"])
+
+        return check_password(raw_password, self.password, setter)
 
     def get_full_name(self):
         return self.full_name_ar if self.language == self.Language.AR else self.full_name_en

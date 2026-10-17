@@ -109,14 +109,14 @@ def test_granting_chairman_to_an_accomplice_is_refused(request, alm, mp, accompl
     assert not AuditLog.objects.filter(action="access.grant", actor=actor).exists()
 
 
-def test_only_chairman_of_that_entity_grants_or_revokes_chairman(alm, sub, mp, chairman, accomplice, make_user,
-                                                                  user_manager):
+def test_no_single_person_grants_or_revokes_chairman(alm, sub, mp, chairman, accomplice, make_user, user_manager):
+    """Superseded the 'Chairman of that entity grants Chairman' rule: D21 review puts it under CFO + MP dual control."""
     chair_sub = make_user("chairsub", (sub, "chairman"))
-    with pytest.raises(AccessDenied):
-        access.grant_access(chair_sub, accomplice, alm, "chairman")  # Chairman elsewhere is not enough
-    grant = access.grant_access(chairman, accomplice, alm, "chairman")
-    assert grant.granted_by == chairman and access.has_role(accomplice, alm, "chairman")
-    # The accomplice is now a Chairman: his roles change only through D21 dual control, not by anyone alone.
+    for actor in (chair_sub, chairman, mp, user_manager):
+        with pytest.raises(AccessDenied) as e:
+            access.grant_access(actor, accomplice, alm, "chairman")
+        assert e.value.code == "chairman_role_protected"
+    grant = access.grant_access(None, accomplice, alm, "chairman")  # operator bootstrap still works
     for actor in (mp, user_manager, chair_sub, chairman):
         with pytest.raises(AccessDenied):
             access.revoke_access(actor, grant)

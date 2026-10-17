@@ -265,6 +265,7 @@ def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ct
         user=user, entity=entity, role=role,
         defaults={"valid_from": valid_from or timezone.localdate(), "valid_to": valid_to, "granted_by": granter},
     )
+    newly_held = created or grant.revoked_at is not None
     before = None
     if not created:
         before = snapshot(grant)
@@ -275,7 +276,31 @@ def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ct
         grant.save()
     audit(granter or system_user(), "access.grant", grant, entity=entity, before=before,
           after=_with_change(snapshot(grant), _approved_change), ctx=ctx)
+    if newly_held and role.code in PROTECTED_ROLE_CODES:
+        _reset_credentials_for_protected_role(granter or system_user(), user, role, ctx)
     return grant
+
+
+PROTECTED_ROLE_CODES = ("managing_partner", "chairman")
+
+
+def _reset_credentials_for_protected_role(actor, user, role, ctx):
+    """D21 review: whoever set this user's password or enrolled his device before he became MP or Chairman
+    (e.g. a user manager) must not keep either factor. Delete his devices and make his password unusable;
+    then someone allowed to manage him now (Chairman for an MP, CFO + MP dual control for a Chairman, or
+    the operator / setup mode) sets an initial password, and he sets his own password and enrols a new
+    device himself (/access/enrol-2fa/) before he can sign in. Applies on every path, including setup
+    mode and the operator bootstrap."""
+    from django_otp.plugins.otp_totp.models import TOTPDevice
+
+    removed = list(TOTPDevice.objects.filter(user=user).values_list("pk", flat=True))
+    TOTPDevice.objects.filter(pk__in=removed).delete()
+    user.set_unusable_password()
+    user.totp_enrolment_required = True
+    user.password_set_by_others = True
+    user.save(update_fields=["password", "totp_enrolment_required", "password_set_by_others"])
+    audit(actor, "access.totp.reset", user, after={"reason": f"role_granted:{role.code}", "removed_devices": removed,
+          "password_unusable": True, "totp_enrolment_required": True, "password_set_by_others": True}, ctx=ctx)
 
 
 @transaction.atomic
@@ -328,8 +353,9 @@ def _require_grant_rights(actor, user, entity, role, setup):
     """Who may grant or revoke `role` for `user` in `entity` (an acting user; operator commands pass none).
 
     - Nobody grants or revokes their own roles, in any mode (closes self-promotion to Chairman).
-    - D19: only a holder of the Chairman role in that entity grants or revokes the Chairman role, so
-      nobody can create a Chairman to get around the Managing Partner protection. Setup mode excepted.
+    - D21 review: the Chairman role is granted or revoked only through CFO + MP dual control, so no
+      single person can create a Chairman. Setup mode (with entity_access.manage) and operator
+      commands excepted.
     - D19: roles of a Managing Partner change only through a Chairman of all of their MP entities.
     - D21: roles of a Chairman change only through a dual-control change (CFO + MP of the group root),
       so here they are refused for everyone except setup mode (can_manage_user).
@@ -339,15 +365,16 @@ def _require_grant_rights(actor, user, entity, role, setup):
         raise AccessDenied("self_grant", "You cannot grant or revoke your own roles.",
                            "لا يمكنك منح أدوارك أو سحبها بنفسك.")
     if role.code == CHAIRMAN_ROLE_CODE and not setup:
-        if not (actor.is_active and actor.is_human and has_role(actor, entity, CHAIRMAN_ROLE_CODE)):
-            raise AccessDenied(
-                "chairman_role_protected",
-                f"Only a Chairman of {entity.code} can grant or revoke the Chairman role (D19).",
-                f"لا يحق إلا لرئيس مجلس الإدارة في {entity.code} منح دور رئيس مجلس الإدارة أو سحبه (D19).",
-            )
+        raise AccessDenied(
+            "chairman_role_protected",
+            "The Chairman role is granted or revoked only through a dual-control request approved by a CFO and "
+            "a Managing Partner of the group (D21).",
+            "لا يُمنح دور رئيس مجلس الإدارة ولا يُسحب إلا بطلب رقابة مزدوجة يعتمده المدير المالي والشريك المدير "
+            "للمجموعة (D21).",
+        )
     if is_protected(user):
         require_manage_user(actor, user, setup=setup)  # D19, D21
-    elif role.code != CHAIRMAN_ROLE_CODE or setup:
+    else:
         require_perm(actor, entity, "access.entity_access.manage")
 
 
@@ -591,6 +618,10 @@ def enroll_totp(actor, user, name="Authenticator app", ctx=None, setup=False):
     if actor is not None and actor.pk == user.pk and user.password_set_by_others:
         raise RuleError("password_set_by_others", "Change the password you were given before enrolling a device.",
                         "غيّر كلمة المرور التي أُعطيت لك قبل تسجيل جهاز.")
+    if user.totp_enrolment_required:
+        raise RuleError("self_enrolment_required", "This user must set his own password and enrol his device "
+                        "himself at /access/enrol-2fa/.", "يجب أن يعيّن هذا المستخدم كلمة مروره ويسجل جهازه بنفسه "
+                        "عبر /access/enrol-2fa/.")
     if not user.is_human or not user.is_active:
         raise RuleError("totp_for_human", "Authenticator apps are for active human users.",
                         "تطبيقات المصادقة للمستخدمين البشريين النشطين فقط.")
@@ -777,7 +808,9 @@ def request_chairman_change(actor, action, *, target=None, role=None, payload=No
         if role is None or target is not None or not role_affects_chairman(role):
             raise RuleError("not_chairman_change", "Use the normal role edit: no Chairman holds this role.",
                             "استخدم تعديل الأدوار المعتاد: لا يحمل أي رئيس مجلس إدارة هذا الدور.")
-    elif target is None or role is not None or not is_protected_chairman(target):
+    elif target is None or role is not None or not (
+            is_protected_chairman(target)
+            or (action == CC.Action.GRANT and (payload or {}).get("role") == CHAIRMAN_ROLE_CODE)):
         raise RuleError("not_chairman_change", "Dual control is only for users holding the Chairman role.",
                         "الرقابة المزدوجة لحسابات رؤساء مجلس الإدارة فقط.")
     if target is not None and is_system_user(target):
@@ -809,7 +842,9 @@ def _require_factors_apart(action, target):
         raise RuleError("factors_apart", "The Chairman must first change the password he was given; only then can "
                         "his authenticator app be reset.", "يجب أن يغيّر رئيس مجلس الإدارة كلمة المرور المعطاة له "
                         "أولاً، ثم يمكن إعادة تعيين تطبيق المصادقة.")
-    if action == CC.Action.PASSWORD and target.totp_enrolment_required:
+    if action == CC.Action.PASSWORD and target.totp_enrolment_required and target.has_usable_password():
+        # (An unusable password after a role grant must be replaced by an initial password; the Chairman
+        # then sets his own on the enrolment page before enrolling.)
         raise RuleError("factors_apart", "The Chairman must first enrol his new authenticator app; only then can his "
                         "password be set.", "يجب أن يسجل رئيس مجلس الإدارة تطبيق المصادقة الجديد أولاً، ثم يمكن تعيين "
                         "كلمة المرور.")
@@ -992,6 +1027,23 @@ def password_changed_by_self(user, ctx=None):
         user.password_set_by_others = False
         user.save(update_fields=["password_set_by_others"])
     audit(user, "access.user.password_change", user, after={"self_service": True}, ctx=ctx)
+
+
+def set_own_password(user, new_password, ctx=None):
+    """Enrolment flow step 1 (caller has proved the current password): the user chooses his own password."""
+    from django.contrib.auth.password_validation import validate_password
+    from django.core.exceptions import ValidationError
+
+    if not (user.is_active and user.is_human):
+        raise AccessDenied("inactive", "The user is inactive.", "المستخدم غير نشط.")
+    try:
+        validate_password(new_password, user)
+    except ValidationError as exc:
+        raise RuleError("invalid_password", " ".join(exc.messages), "كلمة المرور غير مقبولة.")
+    with transaction.atomic():
+        user.set_password(new_password)
+        user.save(update_fields=["password", "password_set_by_others"])
+        password_changed_by_self(user, ctx=ctx)
 
 
 def start_self_enrolment(user, ctx=None):
