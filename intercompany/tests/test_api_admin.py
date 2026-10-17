@@ -232,3 +232,17 @@ def test_seeded_approval_types_route_to_managing_partner_and_vat_rate():
     assert VatRate.objects.get(country="SA").rate == D("15.00")
     assert ServiceType.objects.get(code="RENT_VEH").income_account_code == "4110"
     assert ServiceType.objects.get(code="SECOND").expense_account_code == "5100"
+
+
+def test_management_command_runs_billing_and_refuses_without_rights(make_agreement, accountant, make_user, alm):
+    from django.core.management import CommandError, call_command
+
+    make_agreement()
+    buf = io.StringIO()
+    call_command("run_intercompany_billing", "--entity", "ALM", "--period", "2026-11", "--as", "acc", stdout=buf)
+    assert "1 draft invoice(s) created" in buf.getvalue()
+    call_command("run_intercompany_billing", "--entity", "ALM", "--period", "2026-11", "--as", "acc", stdout=buf)
+    assert "already billed" in buf.getvalue()
+    make_user("pa", (alm, "pa_drafter"))
+    with pytest.raises(CommandError):
+        call_command("run_intercompany_billing", "--entity", "ALM", "--period", "2026-11", "--as", "pa")
