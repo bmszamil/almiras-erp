@@ -85,6 +85,12 @@ class User(AbstractUser):
     user_type = models.CharField(max_length=20, choices=UserType.choices, default=UserType.HUMAN)
     agent_name = models.SlugField(max_length=60, blank=True, help_text="Required for service agents")
     default_entity = models.ForeignKey(Entity, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    totp_enrolment_required = models.BooleanField(
+        default=False, help_text="Set by a dual-controlled 2FA reset (D21): the user enrols a new device himself "
+                                 "at next sign-in (password + one-time enrolment).")
+    password_set_by_others = models.BooleanField(
+        default=False, help_text="The current password was set by others (D21 dual control). Cleared when the "
+                                 "user changes it himself. While set, no 2FA reset or self-enrolment is allowed.")
 
     REQUIRED_FIELDS = ["email", "full_name_en", "full_name_ar"]
 
@@ -314,7 +320,7 @@ class ChairmanChange(models.Model):
 
     class Action(models.TextChoices):
         PASSWORD = "password", "Set password"
-        TOTP = "totp_enroll", "Enrol authenticator app"
+        TOTP_RESET = "totp_reset", "Reset authenticator app (Chairman re-enrols himself)"
         DEACTIVATE = "deactivate", "Deactivate"
         UNLOCK = "unlock", "Clear sign-in lockout"
         UPDATE = "update", "Change account fields"

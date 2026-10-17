@@ -7,6 +7,7 @@ R18 service agents never hold act/post/manage permissions, whatever their roles.
 R19 audit() writes append-only AuditLog rows with before/after.
 """
 import datetime
+import threading
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -293,13 +294,26 @@ def revoke_access(revoker, grant, ctx=None, setup=False, _approved_change=None):
     return grant
 
 
+_APPLYING = threading.local()
+
+
+def _applying_ids():
+    if not hasattr(_APPLYING, "ids"):
+        _APPLYING.ids = set()
+    return _APPLYING.ids
+
+
 def _require_applying(change, target):
-    """D21: only a dual-control change that is being applied right now (both approvals given, see
-    access.dual_control.apply) may change a Chairman's account without the normal checks."""
+    """D21: only a dual-control change that _apply_chairman_change is applying right now may change a
+    Chairman's account without the normal checks. Checked against the database (row applied, both
+    approvals complete) and the in-progress marker, so an in-memory object cannot be forged."""
     from .models import ChairmanChange
 
-    if not (isinstance(change, ChairmanChange) and getattr(change, "_applying", False) is True
-            and change.status == ChairmanChange.Status.APPLIED and change.target_id == target.pk):
+    stored = None
+    if isinstance(change, ChairmanChange) and change.pk in _applying_ids():
+        stored = ChairmanChange.objects.filter(pk=change.pk, status=ChairmanChange.Status.APPLIED,
+                                               target_id=target.pk).select_related("entity", "role").first()
+    if stored is None or not _dual_complete(stored):
         raise AccessDenied("chairman_dual_control", "This change needs an approved dual-control request (D21).",
                            "يتطلب هذا التغيير طلب رقابة مزدوجة معتمداً (D21).")
 
@@ -566,16 +580,17 @@ def revoke_service_token(actor, token, ctx=None, setup=False):
 
 
 @transaction.atomic
-def enroll_totp(actor, user, name="Authenticator app", ctx=None, setup=False, _approved_change=None):
+def enroll_totp(actor, user, name="Authenticator app", ctx=None, setup=False):
     """Create a confirmed TOTP device (D14). Replaces a device of the same name. Returns the device."""
     from django_otp.plugins.otp_totp.models import TOTPDevice
 
     if is_system_user(user):
         raise RuleError("system_user", "The ERP system user cannot sign in.", "لا يمكن لمستخدم النظام تسجيل الدخول.")
-    if _approved_change is not None:
-        _require_applying(_approved_change, user)
-    elif actor is not None and actor.pk != user.pk:
+    if actor is not None and actor.pk != user.pk:
         require_manage_user(actor, user, setup=setup)
+    if actor is not None and actor.pk == user.pk and user.password_set_by_others:
+        raise RuleError("password_set_by_others", "Change the password you were given before enrolling a device.",
+                        "غيّر كلمة المرور التي أُعطيت لك قبل تسجيل جهاز.")
     if not user.is_human or not user.is_active:
         raise RuleError("totp_for_human", "Authenticator apps are for active human users.",
                         "تطبيقات المصادقة للمستخدمين البشريين النشطين فقط.")
@@ -583,8 +598,7 @@ def enroll_totp(actor, user, name="Authenticator app", ctx=None, setup=False, _a
     TOTPDevice.objects.filter(pk__in=replaced).delete()
     device = TOTPDevice.objects.create(user=user, name=name, confirmed=True)
     audit(actor or system_user(), "access.totp.enroll", user,
-          after=_with_change({"device_id": device.pk, "name": name, "replaced_devices": replaced}, _approved_change),
-          ctx=ctx)
+          after={"device_id": device.pk, "name": name, "replaced_devices": replaced}, ctx=ctx)
     return device
 
 
@@ -708,8 +722,8 @@ def _clean_payload(action, target, role, payload, entity):
         except ValidationError as exc:
             raise RuleError("invalid_password", " ".join(exc.messages), "كلمة المرور غير مقبولة.")
         return {"password_hash": make_password(raw)}  # never stored in plain text
-    if action == CC.Action.TOTP:
-        return {"name": payload.get("name") or "Authenticator app"}
+    if action == CC.Action.TOTP_RESET:
+        return {}
     if action in (CC.Action.DEACTIVATE, CC.Action.UNLOCK):
         return {}
     if action == CC.Action.UPDATE:
@@ -768,6 +782,7 @@ def request_chairman_change(actor, action, *, target=None, role=None, payload=No
                         "الرقابة المزدوجة لحسابات رؤساء مجلس الإدارة فقط.")
     if target is not None and is_system_user(target):
         raise RuleError("system_user", "The ERP system user cannot be changed.", "لا يمكن تعديل مستخدم النظام.")
+    _require_factors_apart(action, target)
     days = getattr(settings, "ERP_CHAIRMAN_CHANGE_EXPIRY_DAYS", 7)
     at = timezone.now()
     change = CC(entity=entity, target=target, role=role, action=action, requested_by=actor, requested_at=at,
@@ -781,6 +796,23 @@ def request_chairman_change(actor, action, *, target=None, role=None, payload=No
                  "payload": _public_payload(change), "expires_at": change.expires_at, "approver_roles": sorted(roles)},
           ctx=ctx)
     return change
+
+
+def _require_factors_apart(action, target):
+    """D21 (b): the people who set a Chairman's password must never also control his second factor.
+    No 2FA reset while the password was set by others; no password set while a 2FA re-enrolment is pending."""
+    from .models import ChairmanChange as CC
+
+    if target is None:
+        return
+    if action == CC.Action.TOTP_RESET and target.password_set_by_others:
+        raise RuleError("factors_apart", "The Chairman must first change the password he was given; only then can "
+                        "his authenticator app be reset.", "يجب أن يغيّر رئيس مجلس الإدارة كلمة المرور المعطاة له "
+                        "أولاً، ثم يمكن إعادة تعيين تطبيق المصادقة.")
+    if action == CC.Action.PASSWORD and target.totp_enrolment_required:
+        raise RuleError("factors_apart", "The Chairman must first enrol his new authenticator app; only then can his "
+                        "password be set.", "يجب أن يسجل رئيس مجلس الإدارة تطبيق المصادقة الجديد أولاً، ثم يمكن تعيين "
+                        "كلمة المرور.")
 
 
 def _expire_if_due(change):
@@ -842,7 +874,7 @@ def _refuse_if_expired(change):
 
 def approve_chairman_change(actor, change, ctx=None):
     """Second approval. Applies the change when a CFO and an MP (two people) have approved. Returns
-    (change, result); result is the applied object (e.g. the new TOTP device) or None."""
+    (change, result); result is the applied object (e.g. a new grant) or None. Never returns a secret."""
     from .errors import Conflict
     from .models import ChairmanChangeApproval
 
@@ -889,17 +921,28 @@ def _apply_chairman_change(actor, change, ctx):
     change.decided_at, change.decided_by = timezone.now(), actor
     change._allow_save = True
     change.save(update_fields=["status", "decided_at", "decided_by"])
-    change._applying = True
+    _applying_ids().add(change.pk)
     target, p, result = change.target, change.payload, None
+    if target is not None:
+        target.refresh_from_db()
+        _require_factors_apart(change.action, target)  # checked again at the moment it applies
     try:
         if change.action == CC.Action.PASSWORD:
             before = {"has_usable_password": target.has_usable_password()}
             target.password = p["password_hash"]
-            target.save(update_fields=["password"])
+            target.password_set_by_others = True
+            target.save(update_fields=["password", "password_set_by_others"])
             audit(actor, "access.user.password_change", target, before=before,
-                  after={"chairman_change": change.pk}, ctx=ctx)
-        elif change.action == CC.Action.TOTP:
-            result = enroll_totp(actor, target, name=p["name"], ctx=ctx, _approved_change=change)
+                  after={"chairman_change": change.pk, "password_set_by_others": True}, ctx=ctx)
+        elif change.action == CC.Action.TOTP_RESET:
+            from django_otp.plugins.otp_totp.models import TOTPDevice
+
+            removed = list(TOTPDevice.objects.filter(user=target).values_list("pk", flat=True))
+            TOTPDevice.objects.filter(pk__in=removed).delete()
+            target.totp_enrolment_required = True
+            target.save(update_fields=["totp_enrolment_required"])
+            audit(actor, "access.totp.reset", target, after={"removed_devices": removed,
+                  "totp_enrolment_required": True, "chairman_change": change.pk}, ctx=ctx)
         elif change.action == CC.Action.DEACTIVATE:
             result = deactivate_user(actor, target, ctx=ctx, _approved_change=change)
         elif change.action == CC.Action.UNLOCK:
@@ -931,7 +974,54 @@ def _apply_chairman_change(actor, change, ctx):
             audit(actor, "access.role.change", role, entity=None, before={"permissions": before},
                   after={"permissions": p["permissions"], "chairman_change": change.pk}, ctx=ctx)
     finally:
-        change._applying = False
+        _applying_ids().discard(change.pk)
     audit(actor, "access.chairman_change.apply", change, entity=change.entity,
           after={"action": change.action, "payload": _public_payload(change)}, ctx=ctx)
     return result
+
+
+# ---------------------------------------------------------------- self-service (D21 a) and 2FA self-enrolment (D21 b)
+
+#: What a user may change on his own account himself (D21 a). Never roles, privileges or active status.
+SELF_SERVICE_FIELDS = {"email", "full_name_en", "full_name_ar", "language", "default_entity"}
+
+
+def password_changed_by_self(user, ctx=None):
+    """Called after a user changed his own password: the password is no longer one others set."""
+    if user.password_set_by_others:
+        user.password_set_by_others = False
+        user.save(update_fields=["password_set_by_others"])
+    audit(user, "access.user.password_change", user, after={"self_service": True}, ctx=ctx)
+
+
+def start_self_enrolment(user, ctx=None):
+    """D21 (b): after a 2FA reset the user, signed in with his password only, enrols a new device himself.
+    Returns an unconfirmed device whose secret is shown only to him; any earlier unconfirmed device is
+    replaced (its secret stops working)."""
+    from django_otp.plugins.otp_totp.models import TOTPDevice
+
+    if not (user.is_active and user.is_human and user.totp_enrolment_required) or user.password_set_by_others:
+        raise AccessDenied("no_enrolment_pending", "No authenticator enrolment is pending for this account.",
+                           "لا يوجد تسجيل معلق لتطبيق المصادقة لهذا الحساب.")
+    with transaction.atomic():
+        TOTPDevice.objects.filter(user=user, confirmed=False).delete()
+        device = TOTPDevice.objects.create(user=user, name="Authenticator app", confirmed=False)
+        audit(user, "access.totp.self_enrol_start", user, after={"device_id": device.pk}, ctx=ctx)
+    return device
+
+
+@transaction.atomic
+def finish_self_enrolment(user, device, token, ctx=None):
+    """Confirm the device with a code from the app; clears the enrolment flag. Returns True on success."""
+    if device.user_id != user.pk or device.confirmed or not user.totp_enrolment_required:
+        raise AccessDenied("no_enrolment_pending", "No authenticator enrolment is pending for this account.",
+                           "لا يوجد تسجيل معلق لتطبيق المصادقة لهذا الحساب.")
+    if not device.verify_token(token):
+        audit(user, "access.totp.self_enrol_failed", user, after={"device_id": device.pk}, ctx=ctx)
+        return False
+    device.confirmed = True
+    device.save(update_fields=["confirmed"])
+    user.totp_enrolment_required = False
+    user.save(update_fields=["totp_enrolment_required"])
+    audit(user, "access.totp.enroll", user, after={"device_id": device.pk, "self_service": True}, ctx=ctx)
+    return True

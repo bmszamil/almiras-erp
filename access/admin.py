@@ -69,7 +69,7 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
         themselves change only through dual-control requests (D21, ChairmanChange admin)."""
         managed = self.erp_entities(request)
         chaired = _chaired_entities(request)
-        q = Q(pk__in=[])
+        q = Q(pk=request.user.pk)  # own account: self-service (D21 a); privileges stay read-only
         if managed.exists():
             q |= Q(entity_access__entity__in=managed) | Q(entity_access__isnull=True)
         if chaired:
@@ -116,6 +116,12 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
             if obj.pk == request.user.pk and not setup_mode(request) and any(
                     getattr(stored, f) != getattr(obj, f) for f in IDENTITY_FIELDS):
                 raise PermissionDenied("You cannot change your own username or Keycloak ID.")
+            if obj.pk == request.user.pk and not setup_mode(request):
+                # D21 (a) self-service: only own profile fields; never own roles, privileges or active status.
+                allowed = {User._meta.get_field(f).attname for f in access.SELF_SERVICE_FIELDS}
+                fields = {f.attname for f in User._meta.concrete_fields} - {"password", "last_login"}
+                if {f for f in fields if getattr(stored, f) != getattr(obj, f)} - allowed:
+                    raise PermissionDenied("You can change only your own name, email and language.")
             changed = {f for f in PRIVILEGE_FIELDS if getattr(stored, f) != getattr(obj, f)}
             if changed:
                 if obj.pk == request.user.pk:
@@ -143,7 +149,10 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
             raise PermissionDenied("You cannot change this user's password.")
         response = super().user_change_password(request, id, form_url)
         if request.method == "POST" and getattr(response, "status_code", 200) == 302:
-            access.audit(request.user, "access.user.password_change", target, ctx=admin_ctx(request))
+            if target.pk == request.user.pk:
+                access.password_changed_by_self(User.objects.get(pk=target.pk), ctx=admin_ctx(request))  # D21 (a)
+            else:
+                access.audit(request.user, "access.user.password_change", target, ctx=admin_ctx(request))
         return response
 
     @admin.action(description="Clear sign-in lockout / إلغاء قفل تسجيل الدخول")
@@ -262,15 +271,14 @@ class ChairmanChangeForm(forms.ModelForm):
     """Propose a D21 change. Only the fields for the chosen action are used."""
 
     password = forms.CharField(required=False, widget=forms.PasswordInput, help_text="Set password")
-    device_name = forms.CharField(required=False, help_text="Enrol authenticator app: device name")
     set_is_active = forms.NullBooleanField(required=False, help_text="Change account fields: active")
     set_is_staff = forms.NullBooleanField(required=False, help_text="Change account fields: admin access")
     set_email = forms.EmailField(required=False, help_text="Change account fields: email")
     grant_role = forms.ModelChoiceField(Role.objects.all(), required=False, help_text="Grant role")
     grant_entity = forms.ModelChoiceField(EntityAccess._meta.get_field("entity").related_model.objects.all(),
                                           required=False, help_text="Grant role: entity")
-    revoke_grant = forms.ModelChoiceField(EntityAccess.objects.filter(revoked_at__isnull=True, role__isnull=False),
-                                          required=False, help_text="Revoke role")
+    revoke_grant = forms.ModelChoiceField(EntityAccess.objects.none(), required=False,
+                                          help_text="Revoke role (a grant of the selected Chairman)")
     permissions = forms.ModelMultipleChoiceField(Permission.objects.all(), required=False,
                                                  help_text="Change role permissions: the full new set")
 
@@ -284,14 +292,24 @@ class ChairmanChangeForm(forms.ModelForm):
             return  # read-only change view
         chairmen = EntityAccess.objects.filter(role__code=access.CHAIRMAN_ROLE_CODE, revoked_at__isnull=True)
         self.fields["target"].queryset = User.objects.filter(pk__in=chairmen.values("user_id"))
+        # Only grants of Chairmen; clean() checks the grant belongs to the selected Chairman.
+        self.fields["revoke_grant"].queryset = EntityAccess.objects.filter(
+            revoked_at__isnull=True, user__in=self.fields["target"].queryset).select_related("user", "entity", "role")
+
+    def clean(self):
+        data = super().clean()
+        grant, target = data.get("revoke_grant"), data.get("target")
+        if data.get("action") == ChairmanChange.Action.REVOKE:
+            if grant is None or target is None or grant.user_id != target.pk:
+                raise forms.ValidationError("Choose a role grant of the selected Chairman. / "
+                                            "اختر دوراً ممنوحاً لرئيس مجلس الإدارة المحدد.")
+        return data
 
     def payload(self):
         d, a = self.cleaned_data, self.cleaned_data["action"]
         A = ChairmanChange.Action
         if a == A.PASSWORD:
             return {"password": d.get("password") or ""}
-        if a == A.TOTP:
-            return {"name": d.get("device_name") or ""}
         if a == A.UPDATE:
             fields = {}
             if d.get("set_is_active") is not None:
@@ -377,11 +395,8 @@ class ChairmanChangeAdmin(ScopedAdmin):
             try:
                 change, result = access.approve_chairman_change(request.user, change, ctx=admin_ctx(request))
                 change.refresh_from_db()
-                msg = f"Request {change.pk}: approved; status {change.status}."
-                if result is not None and change.action == ChairmanChange.Action.TOTP:
-                    msg += (f" Authenticator set-up link (shown once; give it to the Chairman in person): "
-                            f"{result.config_url}")
-                self.message_user(request, msg)
+                # D21 (b): never a secret here; a 2FA reset only asks the Chairman to enrol himself.
+                self.message_user(request, f"Request {change.pk}: approved; status {change.status}.")
             except BilingualError as exc:
                 self.message_user(request, f"Request {change.pk}: {exc}", messages.ERROR)
 

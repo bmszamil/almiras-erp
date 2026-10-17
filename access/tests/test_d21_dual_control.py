@@ -146,8 +146,10 @@ def test_d21_each_kind_of_change_applies_after_both_approvals(alm, sub, mp, cfo,
         assert ChairmanChange.objects.get(pk=change.pk).status == "applied"
         return result
 
-    device = both(A.TOTP, target=chairman, payload={"name": "Phone"})
-    assert device.user == chairman and device.name == "Phone"
+    TOTPDevice.objects.create(user=chairman, name="old", confirmed=True)
+    assert both(A.TOTP_RESET, target=chairman) is None  # never returns a device or secret
+    assert not TOTPDevice.objects.filter(user=chairman).exists()
+    assert User.objects.get(pk=chairman.pk).totp_enrolment_required
     both(A.UNLOCK, target=chairman)
     grant = both(A.GRANT, target=chairman, payload={"role": "viewer", "entity": "LZM"})
     assert access.has_role(chairman, sub, "viewer") and grant.granted_by == cfo
@@ -158,7 +160,7 @@ def test_d21_each_kind_of_change_applies_after_both_approvals(alm, sub, mp, cfo,
     assert chairman.email == "chair@example.test" and chairman.is_staff
     both(A.DEACTIVATE, target=chairman)
     assert User.objects.get(pk=chairman.pk).is_active is False
-    for action in ("access.totp.enroll", "access.unlock", "access.grant", "access.revoke",
+    for action in ("access.totp.reset", "access.unlock", "access.grant", "access.revoke",
                    "access.user.privilege_change", "access.user.deactivate"):
         row = AuditLog.objects.filter(action=action, actor=cfo).latest("id")
         assert row.after.get("chairman_change"), action
