@@ -26,7 +26,9 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 
 def write_metrics(values):
     metrics_dir = Path(os.environ.get("ALMIRAS_METRICS_DIR", "/var/lib/almiras/metrics"))
-    if not metrics_dir.is_dir():
+    # Same rule as run-job.sh: no writable metrics directory (e.g. a one-off `docker compose run web`) means no
+    # textfile; the exit code still carries the result.
+    if not metrics_dir.is_dir() or not os.access(metrics_dir, os.W_OK):
         return
     lines = []
     for name, (help_text, value) in values.items():

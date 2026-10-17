@@ -5,3 +5,4 @@ pytest-django>=4.9
 cryptography>=42
 hijridate>=2.6,<3
 lxml>=6.0,<7
+reportlab>=4.4,<6
