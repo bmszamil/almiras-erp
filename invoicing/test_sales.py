@@ -491,10 +491,12 @@ def test_r16_flags_checked_br_ksa_07_and_31(w):
 
 
 def test_r16_export_invoice_carries_no_buyer_vat_number(w):
-    done = final(w, invoice(w, [("rent_commercial", "1", "100", {"vat_category": "Z",
-                                                                 "vat_exemption_reason": "VATEX-SA-33"})],
-                            flag_export=True))
-    assert done.buyer_vat_number == ""
+    lines = [("rent_commercial", "1", "100", {"vat_category": "Z", "vat_exemption_reason": "VATEX-SA-33"})]
+    with pytest.raises(InvoicingError):  # BR-KSA-81 (compliance row 4b): without the VAT number, another ID
+        invoice(w, lines, flag_export=True)
+    services.add_customer_identifier(w.customer, "CRN", "1010999999", user=w.clerk)
+    done = final(w, invoice(w, lines, flag_export=True))
+    assert (done.buyer_vat_number, done.buyer_other_id_scheme, done.buyer_other_id) == ("", "CRN", "1010999999")
 
 
 def test_at16_entity_without_vat_number_cannot_issue_s_lines(w):

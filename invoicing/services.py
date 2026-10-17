@@ -65,6 +65,9 @@ ZERO = Decimal("0")
 CENT = Decimal("0.01")
 HUNDRED = Decimal("100")
 SAR = "SAR"
+OUT_OF_SCOPE_CODE = "VATEX-SA-OOS"  # BT-120 is free text for this code (row 1c)
+CITIZEN_CODES = frozenset({"VATEX-SA-EDU", "VATEX-SA-HEA"})  # buyer NAT ID required (BR-KSA-49, row 1d)
+STANDARD_INVOICE_DAYS = 15  # TIR §4.5: within 15 days from the end of the month of supply (row 6f)
 SIMPLIFIED_LIMIT_SAR = Decimal("1000.00")  # R48: "less than SAR 1,000"; gross in SAR by default (OQ-44)
 
 # Accounts (ledger/coa_template.py; invoicing §5).
@@ -478,7 +481,7 @@ def create_sales_document(entity, *, user, customer, issue_date, doc_type=SalesD
             entity=entity, doc_type=doc_type, customer=customer, issue_date=issue_date, currency=cur,
             original_document=original_document, created_by=user, source=_source(user),
         )
-        if customer.customer_kind == Customer.Kind.INDIVIDUAL:  # OQ-19: simplified only for individuals by default
+        if _natural_person_not_subject_to_vat(customer):  # OQ-19: simplified for individuals by default (R48)
             doc.zatca_profile = SalesDocument.Profile.SIMPLIFIED
         if original_document is not None:  # zatca R-19: the category follows the original invoice
             doc.zatca_profile = original_document.zatca_profile
@@ -511,7 +514,8 @@ def update_sales_document(document, *, user, **fields):
 
 
 def _sales_line_values(doc, line, *, income_type, quantity, unit_price, description_ar, description_en, vat_category,
-                       vat_exemption_reason, income_account, line_discount, unit_code):
+                       vat_exemption_reason, income_account, line_discount, unit_code, exemption_text_ar="",
+                       exemption_text_en=""):
     entity = doc.entity
     if not isinstance(income_type, IncomeType):
         income_type = _reference(IncomeType, income_type, "income type", "نوع الإيراد")
@@ -534,6 +538,8 @@ def _sales_line_values(doc, line, *, income_type, quantity, unit_price, descript
     if reason is not None and not isinstance(reason, VatExemptionReason):
         reason = _reference(VatExemptionReason, reason, "VAT exemption reason", "سبب الإعفاء")
     line.vat_exemption_reason = reason
+    line.exemption_text_ar = (exemption_text_ar or "").strip()
+    line.exemption_text_en = (exemption_text_en or "").strip()
     if income_account is None:
         intercompany = doc.customer.group_entity_id is not None
         code = (income_type.default_intercompany_account_code if intercompany else "") or income_type.default_account_code
@@ -567,6 +573,14 @@ def _line_vat_problems(line, on):
     elif line.vat_exemption_reason.category != line.vat_category:
         problems.append(f"Exemption reason {line.vat_exemption_reason.code} is not for category {line.vat_category}. / "
                         f"سبب الإعفاء {line.vat_exemption_reason.code} لا يخص الفئة {line.vat_category}.")
+    out_of_scope = line.vat_exemption_reason is not None and line.vat_exemption_reason.code == OUT_OF_SCOPE_CODE
+    texts = (getattr(line, "exemption_text_ar", ""), getattr(line, "exemption_text_en", ""))
+    if out_of_scope and not texts[0].strip():  # row 1c: the taxpayer states the reason, visible, so in Arabic
+        problems.append(f"{OUT_OF_SCOPE_CODE} needs the reason the supply is out of scope, in Arabic. / "
+                        f"يحتاج {OUT_OF_SCOPE_CODE} إلى سبب كون التوريد خارج النطاق بالعربية.")
+    if not out_of_scope and any(t.strip() for t in texts):
+        problems.append(f"An exemption reason text is given only with {OUT_OF_SCOPE_CODE}. / "
+                        f"يُدخل نص سبب الإعفاء مع {OUT_OF_SCOPE_CODE} فقط.")
     return problems
 
 
@@ -585,15 +599,17 @@ def _price_line(line, on):
 @transaction.atomic
 def add_sales_line(document, *, user, income_type, quantity, unit_price, description_ar, description_en="",
                    vat_category=None, vat_exemption_reason=None, income_account=None, line_discount="0",
-                   unit_code="C62"):
-    """Add a line to a draft (R5 Sharia, R9 VAT, R10 rates, OQ-18 Arabic)."""
+                   unit_code="C62", exemption_text_ar="", exemption_text_en=""):
+    """Add a line to a draft (R5 Sharia, R9 VAT, R10 rates, OQ-18 Arabic). ``exemption_text_ar`` / ``_en``: the
+    taxpayer's own reason, required (Arabic) with VATEX-SA-OOS and only with it (row 1c)."""
     doc = _draft_sales(document, user)
     last = doc.lines.order_by("-line_no").values_list("line_no", flat=True).first() or 0
     line = SalesDocumentLine(entity=doc.entity, document=doc, line_no=last + 1)
     _sales_line_values(doc, line, income_type=income_type, quantity=quantity, unit_price=unit_price,
                        description_ar=description_ar, description_en=description_en, vat_category=vat_category,
                        vat_exemption_reason=vat_exemption_reason, income_account=income_account,
-                       line_discount=line_discount, unit_code=unit_code)
+                       line_discount=line_discount, unit_code=unit_code, exemption_text_ar=exemption_text_ar,
+                       exemption_text_en=exemption_text_en)
     line.save()
     _touch(doc, user)
     doc.save(update_fields=["modified_by", "modified_at", "updated_at"])
@@ -663,16 +679,20 @@ def _sales_breakdown(doc, lines, sar_rate=None):
     groups = {}
     for line in lines:
         key = (line.vat_category, line.vat_rate.rate if line.vat_rate else ZERO)
-        g = groups.setdefault(key, {"taxable": ZERO, "reasons": set()})
+        g = groups.setdefault(key, {"taxable": ZERO, "reasons": set(), "texts": set()})
         g["taxable"] += line.net_amount
         if line.vat_exemption_reason_id:
             g["reasons"].add(line.vat_exemption_reason.code)
+            if line.vat_exemption_reason.code == OUT_OF_SCOPE_CODE:  # row 1c: the taxpayer's own BT-120 text
+                g["texts"].add((line.exemption_text_en, line.exemption_text_ar))
     breakdown, total_vat, total_vat_sar = [], ZERO, ZERO
     for (category, rate), g in sorted(groups.items()):
         vat = _round(g["taxable"] * rate / HUNDRED)
         vat_sar = _round(vat * sar_rate) if sar_rate is not None else vat
         breakdown.append({"category": category, "rate": str(rate), "taxable": str(g["taxable"]), "vat": str(vat),
-                          "vat_sar": str(vat_sar), "exemption_reasons": sorted(g["reasons"])})
+                          "vat_sar": str(vat_sar), "exemption_reasons": sorted(g["reasons"]),
+                          **({"exemption_texts": [{"en": en, "ar": ar} for en, ar in sorted(g["texts"])]}
+                             if g["texts"] else {})})
         total_vat += vat
         total_vat_sar += vat_sar
     total_net = sum((line.net_amount for line in lines), ZERO)
@@ -702,13 +722,33 @@ def _buyer_snapshot(doc):
         )
         ids = [(i.scheme, i.value) for i in c.identifiers.all()]
     ids = sorted((i for i in ids if i[1]), key=lambda i: BUYER_ID_PRIORITY.index(i[0]))
+    if doc.flag_export:  # BR-KSA-46: no buyer VAT number on an export invoice; cleared first (row 4b)
+        snap["buyer_vat_number"] = ""
+    if _uses_citizen_codes(doc):  # BR-KSA-49 (row 1d): the buyer's national ID, on every profile
+        ids = [i for i in ids if i[0] == "NAT"]
+    elif doc.zatca_profile == SalesDocument.Profile.SIMPLIFIED or snap["buyer_vat_number"]:
+        ids = []  # R50: simplified documents store no buyer ID; a VAT number replaces it (BR-KSA-14)
     scheme, value = ids[0] if ids else ("", "")
-    if doc.zatca_profile == SalesDocument.Profile.SIMPLIFIED or snap["buyer_vat_number"]:
-        scheme, value = "", ""  # R50: simplified documents store no buyer ID; a VAT number replaces it (BR-KSA-14)
-    if doc.flag_export:
-        snap["buyer_vat_number"] = ""  # BR-KSA-46: no buyer VAT number on an export invoice
     snap.update(buyer_other_id_scheme=scheme, buyer_other_id=value)
     return snap
+
+
+def _uses_citizen_codes(doc):
+    return doc.lines.filter(vat_exemption_reason__code__in=CITIZEN_CODES).exists()
+
+
+def _citizen_problems(doc, snap):
+    """BR-KSA-49 / BR-KSA-25 (row 1d): VATEX-SA-EDU or -HEA lines need the buyer's national ID (NAT) and name."""
+    if not _uses_citizen_codes(doc):
+        return []
+    problems = []
+    if snap["buyer_other_id_scheme"] != "NAT" or not snap["buyer_other_id"]:
+        problems.append("Private education or healthcare to a citizen (VATEX-SA-EDU/HEA) needs the buyer's national ID "
+                        "(NAT). / التعليم أو الصحة الخاصة للمواطن تحتاج إلى رقم الهوية الوطنية للمشتري.")
+    if not snap["buyer_name_ar"].strip():
+        problems.append("Private education or healthcare to a citizen needs the buyer's name in Arabic. / "
+                        "التعليم أو الصحة الخاصة للمواطن تحتاج إلى اسم المشتري بالعربية.")
+    return problems
 
 
 def _buyer_problems(doc, snap):
@@ -735,9 +775,9 @@ def _buyer_problems(doc, snap):
         number = c.group_entity.vat_number if c.group_entity_id else c.vat_number
         if not number:
             problems.append("Buyer VAT number is missing (the buyer is VAT registered). / الرقم الضريبي للمشتري ناقص.")
-    elif not registered and not snap["buyer_other_id"]:
-        problems.append("Buyer ID (TIN, CRN, ... ) is missing for a buyer without a VAT number. / "
-                        "هوية المشتري ناقصة لمشترٍ ليس له رقم ضريبي.")
+    if not snap["buyer_vat_number"] and not snap["buyer_other_id"]:  # BR-KSA-81 (row 4b), exports included
+        problems.append("Buyer ID (TIN, CRN, ... ) is missing for a buyer without a VAT number on this document. / "
+                        "هوية المشتري ناقصة لمشترٍ ليس له رقم ضريبي في هذا المستند.")
     return problems
 
 
@@ -837,8 +877,10 @@ def _issue_problems(doc, *, check_period=True, user=None):
             _price_line(line, on)  # supply date changed after the line was added: priced again at issue
     breakdown, net, vat, _ = _sales_breakdown(doc, lines)
     gross = net + vat
+    snap = _buyer_snapshot(doc)
     if doc.zatca_profile == SalesDocument.Profile.STANDARD:
-        problems += _buyer_problems(doc, _buyer_snapshot(doc))
+        problems += _buyer_problems(doc, snap)
+    problems += _citizen_problems(doc, snap)
     if doc.doc_type in (SalesDocument.DocType.CREDIT_NOTE, SalesDocument.DocType.DEBIT_NOTE):
         problems += _note_problems(doc, gross)
     if check_period:
@@ -848,9 +890,21 @@ def _issue_problems(doc, *, check_period=True, user=None):
     return problems
 
 
+def _natural_person_not_subject_to_vat(customer):
+    """R48 / row 8a: an ``individual`` registered for VAT (a sole trader) is a business for the SAR 1,000 rule."""
+    return customer.customer_kind == Customer.Kind.INDIVIDUAL and not customer.is_vat_registered
+
+
 def _simplified_problems(doc, gross_sar):
-    """R48 (OQ-19, OQ-44 default): simplified only below SAR 1,000 gross, or for individual customers."""
-    if (doc.zatca_profile == SalesDocument.Profile.SIMPLIFIED and doc.customer.customer_kind != Customer.Kind.INDIVIDUAL
+    """R48 (OQ-19, OQ-44 default): simplified only below SAR 1,000 gross, or for a natural person not subject to VAT.
+
+    Notes are not tested (row 8b): a credit or debit note "is subject to the same issuing requirements as the type
+    of invoice on which it is based" (XML v1.2 §5.2) and keeps its original's profile (zatca R-19), so a note of
+    SAR 1,000 or more on a simplified invoice stays issuable.
+    """
+    if doc.doc_type != SalesDocument.DocType.INVOICE:
+        return []
+    if (doc.zatca_profile == SalesDocument.Profile.SIMPLIFIED and not _natural_person_not_subject_to_vat(doc.customer)
             and gross_sar >= SIMPLIFIED_LIMIT_SAR):
         return [f"A simplified invoice is allowed only below SAR 1,000 for a non-individual buyer (gross SAR {gross_sar}); "
                 f"issue a standard invoice. / الفاتورة المبسطة مسموحة لمشترٍ غير فرد فقط إذا قلّ المبلغ عن 1,000 ريال "
@@ -872,6 +926,23 @@ def _retention_until(entity, doc):
     years = 15 if doc.retention_class == SalesDocument.Retention.REAL_ESTATE else 6
     year = end.year + years
     return date_type(year, end.month, min(end.day, calendar.monthrange(year, end.month)[1]))
+
+
+def _late_invoice_warnings(doc):
+    """Row 6f (TIR §4.5): a standard tax invoice is issued within 15 days from the end of the month of supply.
+
+    Warning only. The end of supply (``supply_end_date``, else ``supply_date``) decides the month.
+    """
+    supplied = doc.supply_end_date or doc.supply_date
+    if (doc.doc_type != SalesDocument.DocType.INVOICE or doc.zatca_profile != SalesDocument.Profile.STANDARD
+            or supplied is None):
+        return []
+    month_end = date_type(supplied.year, supplied.month, calendar.monthrange(supplied.year, supplied.month)[1])
+    deadline = month_end + timedelta(days=STANDARD_INVOICE_DAYS)
+    if doc.issue_date > deadline:
+        return [f"This tax invoice is issued after {deadline}, 15 days after the end of the month of supply "
+                f"(TIR §4.5). / تصدر هذه الفاتورة الضريبية بعد {deadline}، أي بعد 15 يومًا من نهاية شهر التوريد."]
+    return []
 
 
 def _note_warnings(doc):
@@ -974,7 +1045,7 @@ def approve_sales_document(document, *, user):
         access.use_grant(grant, target=doc)  # a used, current approval: the clearance posting checks it (access R42)
         port = zatca_port.get_port()
         transaction.on_commit(lambda: port.submit_document(SalesDocument.objects.get(pk=doc.pk), user))
-    doc.warnings = _issue_date_warnings(doc) + _note_warnings(doc)
+    doc.warnings = _issue_date_warnings(doc) + _late_invoice_warnings(doc) + _note_warnings(doc)
     return doc
 
 

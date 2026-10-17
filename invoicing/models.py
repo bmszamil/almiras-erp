@@ -730,6 +730,11 @@ class SalesDocumentLine(LineAmounts, GuardedLine):
                                     verbose_name=bi("Income type", "نوع الإيراد"))
     income_account = models.ForeignKey("ledger.Account", on_delete=models.PROTECT, related_name="+",
                                        verbose_name=bi("Income account", "حساب الإيراد"))
+    # BT-120 for VATEX-SA-OOS: "free text, to be provided by the taxpayer on case to case basis" (row 1c).
+    exemption_text_en = models.CharField(bi("Exemption reason text (English)", "نص سبب الإعفاء (بالإنجليزية)"),
+                                         max_length=300, blank=True)
+    exemption_text_ar = models.CharField(bi("Exemption reason text (Arabic)", "نص سبب الإعفاء (بالعربية)"),
+                                         max_length=300, blank=True)
 
     class Meta:
         verbose_name = bi("sales document line", "بند مستند مبيعات")
