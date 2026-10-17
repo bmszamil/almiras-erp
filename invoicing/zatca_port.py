@@ -63,7 +63,7 @@ def record_submission(document):
     from .models import SalesDocument
 
     with transaction.atomic():
-        doc = SalesDocument.objects.select_for_update().get(pk=document.pk)
+        doc = SalesDocument.objects.select_for_update(of=("self",)).get(pk=document.pk)
         if doc.zatca_status == SalesDocument.ZatcaStatus.NOT_SUBMITTED:
             doc.zatca_status = SalesDocument.ZatcaStatus.PENDING
             doc._service_write = True

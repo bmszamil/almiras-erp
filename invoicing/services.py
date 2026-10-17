@@ -150,7 +150,7 @@ def _settings(entity):
 def _next_number(entity, doc_type, year):
     """Gap-free per (entity, type, year), locked until the caller's transaction ends (R14, OQ-4)."""
     code = SEQUENCE_CODES.get(doc_type, doc_type)
-    seq, _ = DocumentSequence.objects.select_for_update().get_or_create(entity=entity, doc_type=code, year=year)
+    seq, _ = DocumentSequence.objects.select_for_update(of=("self",)).get_or_create(entity=entity, doc_type=code, year=year)
     seq.last_number += 1
     seq.save(update_fields=["last_number"])
     return f"{entity.code}-{code}-{year}-{seq.last_number:06d}"
@@ -336,7 +336,7 @@ def create_customer(entity, *, user, **fields):
 @transaction.atomic
 def update_customer(customer, *, user, **fields):
     """Change a customer. Issued documents keep their frozen buyer snapshot (R15)."""
-    customer = Customer.objects.select_for_update().get(pk=customer.pk)
+    customer = Customer.objects.select_for_update(of=("self",)).get(pk=customer.pk)
     access.require(user, customer.entity, "invoicing.manage_customer")
     customer.modified_by, customer.modified_at = user, timezone.now()
     return _save_party(customer, user, fields, CUSTOMER_FIELDS)
@@ -365,7 +365,7 @@ def create_vendor(entity, *, user, **fields):
 
 @transaction.atomic
 def update_vendor(vendor, *, user, **fields):
-    vendor = Vendor.objects.select_for_update().get(pk=vendor.pk)
+    vendor = Vendor.objects.select_for_update(of=("self",)).get(pk=vendor.pk)
     access.require(user, vendor.entity, "invoicing.manage_vendor")
     vendor.modified_by, vendor.modified_at = user, timezone.now()
     return _save_party(vendor, user, fields, VENDOR_FIELDS)
@@ -462,7 +462,7 @@ def create_sales_document(entity, *, user, customer, issue_date, doc_type=SalesD
 
 
 def _draft_sales(document, user, permission="invoicing.create_sales_document"):
-    doc = SalesDocument.objects.select_for_update().select_related("entity").get(pk=document.pk)
+    doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity").get(pk=document.pk)
     access.require(user, doc.entity, permission)
     if doc.status != Status.DRAFT:
         raise error("Only drafts can be edited (R13).", "يمكن تعديل المسودات فقط.", code="not_draft")
@@ -591,7 +591,7 @@ def delete_sales_draft(document, *, user):
 @transaction.atomic
 def submit_sales_document(document, *, user):
     """draft -> submitted (R57). An agent never submits (R22, access R12); the submitter cannot approve (R14)."""
-    doc = SalesDocument.objects.select_for_update().select_related("entity").get(pk=document.pk)
+    doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity").get(pk=document.pk)
     access.require(user, doc.entity, "invoicing.submit_sales_document")
     if doc.status != Status.DRAFT:
         raise error("Only drafts can be submitted.", "يمكن تقديم المسودات فقط.", code="not_draft")
@@ -608,7 +608,7 @@ def submit_sales_document(document, *, user):
 @transaction.atomic
 def return_to_draft(document, *, user):
     """submitted -> draft for edits (R57): by staff who submit, or by the approver."""
-    doc = SalesDocument.objects.select_for_update().select_related("entity").get(pk=document.pk)
+    doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity").get(pk=document.pk)
     if not access.has(user, doc.entity, "invoicing.submit_sales_document"):
         access.require(user, doc.entity, "invoicing.approve_sales_document", document=doc)
     if doc.status != Status.SUBMITTED:
@@ -862,7 +862,7 @@ def approve_sales_document(document, *, user):
     doc = SalesDocument.objects.select_related("entity", "customer").get(pk=document.pk)
     grant = access.require(user, doc.entity, "invoicing.approve_sales_document", document=doc)
     with transaction.atomic():
-        doc = SalesDocument.objects.select_for_update().select_related("entity", "customer").get(pk=doc.pk)
+        doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity", "customer").get(pk=doc.pk)
         if doc.status != Status.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
         problems = _issue_problems(doc, user=user)
@@ -932,7 +932,7 @@ def on_zatca_result(document, result, *, user):
     if result.status not in zatca_port.RESULT_STATUSES:
         raise error(f"Unknown ZATCA status {result.status!r}.", f"حالة الهيئة {result.status!r} غير معروفة.")
     with transaction.atomic():
-        doc = SalesDocument.objects.select_for_update().get(pk=doc.pk)
+        doc = SalesDocument.objects.select_for_update(of=("self",)).get(pk=doc.pk)
         if doc.status != Status.ISSUED:
             raise error("Only issued documents await a ZATCA result.", "تنتظر المستندات الصادرة فقط نتيجة الهيئة.",
                         code="not_issued")
@@ -956,7 +956,7 @@ def post_cleared_document(document, *, user):
     doc = SalesDocument.objects.select_related("entity").get(pk=document.pk)
     grant = access.require(user, doc.entity, "invoicing.post_on_clearance", document=doc)
     with transaction.atomic():
-        doc = SalesDocument.objects.select_for_update().select_related("entity", "approved_by").get(pk=doc.pk)
+        doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity", "approved_by").get(pk=doc.pk)
         if doc.status != Status.ISSUED or doc.zatca_status not in zatca_port.POSTING_STATUSES:
             raise error("Only issued documents cleared or reported by ZATCA are posted.",
                         "تُرحَّل المستندات الصادرة التي اعتمدتها الهيئة أو أُبلغت بها فقط.", code="not_cleared")
@@ -980,7 +980,7 @@ def post_cleared_document(document, *, user):
 
 def _lock_note_target(doc):
     if doc.doc_type == SalesDocument.DocType.CREDIT_NOTE and doc.original_document_id:
-        return list(SalesDocument.objects.select_for_update().filter(pk=doc.original_document_id))
+        return list(SalesDocument.objects.select_for_update(of=("self",)).filter(pk=doc.original_document_id))
     return []
 
 
@@ -1256,8 +1256,8 @@ def allocate(source, target, amount, *, user):
     sales = isinstance(target, SalesDocument)
     with transaction.atomic():
         model_t = SalesDocument if sales else PurchaseDocument
-        target = model_t.objects.select_for_update().select_related("entity").get(pk=target.pk)
-        source = type(source).objects.select_for_update().select_related("entity").get(pk=source.pk)
+        target = model_t.objects.select_for_update(of=("self",)).select_related("entity").get(pk=target.pk)
+        source = type(source).objects.select_for_update(of=("self",)).select_related("entity").get(pk=source.pk)
         problems = _allocation_problems(source, target, amount)
         if problems:
             raise _problems_error(problems, "allocation_invalid")
@@ -1276,7 +1276,7 @@ def unallocate(allocation, *, user):
     access.require(user, allocation.entity, "invoicing.allocate")
     model = type(allocation)
     with transaction.atomic():
-        original = model.objects.select_for_update().get(pk=allocation.pk)
+        original = model.objects.select_for_update(of=("self",)).get(pk=allocation.pk)
         if original.amount <= ZERO or original.reverses_id is not None:
             raise error("Only an allocation is un-allocated, not an un-allocation.", "يُلغى التخصيص فقط.",
                         code="unallocate_invalid")
@@ -1340,7 +1340,7 @@ def create_purchase_document(entity, *, user, vendor, vendor_document_number, ve
 
 
 def _draft_purchase(document, user):
-    doc = PurchaseDocument.objects.select_for_update().select_related("entity", "vendor").get(pk=document.pk)
+    doc = PurchaseDocument.objects.select_for_update(of=("self",)).select_related("entity", "vendor").get(pk=document.pk)
     access.require(user, doc.entity, "invoicing.create_bill")
     if doc.status != PStatus.DRAFT:
         raise error("Only drafts can be edited (R24).", "يمكن تعديل المسودات فقط.", code="not_draft")
@@ -1502,7 +1502,7 @@ def _purchase_problems(doc, check_period=True):
 @transaction.atomic
 def submit_purchase_document(document, *, user):
     """draft -> submitted (R58). An agent-created bill stays a draft until a human submits it (R22, AT-22)."""
-    doc = PurchaseDocument.objects.select_for_update().select_related("entity", "vendor").get(pk=document.pk)
+    doc = PurchaseDocument.objects.select_for_update(of=("self",)).select_related("entity", "vendor").get(pk=document.pk)
     access.require(user, doc.entity, "invoicing.submit_bill")
     if doc.status != PStatus.DRAFT:
         raise error("Only drafts can be submitted.", "يمكن تقديم المسودات فقط.", code="not_draft")
@@ -1525,7 +1525,7 @@ def approve_purchase_document(document, *, user):
     doc = PurchaseDocument.objects.select_related("entity").get(pk=document.pk)
     grant = access.require(user, doc.entity, "invoicing.approve_bill", document=doc)
     with transaction.atomic():
-        doc = PurchaseDocument.objects.select_for_update().select_related("entity", "vendor").get(pk=doc.pk)
+        doc = PurchaseDocument.objects.select_for_update(of=("self",)).select_related("entity", "vendor").get(pk=doc.pk)
         if doc.status != PStatus.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
         problems = _purchase_problems(doc)
@@ -1551,7 +1551,7 @@ def approve_purchase_document(document, *, user):
         doc.save()
         targets = []
         if doc.doc_type == PurchaseDocument.DocType.VENDOR_CREDIT_NOTE:
-            targets = list(PurchaseDocument.objects.select_for_update().filter(pk=doc.original_document_id))
+            targets = list(PurchaseDocument.objects.select_for_update(of=("self",)).filter(pk=doc.original_document_id))
         try:
             with _posting_as(user):
                 entry = ledger.create_entry(
@@ -1680,7 +1680,7 @@ def _application_problems(source, target, amount, receivable):
 @transaction.atomic
 def add_receipt_application(receipt, target, amount, *, user):
     """Plan which invoices a draft receipt settles; allocations are made when it posts (R34, ledger-fx R18)."""
-    receipt = CustomerReceipt.objects.select_for_update().select_related("entity").get(pk=receipt.pk)
+    receipt = CustomerReceipt.objects.select_for_update(of=("self",)).select_related("entity").get(pk=receipt.pk)
     _require_receipt_staff(user, receipt.entity)
     if receipt.status != "draft" or receipt.kind != CustomerReceipt.Kind.RECEIPT:
         raise error("Only draft receipts get applications.", "تُضاف التخصيصات إلى مسودات سندات القبض فقط.", code="not_draft")
@@ -1703,14 +1703,14 @@ def _post_money(movement, *, user, grant, receivable):
     """Shared posting of a receipt or payment: lock, check, number, book, allocate (R26, R28, R33, R59)."""
     model = CustomerReceipt if receivable else VendorPayment
     target_model = SalesDocument if receivable else PurchaseDocument
-    movement = model.objects.select_for_update().select_related("entity").get(pk=movement.pk)
+    movement = model.objects.select_for_update(of=("self",)).select_related("entity").get(pk=movement.pk)
     entity = movement.entity
     expected = "draft" if receivable else "submitted"
     if movement.status != expected:
         raise error(f"Only {expected} documents are posted here.", "لا يُرحَّل هذا المستند في حالته الحالية.",
                     code="wrong_status")
     apps = list(movement.applications.select_related("target").order_by("pk"))
-    targets = {t.pk: t for t in target_model.objects.select_for_update().filter(pk__in=[a.target_id for a in apps])}
+    targets = {t.pk: t for t in target_model.objects.select_for_update(of=("self",)).filter(pk__in=[a.target_id for a in apps])}
     problems = []
     for app in apps:
         problems += _application_problems(movement, targets[app.target_id], app.amount, receivable)
@@ -1803,7 +1803,7 @@ def create_vendor_payment(entity, *, user, vendor, date, amount, currency=None, 
 
 @transaction.atomic
 def add_payment_application(payment, target, amount, *, user):
-    payment = VendorPayment.objects.select_for_update().select_related("entity").get(pk=payment.pk)
+    payment = VendorPayment.objects.select_for_update(of=("self",)).select_related("entity").get(pk=payment.pk)
     access.require(user, payment.entity, "invoicing.create_vendor_payment")
     if payment.status != "draft" or payment.kind != VendorPayment.Kind.PAYMENT:
         raise error("Only draft payments get applications.", "تُضاف التخصيصات إلى مسودات سندات الصرف فقط.", code="not_draft")
@@ -1823,7 +1823,7 @@ def add_payment_application(payment, target, amount, *, user):
 
 @transaction.atomic
 def submit_vendor_payment(payment, *, user):
-    payment = VendorPayment.objects.select_for_update().select_related("entity").get(pk=payment.pk)
+    payment = VendorPayment.objects.select_for_update(of=("self",)).select_related("entity").get(pk=payment.pk)
     access.require(user, payment.entity, "invoicing.submit_vendor_payment")
     if payment.status != "draft":
         raise error("Only drafts can be submitted.", "يمكن تقديم المسودات فقط.", code="not_draft")
@@ -1901,7 +1901,7 @@ def reverse_document(document, *, user, date=None, reason=""):
     document = model.objects.select_related("entity").get(pk=document.pk)
     grant = access.require(user, document.entity, "invoicing.reverse_document", document=document)
     with transaction.atomic():
-        document = model.objects.select_for_update().select_related("entity").get(pk=document.pk)
+        document = model.objects.select_for_update(of=("self",)).select_related("entity").get(pk=document.pk)
         if document.status != "posted" or document.journal_entry_id is None:
             raise error("Only posted documents are reversed.", "تُعكس المستندات المرحّلة فقط.", code="not_posted")
         own, others = _allocations_of(document)
