@@ -303,3 +303,18 @@ def test_item6_only_zatca_admins_resubmit_by_hand_never_agents(w):
     member(admin, w.alm, "zatca_admin")
     assert services.resubmit_to_zatca(doc, user=admin).zatca_status == "pending"
     assert AccessLog.objects.filter(actor=admin, details__action="zatca_resubmit").exists()
+
+
+# --- 7. reconcile_subledger as of a date before a later reversal -----------------------------------
+
+def test_p5_reconcile_as_of_a_date_before_a_later_reversal_ties_out(w):
+    b = services.approve_purchase_document(bill(w), user=w.cfo)  # 2027-01-15
+    r = services.post_receipt(services.create_receipt(w.alm, user=w.clerk, customer=w.customer, date=date(2027, 1, 20),
+                                                      amount="500.00"), user=w.clerk2)
+    FiscalPeriod.objects.filter(entity=w.alm, name="2027-01").update(status="closed")
+    services.reverse_document(b, user=w.accountant)  # reversal dated 2027-02-01, the next open period
+    services.reverse_document(r, user=w.accountant)
+    for as_of, ap, ar in ((date(2027, 1, 31), D("-1150.00"), D("-500.00")), (date(2027, 2, 28), D("0"), D("0"))):
+        rows = {row["account"]: row for row in services.reconcile_subledger(w.alm, as_of, user=w.accountant)}
+        assert all(row["difference"] == D("0") for row in rows.values()), rows
+        assert rows["2100"]["subledger"] == ap and rows["1200"]["subledger"] == ar

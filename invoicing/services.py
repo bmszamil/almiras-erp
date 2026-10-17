@@ -21,7 +21,7 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 from zoneinfo import ZoneInfo
 
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from django.utils import timezone
 
 from core import access
@@ -2069,19 +2069,23 @@ def reconcile_subledger(entity, as_of, *, user):
         account, cp = _control(party, receivable)
         return account, cp.code if cp else None
 
-    for d in SalesDocument.objects.filter(entity=entity, status=Status.FINAL, issue_date__lte=as_of).select_related(
-            "customer__group_entity"):
+    def booked(qs, reversible=True):
+        """Booked as of ``as_of`` (review item 7): its entry is dated on or before it and it was not reversed by
+        then (no reversal, or a reversal dated after ``as_of``)."""
+        qs = qs.filter(entity=entity, journal_entry__isnull=False, journal_entry__date__lte=as_of)
+        if reversible:
+            qs = qs.filter(Q(reversal_entry__isnull=True) | Q(reversal_entry__date__gt=as_of))
+        return qs
+
+    for d in booked(SalesDocument.objects.all(), reversible=False).select_related("customer__group_entity"):
         sign = -1 if d.doc_type == SalesDocument.DocType.CREDIT_NOTE else 1
         add(*ctrl(d.customer, True), d.currency_id, sign * d.total_gross)
-    for r in CustomerReceipt.objects.filter(entity=entity, status="posted", date__lte=as_of).select_related(
-            "customer__group_entity"):
+    for r in booked(CustomerReceipt.objects.all()).select_related("customer__group_entity"):
         add(*ctrl(r.customer, True), r.currency_id, r.amount if r.kind == CustomerReceipt.Kind.REFUND else -r.amount)
-    for d in PurchaseDocument.objects.filter(entity=entity, status=PStatus.POSTED, accounting_date__lte=as_of
-                                             ).select_related("vendor__group_entity"):
+    for d in booked(PurchaseDocument.objects.all()).select_related("vendor__group_entity"):
         sign = 1 if d.doc_type == PurchaseDocument.DocType.VENDOR_CREDIT_NOTE else -1
         add(*ctrl(d.vendor, False), d.currency_id, sign * d.total_gross)
-    for p in VendorPayment.objects.filter(entity=entity, status="posted", date__lte=as_of).select_related(
-            "vendor__group_entity"):
+    for p in booked(VendorPayment.objects.all()).select_related("vendor__group_entity"):
         add(*ctrl(p.vendor, False), p.currency_id, -p.amount if p.kind == VendorPayment.Kind.REFUND_RECEIVED else p.amount)
     gl = {}
     lines = JournalLine.objects.filter(
