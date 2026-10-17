@@ -343,7 +343,9 @@ def _line_terms(line):
     }
     window = None
     if line.secondment_id:
-        attrs["employee_ref"] = line.secondment.employee_ref
+        # The secondment's id, never its employee_ref: invoice_lines is readable by every billing.view holder,
+        # and employee_ref is shown only with billing.view_employee_ref (access R29, PDPL; review finding 2).
+        attrs["secondment"] = line.secondment_id
         window = (line.secondment.start_date, line.secondment.end_date)
     steps = tuple(sorted((s.effective_from, s.new_amount) for s in line.price_steps.all()))
     return calc.LineTerms(str(line.line_key), line.line_no, line.amount, steps, window, attrs)
@@ -1046,7 +1048,7 @@ def _invoice_line_attrs(period, key, line_terms):
             return {k: line[k] for k in ("line_no", "description_en", "description_ar", "unit_code", "vat_category",
                                          "vat_exemption_reason", "income_type", "income_account")}
     attrs = dict(line_terms.attrs) if line_terms else {}
-    attrs.pop("employee_ref", None)
+    attrs.pop("secondment", None)
     return attrs
 
 
@@ -1425,7 +1427,12 @@ def _wholly_closed(entity, start, end):
 
 
 def _invoice_lines(p, contract):
-    """R52: the frozen invoice input, one entry per line key with a positive net (actual days, R16)."""
+    """R52: the frozen invoice input, one entry per line key with a positive net (actual days, R16).
+
+    Secondment lines carry ``secondment`` (the ``SecondmentAssignment`` id), not ``employee_ref``: the frozen
+    lines are visible to every ``billing.view`` holder (``periods``, admin), and ``employee_ref`` is personal data
+    shown only with ``billing.view_employee_ref`` (3.6, access R29). Invoicing resolves the id itself if it needs
+    the reference (deviation from 3.5, which lists ``employee_ref``; reported to the spec-writer)."""
     versions = _version_terms(contract)
     end = _billable_end(contract, versions)
     nets = calc.required_nets(p.period_start, p.period_end, p.full_period_days, versions, contract.start_date, end,
@@ -1441,8 +1448,8 @@ def _invoice_lines(p, contract):
                "unit_code": a["unit_code"], "vat_category": a["vat_category"],
                "vat_exemption_reason": a["vat_exemption_reason"], "income_type": a["income_type"],
                "income_account": a["income_account"]}
-        if "employee_ref" in a:
-            row["employee_ref"] = a["employee_ref"]
+        if "secondment" in a:
+            row["secondment"] = a["secondment"]
         lines.append(row)
     return sorted(lines, key=lambda r: r["line_no"])
 

@@ -27,3 +27,33 @@ def test_p1_due_days_only_amendment_makes_no_correction_and_full_months_stay_who
     june = period(c, date(2027, 6, 1))
     assert june.invoice_lines[0]["net"] == "1000.05" and june.sales_document.total_net == D("1000.05")
     assert services.recompute_corrections(c, user=w.s) == []
+
+
+# --- P2 / finding 2: access R29 (employee_ref masked for billing.view holders) ------------------------------------
+
+def test_p2_viewer_never_reads_employee_ref_in_invoice_lines(w):
+    from types import SimpleNamespace
+
+    from django.contrib import admin
+
+    from billing.test_secondments import secondment_contract
+
+    c, a = secondment_contract(w, amount="31000.00")
+    run(w, date(2027, 2, 1))
+    p = services.periods(c, user=w.v).get(period_start=date(2027, 1, 1))  # w.v: viewer (billing.view only)
+    assert p.status == "generated"
+    assert all("employee_ref" not in row for row in p.invoice_lines)
+    assert "EMP-T-0001" not in str(p.invoice_lines)
+    assert p.invoice_lines[0]["secondment"] == a.pk  # invoicing resolves the person through its own rights
+    assert services.view_secondment(a, user=w.v)["employee_ref"] == "••••"
+    model_admin = admin.site._registry[BillingPeriod]
+    request = SimpleNamespace(user=w.v)
+    assert list(model_admin.get_queryset(request).filter(pk=p.pk)) == [p]
+    assert "invoice_lines" in model_admin.exclude
+    assert "invoice_lines" not in model_admin.get_readonly_fields(request, p)
+    assert "invoice_lines" not in model_admin.get_fields(request, p)
+    # corrections of a secondment line carry no employee_ref either
+    w.clock.set(date(2027, 2, 3))
+    services.end_secondment(w.alm, a, date(2027, 1, 20), w.s, source="manual")
+    (adj,) = BillingAdjustment.objects.filter(contract=c)
+    assert "EMP-T-0001" not in str(adj.lines) and all("secondment" not in row for row in adj.lines)

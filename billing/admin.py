@@ -36,8 +36,15 @@ class ContractVersionAdmin(BillingAdmin):
 
 @admin.register(BillingPeriod)
 class BillingPeriodAdmin(BillingAdmin):
+    """``invoice_lines`` is not shown: it is the frozen hand-off to invoicing (R52) and is read through
+    ``billing.services``; it never holds ``employee_ref`` (access R29), and admin is not the place to read it."""
+
     list_display = ("contract", "period_start", "period_end", "bill_date", "status", "sales_document")
     list_filter = ("status",)
+    exclude = ("invoice_lines",)
+
+    def get_readonly_fields(self, request, obj=None):
+        return [f.name for f in self.model._meta.fields if f.name != "invoice_lines"]
 
 
 @admin.register(BillingRun)
