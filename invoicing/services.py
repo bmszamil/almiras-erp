@@ -1019,19 +1019,6 @@ def _late_invoice_warnings(doc):
     return []
 
 
-def _note_warnings(doc):
-    """R71 (OQ-47): a note should be issued by the 15th of the month after the adjustment event; warning only."""
-    if doc.doc_type == SalesDocument.DocType.INVOICE or not doc.adjustment_event_date:
-        return []
-    e = doc.adjustment_event_date
-    year, month = (e.year + 1, 1) if e.month == 12 else (e.year, e.month + 1)
-    deadline = date_type(year, month, 15)
-    if doc.issue_date > deadline:
-        return [f"This note is issued after {deadline}, the 15th of the month after the adjustment event (TIR §7.2). / "
-                f"يصدر هذا الإشعار بعد {deadline}، أي بعد اليوم الخامس عشر من الشهر التالي لحدث التعديل."]
-    return []
-
-
 def _refuse_stale_grant(grant, doc, seen_version):
     """Review item 3 (access R14, R42): an approval checked against another version of the document does not count.
 
@@ -1056,7 +1043,8 @@ def approve_sales_document(document, *, user):
     ZATCA hand-off after commit (R40). The approver is never the creator, submitter or last modifier: approvals
     that post are always segregated (access R35, OQ-19), whatever ``segregation_required`` says.
 
-    Returns the document; ``document.warnings`` lists R71 warnings (bilingual), which do not block.
+    Returns the document; ``document.warnings`` lists the issue-date (R78) and late-invoice (R84) warnings
+    (bilingual), which do not block.
     """
     doc = SalesDocument.objects.select_related("entity", "customer").get(pk=document.pk)
     grant = access.require(user, doc.entity, "invoicing.approve_sales_document", document=doc)
@@ -1122,7 +1110,9 @@ def approve_sales_document(document, *, user):
         access.use_grant(grant, target=doc)  # a used, current approval: the clearance posting checks it (access R42)
         port = zatca_port.get_port()
         transaction.on_commit(lambda: port.submit_document(SalesDocument.objects.get(pk=doc.pk), user))
-    doc.warnings = _issue_date_warnings(doc) + _late_invoice_warnings(doc) + _note_warnings(doc)
+    # R95 (D30a): a credit or debit note is dated and taxed on its own issue date; R71's 15-day warning from
+    # adjustment_event_date is withdrawn (that date is information only).
+    doc.warnings = _issue_date_warnings(doc) + _late_invoice_warnings(doc)
     return doc
 
 

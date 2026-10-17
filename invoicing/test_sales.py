@@ -545,7 +545,7 @@ def test_at7_snapshot_frozen_after_issue(w):
         "شارع المشتري", "شركة المشتري التجريبية", "شارع الاختبار")
 
 
-# --- credit and debit notes (R17 to R19, R37; AT-10, AT-11, AT-63, AT-64) -------------------------
+# --- credit and debit notes (R17 to R19, R37, R95; AT-10, AT-11, AT-63, AT-101) -------------------------
 
 def note(w, original, doc_type="credit_note", lines=(("rent_commercial", "1", "4000.00"),), **fields):
     fields.setdefault("payment_means_code", "30")
@@ -629,14 +629,17 @@ def test_r18_note_needs_a_final_original(w):
     assert "not final" in messages(exc)
 
 
-def test_at64_late_note_warns_but_issues(w):
+def test_at101_note_is_dated_and_taxed_on_its_own_date_without_a_warning(w):
+    """R95 (D30a; replaces AT-64 / R71): the event date is information only; no 15-day warning is computed."""
     original = final(w, invoice(w, issue_date=date(2027, 3, 1)))
-    on_time = approve(w, note(w, original, lines=[("rent_commercial", "1", "100")], issue_date=date(2027, 4, 15),
-                              adjustment_event_date=date(2027, 3, 2)))
-    late = approve(w, note(w, original, lines=[("rent_commercial", "1", "100")], issue_date=date(2027, 4, 16),
-                           adjustment_event_date=date(2027, 3, 2)))
-    assert on_time.warnings == [] and on_time.status == "issued"
-    assert late.status == "issued" and "2027-04-15" in late.warnings[0] and "الخامس عشر" in late.warnings[0]
+    late = note(w, original, lines=[("rent_commercial", "1", "100")], issue_date=date(2027, 4, 16),
+                adjustment_event_date=date(2027, 3, 2))
+    issued = approve(w, late)
+    assert (issued.status, issued.issue_date, issued.warnings) == ("issued", date(2027, 4, 16), [])
+    assert issued.adjustment_event_date == date(2027, 3, 2)  # kept, information only
+    done = w.zatca.clear(issued)
+    assert done.journal_entry.date == date(2027, 4, 16) and done.journal_entry.period.name == "2027-04"
+    assert not hasattr(services, "_note_warnings")
 
 
 # --- money and currency (R56, R93; AT-46, AT-47, AT-99) ---------------------------------------------
