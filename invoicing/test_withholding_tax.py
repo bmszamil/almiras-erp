@@ -256,3 +256,19 @@ def test_deductions_are_immutable(w):
         with pytest.raises(InvoicingError):
             attempt()
     assert TreatyCertificate.objects.count() == 0
+
+
+def test_r64_wht_needs_a_sar_functional_currency(w):
+    """Review finding 7: an entity keeping its books in another currency gets no WHT computation or return data."""
+    usd = make_entity("USE", "full", w.alm, vat="333333333300003", cr="1010000009", base_currency_id="USD")
+    ap, accountant = make_user("use.ap"), make_user("use.accountant")
+    member(ap, usd, "payables_clerk")
+    member(accountant, usd, "accountant")
+    with pytest.raises(InvoicingError) as exc:
+        services.wht_return_data(usd, date(2027, 1, 1), user=accountant)
+    assert exc.value.code == "wht_requires_sar_functional" and "الريال" in str(exc.value)
+    nr = nr_vendor(w, code="NRU", entity=usd, user=ap, currency="USD")
+    with pytest.raises(InvoicingError) as exc:
+        services.create_vendor_payment(usd, user=ap, vendor=nr, date=date(2027, 1, 25), amount="100.00")
+    assert exc.value.code == "wht_requires_sar_functional"
+    assert services.wht_return_data(w.alm, date(2027, 1, 1), user=w.accountant)["rows"] == []  # SAR: allowed

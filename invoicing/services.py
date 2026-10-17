@@ -2159,6 +2159,7 @@ def _post_money(movement, *, user, grant, receivable, approved=False):
     targets = {t.pk: t for t in target_model.objects.select_for_update(of=("self",)).filter(pk__in=[a.target_id for a in apps])}
     wht_rows = []
     if not receivable and _needs_wht(movement.vendor, movement.kind):  # R62, R63: computed on the payment date
+        _require_sar_functional(movement.entity)
         wht_rows, wht_total, wht_problems = _wht_plan(movement, movement.date)
         if wht_problems:
             raise _problems_error(wht_problems, "wht_invalid")
@@ -2261,9 +2262,22 @@ def _needs_wht(vendor, kind):
     return not vendor.is_resident and kind == VendorPayment.Kind.PAYMENT
 
 
+def _require_sar_functional(entity):
+    """R62, R64 (review finding 7): WHT is assessed and returned in SAR (``base_amount_sar`` / ``wht_amount_sar``
+    and the 2220 tie-out are functional amounts). An entity with another functional currency has no SAR books to
+    tie to, so its WHT is refused until the owner decides how such an entity files (not specified)."""
+    if entity.base_currency_id != SAR:
+        raise error(f"Withholding tax needs SAR as the functional currency; {entity.code} keeps its books in "
+                    f"{entity.base_currency_id} (R62, R64).",
+                    f"تتطلب ضريبة الاستقطاع أن تكون العملة الوظيفية الريال السعودي؛ دفاتر {entity.code} بعملة "
+                    f"{entity.base_currency_id}.", code="wht_requires_sar_functional")
+
+
 def _no_payment_without_wht(vendor, kind):
     """D14 / R61: a payment to a non-resident vendor carries withholding tax, so it needs the vendor's withholding
     tax category; without one it is refused (the slice-1 block stays for those vendors)."""
+    if _needs_wht(vendor, kind):
+        _require_sar_functional(vendor.entity)
     if _needs_wht(vendor, kind) and vendor.wht_category_id is None:
         raise error(f"Vendor {vendor.code} is not resident: set its withholding tax category before paying it "
                     "(R61, D14).",
@@ -2414,6 +2428,7 @@ def _wht_plan(payment, on):
     vendor receives the full amount, WHT = round(base x rate / (1 - rate)) and is borne by the entity (E21).
     """
     vendor, entity = payment.vendor, payment.entity
+    _require_sar_functional(entity)
     places = _places(payment.currency_id)
     gross_up = bool(vendor.wht_gross_up)
     problems, rows = [], []
@@ -2470,11 +2485,8 @@ def _wht_plan(payment, on):
 def _record_wht(payment, row, user):
     """One WhtDeduction (R62, R64); SAR amounts at the payment's pinned rate, as its entry books them."""
     entity = payment.entity
-    if entity.base_currency_id == SAR:
-        to_sar = (lambda a: fx.convert(a, payment.fx_rate)) if payment.currency_id != SAR else (lambda a: _round(a, 2))
-    else:
-        rate = _sar_rate(entity, payment.currency_id, payment.fx_rate, payment.date, user)
-        to_sar = lambda a: _round(a * rate, 2)  # noqa: E731
+    _require_sar_functional(entity)  # the functional amounts are the SAR amounts
+    to_sar = (lambda a: fx.convert(a, payment.fx_rate)) if payment.currency_id != SAR else (lambda a: _round(a, 2))
     deduction = WhtDeduction(
         entity=entity, payment=payment, bill=row["bill"], wht_category=row["category"], base_amount=row["base"],
         base_amount_sar=to_sar(row["base"]), rate_applied=row["rate"], treaty_certificate=row["certificate"],
@@ -2554,8 +2566,10 @@ def wht_return_data(entity, month, *, user):
     """R64: monthly WHT return data of ``entity`` (``month`` = any day of it), per category and vendor, from
     ``WhtDeduction``: base, rate, WHT (SAR), treaty reference and country. A payment reversed in the month shows
     as a negative row. Ties to the 2220 movements of the month's vendor-payment entries (``ledger_2220_sar``).
-    Remittance (E22) is not part of it. Individual vendors are shown by code only (R91)."""
+    Remittance (E22) is not part of it. Individual vendors are shown by code only (R91). Refused with
+    ``wht_requires_sar_functional`` for an entity whose functional currency is not SAR (review finding 7)."""
     access.require(user, entity, "invoicing.view")
+    _require_sar_functional(entity)
     start = month.replace(day=1)
     end = date_type(start.year, start.month, calendar.monthrange(start.year, start.month)[1])
     rows = {}
