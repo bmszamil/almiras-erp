@@ -544,13 +544,12 @@ def create_sales_document(entity, *, user, customer, issue_date, doc_type=SalesD
     return doc
 
 
-def _new_sales_document(entity, *, user, customer, issue_date, doc_type, currency, original_document, fields,
-                        source=None, **links):
-    """A saved draft (rights checked by the caller)."""
+def _new_sales_document(entity, *, user, customer, issue_date, doc_type, currency, original_document, fields):
+    """A saved draft (rights checked by the caller). Billing documents are built by their own hooks."""
     cur = _currency(currency or (original_document.currency_id if original_document else customer.currency_id), entity)
     doc = SalesDocument(
         entity=entity, doc_type=doc_type, customer=customer, issue_date=issue_date, currency=cur,
-        original_document=original_document, created_by=user, source=source or _source(user), **links,
+        original_document=original_document, created_by=user, source=_source(user),
     )
     if _natural_person_not_subject_to_vat(customer):  # OQ-19: simplified for individuals by default (R48)
         doc.zatca_profile = SalesDocument.Profile.SIMPLIFIED
@@ -3352,7 +3351,8 @@ def create_from_billing(period, user):
 
     Idempotent: a second call returns the period's non-rejected document. All-or-nothing: a refusal raises with a
     code billing maps (billing R54) and leaves nothing behind: ``entity_not_vat_registered``, ``period_closed``,
-    ``third_decimal_pending``, ``rate_required``, ``contract_not_billable`` or ``document_invalid``.
+    ``third_decimal_pending``, ``rate_required``, ``contract_not_billable``, ``purification_flag_mismatch`` (the
+    contract's ``requires_purification`` disagrees with the lines' income accounts) or ``document_invalid``.
     The returned document carries ``warnings`` (en/ar, e.g. the late-invoice warning R84).
     """
     entity = period.entity
@@ -3388,7 +3388,16 @@ def create_from_billing(period, user):
         for row in sorted(period.invoice_lines, key=lambda r: r.get("line_no", 0)):
             _billing_line(doc, row, unit_price=row["net"])
         doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity", "customer").get(pk=doc.pk)
-        lines = list(doc.lines.select_related("vat_rate", "vat_exemption_reason"))
+        lines = list(doc.lines.select_related("vat_rate", "vat_exemption_reason", "income_account"))
+        flagged = any(line.income_account.requires_purification
+                      or (line.income_account.sharia_prohibited and not entity.sharia_enforced) for line in lines)
+        if flagged != bool(contract.requires_purification):  # rule 5: billing and the invoice agree on the flag
+            raise _billing_refusal(
+                f"The contract says purification is {'' if contract.requires_purification else 'not '}required, but "
+                f"the invoice lines' income accounts say it is{'' if flagged else ' not'}; correct the contract or the "
+                "accounts in billing before invoicing (rule 5, R6).",
+                "لا يتطابق مؤشر التطهير في العقد مع حسابات الإيراد في بنود الفاتورة؛ صحّح العقد أو الحسابات في وحدة "
+                "الفوترة قبل الفوترة.", "purification_flag_mismatch")
         breakdown, net, vat, _ = _sales_breakdown(doc, lines)
         odd = _third_decimal_problems(doc, lines, breakdown, net, vat)
         if odd:  # OQ-62: billing holds the period until a person releases it

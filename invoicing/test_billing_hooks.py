@@ -137,6 +137,28 @@ def test_r60_refusals_create_nothing_and_use_no_number(bw):
     assert not DocumentSequence.objects.exclude(last_number=0).exists()
 
 
+def test_r60_purification_flag_must_agree_with_the_line_accounts(bw):
+    """Review finding 9 (rule 5): the contract's requires_purification and the invoice lines' income accounts
+    disagree -> refused with a code billing maps, nothing created."""
+    from ledger.models import Account
+
+    w = bw
+    c = approved(w, start=date(2027, 3, 1))
+    assert c.requires_purification is False
+    p = _frozen(w, c, date(2027, 3, 1))
+    account = Account.objects.get(pk=c.versions.get(version_no=1).lines.get().income_account_id)
+    from django.db.models import QuerySet
+
+    QuerySet.update(Account.objects.filter(pk=account.pk), requires_purification=True)  # fixture: account re-flagged
+    with pytest.raises(InvoicingError) as exc, transaction.atomic():
+        inv.create_from_billing(p, w.sys)
+    assert exc.value.code == "purification_flag_mismatch" and "التطهير" in str(exc.value)
+    assert not SalesDocument.objects.exists()
+    assert not DocumentSequence.objects.exclude(last_number=0).exists()
+    QuerySet.update(Account.objects.filter(pk=account.pk), requires_purification=False)
+    assert inv.create_from_billing(p, w.sys).status == "issued"
+
+
 # --- billing R53: posting on the contract approval --------------------------------------------------------------
 
 def test_r53_auto_issued_invoice_posts_on_the_contract_approval(bw):
