@@ -619,3 +619,28 @@ def test_at69_module_signed_simplified_invoice_shape(live):
                                         b"<cbc:ID>PIH</cbc:ID>", b"<cbc:ID>QR</cbc:ID>", b"<cac:Signature>",
                                         b"<cac:AccountingSupplierParty>")]
     assert order == sorted(order)
+
+
+def test_br_ksa_16_standard_invoice_always_carries_payment_means(live):
+    _, einv = stamped(live)
+    assert einv.source_document.payment_means_code == ""
+    assert text(xml_of(einv), "/*/cac:PaymentMeans/cbc:PaymentMeansCode") == "1"  # instrument not defined
+    _, simp = stamped(live, simplified=True)
+    assert b"<cac:PaymentMeans>" not in xml_of(simp)
+
+
+def test_r39_type_386_is_not_built(live, monkeypatch):
+    _held(live, monkeypatch, "type_code", type_code="386")
+
+
+def test_r1_attempts_follow_their_e_invoice_entity(live):
+    _, einv = stamped(live)
+    attempt = SubmissionAttempt(entity=live.tst2, einvoice=einv, attempt_no=1, api="clearance", environment="sandbox",
+                                request_sha256="0" * 64, outcome="accepted", started_at=NOW, finished_at=NOW,
+                                created_by=live.queue)
+    with pytest.raises(ZatcaError):
+        attempt.save()
+    message = ValidationMessage(entity=live.tst2, einvoice=einv, level="info", origin="zatca", code="x",
+                                message_en="x")
+    with pytest.raises(ZatcaError):
+        message.save()

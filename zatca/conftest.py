@@ -60,6 +60,10 @@ def _entity(code, parent, vat, cr, unified=""):
 
 @pytest.fixture
 def zw(db, fakes):
+    return build_world(fakes)
+
+
+def build_world(fakes):
     par = _entity("PAR", None, vat="300000000000003", cr="1010000009")
     tst1 = _entity("TST1", par, vat="311111111100003", cr="1010000001", unified="7000000001")
     tst2 = _entity("TST2", par, vat="322222222200003", cr="1010000002")

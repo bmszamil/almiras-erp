@@ -32,6 +32,7 @@ class Party:
     district: str = ""
     city: str = ""
     postal_code: str = ""
+    region: str = ""  # CountrySubentity (BT-39/54): optional; required only by SDK 2.0.3's 2021 BR-KSA-10
     country: str = ""
 
 
@@ -141,6 +142,8 @@ def _address(parent, p):
         _sub(addr, CBC, "CityName", p.city)
     if p.postal_code:
         _sub(addr, CBC, "PostalZone", p.postal_code)
+    if p.region:
+        _sub(addr, CBC, "CountrySubentity", p.region)
     country = _sub(addr, CAC, "Country")
     _sub(country, CBC, "IdentificationCode", p.country or "SA")
 
@@ -205,7 +208,9 @@ def build_unsigned(data: InvoiceData, icv: int, pih: str) -> bytes:
         _sub(delivery, CBC, "ActualDeliveryDate", data.supply_date.isoformat())
         if data.supply_end_date:
             _sub(delivery, CBC, "LatestDeliveryDate", data.supply_end_date.isoformat())
-    if data.payment_means_code or data.reason:
+    if data.payment_means_code or data.reason or data.category == "standard":
+        # BR-KSA-16 (SDK 2.0.3 rules): a standard document carries BT-81; without a code from invoicing it is
+        # 1 "instrument not defined". Simplified documents carry it only when given (or for a note, R-19).
         pm = _sub(root, CAC, "PaymentMeans")
         _sub(pm, CBC, "PaymentMeansCode", data.payment_means_code or "1")
         if data.reason:  # KSA-10 (BR-KSA-17)
