@@ -50,9 +50,15 @@ TEMPLATE = [
     ("4000", "Income", "الإيرادات", I, {"header": True}),
     ("4100", "Rental income", "إيرادات الإيجار", I, {}),
     ("4110", "Intercompany rental income", "إيرادات إيجار من شركات المجموعة", I, {}),
+    # PROPOSED (invoicing.md §5, D16, D18): accountant to review before this merges.
+    ("4120", "Residential rental income (VAT-exempt)", "إيرادات الإيجار السكني (معفاة)", I, {}),
     ("4200", "Secondment and consulting income", "إيرادات الإعارة والاستشارات", I, {}),
     ("4210", "Intercompany service income", "إيرادات خدمات من شركات المجموعة", I, {}),
+    ("4220", "Management fee income", "إيرادات رسوم الإدارة", I, {}),  # PROPOSED (invoicing D16, D18)
+    ("4230", "Service charge income", "إيرادات رسوم الخدمات المشتركة", I, {}),  # PROPOSED (invoicing D16, D18)
+    ("4240", "Service fee income", "إيرادات أتعاب الخدمات", I, {}),  # PROPOSED (invoicing D16, D18)
     ("4300", "IP and licence income", "إيرادات الملكية الفكرية والتراخيص", I, {}),
+    ("4310", "Intercompany IP and licence income", "إيرادات ملكية فكرية من شركات المجموعة", I, {}),  # PROPOSED (E2, D18)
     ("4400", "Dividend income", "إيرادات توزيعات الأرباح", I, {}),
     ("4500", "Share of profit of associates", "الحصة من أرباح الشركات الزميلة", I, {}),
     ("4600", "Islamic deposit profit", "أرباح الودائع الإسلامية", I, {}),
