@@ -227,3 +227,21 @@ def test_concurrent_bookings_of_one_document(request):
         t.join(timeout=30)
     assert sorted(results) == ["document_booked", "ok"]
     assert JournalEntry.objects.filter(document_type="testdocs.receipt", document_id=receipt.pk).count() == 1
+
+
+@postgres_only
+@pytest.mark.parametrize("column, value", [("line_kind", "'rounding'"), ("rate_source", "'manual'")])
+def test_l2_database_mirror_check_compares_rate_source_and_line_kind(w, column, value):
+    """Spec-writer follow-up L2: a raw "reversal" that mirrors amounts but not the line kind or rate source."""
+    original = post(w, draft(w))  # Dr 1100 10 / Cr 3100 10
+    _raw("INSERT INTO ledger_journalentry (entity_id, number, date, description, reference, status, reversal_of_id, "
+         "created_at, source, document_type) VALUES (%s, '', '2027-01-10', 'x', '', 'draft', %s, now(), 'human', '')",
+         [w.alm.pk, original.pk])
+    forged = JournalEntry.objects.get(reversal_of=original)
+    _add_lines(forged, [("1100", 0, 10), ("3100", 10, 0)])  # exactly mirrored amounts
+    _raw(f"UPDATE ledger_journalline SET {column} = {value} WHERE entry_id = %s AND debit > 0", [forged.pk])
+    period = FiscalPeriod.objects.get(entity=w.alm, name="2027-01")
+    with pytest.raises(DatabaseError, match="do not mirror"):
+        _raw("UPDATE ledger_journalentry SET status = 'posted', number = 'X-1', period_id = %s, posted_at = now(), "
+             "posted_by_id = %s WHERE id = %s", [period.pk, w.cfo.pk, forged.pk])
+    assert status(forged) == "draft"
