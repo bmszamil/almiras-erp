@@ -466,6 +466,11 @@ class EmploymentContract(Tracked, ServiceGuarded):
     job_title_en = models.CharField(bi("Job title (English)", "المسمى الوظيفي (بالإنجليزية)"), max_length=200)
     job_title_ar = models.CharField(bi("Job title (Arabic)", "المسمى الوظيفي (بالعربية)"), max_length=200)
     occupation_code = models.CharField(bi("Occupation code", "رمز المهنة"), max_length=20, blank=True)
+    # R16(b) (Art. 55): consecutive renewals of a fixed contract (3 renewals or 4 years make a Saudi's open-ended).
+    renewal_count = models.PositiveSmallIntegerField(bi("Consecutive renewals", "عدد التجديدات المتتالية"), default=0)
+    # R19 (Art. 99): ministerial decision allowing 9 hours a day for the category of this job.
+    extended_hours_ref = models.CharField(bi("Ministerial decision for 9-hour days", "القرار الوزاري لساعات العمل التسع"),
+                                          max_length=200, blank=True)
     weekly_hours = models.DecimalField(bi("Weekly hours", "ساعات العمل الأسبوعية"), max_digits=5, decimal_places=2)
     daily_hours = models.DecimalField(bi("Daily hours", "ساعات العمل اليومية"), max_digits=4, decimal_places=2)
     annual_leave_days = models.PositiveSmallIntegerField(bi("Annual leave days", "أيام الإجازة السنوية"))

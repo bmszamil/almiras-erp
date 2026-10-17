@@ -306,3 +306,37 @@ def test_at33_probation_end_skips_founding_day_and_sick_days(w):
                                  document_ref="MED-1")
     services.approve_leave(req, user=w.h2)
     assert services.probation_end_date(c, user=w.h) == date(2027, 5, 5)  # and the 3 sick days
+
+
+# --- R16(b), R63 / AT-10 (Art. 55) and R19 (Art. 99) ---------------------------------------------------------
+
+def test_at10_saudi_fourth_fixed_term_refused(w):
+    emp = employee(w)
+    c = contract(w, emp, contract_type="fixed", end_date=date(2028, 1, 1), renewal_count=3)
+    assert any("Art. 55" in x for x in c.warnings)  # the third renewal reaches the limit
+    with pytest.raises(HrError) as exc:
+        _submit(w, emp, contract_type="fixed", effective_date=date(2028, 1, 2), end_date=date(2029, 1, 1),
+                renewal_count=4)
+    assert "Art. 55" in exc.value.messages[0] and "المادة 55" in exc.value.messages[0]
+    with pytest.raises(HrError):  # also when the count is not raised: the previous term reached the limit
+        _submit(w, emp, contract_type="fixed", effective_date=date(2028, 1, 2), end_date=date(2029, 1, 1))
+    assert contract(w, emp, contract_type="unlimited", end_date=None, effective_date=date(2028, 1, 2)).status == "approved"
+
+
+def test_r16_salary_amendment_inside_the_same_fixed_term_is_not_a_renewal(w):
+    emp = employee(w)
+    contract(w, emp, contract_type="fixed", end_date=date(2031, 6, 30))  # reaches 4 years: warned
+    c = contract(w, emp, {"BASIC": "6500.00"}, contract_type="fixed", end_date=date(2031, 6, 30),
+                 effective_date=date(2027, 4, 1))
+    assert c.status == "approved"
+
+
+def test_r19_nine_hour_days_only_with_an_art99_reference(w):
+    emp = employee(w)
+    with pytest.raises(HrError) as exc:
+        _submit(w, emp, daily_hours="9", weekly_hours="45")
+    assert "Art. 98, 99" in exc.value.messages[0]
+    c = contract(w, emp, daily_hours="9", weekly_hours="45", extended_hours_ref="Ministerial decision 1/99 (test)")
+    assert c.status == "approved"
+    with pytest.raises(HrError):
+        _submit(w, employee(w), daily_hours="10", weekly_hours="45", extended_hours_ref="Ministerial decision (test)")

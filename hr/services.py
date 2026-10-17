@@ -849,7 +849,7 @@ def overtime_approver(employee, on, *, user):
 
 CONTRACT_FIELDS = frozenset({
     "effective_date", "contract_type", "start_date", "end_date", "calendar_basis", "calendar_basis_ref", "probation_periods",
-    "probation_agreement_ref", "job_title_en",
+    "probation_agreement_ref", "renewal_count", "extended_hours_ref", "job_title_en",
     "job_title_ar", "occupation_code", "weekly_hours", "daily_hours", "annual_leave_days", "notice_days_employer",
     "notice_days_employee", "currency", "department", "grade", "qiwa_contract_ref", "suspension_agreement_ref", "paid_monthly",
 })
@@ -998,21 +998,34 @@ def _statutory_contract_problems(contract, emp, use, jurisdiction):
         problems.append("A non-Saudi's contract must be fixed-term; an open-ended contract is refused (Art. 37, Regs "
                         "Art. 12). / يجب أن يكون عقد غير السعودي محدد المدة؛ ويُرفض العقد غير محدد المدة.")
     if contract.contract_type == EmploymentContract.ContractType.FIXED and emp.is_saudi and contract.end_date:
+        # R16(b), R63 (Art. 55): 3 consecutive renewals or 4 years in total make the contract open-ended; the version
+        # that reaches the limit warns, a later fixed term is refused (the next version must be open-ended).
         rule = use.get(jurisdiction, "contract.saudi_open_ended", on)
-        fixed = list(_approved_versions(emp).filter(contract_type="fixed").order_by("version_no"))
-        ends = {c.end_date for c in fixed if c.end_date} | {contract.end_date}
+        max_renewals = int(rule["renewals"])
+        fixed = list(_approved_versions(emp).filter(contract_type="fixed").exclude(pk=contract.pk).order_by("version_no"))
+        ends = {c.end_date for c in fixed if c.end_date}
+        renewals = max([contract.renewal_count, len(ends | {contract.end_date}) - 1] + [c.renewal_count for c in fixed])
         first_start = min([c.start_date for c in fixed] + [contract.start_date])
-        year_days = _year_days(use, jurisdiction, contract.calendar_basis, on)
-        limit = _anniversary(first_start, int(rule["years"]), contract.calendar_basis, year_days)
-        if len(ends) - 1 >= int(rule["renewals"]) or limit <= contract.end_date:
+        limit = _anniversary(first_start, int(rule["years"]), contract.calendar_basis)
+        prev = fixed[-1] if fixed else None
+        renewed = prev is not None and prev.end_date != contract.end_date
+        prev_reached = renewed and (max(prev.renewal_count, len(ends) - 1) >= max_renewals or limit <= prev.end_date)
+        if renewals > max_renewals or prev_reached:
+            problems.append(f"This Saudi employee's fixed-term contract has reached {max_renewals} consecutive renewals or "
+                            f"{rule['years']} years: it is open-ended and the next version must be open-ended (Art. 55). "
+                            f"/ بلغ عقد هذا الموظف السعودي محدد المدة {max_renewals} تجديدات متتالية أو {rule['years']} "
+                            "سنوات: أصبح غير محدد المدة ويجب أن تكون النسخة التالية غير محددة المدة (المادة 55).")
+        elif renewals == max_renewals or limit <= contract.end_date:
             warnings.append("This fixed-term contract reaches the renewal or four-year limit: it becomes open-ended for "
                             "a Saudi employee (Art. 55). / يبلغ هذا العقد حد التجديد أو السنوات الأربع: يصبح غير "
                             "محدد المدة للموظف السعودي.")
-    # R19.
+    # R19 (Art. 98, 99): 8 / 48 hours; 9 a day only with the ministerial decision for the job's category.
     max_daily = _decimal(use.get(jurisdiction, "hours.max_daily", on)["hours"], "hours")
     max_weekly = _decimal(use.get(jurisdiction, "hours.max_weekly", on)["hours"], "hours")
+    if (contract.extended_hours_ref or "").strip():
+        max_daily = _decimal(use.get(jurisdiction, "hours.max_daily_extended", on)["hours"], "hours")
     if contract.daily_hours > max_daily or contract.weekly_hours > max_weekly:
-        problems.append(f"Working hours exceed {max_daily} a day or {max_weekly} a week (Art. 98). / "
+        problems.append(f"Working hours exceed {max_daily} a day or {max_weekly} a week (Art. 98, 99). / "
                         f"ساعات العمل تتجاوز {max_daily} يوميًا أو {max_weekly} أسبوعيًا.")
     # R21, R56.
     if contract.annual_leave_days not in ANNUAL_LEAVE_CONTRACT_DAYS:
