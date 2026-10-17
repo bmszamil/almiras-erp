@@ -20,7 +20,7 @@ Tick every item before the ERP serves real users. Data stays in a Saudi cloud re
 - [ ] **HSTS preload decision:** `SECURE_HSTS_PRELOAD` is off. Turning it on and submitting the domain to browser preload lists is hard to undo. Needs an explicit decision (all subdomains must serve HTTPS forever).
 
 ## Accounts and access
-- [ ] Every human user has an authenticator app enrolled (`manage.py setup_totp <user>`), and the enrolment shows in the audit log.
+- [ ] Every human user has an authenticator app enrolled (`manage.py setup_totp <user>`), and the enrolment shows in the audit log. Managing Partners and Chairmen cannot be enrolled by anyone else: after the role grant they set their own password and enrol at `/access/enrol-2fa/` (D21).
 - [ ] Service tokens are issued with `manage.py issue_service_token <user> --days N`; expiry dates are recorded and rotated.
 - [ ] Initial grants are made (`manage.py grant_access`), then reviewed with `manage.py access_review --as <reviewer>`. The review is repeated quarterly.
 - [ ] Cron: `run_escalations` every 15 minutes; `send_notifications` (email retry) every 15 minutes; `expire_chairman_changes` (D21 dual-control requests) hourly.
