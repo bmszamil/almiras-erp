@@ -359,7 +359,7 @@ None. The access module posts no journal entries and touches no accounts. It onl
 |---|---|---|---|
 | Agent gateway (`/api/agents/v1/`, MCP) | In | Token → agent user; every call checked with `require` | Gateway not built |
 | OpenBao (via zatca) | Out | Nothing from `core`. zatca applies the custodian's OpenBao policy on delegation (R-41) | zatca spec |
-| ZATCA, banks, GOSI, Mudad, SAP B1, Daftra | — | None. Later HR (GOSI/Mudad) and integrations use this same model | — |
+| ZATCA, banks, GOSI, Mudad, Falcon (or other legacy system) | — | None. Later HR (GOSI/Mudad) and integrations use this same model | — |
 | Directory / SSO / MFA | In | None now; Django login. MFA: OQ-4 | Open |
 
 ## 7. Permissions

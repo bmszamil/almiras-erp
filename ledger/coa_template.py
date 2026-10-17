@@ -1,7 +1,7 @@
 """Group chart-of-accounts template (IFRS for SMEs, Saudi holding company).
 
-Draft for review by the Almiras accountant; to be reconciled with the Daftra chart
-before opening balances are loaded. Format: (code, English, Arabic, type, flags).
+Draft for review by the Almiras accountant; to be reconciled with the Falcon (or other legacy
+system) chart before opening balances are loaded (docs/specs/migration.md). Format: (code, English, Arabic, type, flags).
 Header accounts end in "000" and are not postable.
 
 Flags: header, intercompany, prohibited (Sharia), purify, monetary (included in FX

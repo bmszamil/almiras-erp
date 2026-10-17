@@ -160,7 +160,7 @@ None. The web module posts no journal entries and touches no accounts. Postings 
 |---|---|---|---|
 | ZATCA | — | None directly. Shows e-invoice status, holds and late-reporting tasks from `zatca.services`; actions call zatca services | Read via services |
 | Banks | In (file) | Statement files uploaded by a user, passed to `banking.services.import_statement` | Via banking |
-| GOSI, Mudad, Qiwa, SAP B1, Daftra | — | None | — |
+| GOSI, Mudad, Qiwa, Falcon (or other legacy system) | — | None | — |
 | Agent gateway (`/api/agents/v1/`) | — | Separate module; not served by `web`; agent users refused at login (R12) | Gateway not built |
 | Outside web services (CDNs, fonts, analytics, QR APIs) | — | None: all assets self-hosted, QR generated locally (R16, R20) | — |
 | E-mail / SMS notifications | — | None in this module (OQ-19) | — |

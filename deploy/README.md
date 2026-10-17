@@ -370,7 +370,7 @@ before real personal data is loaded.
 | 15 | Deposit VAT sign-off | invoicing OQ-16 | tax adviser | sign-off |
 | 16 | Billing → invoicing functions implemented; contract approval accepted for clearance posting | billing **OQ-22** (R52 to R56, R53) | builders + reviewer | tests green; billing_run on staging |
 | 17 | Bank codes verified, banking retention, cutover balances tie to the opening TB | banking OQ-4, OQ-15, OQ-17 | accountant + migration-agent | tie-out report |
-| 18 | Opening balances from Daftra tie out | README "Next steps" 1 | migration-agent + accountant | tie-out report |
+| 18 | Opening balances from Falcon (or other legacy system) tie out | README "Next steps" 1 | migration-agent + accountant | tie-out report |
 | 19 | TLS certificate valid; HSTS on; HTTP redirects; `/admin` reachable only as intended | this kit | IT | browser + `curl -I` |
 | 20 | Alerts reach people: test each receiver | this kit | IT | test alert received by IT, ZATCA admins and MP |
 | 21 | `lxml` added to `requirements.txt` (zatca imports it; `deploy/requirements.lock` already pins it) | zatca §6 | builder | CI `tests` installs only `requirements.txt` |

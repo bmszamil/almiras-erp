@@ -249,7 +249,7 @@ No new accounts are proposed. 5810 and 2250 are proposed in tax-returns.md; 2220
 | `invoicing` | In | Income types, intercompany documents, purification flags | |
 | Ministry of Commerce Qawaem / ZATCA Zakat filing (financial statements upload) | Out (manual) | PDF/XLSX exports of final statements | Format requirements **[CC-verify]**; no XBRL (OQ-23) |
 | Auditors | Out | Exports and drill-down listings; viewer role | |
-| SAP B1 / Daftra | In (one-off) | 2026 comparatives: closing TB 31 Dec 2026 loaded as opening balances (README next step 1); prior-year P&L for comparatives as a summary import | migration-agent; comparatives method OQ-17 |
+| Falcon (or other legacy system) | In (one-off) | 2026 comparatives: closing TB 31 Dec 2026 loaded as opening balances (README next step 1); prior-year P&L for comparatives as a summary import | migration-agent; comparatives method OQ-17 |
 | Banks, GOSI, Mudad, ZATCA e-invoicing | none | | |
 
 ## 7. Permissions
@@ -332,7 +332,7 @@ Fixtures: ALM (parent, IFRS for SMEs, SAR, Sharia), SUB (100%, IFRS for SMEs), F
 | OQ-14 | OCI items and accounts (none in template). | Accountant | D | None |
 | OQ-15 | Separate statements: investments in subsidiaries and associates at cost, fair value or equity method **[CC-verify]**. | Accountant / auditor | D | As booked (cost) |
 | OQ-16 | Prior-period errors (IAS 8 / SME section 10): restatement layer or current-period correction; Zakat assessment differences of prior years (tax-returns T8). | Accountant / auditor | D | Current period, disclosed |
-| OQ-17 | FY2026 comparatives from Daftra: full prior-year TB by month, or annual summary only. | Accountant + migration-agent | **B** for FY2027 comparatives | Annual summary import |
+| OQ-17 | FY2026 comparatives from Falcon (or other legacy system): full prior-year TB by month, or annual summary only. | Accountant + migration-agent | **B** for FY2027 comparatives | Annual summary import |
 | OQ-18 | 3900 must be nil after migration; enforce as a check from which date? | Accountant | D | From the first final run |
 | OQ-19 | Budget model, source (spreadsheet import) and approval. | CFO | D | Not built |
 | OQ-20 | Approve `openpyxl`, `WeasyPrint` and an OFL Arabic font as dependencies. | Dev + Managing Partner | D | Approved if open source licences confirmed |

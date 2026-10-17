@@ -203,7 +203,7 @@ Consolidation eliminates the 20,000.00 gain and excess depreciation (consolidati
 | `reporting` (internal) | Out | Movement schedule per class (opening, additions, disposals, depreciation, impairment, closing) for PPE and IP notes. |
 | ZATCA (external) | none direct | Through invoicing / zatca only. |
 | Banks, GOSI, Mudad | none | |
-| SAP B1 / Daftra | In (migration) | Opening register: cost, accumulated depreciation, acquisition date, remaining life per asset, tied out to the 31 Dec 2026 TB by migration-agent (`source=import`, component `opening_balance`). |
+| Falcon (or other legacy system) | In (migration) | Opening register: cost, accumulated depreciation, acquisition date, remaining life per asset, tied out to the 31 Dec 2026 TB by migration-agent (`source=import`, component `opening_balance`). |
 
 ## 7. Permissions (proposed codenames; per entity)
 
@@ -277,6 +277,6 @@ Fixtures: ALM (parent, SAR, Sharia enforced), SUB (100%, SAR), NSH (SAR, `sharia
 | OQ-16 | Componentisation (e.g. building structure vs lifts, vehicle vs fit-out) and major overhauls (subsequent cost). | Accountant | Default: one asset per bill line; land and building separate; subsequent cost via event |
 | OQ-17 | Leases as lessee (right-of-use assets, IFRS 16 / s20) in scope? | Accountant | Default: out of scope |
 | OQ-18 | Physical verification (asset tags, counts) and custodian sign-off. | CFO | Default: not built; `custodian_ref` and location only |
-| OQ-19 | Opening register from Daftra: per-asset detail available, or category totals only? | Accountant + migration-agent | Default: per asset; category-level opening assets allowed with `source=import` if detail missing |
+| OQ-19 | Opening register from Falcon (or other legacy system): per-asset detail available, or category totals only? | Accountant + migration-agent | Default: per asset; category-level opening assets allowed with `source=import` if detail missing |
 
 **Blocking:** OQ-2 (lives, before real assets are activated), OQ-14 (invoicing changes for disposals and retention). **Sharia board:** OQ-9, OQ-12. **Tax sign-off:** OQ-10, OQ-15.

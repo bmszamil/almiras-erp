@@ -239,7 +239,7 @@ In later years the opening part goes to 3300 instead of 4800 / 5400. Upstream (s
 | `reporting` (internal) | Out | `consolidated_trial_balance(run, *, user)` → rows (group code, amount, NCI attribution, member drill-down per R31); `reporting` renders consolidated statements from **approved** runs (drafts watermarked). Entity statements → consolidation hand-off: account-to-statement-line mapping owned by `reporting`. |
 | `tax_returns` (internal) | none | Zakat is per entity; any consolidated zakat filing for wholly owned subsidiaries **[CC-verify]** is for `docs/specs/tax-returns.md`. |
 | ZATCA, banks, GOSI, Mudad | none | Consolidation is not a tax, payment or labour filing. |
-| SAP B1 / Daftra | none | Opening structure and historical equity rates may be loaded by migration-agent (OQ-12). |
+| Falcon (or other legacy system) | none | Opening structure and historical equity rates may be loaded by migration-agent (OQ-12). |
 
 ## 7. Permissions (proposed codenames; roles per access.md §3.1)
 
@@ -303,7 +303,7 @@ Fixtures: ALM (parent, SAR, Sharia enforced), SUB (100% full, SAR), PRT (80% ful
 | OQ-9 | Associates without ERP books: data source (audited / management accounts), reporting-date lag allowed, who approves. | Accountant | Default: approved `AssociateResult` for the same period end; MP approves |
 | OQ-10 | Who drafts and approves structure changes, prepares, reviews and approves runs. | Managing Partner | Default: accountant / CFO / MP as §7 |
 | OQ-11 | May a run be approved while a member period is open (e.g. monthly management consolidation)? | CFO | Default: approval needs closed periods; drafts allowed on open periods |
-| OQ-12 | Year-end close in the ledger: no closing entry is specified; snapshot treats income/expense before `period_start` as opening 3300. Opening consolidated equity for the first run (Daftra history, pre-acquisition reserves). | Accountant + migration-agent | Default: as stated; first run needs a migrated opening consolidation journal |
+| OQ-12 | Year-end close in the ledger: no closing entry is specified; snapshot treats income/expense before `period_start` as opening 3300. Opening consolidated equity for the first run (Falcon (or other legacy system) history, pre-acquisition reserves). | Accountant + migration-agent | Default: as stated; first run needs a migrated opening consolidation journal |
 | OQ-13 | SAR residual from translating mirrored foreign-currency pairs: 3400, or consolidated FX gain/loss (4710 / 5760)? | Accountant | Default: 3400 |
 | OQ-14 | Group presentation currency SAR (ledger-fx OQ-7). | Managing Partner | Default SAR |
 | OQ-15 | Mixed standards (a full-IFRS member in an IFRS-for-SMEs group or the reverse) and accounting-policy alignment (e.g. investment property cost vs fair value, fixed-assets OQ-6). | Accountant / auditor | Default: group standard = parent's; alignment by manual journals |

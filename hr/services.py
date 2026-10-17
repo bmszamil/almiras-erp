@@ -2164,7 +2164,7 @@ def cancel_leave(leave_request, *, user):
 @transaction.atomic
 def record_opening_leave_balance(employee, leave_type, days, on, *, user, reason_ar="رصيد افتتاحي من ترحيل البيانات",
                                  reason_en="Opening balance from the data migration"):
-    """An opening balance from a migration (Daftra or another system, hr §6) as of ``on``. It is an **approved
+    """An opening balance from a migration (Falcon or another legacy system, hr §6) as of ``on``. It is an **approved
     adjustment**, not a direct ledger row (R29, review finding 1): this records a draft ``LeaveAdjustment`` of kind
     ``opening`` with ``source=import``; ``approve_leave_adjustment`` (``hr.adjust_leave_balance``, A, someone other
     than its creator) writes the ``opening`` ledger row, capped at what the service years up to ``on`` could have
