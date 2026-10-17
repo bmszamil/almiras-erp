@@ -1616,6 +1616,30 @@ def create_bank_transaction(bank_account, *, user, kind, statement_line=None, am
     return txn
 
 
+def create_receipt_from_line(statement_line, *, user, customer, reference_en="", reference_ar=""):
+    """OQ-22 default: a draft customer receipt prefilled from an unmatched statement credit, created through
+    ``invoicing.services.create_receipt`` with the caller's own invoicing rights (B7 applies to its posting).
+    The customer is chosen by the user, never guessed. Nothing is matched or posted here (R24)."""
+    from invoicing import services as invoicing
+
+    line = StatementLine.objects.select_related("bank_account", "bank_account__gl_account", "entity").get(
+        pk=statement_line.pk)
+    access.require(user, line.entity, "banking.view")
+    if line.direction != StatementLine.Direction.CREDIT:
+        raise error("A receipt is drafted from a bank credit only.", "يُعد سند القبض من إيداع بنكي فقط.",
+                    code="not_a_credit")
+    _require_active(line.bank_account, line.booking_date)
+    open_amount = line.amount - _consumed("statement_line", [line.pk]).get(line.pk, ZERO)
+    if open_amount <= ZERO:
+        raise error("The statement line is already fully matched.", "سطر الكشف مطابق بالكامل.", code="line_matched")
+    return invoicing.create_receipt(
+        line.entity, user=user, customer=customer, date=line.booking_date, amount=open_amount,
+        currency=line.currency_id, bank_account=line.bank_account.gl_account,
+        bank_reference=(line.bank_reference or line.end_to_end_id or line.customer_reference)[:100],
+        reference_en=reference_en, reference_ar=reference_ar,
+    )
+
+
 def _cross_currency(txn):
     return txn.kind == Kind_.OWN_TRANSFER and txn.to_bank_account is not None \
         and txn.to_bank_account.currency_id != txn.currency_id

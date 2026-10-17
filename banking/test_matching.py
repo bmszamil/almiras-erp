@@ -218,3 +218,11 @@ def test_r24_no_entry_or_document_creation_is_reachable_from_the_matching_engine
     called = set().union(*(calls(funcs[n]) for n in reachable))
     assert not (called & FORBIDDEN), called & FORBIDDEN
     assert {"_m0", "_m1", "_m2", "_m3", "_confirm"} <= reachable
+
+
+def test_m3_confidence_90_when_every_reference_is_in_the_line(w, accounts):
+    for ref, day in (("REF-A1", 5), ("REF-A2", 6)):
+        receipt(w, "10000.00", date(2027, 1, day), bank_reference=ref)
+    jan(w, accounts.riyad, [(date(2027, 1, 6), "C", "20000.00", "NTRF", "", "", "Batch REF-A1 REF-A2")])
+    group = Match.objects.get(bank_account=accounts.riyad, rule="M3")
+    assert (group.confidence, group.status) == (90, "proposed")

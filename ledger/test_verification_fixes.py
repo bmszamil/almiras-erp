@@ -105,13 +105,14 @@ def test_r90_the_helper_is_not_public():
 
 
 def test_r90_only_the_posting_services_name_the_helper():
-    """No view, API, admin or agent code reaches it: only the ledger and the invoicing posting path."""
+    """No view, API, admin or agent code reaches it: only the ledger and the invoicing and banking posting paths
+    (banking R33: a bank transaction's build_lines settles intercompany items)."""
     users = sorted(
         path.relative_to(REPO).as_posix() for path in REPO.glob("*/**/*.py")
         if "_settlement_for_document" in path.read_text(encoding="utf-8")
         and not path.name.startswith("test_") and "migrations" not in path.parts
     )
-    assert users == ["invoicing/services.py", "ledger/services.py"]
+    assert users == ["banking/services.py", "invoicing/services.py", "ledger/services.py"]
 
 
 def test_r90_the_helper_is_refused_outside_a_documents_build_lines(w):

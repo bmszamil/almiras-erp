@@ -325,3 +325,20 @@ def test_at30_no_kind_for_a_conventional_interest_debit(w, accounts):
     with pytest.raises(LedgerError, match="Sharia-prohibited"):
         ledger.post_entry(entry, access.require(w.p, w.alm, "ledger.post_entry", document=entry))
     entry.delete()
+
+
+def test_oq22_receipt_drafted_from_a_bank_credit_then_matched(w, accounts):
+    from banking.conftest import customer
+    from invoicing import services as inv
+
+    line = jan(w, accounts.riyad, [(date(2027, 1, 9), "C", "2300.00", "NTRF", "", "TRF-5521", "From buyer")]).lines.get()
+    buyer = customer(w)
+    with pytest.raises(access.AccessDenied):  # the agent has no invoicing rights
+        services.create_receipt_from_line(line, user=w.g, customer=buyer)
+    draft = services.create_receipt_from_line(line, user=w.a, customer=buyer)
+    assert (draft.status, draft.amount, draft.date, draft.bank_reference, draft.bank_account.code) == (
+        "draft", D("2300.00"), date(2027, 1, 9), "TRF-5521", "1101")
+    assert not Match.objects.filter(bank_account=accounts.riyad).exists()  # nothing matched or posted here
+    inv.post_receipt(draft, user=w.a)
+    services.run_matching(accounts.riyad, user=w.a)
+    assert services.statement_line_state(line, user=w.a) == "matched"
