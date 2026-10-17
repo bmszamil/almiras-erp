@@ -2,7 +2,7 @@
 
 Nothing here reads or writes the database or checks rights; ``billing.services`` loads the rows, checks the
 caller's rights and passes plain values in. All money is ``Decimal``, rounded half-up to the contract currency's
-decimals (2 or 3, D11), once per version segment (R42, OQ-24).
+decimals (2 or 3, D11), once per run of days with the same amount (R42, OQ-24).
 """
 import calendar
 from dataclasses import dataclass, field
@@ -177,6 +177,12 @@ def required_nets(period_start, period_end, full_days, versions, contract_start,
     ``round(amount × billable days / full period days, places)``. Also used to price a new invoice, so an
     invoice and its later corrections are computed the same way.
 
+    Consecutive version segments in which the line's amount is unchanged are one part: rounding happens only
+    where the amount changes (OQ-24 "rounded per segment" read as per *amount* segment). So an amendment that
+    changes no amount (e.g. ``due_days`` only) never moves a cent: a full month is still the monthly amount, and
+    an already-billed period needs no correction. AT-25 still holds: 10,000.00 × 15/31 and 12,000.00 × 16/31 are
+    rounded separately.
+
     Returns ``{line_key: (net, governing LineTerms of the last billable day)}`` for every line key that appears in
     any governing version of the period (net may be 0).
     """
@@ -196,20 +202,25 @@ def required_nets(period_start, period_end, full_days, versions, contract_start,
                 keys.append(line.line_key)
     result = {}
     for key in keys:
-        net = ZERO
+        parts = []  # [[amount, billable days]]: consecutive billable segments with the same amount merged
         shown = None
         for v, seg_days in segments:
             line = v.line(key) if v else None
             count = sum(1 for d in seg_days if billable(d, contract_start, v, line, end))
             if count:
                 amount = line.amount_on(period_start)
-                with localcontext() as ctx:
-                    ctx.prec = 60
-                    part = round_money(amount * Decimal(count) / Decimal(full_days), places)
-                net += part
+                if parts and parts[-1][0] == amount:
+                    parts[-1][1] += count
+                else:
+                    parts.append([amount, count])
                 shown = line
             elif line is not None and shown is None:
                 shown = line
+        net = ZERO
+        for amount, count in parts:
+            with localcontext() as ctx:
+                ctx.prec = 60
+                net += round_money(amount * Decimal(count) / Decimal(full_days), places)
         result[key] = (net, shown)
     return result
 

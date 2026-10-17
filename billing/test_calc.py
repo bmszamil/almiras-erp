@@ -122,3 +122,32 @@ def test_r10_open_ended_schedule_has_whole_periods_up_to_the_horizon():
     periods = calc.schedule(date(2027, 1, 1), versions, None, calc.horizon_for(date(2027, 1, 10), date(2027, 1, 1)))
     assert (periods[-1].period_start, periods[-1].period_end) == (date(2028, 2, 1), date(2028, 2, 29))
     assert len(periods) == 14 and all(p.proration_factor == 1 for p in periods)
+
+
+# --- R42 / OQ-24: rounding only where the amount changes (review finding 1, probe P1) -------------------------
+
+def test_r42_unchanged_amount_across_versions_is_one_part():
+    """A due_days-only amendment mid-month in a 30-day month: 1,000.05 × 15/30 rounded twice would be 1,000.06."""
+    versions = [v(1, date(2027, 1, 1), lines=(("k1", "1000.05"),)),
+                v(2, date(2027, 4, 16), lines=(("k1", "1000.05"),))]
+    nets = calc.required_nets(date(2027, 4, 1), date(2027, 4, 30), 30, versions, date(2027, 1, 1), None, 2)
+    assert nets["k1"][0] == D("1000.05")
+    assert nets["k1"][1] is versions[1].lines[0]  # still shown with the terms of the last billable day
+
+
+def test_r42_full_month_after_a_non_amount_amendment_equals_the_monthly_amount():
+    versions = [v(1, date(2027, 1, 1), lines=(("k1", "1000.05"),)),
+                v(2, date(2027, 6, 16), lines=(("k1", "1000.05"),)),
+                v(3, date(2027, 6, 20), lines=(("k1", "1000.05"),))]
+    for start, finish, full in ((date(2027, 6, 1), date(2027, 6, 30), 30), (date(2027, 7, 1), date(2027, 7, 31), 31)):
+        assert calc.required_nets(start, finish, full, versions, date(2027, 1, 1), None, 2)["k1"][0] == D("1000.05")
+    three = [v(1, date(2027, 1, 1), lines=(("k1", "1000.005"),)), v(2, date(2027, 6, 16), lines=(("k1", "1000.005"),))]
+    assert calc.required_nets(date(2027, 6, 1), date(2027, 6, 30), 30, three, date(2027, 1, 1), None, 3)["k1"][0] == \
+        D("1000.005")
+
+
+def test_r42_amount_change_still_rounds_each_amount_segment():
+    """AT-25 shape with a no-amount version in between: v1 and v2 (same amount) merge, v3 (new amount) is apart."""
+    versions = [v(1, date(2027, 1, 1)), v(2, date(2027, 3, 10)), v(3, date(2027, 3, 16), lines=(("k1", "12000.00"),))]
+    nets = calc.required_nets(date(2027, 3, 1), date(2027, 3, 31), 31, versions, date(2027, 1, 1), None, 2)
+    assert nets["k1"][0] == D("4838.71") + D("6193.55")
