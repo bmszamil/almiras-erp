@@ -179,8 +179,31 @@ ROLE_SEED_V5 = {
     "viewer": (*ROLE_SEED_V4["viewer"][:5],
                tuple(p for p in ROLE_SEED_V4["viewer"][5] if p != "hr.view") + ("hr.view_counts",)),
 }
+# V6 (migration core.0015, billing.md §7 as amended 2026-10-17; access A11): the billing version, correction and
+# recompute rights; billing.create_credit_note_draft (withdrawn from the catalogue) leaves every role; the billing
+# system user gets the correction-draft right and the rate reads create_from_billing needs (billing R67).
+_BILLING_STAFF = ("billing.edit_version_draft", "billing.review_correction", "billing.recompute_corrections")
+
+
+def _without(seed, code, *perms):
+    return (*seed[code][:5], tuple(p for p in seed[code][5] if p not in perms))
+
+
+def _billing_v6(seed):
+    out = {code: _without(seed, code, "billing.create_credit_note_draft") for code in seed}
+    out["accountant"] = _plus(out, "accountant", *_BILLING_STAFF)
+    out["approver"] = _plus(out, "approver", "billing.edit_version_draft", "billing.approve_version",
+                            "billing.recompute_corrections")
+    out["receivables_clerk"] = _plus(out, "receivables_clerk", "billing.review_correction")
+    out["managing_partner"] = _plus(out, "managing_partner", "billing.approve_version")  # every A permission (OQ-1)
+    out["system_billing"] = _plus(out, "system_billing", "invoicing.create_adjustment_from_billing",
+                                  "ledger.view_rates")
+    return out
+
+
+ROLE_SEED_V6 = _billing_v6(ROLE_SEED_V5)
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V5
+ROLE_SEED = ROLE_SEED_V6
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {

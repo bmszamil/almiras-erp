@@ -110,6 +110,9 @@ _PERMS = [
     _p("invoicing.submit_sales_document", "Submit sales documents", "تقديم مستندات المبيعات"),
     _p("invoicing.approve_sales_document", "Approve and issue sales documents", "اعتماد مستندات المبيعات وإصدارها", APPROVAL, POSTS),
     _p("invoicing.create_from_billing", "Create invoices from billing", "إنشاء الفواتير من نظام الفوترة", system="billing"),
+    # billing R43, R46c (A11): draft credit/debit notes from billing corrections, and deleting superseded drafts.
+    _p("invoicing.create_adjustment_from_billing", "Create draft correction notes from billing",
+       "إنشاء مسودات إشعارات التصحيح من نظام الفوترة", system="billing"),
     _p("invoicing.post_on_clearance", "Post sales on ZATCA clearance", "ترحيل المبيعات عند الاعتماد من الهيئة", POSTS, system="zatca_queue"),
     _p("invoicing.create_bill", "Create draft bills", "إنشاء مسودات فواتير الموردين", AGENT_OK),
     _p("invoicing.create_vendor_payment", "Create vendor payments", "إنشاء مدفوعات الموردين"),
@@ -135,7 +138,13 @@ _PERMS = [
     _p("billing.start_run", "Start billing runs", "بدء دورات الفوترة"),
     _p("billing.release_period", "Release billing periods", "إطلاق فترات الفوترة"),
     _p("billing.issue_from_contract", "Issue invoices from contracts", "إصدار الفواتير من العقود", system="billing"),
-    _p("billing.create_credit_note_draft", "Create draft credit notes", "إنشاء مسودات الإشعارات الدائنة"),
+    # billing §7 as amended 2026-10-17 (A11): versions, corrections and recompute. billing.create_credit_note_draft
+    # (pre-D9) is withdrawn: billing.review_correction + invoicing.create_adjustment_from_billing replace it.
+    _p("billing.edit_version_draft", "Draft and submit contract versions", "إعداد نسخ العقود وتقديمها"),
+    _p("billing.approve_version", "Approve contract versions", "اعتماد نسخ العقود", APPROVAL),
+    _p("billing.review_correction", "Review, submit or discard billing corrections",
+       "مراجعة تصحيحات الفوترة وتقديمها أو استبعادها"),
+    _p("billing.recompute_corrections", "Recompute billing corrections", "إعادة احتساب تصحيحات الفوترة"),
     _p("billing.view", "View billing", "عرض العقود والفوترة", AGENT_OK),
     _p("billing.view_employee_ref", "View employee references", "عرض مراجع الموظفين"),
     # zatca
@@ -217,7 +226,8 @@ def dual_control_roles(codename, step):
 
 # Plain (non-Sys) permissions a system user may also hold (3.6 holders column, R13).
 SYSTEM_EXTRA = {
-    "billing": frozenset({"billing.start_run"}),
+    # billing R67: the run's own right, plus the rate reads create_from_billing needs.
+    "billing": frozenset({"billing.start_run", "ledger.view_rates"}),
     "zatca_queue": frozenset(),
     "fx_import": frozenset(),
 }
