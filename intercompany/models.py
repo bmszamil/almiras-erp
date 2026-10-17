@@ -239,7 +239,7 @@ class CostPoolPeriod(Sourced):
         stored = self._stored()
         if stored is not None:
             changed = self._changed(stored)
-            if "locked_id" in changed or ("locked" in changed and not getattr(self, "_workflow", False)):
+            if "locked" in changed and not getattr(self, "_workflow", False):
                 raise locked_error("Pool locks change only through billing.", "يتغير قفل المجمع عبر الفوترة فقط.")
             if stored.locked and changed - {"locked"}:
                 raise locked_error("This cost pool period was billed and is locked (R6).",
