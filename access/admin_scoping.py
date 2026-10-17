@@ -7,6 +7,7 @@
 """
 from django.conf import settings
 from django.contrib import admin
+from django.contrib.admin.options import ActionLocation
 
 from . import services as access
 from .models import AuditLog
@@ -65,8 +66,8 @@ class ScopedAdmin(admin.ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         return False
 
-    def get_actions(self, request):
-        actions = super().get_actions(request)
+    def get_actions(self, request, action_location=ActionLocation.CHANGE_LIST):
+        actions = super().get_actions(request, action_location)
         actions.pop("delete_selected", None)
         return actions
 

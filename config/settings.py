@@ -147,9 +147,21 @@ STATIC_URL = "static/"
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
+# Console in DEBUG; SMTP otherwise (self-hosted, Saudi region — OQ11). Host/credentials from the environment.
 MAILERS = {
     "default": {
-        "BACKEND": "django.core.mail.backends.console.EmailBackend",
+        "BACKEND": os.environ.get(
+            "DJANGO_EMAIL_BACKEND",
+            "django.core.mail.backends.console.EmailBackend" if DEBUG else "django.core.mail.backends.smtp.EmailBackend",
+        ),
+        "OPTIONS": {} if DEBUG else {
+            "host": os.environ.get("EMAIL_HOST", "localhost"),
+            "port": int(os.environ.get("EMAIL_PORT", "587")),
+            "username": os.environ.get("EMAIL_HOST_USER", ""),
+            "password": os.environ.get("EMAIL_HOST_PASSWORD", ""),
+            "use_tls": os.environ.get("EMAIL_USE_TLS", "1") == "1",
+            "timeout": 10,
+        },
     },
 }
 
