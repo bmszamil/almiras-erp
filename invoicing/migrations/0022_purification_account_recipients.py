@@ -264,8 +264,8 @@ class Migration(migrations.Migration):
                         plain_max_length=34, verbose_name="IBAN / الآيبان"
                     ),
                 ),
-                ("iban_hash", models.CharField(editable=False, max_length=64)),
-                ("iban_last4", models.CharField(editable=False, max_length=4)),
+                ("iban_hash", models.CharField(editable=False, max_length=64, verbose_name="IBAN keyed hash / البصمة المفتاحية للآيبان")),
+                ("iban_last4", models.CharField(editable=False, max_length=4, verbose_name="IBAN last 4 / آخر 4 خانات من الآيبان")),
                 (
                     "platform_reference",
                     models.CharField(
@@ -410,7 +410,7 @@ class Migration(migrations.Migration):
                         verbose_name="Beneficiary IBAN / آيبان المستفيد",
                     ),
                 ),
-                ("beneficiary_iban_last4", models.CharField(max_length=4)),
+                ("beneficiary_iban_last4", models.CharField(max_length=4, verbose_name="Beneficiary IBAN last 4 / آخر 4 خانات من آيبان المستفيد")),
                 (
                     "amount",
                     models.DecimalField(
@@ -445,9 +445,9 @@ class Migration(migrations.Migration):
                         verbose_name="Status / الحالة",
                     ),
                 ),
-                ("created_at", models.DateTimeField(auto_now_add=True)),
-                ("cancelled_at", models.DateTimeField(blank=True, null=True)),
-                ("cancel_reason", models.CharField(blank=True, max_length=300)),
+                ("created_at", models.DateTimeField(auto_now_add=True, verbose_name="Created at / تاريخ الإنشاء")),
+                ("cancelled_at", models.DateTimeField(blank=True, null=True, verbose_name="Cancelled at / تاريخ الإلغاء")),
+                ("cancel_reason", models.CharField(blank=True, max_length=300, verbose_name="Cancellation reason / سبب الإلغاء")),
                 (
                     "beneficiary_bank",
                     models.ForeignKey(
@@ -465,6 +465,7 @@ class Migration(migrations.Migration):
                         on_delete=django.db.models.deletion.PROTECT,
                         related_name="+",
                         to=settings.AUTH_USER_MODEL,
+                        verbose_name="Cancelled by / ألغاه",
                     ),
                 ),
                 (
@@ -473,6 +474,7 @@ class Migration(migrations.Migration):
                         on_delete=django.db.models.deletion.PROTECT,
                         related_name="+",
                         to=settings.AUTH_USER_MODEL,
+                        verbose_name="Created by (payout poster) / أنشأه (مرحّل الصرف)",
                     ),
                 ),
                 (

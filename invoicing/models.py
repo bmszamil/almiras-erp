@@ -1502,8 +1502,8 @@ class CharityRecipient(models.Model):
     bank = models.ForeignKey("banking.Bank", on_delete=models.PROTECT, related_name="+",
                              verbose_name=bi("Bank", "البنك"))
     iban = EncryptedTextField(bi("IBAN", "الآيبان"), plain_max_length=34)
-    iban_hash = models.CharField(max_length=64, editable=False)
-    iban_last4 = models.CharField(max_length=4, editable=False)
+    iban_hash = models.CharField(bi("IBAN keyed hash", "البصمة المفتاحية للآيبان"), max_length=64, editable=False)
+    iban_last4 = models.CharField(bi("IBAN last 4", "آخر 4 خانات من الآيبان"), max_length=4, editable=False)
     platform_reference = models.CharField(
         bi("Platform reference", "مرجع المنصة"), max_length=100, blank=True,
         help_text=bi("Optional, e.g. the Ihsan national platform reference", "اختياري، مثل مرجع منصة إحسان"))
@@ -1594,19 +1594,21 @@ class PurificationInstruction(models.Model):
     beneficiary_bank = models.ForeignKey("banking.Bank", on_delete=models.PROTECT, related_name="+",
                                          verbose_name=bi("Beneficiary bank", "بنك المستفيد"))
     beneficiary_iban = EncryptedTextField(bi("Beneficiary IBAN", "آيبان المستفيد"), plain_max_length=34)
-    beneficiary_iban_last4 = models.CharField(max_length=4)
+    beneficiary_iban_last4 = models.CharField(bi("Beneficiary IBAN last 4", "آخر 4 خانات من آيبان المستفيد"),
+                                              max_length=4)
     amount = models.DecimalField(bi("Amount", "المبلغ"), max_digits=18, decimal_places=2)
     currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Currency", "العملة"))
     reference = models.CharField(bi("Reference", "المرجع"), max_length=140)
     execution_date = models.DateField(bi("Requested execution date", "تاريخ التنفيذ المطلوب"))
     status = models.CharField(bi("Status", "الحالة"), max_length=9, choices=Status.choices, default=Status.PENDING)
-    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                   verbose_name=bi("Created by (payout poster)", "أنشأه (مرحّل الصرف)"))
+    created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
     cancelled_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
-                                     related_name="+")
-    cancelled_at = models.DateTimeField(null=True, blank=True)
-    cancel_reason = models.CharField(max_length=300, blank=True)
+                                     related_name="+", verbose_name=bi("Cancelled by", "ألغاه"))
+    cancelled_at = models.DateTimeField(bi("Cancelled at", "تاريخ الإلغاء"), null=True, blank=True)
+    cancel_reason = models.CharField(bi("Cancellation reason", "سبب الإلغاء"), max_length=300, blank=True)
 
     objects = _ServiceOnlyQuerySet.as_manager()
 
