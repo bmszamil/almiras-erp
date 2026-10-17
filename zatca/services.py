@@ -42,6 +42,7 @@ from .models import (
     EntityMasterKey,
     GroupSuperKey,
     KeyCustodianDelegation,
+    NoBulkQuerySet,
     OnboardingEvent,
     Source,
     SubmissionAttempt,
@@ -483,15 +484,22 @@ def _token_and_secret(response):
 
 
 def _otp_refused(egs, user, response):
-    _event(egs.entity, egs, Action.OTP_REJECTED, user, http_status=response.status)
-    if response.status is None:
-        raise ZatcaError("ZATCA could not be reached; nothing changed. Try again (with a new OTP once it expires).",
-                         "تعذر الوصول إلى الهيئة؛ لم يتغير شيء. أعد المحاولة (برمز تحقق جديد عند انتهاء صلاحيته).",
-                         code="zatca_unreachable")
-    raise ZatcaError("ZATCA refused the OTP (expired or invalid). Get a new OTP from the Fatoora portal "
-                     "(valid for 1 hour); the same OTP is never sent again (R-7).",
-                     "رفضت الهيئة رمز التحقق (منتهي أو غير صالح). احصل على رمز جديد من بوابة فاتورة (صالح لمدة ساعة)؛ "
-                     "لا يُرسل الرمز نفسه مرة أخرى.", code="otp_rejected")
+    """R-7: only a 4xx answer is ZATCA refusing the OTP (``otp_rejected`` logged, a new OTP needed). No answer, a
+    5xx or a 2xx without a certificate is not a rejection: nothing is logged as one and the user may try again."""
+    status = response.status
+    if status is not None and 400 <= status < 500:
+        _event(egs.entity, egs, Action.OTP_REJECTED, user, http_status=status)
+        raise ZatcaError("ZATCA refused the OTP (expired or invalid). Get a new OTP from the Fatoora portal "
+                         "(valid for 1 hour); the same OTP is never sent again (R-7).",
+                         "رفضت الهيئة رمز التحقق (منتهي أو غير صالح). احصل على رمز جديد من بوابة فاتورة (صالح لمدة "
+                         "ساعة)؛ لا يُرسل الرمز نفسه مرة أخرى.", code="otp_rejected")
+    if status is None or status >= 500:
+        raise ZatcaError("ZATCA could not be reached or had an error; nothing changed. Try again (with a new OTP "
+                         "once it expires).",
+                         "تعذر الوصول إلى الهيئة أو حدث خطأ لديها؛ لم يتغير شيء. أعد المحاولة (برمز تحقق جديد عند "
+                         "انتهاء صلاحيته).", code="zatca_unreachable")
+    raise ZatcaError(f"ZATCA answered HTTP {status} without a certificate; nothing changed. Try again.",
+                     f"ردت الهيئة بالرمز {status} دون شهادة؛ لم يتغير شيء. أعد المحاولة.", code="no_certificate")
 
 
 def _store_credential(egs, kind, environment, response, user):
@@ -605,7 +613,7 @@ def _sign_xml(data, icv, pih, key_ref, master, credential, signing_time):
     if data.category == "simplified":
         qr_b64 = qr.encode(qr.simplified_values(
             seller_name=data.seller.name, vat_number=data.seller.vat_number,
-            timestamp=f"{data.issue_date_text}T{data.issue_time_text}Z", total=ubl.amount(data.total_gross),
+            timestamp=data.qr_timestamp, total=ubl.amount(data.total_gross),
             vat_total=ubl.amount(data.total_vat), invoice_hash=invoice_hash, signature_b64=signature_b64,
             public_key_der=crypto.spki_der(cert.public_key()), certificate_signature=cert.signature,
             signature_r_s=crypto.signature_r_s(signature)))
@@ -880,7 +888,8 @@ def _authorise_submit(user, doc):
 
 
 def _issue_moment(doc):
-    """The document's issue moment (invoicing R78: approval date and time in Riyadh), stored in UTC."""
+    """The document's issue moment (invoicing R78: approval date and time in Riyadh), stored in UTC (§3.4
+    ``issue_datetime``); the XML shows it again in Riyadh time, so its IssueDate is ``doc.issue_date``."""
     return datetime.combine(doc.issue_date, doc.issue_time or time(0, 0), tzinfo=RIYADH).astimezone(dt_timezone.utc)
 
 
@@ -999,11 +1008,13 @@ def _invoice_data(einv):
         text = ""
         if codes:
             texts = g.get("exemption_texts") or []
-            if codes[0] == "VATEX-SA-OOS" and texts:
+            if codes[0] == "VATEX-SA-OOS" and texts:  # the taxpayer's own text, case by case (XML v1.2 §11.2.4)
                 text = texts[0].get("ar") or texts[0].get("en") or ""
             else:
+                # BR-KSA-83: one of the official §11.2.4 texts of the code; Arabic, as every visible field must be
+                # (R-33; DTG p.79). English only if the code table has no Arabic. [SDK-confirm] exact-match rule.
                 reason = VatExemptionReason.objects.filter(code=codes[0]).first()
-                text = reason.name_en if reason else ""
+                text = (reason.name_ar or reason.name_en) if reason else ""
         groups.append(ubl.TaxGroup(g["category"], Decimal(g["rate"]), Decimal(g["taxable"]), Decimal(g["vat"]),
                                    codes, text))
     flags = {"third_party": doc.flag_third_party, "nominal": doc.flag_nominal, "export": doc.flag_export,
@@ -1019,6 +1030,8 @@ def _invoice_data(einv):
         billing_reference=original.source_document.number if original else "",
         billing_reference_entity_ok=original is None or original.entity_id == einv.entity_id,
         billing_reference_category=original.zatca_category if original else "",
+        billing_reference_pre_go_live=bool(doc.original_document_id) and (
+            original is None or (original.icv is None and original.hold_reason == EInvoice.Hold.NOT_LIVE)),
         reason=doc.reason_ar.strip(), flags=flags, retention_class=einv.retention_class,
         acquisition_date=einv.acquisition_date)
 
@@ -1730,7 +1743,7 @@ def export_archive(einvoice, *, user):
     if not einv.signed_xml:
         raise ZatcaError("Nothing is archived before stamping.", "لا يُؤرشف شيء قبل الختم.", code="not_stamped")
     xml = (einv.cleared_xml or einv.signed_xml).encode("utf-8")
-    issue = einv.issue_datetime.astimezone(dt_timezone.utc)
+    issue = einv.issue_datetime.astimezone(RIYADH)  # the date and time printed in the XML (finding 4)
     vat = einv.source_document.seller_vat_number
     return rules.archive_file_name(vat, issue.strftime("%Y-%m-%d"), issue.strftime("%H:%M:%S"),
                                    einv.source_document.number), xml
@@ -1745,10 +1758,60 @@ def purge_archive(entity, *, user, today=None):
     return {"kept": kept, "deleted": 0, "past_retention": expired}
 
 
+PERSONAL_XML_FIELDS = ("signed_xml", "cleared_xml")
+
+
+def _masking_iterable(allowed_entity_ids):
+    from django.db.models.query import ModelIterable
+
+    class MaskPersonalXml(ModelIterable):
+        """Withholds the XML (it names the buyer) of documents to individual buyers in entities where the user lacks
+        ``invoicing.view_personal_data`` (access OQ-7 default, as :func:`export_archive`)."""
+
+        def __iter__(self):
+            for einv in super().__iter__():
+                if einv.entity_id not in allowed_entity_ids and einv.buyer_is_individual:
+                    for name in PERSONAL_XML_FIELDS:
+                        setattr(einv, name, "")
+                    einv.personal_data_withheld = True
+                else:
+                    einv.personal_data_withheld = False
+                yield einv
+
+    return MaskPersonalXml
+
+
+class MaskedEInvoiceQuerySet(NoBulkQuerySet):
+    """``values()`` / ``values_list()`` would bypass the masking, so they may not name the XML fields."""
+
+    def _check_fields(self, fields):
+        if not fields or set(fields) & set(PERSONAL_XML_FIELDS):
+            raise ZatcaError("The signed and cleared XML are read through the e-invoice objects only.",
+                             "تُقرأ الفاتورة الموقعة والمعتمدة من خلال سجلات الفواتير الإلكترونية فقط.",
+                             code="masked_fields")
+
+    def values(self, *fields, **expressions):
+        self._check_fields(fields)
+        return super().values(*fields, **expressions)
+
+    def values_list(self, *fields, **kwargs):
+        self._check_fields(fields)
+        return super().values_list(*fields, **kwargs)
+
+
 def einvoices(user, entity=None):
-    """E-invoices the user may view (``zatca.view``), entity-filtered (R-3)."""
-    qs = access.scope(EInvoice.objects.select_related("entity", "source_document"), user, "zatca.view")
-    return qs.filter(entity=entity) if entity is not None else qs
+    """E-invoices the user may view (``zatca.view``), entity-filtered (R-3). Finding 15: the signed and cleared XML
+    of documents to individual buyers are withheld (``""``, ``personal_data_withheld=True``) unless the user also
+    holds ``invoicing.view_personal_data`` for that entity."""
+    allowed = frozenset(e.pk for e in access.entities_for(user, "invoicing.view_personal_data"))
+    base = MaskedEInvoiceQuerySet(EInvoice, using=EInvoice.objects.db)
+    qs = access.scope(base.select_related("entity", "source_document"), user, "zatca.view").annotate(
+        buyer_is_individual=ExpressionWrapper(Q(source_document__customer__customer_kind="individual"),
+                                              output_field=models.BooleanField()))
+    if entity is not None:
+        qs = qs.filter(entity=entity)
+    qs._iterable_class = _masking_iterable(allowed)
+    return qs
 
 
 def einvoice_statuses(user, entity=None):

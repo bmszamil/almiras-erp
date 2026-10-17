@@ -151,7 +151,7 @@ class FakeZatcaClient:
         cert = crypto.load_cert_base64(g("//ds:X509Certificate"))
         values = [(1, g("/*/cac:AccountingSupplierParty/cac:Party/cac:PartyLegalEntity/cbc:RegistrationName").encode()),
                   (2, g("/*/cac:AccountingSupplierParty/cac:Party/cac:PartyTaxScheme/cbc:CompanyID").encode()),
-                  (3, f"{g('/*/cbc:IssueDate')}T{g('/*/cbc:IssueTime').rstrip('Z')}Z".encode()),
+                  (3, f"{g('/*/cbc:IssueDate')}T{g('/*/cbc:IssueTime')}Z".encode()),
                   (4, g("/*/cac:LegalMonetaryTotal/cbc:TaxInclusiveAmount").encode()),
                   (5, g("/*/cac:TaxTotal/cbc:TaxAmount").encode()), (6, body["invoiceHash"].encode()),
                   (7, g("//ds:SignatureValue").encode()), (8, crypto.spki_der(cert.public_key()))]

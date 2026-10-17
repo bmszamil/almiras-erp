@@ -76,12 +76,23 @@ LOCAL = {
     "buyer_name": ("A standard invoice needs the buyer's name (BR-KSA-42).", "تحتاج الفاتورة القياسية إلى اسم المشتري."),
     "buyer_address": ("A standard invoice needs the buyer's street, city and country (BR-KSA-10).",
                       "تحتاج الفاتورة القياسية إلى شارع المشتري ومدينته ودولته."),
+    "buyer_address_sa": ("A standard invoice to a buyer in Saudi Arabia needs the buyer's building number, postal "
+                         "code and district (BR-KSA-63).",
+                         "تحتاج الفاتورة القياسية لمشترٍ في المملكة إلى رقم مبنى المشتري ورمزه البريدي والحي."),
+    "buyer_postal_code": ("The postal code of a buyer in Saudi Arabia must be exactly 5 digits (BR-KSA-67).",
+                          "يجب أن يتكون الرمز البريدي لمشترٍ في المملكة من 5 أرقام بالضبط."),
     "supply_date": ("A standard tax invoice needs the supply date (BR-KSA-15).",
                     "تحتاج الفاتورة الضريبية القياسية إلى تاريخ التوريد."),
     "billing_reference": ("A credit or debit note must reference an e-invoice of the same entity (BR-KSA-56, R-19).",
                           "يجب أن يشير الإشعار الدائن أو المدين إلى فاتورة إلكترونية للكيان نفسه."),
     "reason": ("A credit or debit note needs its reason in Arabic, 1 to 1,000 characters (BR-KSA-17, R-19).",
                "يحتاج الإشعار الدائن أو المدين إلى سببه بالعربية من حرف واحد إلى 1000 حرف."),
+    "original_pre_go_live": ("This note corrects an invoice issued before the entity went live on ZATCA Phase 2; that "
+                             "invoice has no e-invoice to reference, so the note is not sent to ZATCA. How such notes "
+                             "are reported is an open question (zatca R-19); ask the tax adviser.",
+                             "يصحح هذا الإشعار فاتورة صدرت قبل بدء الكيان المرحلة الثانية مع الهيئة؛ ليس لتلك الفاتورة "
+                             "فاتورة إلكترونية يُشار إليها، لذلك لا يُرسل الإشعار إلى الهيئة. طريقة الإبلاغ عن هذه "
+                             "الإشعارات مسألة مفتوحة؛ استشر المستشار الضريبي."),
     "payment_means": ("A credit or debit note needs a payment means code (BR-49, R-19).",
                       "يحتاج الإشعار الدائن أو المدين إلى رمز وسيلة الدفع."),
     "category_follows": ("A note has the category (standard or simplified) of its original invoice (R-19).",
@@ -92,6 +103,8 @@ LOCAL = {
                      "ضريبة إحدى الفئات لا تساوي المبلغ الخاضع مضروبًا في النسبة مقربًا إلى خانتين."),
     "total_vat": ("The VAT total differs from the sum of the category VAT amounts (R-31, BR-CO-14).",
                   "إجمالي الضريبة لا يساوي مجموع ضرائب الفئات."),
+    "total_gross": ("The total including VAT differs from the net total plus the VAT total (BR-CO-15).",
+                    "الإجمالي شاملًا الضريبة لا يساوي الصافي مضافًا إليه إجمالي الضريبة."),
     "line_total": ("A line amount including VAT differs from its net amount plus its VAT (R-31, BR-KSA-51).",
                    "مبلغ أحد البنود شاملًا الضريبة لا يساوي صافيه مضافًا إليه ضريبته."),
     "sar_vat": ("A document in a currency other than SAR needs its VAT total in SAR from invoicing (R-40).",

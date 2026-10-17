@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from lxml import etree
 
@@ -18,6 +19,7 @@ from . import crypto
 INV, CAC, CBC, EXT = (crypto.NS[k] for k in ("inv", "cac", "cbc", "ext"))
 DS, XADES = crypto.NS["ds"], crypto.NS["xades"]
 TWO = Decimal("0.01")
+RIYADH = ZoneInfo("Asia/Riyadh")
 
 
 @dataclass
@@ -65,7 +67,7 @@ class TaxGroup:
 class InvoiceData:
     number: str
     uuid: str
-    issue: datetime  # aware, UTC (OQ-18 default: emitted in UTC with Z)
+    issue: datetime  # aware; emitted as Asia/Riyadh local date and time (KSA-25 "hh:mm:ss" in AST, no suffix)
     type_code: str  # 388 / 381 / 383
     category: str  # standard / simplified
     subtype_code: str
@@ -85,6 +87,7 @@ class InvoiceData:
     billing_reference: str = ""  # BT-25: the original's invoice number (not a UUID)
     billing_reference_entity_ok: bool = True
     billing_reference_category: str = ""
+    billing_reference_pre_go_live: bool = False  # the original was issued before go-live (no e-invoice, R-19)
     reason: str = ""  # KSA-10, Arabic required
     flags: dict = field(default_factory=dict)  # third_party, nominal, export, summary, self_billed
     retention_class: str = "standard"
@@ -92,12 +95,30 @@ class InvoiceData:
     attachments: list = field(default_factory=list)  # [(id, base64 text)] extra AdditionalDocumentReference
 
     @property
+    def issue_local(self):
+        """The issue moment in Riyadh time. Coordinator decision 2026-10-17, pending the owner's confirmation in an
+        OQ-18 amendment: BT-2 / KSA-25 are emitted in AST without a suffix (XML v1.2 p.47 allows ``hh:mm:ss`` in
+        AST), so the XML issue date is the Riyadh calendar date of the document (invoicing R78)."""
+        if self.issue.tzinfo is None:
+            raise ValueError("InvoiceData.issue must be timezone-aware")
+        return self.issue.astimezone(RIYADH)
+
+    @property
     def issue_date_text(self):
-        return self.issue.strftime("%Y-%m-%d")
+        return self.issue_local.strftime("%Y-%m-%d")
 
     @property
     def issue_time_text(self):
-        return self.issue.strftime("%H:%M:%S")
+        return self.issue_local.strftime("%H:%M:%S")
+
+    @property
+    def qr_timestamp(self):
+        """QR tag 3, built from the emitted IssueDate and IssueTime as R-15 writes it: ``IssueDate "T" IssueTime
+        "Z"``. SDK 2.0.3 (checked offline 2026-10-17) accepts exactly that concatenation for an AST IssueTime and
+        refuses the UTC time, the bare local time and ``+03:00`` ("timeStamp does not match with qr code
+        timeStamp"), although the "Z" then does not mean UTC. Kept pending a current SDK or the sandbox
+        [SDK-confirm: needs current SDK or sandbox] (OQ-18, OQ-28)."""
+        return f"{self.issue_date_text}T{self.issue_time_text}Z"
 
 
 def subtype_code(category, flags):
@@ -160,7 +181,7 @@ def build_unsigned(data: InvoiceData, icv: int, pih: str) -> bytes:
     _sub(root, CBC, "ID", data.number)
     _sub(root, CBC, "UUID", data.uuid)
     _sub(root, CBC, "IssueDate", data.issue_date_text)
-    _sub(root, CBC, "IssueTime", data.issue_time_text + "Z")  # KSA-25 in UTC (OQ-18 default)
+    _sub(root, CBC, "IssueTime", data.issue_time_text)  # KSA-25 in AST, no suffix (OQ-18 amendment pending)
     _sub(root, CBC, "InvoiceTypeCode", data.type_code, name=data.subtype_code)
     _sub(root, CBC, "DocumentCurrencyCode", cur)
     _sub(root, CBC, "TaxCurrencyCode", "SAR")  # R-40: every document, SAR included

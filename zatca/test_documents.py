@@ -161,7 +161,8 @@ def test_at14_simplified_qr_tags_1_to_9(live):
     assert tags[1].decode() == "شركة TST1 للاختبار"  # Arabic seller name
     assert tags[2] == b"311111111100003"
     xml = xml_of(einv)
-    assert tags[3].decode() == f"{text(xml, '/*/cbc:IssueDate')}T{text(xml, '/*/cbc:IssueTime').rstrip('Z')}Z"
+    # finding 4: tag 3 = emitted (Riyadh) IssueDate "T" IssueTime "Z", as SDK 2.0.3 checks it (OQ-18, OQ-28)
+    assert tags[3].decode() == f"{text(xml, '/*/cbc:IssueDate')}T{text(xml, '/*/cbc:IssueTime')}Z"
     assert tags[4] == b"115.00" and tags[5] == b"15.00"
     assert tags[6].decode() == einv.invoice_hash and len(tags[6]) == 44
     assert tags[7].decode() == text(xml, "//ds:SignatureValue") and base64.b64decode(tags[7])[0] == 0x30
@@ -356,7 +357,9 @@ def test_at51_at45_sar_invoice_xml(live):
     assert text(xml, f"{seller}/cac:PostalAddress/cbc:CityName") == "الرياض"
     assert text(xml, f"{seller}/cac:PostalAddress/cbc:BuildingNumber") == "1234"
     assert text(xml, "/*/cbc:InvoiceTypeCode/@name") == "0100000" and text(xml, "/*/cbc:InvoiceTypeCode") == "388"
-    assert text(xml, "/*/cbc:IssueTime").endswith("Z")
+    issue_riyadh = einv.issue_datetime.astimezone(services.RIYADH)  # KSA-25 in AST, no suffix (finding 4)
+    assert text(xml, "/*/cbc:IssueDate") == issue_riyadh.strftime("%Y-%m-%d")
+    assert text(xml, "/*/cbc:IssueTime") == issue_riyadh.strftime("%H:%M:%S")
     assert text(xml, "/*/cac:Delivery/cbc:ActualDeliveryDate") == TODAY.isoformat()
 
 
@@ -590,8 +593,8 @@ def test_at59_archive_file_name_and_export_rights(live):
     doc, einv = stamped(live)
     run(live)
     name, xml = services.export_archive(einv, user=live.admin1)
-    issue_utc = einv.issue_datetime
-    assert name == f"311111111100003_{issue_utc:%Y%m%d}_{issue_utc:%H%M%S}_{doc.number}.xml"
+    issued = einv.issue_datetime.astimezone(services.RIYADH)  # the XML's date and time (finding 4)
+    assert name == f"311111111100003_{issued:%Y%m%d}_{issued:%H%M%S}_{doc.number}.xml"
     einv.refresh_from_db()
     assert xml == einv.cleared_xml.encode()
     assert services.export_archive(einv, user=live.viewer)[0] == name

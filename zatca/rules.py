@@ -79,7 +79,8 @@ def _third_decimal(value):
 
 
 def document_problems(data):
-    """Local checks before any ICV is used (R-16, R-19, R-31, R-40, R-46, R-48, R-51, BT-27).
+    """Local checks before any ICV is used (R-16, R-19, R-31, R-40, R-46, R-48, R-51, BT-27, BR-KSA-63/-67,
+    BR-CO-15).
 
     ``data`` is a :class:`zatca.ubl.InvoiceData`.
     """
@@ -117,11 +118,18 @@ def document_problems(data):
             problems.append(local("buyer_name"))
         if not (b.street.strip() and b.city.strip() and b.country.strip()):
             problems.append(local("buyer_address"))
+        if (b.country or "").strip().upper() == "SA":  # BR-KSA-63 (XML v1.2 p.57), BR-KSA-67 (p.58)
+            if not ((b.building_no or "").strip() and (b.postal_code or "").strip() and (b.district or "").strip()):
+                problems.append(local("buyer_address_sa"))
+            elif not _digits(b.postal_code.strip(), 5):
+                problems.append(local("buyer_postal_code"))
         if data.type_code == "388" and not data.supply_date:
             problems.append(local("supply_date"))
     # R-19: notes.
     if data.type_code in ("381", "383"):
-        if not data.billing_reference or not data.billing_reference_entity_ok:
+        if data.billing_reference_pre_go_live:
+            problems.append(local("original_pre_go_live"))
+        elif not data.billing_reference or not data.billing_reference_entity_ok:
             problems.append(local("billing_reference"))
         elif data.billing_reference_category and data.billing_reference_category != data.category:
             problems.append(local("category_follows"))
@@ -146,6 +154,8 @@ def document_problems(data):
                 problems.append(local("exemption_reason"))
     if Decimal(data.total_vat) != group_vat:
         problems.append(local("total_vat"))
+    if Decimal(data.total_gross) != Decimal(data.total_net) + Decimal(data.total_vat):  # BR-CO-15
+        problems.append(local("total_gross"))
     for line in data.lines:
         if line.amount_with_vat is not None and Decimal(line.amount_with_vat) != Decimal(line.net) + Decimal(line.vat):
             problems.append(local("line_total"))
@@ -158,7 +168,7 @@ def document_problems(data):
     # R-51: no non-zero third decimal anywhere.
     amounts = [data.total_net, data.total_vat, data.total_gross]
     for line in data.lines:
-        amounts += [line.net, line.vat, line.discount]
+        amounts += [line.net, line.vat, line.discount, line.unit_price]
     for g in data.groups:
         amounts += [g.taxable, g.vat]
     if data.currency_places > 2 and any(_third_decimal(a) for a in amounts):
