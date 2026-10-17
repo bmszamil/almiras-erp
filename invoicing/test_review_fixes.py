@@ -180,22 +180,28 @@ def test_p2_receipt_posting_refused_when_an_application_was_added_after_the_gran
 
 
 @pytest.mark.parametrize("kind", ["bill", "payment"])
-def test_p2_bill_and_payment_approval_refused_when_changed_after_the_grant(w, kind):
-    from django.db import models
-    from django.utils import timezone
+def test_p2_bill_and_payment_approval_refused_with_a_grant_older_than_the_last_change(w, kind):
+    """No service changes a submitted bill or payment (and the database refuses raw writes on PostgreSQL), so the
+    race is simulated with a grant checked before the document's submission."""
+    import dataclasses
+    from datetime import timedelta
 
     if kind == "bill":
-        doc, permission = bill(w), "invoicing.approve_bill"
-        approve_ = services.approve_purchase_document
+        doc, permission, approve_ = bill(w), "invoicing.approve_bill", services.approve_purchase_document
     else:
         doc = services.create_vendor_payment(w.alm, user=w.ap, vendor=w.vendor, date=date(2027, 1, 25), amount="100")
         doc = services.submit_vendor_payment(doc, user=w.ap)
         permission, approve_ = "invoicing.approve_vendor_payment", services.approve_vendor_payment
+    real = access.require
 
-    def change():  # a write that bypasses the services, after the grant
-        models.QuerySet.update(type(doc)._base_manager.filter(pk=doc.pk), modified_at=timezone.now())
+    def older_grant(user, entity, perm, **kw):
+        grant = real(user, entity, perm, **kw)
+        if perm == permission:
+            return dataclasses.replace(grant, checked_at=doc.submitted_at - timedelta(seconds=1))
+        return grant
 
-    with _race(permission, change), pytest.raises(access.AccessDenied) as exc:
+    with mock.patch.object(services.access, "require", side_effect=older_grant), \
+            pytest.raises(access.AccessDenied) as exc:
         approve_(doc, user=w.cfo)
     assert exc.value.code == "grant_document_changed"
     doc.refresh_from_db()

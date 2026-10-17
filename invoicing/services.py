@@ -1892,7 +1892,7 @@ def add_receipt_application(receipt, target, amount, *, user):
     return app
 
 
-def _post_money(movement, *, user, grant, receivable):
+def _post_money(movement, *, user, grant, receivable, approved=False):
     """Shared posting of a receipt or payment: lock, check, number, book, allocate (R26, R28, R33, R59)."""
     model = CustomerReceipt if receivable else VendorPayment
     target_model = SalesDocument if receivable else PurchaseDocument
@@ -1922,6 +1922,8 @@ def _post_money(movement, *, user, grant, receivable):
     movement.number = _next_number(entity, "RCPT" if receivable else "PAY", movement.date.year)
     movement.status = "posted"
     movement.posted_by, movement.posted_at = user, timezone.now()
+    if approved:  # vendor payments: CFO approval posts (R59); recorded in the same write as the posting
+        movement.approved_by, movement.approved_at = user, movement.posted_at
     movement._service_write = True
     movement.save()
     try:
@@ -2046,11 +2048,7 @@ def approve_vendor_payment(payment, *, user):
     grant = access.require(user, payment.entity, "invoicing.approve_vendor_payment", document=payment)
     _no_payment_without_wht(payment.vendor, payment.kind)
     with transaction.atomic():
-        payment = _post_money(payment, user=user, grant=grant, receivable=False)
-        payment.approved_by, payment.approved_at = user, payment.posted_at
-        payment._service_write = True
-        payment.save(update_fields=["approved_by", "approved_at", "updated_at"])
-        return payment
+        return _post_money(payment, user=user, grant=grant, receivable=False, approved=True)
 
 
 def _payment_lines(document):

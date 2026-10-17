@@ -969,25 +969,60 @@ class VendorPayment(MoneyMovement):
         return f"{self.number or 'DRAFT'} {self.amount} {self.currency_id} ({self.status})"
 
 
+class ApplicationQuerySet(models.QuerySet):
+    """Bulk writes skip save()/delete(): applications of posted receipts and payments never change (R36)."""
+
+    def _touches_locked(self):
+        source = self.model.SOURCE_FIELD
+        return self.exclude(**{f"{source}__status": "draft"}).exists()
+
+    def update(self, **kwargs):
+        if self._touches_locked() or self.model.SOURCE_FIELD in kwargs or f"{self.model.SOURCE_FIELD}_id" in kwargs:
+            raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
+        return super().update(**kwargs)
+
+    def delete(self):
+        if self._touches_locked():
+            raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
+        return super().delete()
+
+
 class Application(models.Model):
     """A planned allocation entered on a draft receipt or payment; becomes an allocation when it posts."""
 
+    SOURCE_FIELD = None
     amount = models.DecimalField(bi("Amount", "المبلغ"), max_digits=18, decimal_places=2)
+
+    objects = ApplicationQuerySet.as_manager()
 
     class Meta:
         abstract = True
+
+    def _source_status(self):
+        source = self.source_document
+        return type(source)._base_manager.filter(pk=source.pk).values_list("status", flat=True).first()
+
+    def delete(self, *args, **kwargs):
+        if self._source_status() != "draft":
+            raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
+        return super().delete(*args, **kwargs)
 
     def save(self, *args, **kwargs):
         source = self.source_document
         if self.entity_id != source.entity_id:
             raise error("An application belongs to its document's entity.", "يتبع التخصيص كيان مستنده.",
                         code="entity_mismatch")
-        if type(source)._base_manager.filter(pk=source.pk).values_list("status", flat=True).first() != "draft":
+        if self._source_status() != "draft":
             raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
+        if self.pk is not None:  # never moved to another receipt or payment
+            stored = type(self)._base_manager.filter(pk=self.pk).values_list(f"{self.SOURCE_FIELD}_id", flat=True).first()
+            if stored is not None and stored != source.pk:
+                raise error(SERVICE_ONLY.split(" / ")[0], SERVICE_ONLY.split(" / ")[1], code="service_only")
         super().save(*args, **kwargs)
 
 
 class ReceiptApplication(Application):
+    SOURCE_FIELD = "receipt"
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     receipt = models.ForeignKey(CustomerReceipt, on_delete=models.CASCADE, related_name="applications",
         verbose_name=bi("Receipt", "سند القبض"))
@@ -1005,6 +1040,7 @@ class ReceiptApplication(Application):
 
 
 class PaymentApplication(Application):
+    SOURCE_FIELD = "payment"
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     payment = models.ForeignKey(VendorPayment, on_delete=models.CASCADE, related_name="applications",
         verbose_name=bi("Payment", "سند الصرف"))
