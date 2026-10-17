@@ -136,7 +136,7 @@ def test_d15_integration_drafts_with_own_source_and_cannot_submit(make_agreement
     sync = make_user("rental-sync", (alm, "agent_drafter"), user_type="service_integration")
     inv = services.create_invoice_draft(sync, a, nov)
     assert (inv.source, inv.source_agent, inv.source_label) == ("integration", "rental-sync", "integration:rental-sync")
-    with pytest.raises(AccessDenied, match="D15"):
+    with pytest.raises(AccessDenied, match="D15|D20"):  # engine-level D20 check fires first
         approvals.submit(inv, sync)
     assert services.source_fields(None) == {"source": "import", "source_agent": ""}
     assert services.source_fields(access.system_user())["source"] == "import"
@@ -145,7 +145,7 @@ def test_d15_integration_drafts_with_own_source_and_cannot_submit(make_agreement
 def test_d15_agent_cannot_submit_agreement(make_agreement, make_user, alm):
     bot = make_user("ic-bot", (alm, "agent_drafter"), user_type="service_agent", agent_name="ic-bot")
     a = make_agreement(user=bot, activate=False)
-    with pytest.raises(AccessDenied, match="D15"):
+    with pytest.raises(AccessDenied, match="D15|D20"):  # engine-level D20 check fires first
         approvals.submit(a, bot)
     a.refresh_from_db()
     assert a.status == "draft" and not ApprovalRequest.objects.exists()

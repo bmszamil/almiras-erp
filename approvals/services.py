@@ -436,8 +436,8 @@ def submit_by_code(code, object_id, user, ctx=None):
     if not user.is_human:
         # D20: AI agents and integrations create drafts only; a human must submit them.
         raise AccessDenied("service_user_cannot_submit",
-                           "AI agents and integrations cannot submit for approval; a person must submit the draft.",
-                           "لا يمكن للوكلاء والتكاملات تقديم طلبات الموافقة؛ يجب أن يقدّم شخص المسودة.")
+                           "AI agents and integrations cannot submit for approval; a person must submit the draft (D20).",
+                           "لا يمكن للوكلاء والتكاملات تقديم طلبات الموافقة؛ يجب أن يقدّم شخص المسودة (D20).")
     # R1/R2/T2: permission in the document's own entity only.
     access.require_perm(user, entity, "approvals.request.submit")
     if adapter.submit_permission:
