@@ -29,7 +29,7 @@ def _submitted_termination(w, emp, kind="employer_termination", **fields):
 
 def test_r6_seeded_parameters_are_unverified_sa_rows(db):
     rows = StatutoryParameter.objects.filter(jurisdiction="SA")
-    assert set(rows.values_list("code", flat=True)) == set(statutory_seed.SA_PARAMETERS)
+    assert set(rows.values_list("code", flat=True)) == set(statutory_seed.ALL_CODES)
     assert set(rows.values_list("status", flat=True)) == {"unverified"}
     assert all(r.source_url and r.source_reference for r in rows)
     assert not StatutoryParameter.objects.exclude(jurisdiction="SA").exists()  # OQ-26: none for EG, CN, AE

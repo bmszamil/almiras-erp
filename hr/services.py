@@ -56,6 +56,7 @@ from .models import (
     FinalSettlementInput,
     Grade,
     HrAlert,
+    HrChecklistItem,
     HrError,
     HrSequence,
     HrSettings,
@@ -63,6 +64,7 @@ from .models import (
     LeaveLedger,
     LeaveRequest,
     LeaveType,
+    PregnancyNotice,
     SalaryComponent,
     SickLeaveDay,
     Source,
@@ -483,6 +485,10 @@ LEAVE_TYPE_SEED_SA = (
      "leave.iddah_extension", "unpaid", False, True, "female", False),
     ("HAJJ", "Hajj leave", "إجازة الحج", True, "leave.hajj", "full", False, False, "", True),
     ("EXAM", "Exam leave", "إجازة الامتحان", True, "leave.exam", "full", False, True, "", False),
+    # R37(c) (Art. 78): one paid day (or 8 hours) a week during the employer's notice, to look for other work.
+    ("NOTICE_ABSENCE", "Paid weekly absence during the employer's notice (Art. 78)",
+     "غياب أسبوعي بأجر خلال مهلة إشعار صاحب العمل (المادة 78)", True, "leave.notice_absence", "full", False, False, "",
+     False),
 )
 LEAVE_TYPE_UNPAID = ("UNPAID", "Unpaid leave", "إجازة بدون أجر", False, "", "unpaid", False, False, "", False)
 EVENT_TYPES = frozenset({"MARRIAGE", "BEREAVEMENT", "BEREAVEMENT_SIBLING", "PATERNITY", "MATERNITY", "MATERNITY_UNPAID",
@@ -1830,7 +1836,93 @@ def _leave_problems(req, use):
                             "يومًا في السنة؛ تُسجَّل إجازة بدون أجر.")
     elif lt.code in EVENT_TYPES or lt.code in ("HAJJ", "EXAM"):
         problems += _statutory_leave_problems(req, rule, use, jurisdiction, terms)
+    elif lt.code == "NOTICE_ABSENCE":
+        problems += _notice_absence_problems(req, rule)
     return problems
+
+
+def _notice_absence_problems(req, rule):
+    """R37(c) (Art. 78): only inside an employer's notice period (from ``notice_given_on`` to the last working day
+    of the employee's open or approved ``employer_termination``), and at most ``days_per_week`` days in each 7-day
+    block counted from the notice date. The 8-hour form is not built: whole days only."""
+    term = (Termination.objects.filter(employee=req.employee, kind=TKind.EMPLOYER_TERMINATION,
+                                       status__in=(TS.DRAFT, TS.SUBMITTED, TS.APPROVED), notice_given_on__isnull=False)
+            .order_by("-id").first())
+    if term is None or req.start_date < term.notice_given_on or req.end_date > term.last_working_day:
+        return ["This paid weekly absence is only taken during the employer's notice period (Art. 78). / يؤخذ هذا "
+                "الغياب الأسبوعي بأجر خلال مهلة إشعار صاحب العمل فقط (المادة 78)."]
+    per_week = int(rule["days_per_week"])
+    others = LeaveRequest.objects.filter(employee=req.employee, leave_type=req.leave_type, status__in=LIVE).exclude(
+        pk=req.pk)
+    taken = [d for o in others for d in _days(o.start_date, o.end_date)]
+    blocks = {}
+    for d in taken + list(_days(req.start_date, req.end_date)):
+        k = (d - term.notice_given_on).days // 7
+        blocks[k] = blocks.get(k, 0) + 1
+    if any(n > per_week for n in blocks.values()):
+        return [f"At most {per_week} paid day(s) of absence in each week of the notice (Art. 78). / بحد أقصى "
+                f"{per_week} يوم غياب بأجر في كل أسبوع من مهلة الإشعار (المادة 78)."]
+    return []
+
+
+def notice_absence_days(employee, start, end, *, user):
+    """R37(c) / payroll hand-off: the approved Art. 78 paid absence days of ``employee`` between start and end
+    (paid in full; payroll pays them as working days and shows them on the payslip)."""
+    access.require(user, employee.entity, "hr.view")
+    result = set()
+    for r in LeaveRequest.objects.filter(employee=employee, leave_type__code="NOTICE_ABSENCE",
+                                         status__in=(LR.APPROVED, LR.TAKEN), start_date__lte=end, end_date__gte=start):
+        result |= set(_days(max(r.start_date, start), min(r.end_date, end)))
+    return sorted(result)
+
+
+@transaction.atomic
+def record_exam_result(leave_request, taken, *, user):
+    """R33 (Art. 115): after the exam, record whether it was taken. ``False`` reverses the exam-leave pay: the
+    request's days become unpaid, so payroll deducts them (as a retro correction for a month already paid; payroll
+    R14, R16). Recorded once."""
+    req = _lock(LeaveRequest, leave_request.pk)
+    access.require(user, req.entity, "hr.request_leave")
+    if not isinstance(taken, bool):
+        raise error("State whether the exam was taken (True or False).", "حدّد ما إذا أُدّي الامتحان.", code="exam_result")
+    if req.leave_type.code != "EXAM" or req.status not in (LR.APPROVED, LR.TAKEN) or req.exam_taken is not None:
+        raise error("The exam result is recorded once, on approved exam leave.",
+                    "تُسجَّل نتيجة أداء الامتحان مرة واحدة على إجازة امتحان معتمدة.", code="leave_status")
+    req.exam_taken = taken
+    if not taken:
+        req.unpaid = True
+    req.modified_by, req.modified_at = user, timezone.now()
+    _save(req, update_fields=["exam_taken", "unpaid", "modified_by", "modified_at"])
+    return req
+
+
+@transaction.atomic
+def record_pregnancy(employee, *, user, document_ref, notified_on):
+    """R60 (Art. 155): record a pregnancy (or related illness) notified by the employee, as a document reference only
+    (R12): from ``notified_on`` an employer-initiated termination or notice gets the Art. 155 warning, also without
+    any leave. ``hr.manage_employee``."""
+    emp = _lock(Employee, employee.pk)
+    access.require(user, emp.entity, "hr.manage_employee")
+    if emp.gender != Employee.Gender.FEMALE:
+        raise error("A pregnancy is recorded for a female employee.", "يُسجَّل الحمل لموظفة.", code="gender")
+    if not (document_ref or "").strip():
+        raise error("The document reference is required.", "مرجع المستند مطلوب.", code="document_required")
+    notice = PregnancyNotice(entity=emp.entity, employee=emp, document_ref=document_ref.strip(), notified_on=notified_on,
+                             created_by=user, source=_source(user))
+    return _save(notice)
+
+
+@transaction.atomic
+def end_pregnancy_notice(notice, *, user, ended_on):
+    """R60: the recorded pregnancy ended (delivery, or otherwise); the Art. 155 warning stops after ``ended_on``
+    (maternity leave keeps its own warning)."""
+    n = PregnancyNotice.objects.select_for_update().get(pk=notice.pk)
+    access.require(user, n.entity, "hr.manage_employee")
+    if n.ended_on is not None or ended_on < n.notified_on:
+        raise error("The notice ends once, on or after the day it was notified.",
+                    "ينتهي الإشعار مرة واحدة في يوم الإبلاغ أو بعده.", code="pregnancy_notice")
+    n.ended_on, n.modified_by, n.modified_at = ended_on, user, timezone.now()
+    return _save(n)
 
 
 def _statutory_leave_problems(req, rule, use, jurisdiction, terms):
@@ -2408,9 +2500,10 @@ def _reverse_termination_accruals(term, user):
 # =====================================================================================================
 
 TS = Termination.Status
+# Art. 79 bis: a postponement is the approver's decision (postpone_resignation), never part of the draft.
 TERMINATION_FIELDS = frozenset({
-    "kind", "last_working_day", "reason_ar", "reason_en", "notice_given_on", "submitted_on", "postponed_until",
-    "postponement_reason_ar", "written_consent_ref", "article_ref", "article_paragraph", "hearing_ref",
+    "kind", "last_working_day", "reason_ar", "reason_en", "notice_given_on", "submitted_on",
+    "written_consent_ref", "article_ref", "article_paragraph", "hearing_ref",
     "absence_warning_ref", "marriage_contract_date", "delivery_date", "art77_compensation", "compensation_ref",
     "agreed_fraction",
 })
@@ -2462,9 +2555,54 @@ def _protection_warnings(term, use, jurisdiction):
                if (r.declarations or {}).get("pregnancy_related")]
     ill_days = sorted({d for r in illness for d in _days(r.start_date, r.end_date)})
     protected = set(ill_days[:limit])  # the related illness is protected up to the parameter's days
-    if maternity or any(start <= d <= lwd for d in protected):
+    # R60: a pregnancy recorded by document reference without any leave (PregnancyNotice) protects too.
+    noticed = PregnancyNotice.objects.filter(employee=emp, notified_on__lte=lwd).filter(
+        Q(ended_on__isnull=True) | Q(ended_on__gte=start)).exists()
+    if maternity or noticed or any(start <= d <= lwd for d in protected):
         found.append(ART155)
     return found
+
+
+def _age_on(birth, day):
+    """Completed Gregorian years of age on ``day``."""
+    return day.year - birth.year - ((day.month, day.day) < (birth.month, birth.day))
+
+
+def _retirement_warnings(term, use):
+    """R37 (GOSI check): a ``retirement`` before the GOSI legal age of the employee's cohort is a warning (en/ar)
+    the approver acknowledges, never a refusal (OQ-40). Non-Saudis and an empty cohort: a warning that no GOSI age
+    check was done. Returns ``(warnings, articles needing acknowledgement)``."""
+    emp, lwd = term.employee, term.last_working_day
+    if not emp.is_saudi or not emp.gosi_cohort:
+        why_en = "the employee is not Saudi" if not emp.is_saudi else "the GOSI cohort is not recorded"
+        why_ar = "الموظف غير سعودي" if not emp.is_saudi else "فئة التأمينات غير مسجلة"
+        return [f"No GOSI legal-age check was done for this retirement: {why_en} (R37, OQ-40). / لم يُجرَ التحقق من "
+                f"السن النظامية للتأمينات لهذا التقاعد: {why_ar}."], []
+    row = param("SA", "gosi.legal_age", lwd, required=False)
+    entry = (row.value if row else {}).get(emp.gosi_cohort) if row else None
+    if not entry or not entry.get("years"):
+        return [f"No GOSI legal age is configured for cohort {emp.gosi_cohort} on {lwd}: no age check was done (R37). / "
+                f"لا توجد سن نظامية مهيأة للفئة {emp.gosi_cohort} في {lwd}: لم يُجرَ التحقق من السن."], []
+    value = use.get("SA", "gosi.legal_age", lwd)[emp.gosi_cohort]
+    legal, article = int(Decimal(value["years"])), value["article"]
+    age = _age_on(emp.date_of_birth, lwd)
+    warnings = []
+    if emp.gosi_cohort == Employee.GosiCohort.LEGACY_M33:
+        warnings.append("Legacy contributor: checked against the age for contributors outside the Clause Fifth group; "
+                        "the Clause Fifth schedule is not loaded, check it on the GOSI record if it applies (OQ-40). / "
+                        "مشترك وفق النظام السابق: قورن بالسن لغير فئة البند خامسًا؛ جدول البند خامسًا غير محمّل، فتحقق "
+                        "منه في سجل التأمينات إن انطبق.")
+    if row.status != StatutoryParameter.Status.VERIFIED:
+        warnings.append(f"The GOSI legal-age row ({row.source_reference[:60]}) is not verified yet (R7). / صف السن "
+                        "النظامية للتأمينات غير متحقق منه بعد.")
+    if age >= legal:
+        return warnings, []
+    warnings.append(f"Retirement at age {age}, before the GOSI legal age of {legal} for cohort {emp.gosi_cohort} "
+                    f"({article}); whether Labour Law Art. 74(4) uses that age is open (OQ-40). The approver must "
+                    f"acknowledge this warning. / تقاعد في سن {age} قبل السن النظامية للتأمينات {legal} للفئة "
+                    f"{emp.gosi_cohort} ({article})؛ ومسألة اعتماد المادة 74(4) من نظام العمل لهذه السن مفتوحة. يجب أن "
+                    "يقر المعتمد بهذا التنبيه.")
+    return warnings, [article]
 
 
 def _resignation_dates(term, use, jurisdiction, accepted_on=None):
@@ -2594,6 +2732,11 @@ def _termination_problems(term, use):
     for article, en, ar in _protection_warnings(term, use, jurisdiction):
         term.protection_articles.append(article)
         warnings.append(f"{en} / {ar}")
+    # R37 (GOSI check): retirement before the cohort's legal age.
+    if term.kind == TKind.RETIREMENT:
+        retirement_warnings, articles = _retirement_warnings(term, use)
+        warnings += retirement_warnings
+        term.protection_articles += articles
     return problems, warnings
 
 
@@ -2706,7 +2849,13 @@ def _compute_eosb(employee, as_of, kind, use, additional_wage=ZERO):
     years = _years_between(start, as_of + timedelta(days=1 - excluded), terms.calendar_basis, year_days)
     components = {c.component.code: c.monthly_amount for c in terms.components.select_related("component")
                   if c.component.counts_for_eosb}
-    wage = sum(components.values(), ZERO) + _decimal(additional_wage, "additional_wage")
+    # R39: payroll's regular additions (payroll_port.AdditionalWage), or a plain amount from a preview caller.
+    extra_parts = dict(getattr(additional_wage, "parts", None) or {})
+    extra = _decimal(getattr(additional_wage, "amount", additional_wage), "additional_wage")
+    wage = sum(components.values(), ZERO) + extra
+    if extra:
+        components.update({f"additional:{code}": _decimal(v, code) for code, v in extra_parts.items()}
+                          or {"additional": extra})
     wage_f = Fraction(wage)
     full, remaining, done = Fraction(0), years, Fraction(0)
     for tier in table["tiers"]:
@@ -2786,12 +2935,14 @@ def _settlement_input(term, eosb, user, use):
 def approve_termination(termination, *, user, acknowledge_protection=False):
     """R38: approval in one transaction: termination approved; employee terminated (or on notice until the last
     working day); contract ended; active assignments ended at the last working day (events, R27); leave after it
-    cancelled and returned (R35); an EOSB snapshot (not for remuneration staff, R52); settlement inputs handed to
-    payroll. Any failure rolls everything back.
+    cancelled and returned (R35); the annual leave accrued up to the last working day; an EOSB snapshot (not for
+    remuneration staff, R52) with payroll's regular additions to the wage (R39); settlement inputs handed to payroll;
+    the GOSI exclusion checklist item (R65). Any failure rolls everything back.
 
-    R59, R60: when the Art. 82 or Art. 155 warning applies, the approver must pass ``acknowledge_protection=True``;
-    the acknowledgement (who, when, which articles) is stored on the termination. Without it the approval is
-    refused (OQ-23 default: warn and acknowledge, not refuse outright)."""
+    R59, R60 and the R37 retirement age check: when the Art. 82, Art. 155 or GOSI legal-age warning applies, the
+    approver must pass ``acknowledge_protection=True``; the acknowledgement (who, when, which articles) is stored on
+    the termination. Without it the approval is refused (OQ-23 default: warn and acknowledge, not refuse
+    outright)."""
     t = _lock(Termination, termination.pk)
     access.require(user, t.entity, "hr.approve_termination", document=t)
     emp = _lock(Employee, t.employee_id)
@@ -2808,23 +2959,33 @@ def approve_termination(termination, *, user, acknowledge_protection=False):
         if problems:
             raise _problems(problems, "termination_invalid")
         t.contract = _terms_on(emp, t.last_working_day) or t.contract
+    return _complete_termination(t, emp, use, actor=user, approver=user, acknowledge_protection=acknowledge_protection)
+
+
+def _complete_termination(t, emp, use, *, actor, approver, acknowledge_protection):
+    """The R38 effects of an approval by ``approver``, or of a deemed acceptance (Art. 79 bis, ``approver`` None,
+    run by the job); ``actor`` is the user recorded on the rows written."""
     problems, warnings = _termination_problems(t, use)
     if problems:
         raise _problems(problems, "termination_invalid")
     if t.protection_articles:
         if not acknowledge_protection:
             names = ", ".join(t.protection_articles)
-            raise error(f"Approval needs your acknowledgement of the protection warnings ({names}): no dismissal for "
-                        "illness before sick leave is used up (Art. 82); none during pregnancy or maternity (Art. 155).",
-                        f"يتطلب الاعتماد إقرارك بتنبيهات الحماية ({names}): لا فصل بسبب المرض قبل استنفاد الإجازة "
-                        "المرضية (المادة 82)، ولا فصل أثناء الحمل أو الوضع (المادة 155).", code="protection_ack_required")
-        t.protection_acknowledged_by, t.protection_acknowledged_at = user, timezone.now()
+            raise error(f"Approval needs your acknowledgement of the warnings ({names}): no dismissal for illness before "
+                        "sick leave is used up (Art. 82); none during pregnancy or maternity (Art. 155); retirement "
+                        "before the GOSI legal age (R37).",
+                        f"يتطلب الاعتماد إقرارك بالتنبيهات ({names}): لا فصل بسبب المرض قبل استنفاد الإجازة المرضية "
+                        "(المادة 82)، ولا فصل أثناء الحمل أو الوضع (المادة 155)، والتقاعد قبل السن النظامية للتأمينات.",
+                        code="protection_ack_required")
+        t.protection_acknowledged_by, t.protection_acknowledged_at = approver, timezone.now()
     eosb_result = None
     if emp.employment_basis != Basis.REMUNERATION:
-        eosb_result = _compute_eosb(emp, t.last_working_day, t.kind, use)
+        extra = payroll_port.get_port().eosb_additional_wage(emp, t.last_working_day)
+        eosb_result = _compute_eosb(emp, t.last_working_day, t.kind, use, extra)
     use.check_verified()
     lwd = t.last_working_day
-    t.status, t.approved_by, t.approved_at, t.warnings = TS.APPROVED, user, timezone.now(), warnings
+    t.gosi_exclusion_reason = _mapped_exclusion_reason(t) if _gosi_excludable(emp) else ""
+    t.status, t.approved_by, t.approved_at, t.warnings = TS.APPROVED, approver, timezone.now(), warnings + use.warnings
     _save(t)
     emp.status = Employee.Status.TERMINATED if lwd < _today() else Employee.Status.ON_NOTICE
     _save(emp, update_fields=["status"])
@@ -2834,19 +2995,201 @@ def approve_termination(termination, *, user, acknowledge_protection=False):
     for a in Assignment.objects.filter(employee=emp, status__in=(ASt.APPROVED, ASt.ACTIVE, ASt.ENDED)):
         a = _lock(Assignment, a.pk)
         if a.start_date > lwd:
-            _cancel_assignment_for_termination(a, t, user)
+            _cancel_assignment_for_termination(a, t, actor)
         elif a.end_date is None or a.end_date > lwd:
-            _end_assignment(a, lwd, t.reason_ar, t.reason_en, user, termination=t)
+            _end_assignment(a, lwd, t.reason_ar, t.reason_en, actor, termination=t)
     for r in LeaveRequest.objects.filter(employee=emp, status=LR.APPROVED, end_date__gt=lwd).order_by("start_date"):
-        _cancel_leave(_lock(LeaveRequest, r.pk), user, lwd + timedelta(days=1), use)
+        _cancel_leave(_lock(LeaveRequest, r.pk), actor, lwd + timedelta(days=1), use)
     for r in LeaveRequest.objects.filter(employee=emp, status__in=(LR.DRAFT, LR.SUBMITTED), end_date__gt=lwd):
         r.status = LR.CANCELLED
         _save(r)
     if emp.employment_basis != Basis.REMUNERATION:
-        _accrue_to_last_day(t, use, _jurisdiction(emp), user)
-    eosb = _snapshot(eosb_result, t, user) if eosb_result else None
-    _settlement_input(t, eosb, user, use)
+        _accrue_to_last_day(t, use, _jurisdiction(emp), actor)
+    eosb = _snapshot(eosb_result, t, actor) if eosb_result else None
+    _settlement_input(t, eosb, actor, use)
+    _gosi_exclusion_item(t, emp)
     use.mark_used()
+    return t
+
+
+def _gosi_excludable(emp):
+    """R65: who gets the GOSI exclusion item: a ``ksa_employee`` (any nationality) with a GOSI number; a remuneration
+    person only when Saudi with a GOSI number (payroll OQ-39); never a local entity employee."""
+    if not emp.gosi_number or emp.employment_basis == Basis.LOCAL_ENTITY_EMPLOYEE:
+        return False
+    return emp.employment_basis == Basis.KSA_EMPLOYEE or emp.is_saudi
+
+
+def _mapped_exclusion_reason(t):
+    """R65: the reason ``gosi.exclusion_reason_map`` gives the termination kind, or "" (empty map, OQ-42). A map row
+    that is not verified while verified rows are required is not used (the item then asks for the reason), so an
+    unverified mapping never reaches GOSI and never blocks the approval."""
+    row = param("SA", "gosi.exclusion_reason_map", t.last_working_day, required=False)
+    if row is None or (_required_verified() and row.status != StatutoryParameter.Status.VERIFIED):
+        return ""
+    return str((row.value or {}).get(t.kind, ""))[:40]
+
+
+def _gosi_exclusion_item(t, emp):
+    """R65: the open checklist item for the entity's hr_officers: exclude the contributor on the GOSI portal by the
+    last day of the leaving month with the mapped reason (or choose it there when unmapped). Nothing is sent to
+    GOSI."""
+    if not _gosi_excludable(emp):
+        return None
+    lwd = t.last_working_day
+    due = date(lwd.year, lwd.month, calendar.monthrange(lwd.year, lwd.month)[1])
+    code, reason = emp.employee_code, t.gosi_exclusion_reason
+    if reason:
+        en = f"Exclude {code} on GOSI by {due} with reason {reason}, then record the date and the GOSI reference here."
+        ar = f"استبعد {code} من التأمينات قبل {due} بالسبب {reason}، ثم سجّل التاريخ ومرجع التأمينات هنا."
+    else:
+        en = (f"Exclude {code} on GOSI by {due}: the reason is not mapped, choose it on the GOSI portal and record it "
+              "here with the date and the GOSI reference.")
+        ar = (f"استبعد {code} من التأمينات قبل {due}: السبب غير محدد، اختره في بوابة التأمينات وسجّله هنا مع التاريخ "
+              "ومرجع التأمينات.")
+    item = HrChecklistItem(entity=t.entity, termination=t, kind=HrChecklistItem.Kind.GOSI_EXCLUSION, due_date=due,
+                           text_en=en, text_ar=ar)
+    return _save(item)
+
+
+@transaction.atomic
+def record_gosi_exclusion(termination, *, user, excluded_on, reference, reason=""):
+    """R65: the hr_officer records that the contributor was excluded on the GOSI portal (date and portal reference,
+    and the reason used when none was mapped); the checklist item closes and its reminders stop."""
+    t = _lock(Termination, termination.pk)
+    access.require(user, t.entity, "hr.record_termination")
+    item = HrChecklistItem.objects.select_for_update().filter(termination=t, kind=HrChecklistItem.Kind.GOSI_EXCLUSION,
+                                                              status=HrChecklistItem.Status.OPEN).first()
+    if t.status != TS.APPROVED or item is None:
+        raise error("There is no open GOSI exclusion item for this termination.",
+                    "لا يوجد بند مفتوح للاستبعاد من التأمينات لإنهاء الخدمة هذا.", code="checklist")
+    reference, reason = (reference or "").strip(), (reason or "").strip()
+    if not reference or len(reference) > 60 or excluded_on is None:
+        raise error("Enter the exclusion date and the GOSI portal reference (at most 60 characters).",
+                    "أدخل تاريخ الاستبعاد ومرجع بوابة التأمينات (60 حرفًا بحد أقصى).", code="checklist")
+    if t.gosi_exclusion_reason and reason and reason != t.gosi_exclusion_reason:
+        raise error(f"The mapped reason is {t.gosi_exclusion_reason}; a different reason is fined (R65).",
+                    f"السبب المحدد هو {t.gosi_exclusion_reason}؛ واستخدام سبب مختلف تفرض عليه غرامة.", code="checklist")
+    if not t.gosi_exclusion_reason and not reason:
+        raise error("The reason was not mapped: enter the reason used on the GOSI portal (R65).",
+                    "السبب غير محدد: أدخل السبب المستخدم في بوابة التأمينات.", code="checklist")
+    t.gosi_exclusion_reason = t.gosi_exclusion_reason or reason[:40]
+    t.gosi_excluded_on, t.gosi_exclusion_ref = excluded_on, reference
+    _save(t, update_fields=["gosi_exclusion_reason", "gosi_excluded_on", "gosi_exclusion_ref"])
+    item.status, item.closed_by, item.closed_at = HrChecklistItem.Status.CLOSED, user, timezone.now()
+    _save(item)
+    return t
+
+
+def _gosi_exclusion_reminders(today):
+    """R65 reminders (``hr_gosi_exclusion_reminders``, daily): on the 25th and on the last day of the leaving month,
+    once each, the entity's HR officers are reminded of every open GOSI exclusion item (en/ar, employee code only)."""
+    sent = 0
+    for item_id in list(HrChecklistItem.objects.filter(status=HrChecklistItem.Status.OPEN,
+                                                       kind=HrChecklistItem.Kind.GOSI_EXCLUSION,
+                                                       due_date__year=today.year, due_date__month=today.month)
+                        .values_list("pk", flat=True)):
+        with transaction.atomic():
+            item = HrChecklistItem.objects.select_for_update().get(pk=item_id)
+            if item.status != HrChecklistItem.Status.OPEN or not (today.day == 25 or today == item.due_date):
+                continue
+            if str(today) in (item.reminders_sent or {}):
+                continue
+            _alert(item.entity, _recipients(item.entity, "hr.receive_alerts"), HrAlert.Kind.GOSI_EXCLUSION,
+                   f"Reminder: {item.text_en}", f"تذكير: {item.text_ar}")
+            item.reminders_sent = {**(item.reminders_sent or {}), str(today): timezone.now().isoformat()}
+            _save(item)
+            sent += 1
+    return sent
+
+
+@transaction.atomic
+def postpone_resignation(termination, *, user, postponed_until, reason_ar, reason_en=""):
+    """Art. 79 bis (R41): before day 30 the approver (``hr.approve_termination``, A, not the drafter or submitter)
+    may postpone accepting a resignation by up to the parameter's days after day 30, with a written reason; the last
+    working day becomes the end of the postponement. Postponed again only within the same limit."""
+    t = _lock(Termination, termination.pk)
+    access.require(user, t.entity, "hr.approve_termination", document=t)
+    _deny_own(user, t.entity, "hr.approve_termination", t.employee)
+    if t.kind != TKind.RESIGNATION or t.status not in (TS.DRAFT, TS.SUBMITTED) or t.submitted_on is None:
+        raise error("Only an open resignation is postponed.", "لا يُؤجَّل إلا قبول استقالة قائمة.", code="postpone")
+    use = ParamUse()
+    deemed = t.submitted_on + timedelta(
+        days=int(use.get("SA", "termination.resignation", t.submitted_on)["deemed_acceptance_days"]))
+    if _today() >= deemed:
+        raise error(f"A postponement is decided before {deemed}, the day the resignation is deemed accepted "
+                    "(Art. 79 bis).", f"يُقرَّر التأجيل قبل {deemed}، يوم اعتبار الاستقالة مقبولة.", code="postpone_late")
+    if postponed_until is None or postponed_until <= deemed:
+        raise error(f"The postponement ends after {deemed} (Art. 79 bis).", f"ينتهي التأجيل بعد {deemed}.",
+                    code="postpone")
+    t.postponed_until, t.postponement_reason_ar, t.postponement_reason_en = postponed_until, reason_ar, reason_en
+    t.postponed_by = user
+    t.last_working_day, problems = _resignation_dates(t, use, "SA")
+    if problems:
+        raise _problems(problems, "termination_invalid")
+    use.check_verified()
+    _save(t)
+    use.mark_used()
+    return t
+
+
+def _approvers(entity):
+    return _recipients(entity, "hr.approve_termination")
+
+
+def _resignation_deadlines(today):
+    """Art. 79 bis job (``hr_resignation_deadlines``, daily): for each open resignation of a ``ksa_employee`` the
+    approvers are reminded once on day 20 and once on day 27 after its submission (``HR_RESIGNATION_REMINDER_DAYS``,
+    default); on day 30 with no reply (or at the end of a postponement) a submitted resignation is deemed accepted
+    and the R38 effects run, recorded by the HR user who submitted it, with no approver. Unverified parameters
+    (R7) skip the resignation and are reported. Returns ``{"reminders", "deemed", "skipped"}``."""
+    reminder_days = tuple(getattr(settings, "HR_RESIGNATION_REMINDER_DAYS", (20, 27)))
+    report = {"reminders": 0, "deemed": [], "skipped": []}
+    for t_id in list(Termination.objects.filter(kind=TKind.RESIGNATION, status__in=(TS.DRAFT, TS.SUBMITTED),
+                                                submitted_on__isnull=False,
+                                                employee__employment_basis=Basis.KSA_EMPLOYEE)
+                     .order_by("pk").values_list("pk", flat=True)):
+        try:
+            with transaction.atomic():
+                t = _lock(Termination, t_id)
+                row = param("SA", "termination.resignation", t.submitted_on)
+                deemed = t.submitted_on + timedelta(days=int(row.value["deemed_acceptance_days"]))
+                code = t.employee.employee_code
+                for n in reminder_days:
+                    if t.postponed_until is None and t.submitted_on + timedelta(days=n) <= today < deemed \
+                            and str(n) not in (t.deadline_alerts or {}):
+                        _alert(t.entity, _approvers(t.entity), HrAlert.Kind.RESIGNATION_DEADLINE,
+                               f"{code}: the resignation submitted on {t.submitted_on} is deemed accepted on {deemed} "
+                               "unless it is accepted or postponed (with a written reason) before then (Art. 79 bis).",
+                               f"{code}: تُعد الاستقالة المقدمة في {t.submitted_on} مقبولة في {deemed} ما لم تُقبل أو "
+                               "يُؤجَّل قبولها (بسبب مكتوب) قبل ذلك (المادة 79 مكرر).")
+                        t.deadline_alerts = {**(t.deadline_alerts or {}), str(n): timezone.now().isoformat()}
+                        _save(t, update_fields=["deadline_alerts"])
+                        report["reminders"] += 1
+                if t.status == TS.SUBMITTED and today >= (t.postponed_until or deemed):
+                    _deem_resignation(t, deemed)
+                    report["deemed"].append(code)
+        except HrError as exc:
+            report["skipped"].append((Termination.objects.get(pk=t_id).employee.employee_code, exc.messages[0]))
+    return report
+
+
+def _deem_resignation(t, deemed):
+    """Art. 79 bis: no reply by day 30 (or the postponement ended): accepted by law on that day."""
+    emp = _lock(Employee, t.employee_id)
+    use = ParamUse()
+    due = t.postponed_until or deemed
+    t.accepted_on, t.deemed_accepted = due, t.postponed_until is None
+    t.last_working_day, problems = _resignation_dates(t, use, "SA", accepted_on=due)
+    if problems:
+        raise _problems(problems, "termination_invalid")
+    t.contract = _terms_on(emp, t.last_working_day) or t.contract
+    actor = t.submitted_by or t.created_by
+    _complete_termination(t, emp, use, actor=actor, approver=None, acknowledge_protection=False)
+    _alert(t.entity, _approvers(t.entity), HrAlert.Kind.RESIGNATION_DEADLINE,
+           f"{emp.employee_code}: the resignation is accepted by law on {due} (Art. 79 bis); last working day "
+           f"{t.last_working_day}.",
+           f"{emp.employee_code}: قُبلت الاستقالة بحكم النظام في {due} (المادة 79 مكرر)؛ آخر يوم عمل {t.last_working_day}.")
     return t
 
 

@@ -114,6 +114,33 @@ SA_PARAMETERS = {
     "final_settlement.due_days": ({"employer": "7", "worker": "14"}, LABOUR_LAW, "Labour Law Art. 88"),
     # Payroll R34 / Art. 111: encashment = balance x daily wage, month = 30 days (Art. 2).
     "leave.encashment": ({"day_divisor": "30"}, LABOUR_LAW, "Labour Law Art. 111, 2"),
+    # R37(c) (Art. 78): during the employer's notice the worker may be absent one paid day (or 8 hours) a week to
+    # look for other work; recorded as paid leave (NOTICE_ABSENCE) and handed to payroll.
+    "leave.notice_absence": ({"days_per_week": "1", "hours_per_week": "8"}, LABOUR_LAW, "Labour Law Art. 78"),
+}
+
+# GOSI rows HR reads (hr 3.9, GOSI checks of 2026-10-17; sources read 2026-10-17). Seeded unverified like every
+# row; the managing partner verifies them (R7). Payroll's own GOSI rows (rates, wage cap and floor, deadlines) are
+# not seeded here yet.
+GOSI_BOOKLET = "https://cmsgosi.gosi.gov.sa/SystemsAndRegulations/Documents/SocialInsuranceSystem1421.pdf"
+GOSI_FORM7 = "https://cmsgosi.gosi.gov.sa/SystemsAndRegulations/RequiredDocuments/Documents/form7.pdf"
+GOSI_VALID_FROM = "2024-07-03"
+GOSI_PARAMETERS = {
+    # R37 (GOSI check): legal age by cohort. new_m273: SIL Art. 16(1) (BoE translation, read 2026-10-17);
+    # legacy_m33 outside the Clause Fifth group: 60 full years with >= 120 months (SIL M/33 Art. 38(1)(a), GOSI
+    # booklet 2025 p.21). The Clause Fifth schedule (58 years 4 months to 65 by Gregorian age on 2024-07-03) is not
+    # loaded: its rows are not in the spec; who is in that group is not recorded either.
+    "gosi.legal_age": ({"new_m273": {"years": "65", "article": "SIL Art. 16(1)"},
+                        "legacy_m33": {"years": "60", "article": "SIL M/33 Art. 38(1)(a)"},
+                        "legacy_clause_fifth": {"schedule": [], "article": "SIL Royal Decree Clause Fifth(1), (2)"}},
+                       GOSI_BOOKLET, "SIL Art. 16(1); SIL M/33 Art. 38(1)(a), GOSI booklet 2025 p.21; Royal Decree "
+                       "Clause Fifth (schedule not loaded) | read 2026-10-17; MP verification pending (R7)"),
+}
+# R65: Termination.kind -> GOSI exclusion (leaving) reason. Empty until GOSI's reason list is supplied (OQ-42).
+GOSI_MAP_PARAMETERS = {
+    "gosi.exclusion_reason_map": ({}, GOSI_FORM7, "GOSI Form 7 item 1 (GOSI guide, secondary); violations fines rules "
+                                  "Aug 2024 item 2 [empty until GOSI's reason list is supplied, hr OQ-42] | read "
+                                  "2026-10-17; MP verification pending (R7)"),
 }
 
 
@@ -133,8 +160,13 @@ def apply(StatutoryParameter):
     """Create the SA rows that do not exist yet and bring the seeded rows nobody has verified or used up to date
     (idempotent; takes the model so a migration can pass its own). Never verifies a row and never touches a
     verified, superseded or used row: a change to one of those is a new row entered and verified by people (R7)."""
-    return apply_rows(StatutoryParameter, {code: (value, url, reference(code))
-                                           for code, (value, url, _ref) in SA_PARAMETERS.items()})
+    apply_rows(StatutoryParameter, {code: (value, url, reference(code))
+                                    for code, (value, url, _ref) in SA_PARAMETERS.items()})
+    apply_rows(StatutoryParameter, GOSI_PARAMETERS, valid_from=GOSI_VALID_FROM)
+    apply_rows(StatutoryParameter, GOSI_MAP_PARAMETERS)
+
+
+ALL_CODES = frozenset(SA_PARAMETERS) | frozenset(GOSI_PARAMETERS) | frozenset(GOSI_MAP_PARAMETERS)
 
 
 def apply_rows(StatutoryParameter, rows, jurisdiction="SA", valid_from=VALID_FROM):

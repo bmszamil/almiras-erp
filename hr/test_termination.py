@@ -282,16 +282,69 @@ def test_art79bis_resignation_dates_are_derived(w):
     assert late.status == "terminated"
 
 
-def test_art79bis_postponement(w):
+def test_art79bis_postponement_is_the_approvers_decision_before_day_30(w):
+    """AT-22 (c): resignation 2027-06-01; C postpones on 2027-06-20 to 2027-08-29 with a reason, then to 2027-09-01."""
     emp = hired(w, saudi=False)
-    with pytest.raises(HrError):
+    with pytest.raises(HrError) as exc:  # the drafter cannot type a postponement
         _record(w, emp, "resignation", submitted_on=date(2027, 5, 25), postponed_until=date(2027, 8, 1))
+    assert exc.value.code == "fields"
+    w.clock.set(date(2027, 6, 1))
+    t = services.submit_termination(_record(w, emp, "resignation", submitted_on=date(2027, 6, 1)), user=w.h)
+    w.clock.set(date(2027, 6, 20))
+    with pytest.raises(access.AccessDenied):  # the drafter and submitter is not the approver
+        services.postpone_resignation(t, user=w.h, postponed_until=date(2027, 8, 29), reason_ar="تسليم العمل")
     with pytest.raises(HrError):
-        _record(w, emp, "resignation", submitted_on=date(2027, 5, 25), postponed_until=date(2027, 8, 24),
-                postponement_reason_ar="تسليم العمل")
-    t = _approve(w, emp, "resignation", submitted_on=date(2027, 5, 25), postponed_until=date(2027, 8, 10),
-                 postponement_reason_ar="تسليم العمل")
-    assert t.last_working_day == date(2027, 8, 10)
+        services.postpone_resignation(t, user=w.c, postponed_until=date(2027, 8, 29), reason_ar="")
+    t = services.postpone_resignation(t, user=w.c, postponed_until=date(2027, 8, 29), reason_ar="تسليم العمل")
+    assert t.last_working_day == date(2027, 8, 29) and t.postponed_by == w.c
+    with pytest.raises(HrError):  # more than 60 days after day 30 (2027-07-01)
+        services.postpone_resignation(t, user=w.c, postponed_until=date(2027, 9, 1), reason_ar="تسليم العمل")
+    w.clock.set(date(2027, 7, 1))
+    with pytest.raises(HrError) as exc:  # day 30 reached: too late to postpone
+        services.postpone_resignation(t, user=w.c, postponed_until=date(2027, 8, 20), reason_ar="تسليم العمل")
+    assert exc.value.code == "postpone_late"
+    t = services.approve_termination(t, user=w.c)
+    assert t.last_working_day == date(2027, 8, 29) and not t.deemed_accepted
+
+
+def test_at22b_resignation_deemed_accepted_by_the_job_on_day_30_after_reminders(w):
+    from hr import jobs
+    from hr.models import HrAlert, Termination
+
+    emp = hired(w, saudi=False)
+    w.clock.set(date(2027, 4, 1))
+    t = services.submit_termination(_record(w, emp, "resignation", submitted_on=date(2027, 4, 1)), user=w.h)
+    assert jobs.resignation_deadlines(today=date(2027, 4, 20))["reminders"] == 0
+    w.clock.set(date(2027, 4, 21))
+    assert jobs.resignation_deadlines(today=date(2027, 4, 21))["reminders"] == 1  # day 20
+    assert jobs.resignation_deadlines(today=date(2027, 4, 22))["reminders"] == 0  # once
+    w.clock.set(date(2027, 4, 28))
+    assert jobs.resignation_deadlines(today=date(2027, 4, 28))["reminders"] == 1  # day 27
+    alerts = HrAlert.objects.filter(kind="resignation_deadline")
+    assert w.c in {a.recipient for a in alerts} and w.h not in {a.recipient for a in alerts}
+    assert all("2027-05-01" in a.text_en and "79" in a.text_ar for a in alerts)
+    w.clock.set(date(2027, 5, 1))
+    report = jobs.resignation_deadlines(today=date(2027, 5, 1))
+    assert report["deemed"] == [emp.employee_code]
+    t = Termination.objects.get(pk=t.pk)
+    assert t.status == "approved" and t.deemed_accepted and t.accepted_on == date(2027, 5, 1)
+    assert t.last_working_day == date(2027, 5, 1) and t.approved_by is None
+    assert EosbCalculation.objects.filter(termination=t).exists()  # R38 ran
+    assert FinalSettlementInput.objects.get(termination=t).created_by == w.h
+
+
+def test_art79bis_deemed_acceptance_skips_unverified_parameters(w, settings):
+    from hr import jobs
+
+    emp = hired(w, saudi=False)
+    w.clock.set(date(2027, 4, 1))
+    t = services.submit_termination(_record(w, emp, "resignation", submitted_on=date(2027, 4, 1)), user=w.h)
+    settings.HR_REQUIRE_VERIFIED_PARAMETERS = True
+    w.clock.set(date(2027, 5, 1))
+    report = jobs.resignation_deadlines(today=date(2027, 5, 1))
+    assert report["deemed"] == [] and report["skipped"][0][0] == emp.employee_code
+    t.refresh_from_db()
+    assert t.status == "submitted"
 
 
 def test_art79bis_withdrawal_within_seven_days_and_never_after_acceptance(w):
@@ -304,8 +357,9 @@ def test_art79bis_withdrawal_within_seven_days_and_never_after_acceptance(w):
         services.withdraw_termination(t, user=w.h, reason_ar="تراجع الموظف")
     assert exc.value.code == "withdrawal_late"
     accepted = hired(w, saudi=False)
-    ta = _approve(w, accepted, "resignation", submitted_on=date(2027, 5, 30), postponed_until=date(2027, 8, 1),
-                  postponement_reason_ar="تسليم")
+    ta = services.submit_termination(_record(w, accepted, "resignation", submitted_on=date(2027, 5, 30)), user=w.h)
+    ta = services.postpone_resignation(ta, user=w.c, postponed_until=date(2027, 8, 1), reason_ar="تسليم")
+    ta = services.approve_termination(ta, user=w.c)
     with pytest.raises(HrError) as exc:
         services.withdraw_termination(ta, user=w.mp, reason_ar="تراجع")
     assert exc.value.code == "withdrawal_after_acceptance"

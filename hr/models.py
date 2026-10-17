@@ -883,6 +883,8 @@ class LeaveRequest(Tracked, ServiceGuarded):
     actual_event_date = models.DateField(bi("Actual date of the event (birth)", "التاريخ الفعلي للواقعة (الولادة)"),
                                          null=True, blank=True)
     unpaid_from = models.DateField(bi("Unpaid from", "بدون أجر اعتبارًا من"), null=True, blank=True)
+    # R33 (Art. 115): recorded after the exam; False reverses the exam leave pay (the days become unpaid for payroll).
+    exam_taken = models.BooleanField(bi("Exam taken", "أُدّي الامتحان"), null=True, blank=True)
     declarations = models.JSONField(bi("Declarations", "الإقرارات"), default=dict, blank=True)
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     submitted_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
@@ -1153,6 +1155,11 @@ class Termination(Tracked, ServiceGuarded):
     accepted_on = models.DateField(bi("Accepted on", "تاريخ القبول"), null=True, blank=True)
     postponed_until = models.DateField(bi("Acceptance postponed until", "تأجيل القبول حتى"), null=True, blank=True)
     postponement_reason_ar = models.TextField(bi("Postponement reason (Arabic)", "سبب التأجيل (بالعربية)"), blank=True)
+    postponement_reason_en = models.TextField(bi("Postponement reason (English)", "سبب التأجيل (بالإنجليزية)"), blank=True)
+    postponed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                     related_name="+", verbose_name=bi("Postponed by", "أجّله"))
+    # Art. 79 bis: the day-20 and day-27 reminders sent to the approvers (threshold -> datetime), idempotent.
+    deadline_alerts = models.JSONField(bi("Reply reminders sent", "تذكيرات الرد المرسلة"), default=dict, blank=True)
     written_consent_ref = models.CharField(bi("Written consent reference", "مرجع الموافقة الكتابية"), max_length=100,
                                            blank=True)
     deemed_accepted = models.BooleanField(bi("Deemed accepted (no reply in 30 days)", "مقبولة حكمًا (دون رد خلال 30 يومًا)"),
@@ -1197,6 +1204,12 @@ class Termination(Tracked, ServiceGuarded):
     warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
     notice_shortfall_days = models.PositiveSmallIntegerField(bi("Notice shortfall (days)", "نقص مدة الإشعار (أيام)"),
                                                              default=0)
+    # R65: the GOSI exclusion (leaving) reason copied from gosi.exclusion_reason_map at approval, and what the
+    # hr_officer records after excluding the contributor on the GOSI portal (nothing is sent to GOSI).
+    gosi_exclusion_reason = models.CharField(bi("GOSI exclusion reason", "سبب الاستبعاد من التأمينات"), max_length=40,
+                                             blank=True)
+    gosi_excluded_on = models.DateField(bi("Excluded on GOSI on", "تاريخ الاستبعاد من التأمينات"), null=True, blank=True)
+    gosi_exclusion_ref = models.CharField(bi("GOSI portal reference", "مرجع بوابة التأمينات"), max_length=60, blank=True)
 
     class Meta:
         verbose_name = bi("termination", "إنهاء خدمة")
@@ -1205,6 +1218,75 @@ class Termination(Tracked, ServiceGuarded):
 
     def __str__(self):
         return f"{self.employee.employee_code} {self.kind} {self.last_working_day}"
+
+
+class HrChecklistItem(models.Model):
+    """An open task for the entity's hr_officers (R65: exclude the contributor on GOSI by the end of the leaving
+    month). Closed by the service that records the task's result; reminders by job."""
+
+    class Kind(models.TextChoices):
+        GOSI_EXCLUSION = "gosi_exclusion", bi("Exclude on GOSI", "الاستبعاد من التأمينات")
+
+    class Status(models.TextChoices):
+        OPEN = "open", bi("Open", "مفتوح")
+        CLOSED = "closed", bi("Closed", "مغلق")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    termination = models.ForeignKey(Termination, on_delete=models.PROTECT, related_name="checklist_items",
+                                    verbose_name=bi("Termination", "إنهاء الخدمة"))
+    kind = models.CharField(bi("Kind", "النوع"), max_length=20, choices=Kind.choices)
+    due_date = models.DateField(bi("Due by", "موعد الإنجاز"))
+    text_en = models.TextField(bi("Text (English)", "النص (بالإنجليزية)"))
+    text_ar = models.TextField(bi("Text (Arabic)", "النص (بالعربية)"))
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.OPEN)
+    reminders_sent = models.JSONField(bi("Reminders sent", "التذكيرات المرسلة"), default=dict, blank=True)
+    closed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                  related_name="+", verbose_name=bi("Closed by", "أغلقه"))
+    closed_at = models.DateTimeField(bi("Closed at", "تاريخ الإغلاق"), null=True, blank=True)
+    created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
+
+    objects = ServiceOnlyQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = bi("HR checklist item", "بند قائمة مهام الموارد البشرية")
+        verbose_name_plural = bi("HR checklist items", "قائمة مهام الموارد البشرية")
+        ordering = ["due_date", "id"]
+
+    def save(self, *args, **kwargs):
+        allowed, self._service_write = getattr(self, "_service_write", False), False
+        if not allowed:
+            raise error(*SERVICE_ONLY, code="service_only")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error(*SERVICE_ONLY, code="service_only")
+
+
+class PregnancyNotice(Tracked):
+    """R60 (Art. 155): a recorded pregnancy (or related illness) without leave, kept as a document reference with
+    the dates it was notified and ended, nothing more (R12, PDPL minimisation). Drives the Art. 155 warning."""
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    employee = models.ForeignKey(Employee, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Employee", "الموظف"))
+    document_ref = EncryptedTextField(bi("Document reference", "مرجع المستند"), plain_max_length=100)
+    notified_on = models.DateField(bi("Notified on", "تاريخ الإبلاغ"))
+    ended_on = models.DateField(bi("Ended on", "تاريخ الانتهاء"), null=True, blank=True)
+
+    objects = ServiceOnlyQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = bi("pregnancy notice", "إشعار حمل")
+        verbose_name_plural = bi("pregnancy notices", "إشعارات الحمل")
+        ordering = ["employee", "notified_on"]
+
+    def save(self, *args, **kwargs):
+        allowed, self._service_write = getattr(self, "_service_write", False), False
+        if not allowed:
+            raise error(*SERVICE_ONLY, code="service_only")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error(*SERVICE_ONLY, code="service_only")
 
 
 class EosbCalculation(models.Model):

@@ -3,8 +3,20 @@ because they act for no user (the access scan, core/test_access_scan.py, require
 service function); each command is run by an operator from the KSA-hosted host (H7)."""
 from django.db import IntegrityError, transaction
 
-from . import crypto
+from . import crypto, services
 from .models import Employee, EmployeeDocument, error
+
+
+def resignation_deadlines(*, today=None):
+    """``hr_resignation_deadlines`` (daily, Art. 79 bis): day-20 and day-27 reminders to the approvers, and deemed
+    acceptance on day 30 (or at the end of a postponement). See ``hr.services._resignation_deadlines``."""
+    return services._resignation_deadlines(today or services._today())
+
+
+def gosi_exclusion_reminders(*, today=None):
+    """``hr_gosi_exclusion_reminders`` (daily, R65): reminders on the 25th and the last day of the leaving month
+    while a GOSI exclusion item is open. See ``hr.services._gosi_exclusion_reminders``."""
+    return services._gosi_exclusion_reminders(today or services._today())
 
 
 def rehash_personal_data():

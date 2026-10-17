@@ -242,3 +242,127 @@ def test_h17_remuneration_staff_outside_wps_and_without_labour_law_deadline(w):
     assert not si.wps_included and si.due_by is None and not si.worker_initiated
     local = employee(w, w.egy, basis="local_entity_employee")
     assert not local.wps_included and hired(w).wps_included
+
+
+# --- Finding 11: spec rules that were missing ----------------------------------------------------------------
+
+def test_at42_retirement_before_the_gosi_legal_age_warns_and_needs_acknowledgement(w):
+    e7 = hired(w, date_of_birth=date(1967, 1, 1), gosi_cohort="new_m273", gosi_first_coverage_date=date(1990, 1, 1))
+    t = _record(w, e7, "retirement")
+    assert t.protection_articles == ["SIL Art. 16(1)"]
+    assert any("SIL Art. 16(1)" in x and "65" in x and "OQ-40" in x for x in t.warnings)
+    t = services.submit_termination(t, user=w.h)
+    with pytest.raises(HrError) as exc:
+        services.approve_termination(t, user=w.c)
+    assert exc.value.code == "protection_ack_required"
+    assert services.approve_termination(t, user=w.c, acknowledge_protection=True).status == "approved"
+    e8 = hired(w, date_of_birth=date(1972, 1, 1), gosi_cohort="legacy_m33", gosi_first_coverage_date=date(1995, 1, 1))
+    t8 = _record(w, e8, "retirement")
+    assert t8.protection_articles == ["SIL M/33 Art. 38(1)(a)"]
+    assert any("Clause Fifth" in x for x in t8.warnings) and any("not verified" in x for x in t8.warnings)
+    n2 = hired(w, saudi=False, date_of_birth=date(1967, 1, 1))
+    tn = _record(w, n2, "retirement")
+    assert tn.protection_articles == [] and any("No GOSI legal-age check" in x for x in tn.warnings)
+    older = hired(w, date_of_birth=date(1960, 1, 1), gosi_cohort="new_m273", gosi_first_coverage_date=date(1985, 1, 1))
+    assert _record(w, older, "retirement").protection_articles == []
+
+
+def _map_resignation_only():
+    row = services.param("SA", "gosi.exclusion_reason_map", LWD)
+    row.value = {"resignation": "GOSI-RESIGN"}  # test fixture: the real list is not supplied (OQ-42)
+    row.save()
+
+
+def test_at45_gosi_exclusion_checklist_reminders_and_closing(w):
+    from hr import jobs
+    from hr.models import HrAlert, HrChecklistItem
+
+    _map_resignation_only()
+    e1 = hired(w, saudi=False, gosi_number="111222333")
+    w.clock.set(date(2027, 5, 11))
+    t = services.submit_termination(_record(w, e1, "resignation", submitted_on=date(2027, 5, 11)), user=w.h)
+    t = services.approve_termination(t, user=w.c)
+    assert t.last_working_day == date(2027, 5, 11) and t.gosi_exclusion_reason == "GOSI-RESIGN"
+    item = HrChecklistItem.objects.get(termination=t)
+    assert item.due_date == date(2027, 5, 31) and "GOSI-RESIGN" in item.text_en and "GOSI-RESIGN" in item.text_ar
+    e1b = hired(w, gosi_number="111222334")
+    tb = _approve(w, e1b, "employer_termination")
+    itemb = HrChecklistItem.objects.get(termination=tb)
+    assert tb.status == "approved" and tb.gosi_exclusion_reason == "" and "not mapped" in itemb.text_en
+    e3 = hired(w)
+    t3 = _approve(w, e3, "employer_termination")
+    assert not HrChecklistItem.objects.filter(termination=t3).exists()
+    assert jobs.gosi_exclusion_reminders(today=date(2027, 5, 24)) == 0
+    assert jobs.gosi_exclusion_reminders(today=date(2027, 5, 25)) == 1
+    assert jobs.gosi_exclusion_reminders(today=date(2027, 5, 25)) == 0  # once a day
+    assert jobs.gosi_exclusion_reminders(today=date(2027, 5, 31)) == 1
+    assert {a.recipient.username for a in HrAlert.objects.filter(kind="gosi_exclusion")} == {"h", "h2"}
+    with pytest.raises(HrError):  # unmapped: the reason used is required
+        services.record_gosi_exclusion(tb, user=w.h, excluded_on=date(2027, 6, 30), reference="GOSI-REF-2")
+    services.record_gosi_exclusion(tb, user=w.h, excluded_on=date(2027, 6, 30), reference="GOSI-REF-2",
+                                   reason="END-OF-SERVICE")
+    with pytest.raises(HrError):  # a reason other than the mapped one
+        services.record_gosi_exclusion(t, user=w.h, excluded_on=date(2027, 5, 20), reference="R", reason="OTHER")
+    t = services.record_gosi_exclusion(t, user=w.h, excluded_on=date(2027, 5, 20), reference="GOSI-REF-1")
+    assert (t.gosi_excluded_on, t.gosi_exclusion_ref) == (date(2027, 5, 20), "GOSI-REF-1")
+    assert HrChecklistItem.objects.get(pk=item.pk).status == "closed"
+    with pytest.raises(HrError):
+        services.record_gosi_exclusion(t, user=w.h, excluded_on=date(2027, 5, 20), reference="AGAIN")
+    assert jobs.gosi_exclusion_reminders(today=date(2027, 6, 30)) == 0  # closed: no more reminders
+
+
+def test_r65_unverified_map_is_not_used_when_verified_rows_are_required(w, settings):
+    _map_resignation_only()
+    e1 = hired(w, saudi=False, gosi_number="111222335")
+    t = services.submit_termination(_record(w, e1, "resignation", submitted_on=date(2027, 5, 25)), user=w.h)
+    for row in services.StatutoryParameter.objects.filter(jurisdiction="SA", status="unverified").exclude(
+            code="gosi.exclusion_reason_map"):
+        services.verify_statutory_parameter(row, user=w.mp)
+    settings.HR_REQUIRE_VERIFIED_PARAMETERS = True
+    t = services.approve_termination(t, user=w.c)  # not refused because of the unverified map
+    assert t.status == "approved" and t.gosi_exclusion_reason == ""
+
+
+def test_r60_recorded_pregnancy_without_leave_warns(w):
+    from hr.models import PregnancyNotice
+
+    e = hired(w, gender="female")
+    with pytest.raises(HrError):
+        services.record_pregnancy(hired(w), user=w.h, document_ref="MED-P", notified_on=date(2027, 5, 1))
+    notice = services.record_pregnancy(e, user=w.h, document_ref="MED-P1", notified_on=date(2027, 5, 1))
+    t = _record(w, e)
+    assert "Art. 155" in t.protection_articles
+    with pytest.raises(HrError):
+        PregnancyNotice.objects.filter(pk=notice.pk).update(ended_on=date(2027, 5, 2))
+    services.end_pregnancy_notice(notice, user=w.h, ended_on=date(2027, 5, 15))
+    services.withdraw_termination(t, user=w.h, reason_ar="سحب")
+    # Notice given after the pregnancy ended: no Art. 155 warning.
+    assert "Art. 155" not in _record(w, e, notice_given_on=date(2027, 5, 20)).protection_articles
+
+
+def test_r37c_art78_weekly_paid_absence_during_employer_notice(w):
+    e = hired(w, hire_date=date(2025, 1, 1))
+    with pytest.raises(HrError):  # no employer notice yet
+        _leave(w, e, "NOTICE_ABSENCE", date(2027, 5, 5), date(2027, 5, 5))
+    _record(w, e, notice_given_on=date(2027, 5, 1))
+    first = _leave(w, e, "NOTICE_ABSENCE", date(2027, 5, 3), date(2027, 5, 3))
+    assert first.days == 1 and not first.unpaid
+    with pytest.raises(HrError) as exc:  # a second day in the same week (May 1 to 7)
+        _leave(w, e, "NOTICE_ABSENCE", date(2027, 5, 6), date(2027, 5, 6))
+    assert "Art. 78" in exc.value.messages[0]
+    _leave(w, e, "NOTICE_ABSENCE", date(2027, 5, 9), date(2027, 5, 9))  # next week
+    with pytest.raises(HrError):  # after the last working day
+        _leave(w, e, "NOTICE_ABSENCE", date(2027, 7, 1), date(2027, 7, 1))
+    assert services.notice_absence_days(e, date(2027, 5, 1), date(2027, 5, 31), user=w.p) == [date(2027, 5, 3),
+                                                                                              date(2027, 5, 9)]
+
+
+def test_r39_snapshot_takes_payroll_regular_additions(w):
+    from hr.payroll_port import AdditionalWage
+
+    e = hired(w, hire_date=date(2023, 7, 1))  # 4 years on LWD
+    w.payroll.additional_wage[e.pk] = AdditionalWage(amount=D("1000.00"), parts={"COMMISSION": "1000.00"})
+    t = _approve(w, e)
+    snap = EosbCalculation.objects.get(termination=t)
+    assert snap.wage_basis == D("9000.00") and snap.wage_components["additional:COMMISSION"] == "1000.00"
+    assert snap.award == D("18000.00")  # 4 x 1/2 x 9,000

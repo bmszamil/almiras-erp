@@ -34,6 +34,7 @@ class FakePayrollPort:
         self.approved = set()
         self.discarded = []
         self.balances = {}  # employee pk -> LoanBalances
+        self.additional_wage = {}  # employee pk -> AdditionalWage
 
     def create_draft(self, settlement_input, user):
         self.drafts.append(settlement_input.pk)
@@ -46,6 +47,9 @@ class FakePayrollPort:
 
     def outstanding_balances(self, employee, as_of):
         return self.balances.get(employee.pk, payroll_port.LoanBalances())
+
+    def eosb_additional_wage(self, employee, as_of):
+        return self.additional_wage.get(employee.pk, payroll_port.AdditionalWage())
 
 
 @contextmanager

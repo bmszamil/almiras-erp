@@ -554,3 +554,20 @@ def test_finding7_declarations_are_whitelisted_true_false_answers(w):
     with pytest.raises(HrError):
         services.request_leave(e, "HAJJ", user=w.h, start_date=date(2027, 6, 10), end_date=date(2027, 6, 19),
                                declarations={"hajj_not_performed_before": "yes"})
+
+
+def test_r33_exam_not_taken_reverses_the_pay(w):
+    e = hired(w)
+    req = _approved_leave(w, e, "EXAM", date(2027, 7, 1), date(2027, 7, 2), document_ref="EXAM-1",
+                          declarations={"employer_approved_study": True})
+    assert not req.unpaid and services.unpaid_leave_days(e, date(2027, 7, 1), date(2027, 7, 31), user=w.p) == 0
+    with pytest.raises(HrError):
+        services.record_exam_result(req, "no", user=w.h)
+    req = services.record_exam_result(req, False, user=w.h)
+    assert req.exam_taken is False and req.unpaid
+    assert services.unpaid_leave_days(e, date(2027, 7, 1), date(2027, 7, 31), user=w.p) == 2  # payroll deducts
+    with pytest.raises(HrError):
+        services.record_exam_result(req, True, user=w.h)  # once
+    other = _approved_leave(w, e, "EXAM", date(2027, 8, 1), date(2027, 8, 1), document_ref="EXAM-2",
+                            declarations={"employer_approved_study": True})
+    assert services.record_exam_result(other, True, user=w.h).unpaid is False
