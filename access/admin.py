@@ -22,18 +22,13 @@ except ImportError:  # pragma: no cover
     pass
 
 PRIVILEGE_FIELDS = {"user_type", "is_superuser", "is_staff", "is_active", "agent_name"}
+IDENTITY_FIELDS = {"username", "keycloak_id"}
 
 
-def _mp_held(role):
-    """D19: editing a role held by any Managing Partner changes that MP's privileges."""
-    from .services import mp_entities
-
-    holders = User.objects.filter(entity_access__role=role, entity_access__revoked_at__isnull=True).distinct()
-    return role.code == access.MP_ROLE_CODE or any(mp_entities(u) for u in holders)
-
-
-def _is_chairman(request):
-    return access.active_grants(request.user).filter(role__code=access.CHAIRMAN_ROLE_CODE).exists()
+def _chaired_entities(request):
+    """D19: entities where the admin user holds an active Chairman grant."""
+    return set(access.active_grants(request.user).filter(role__code=access.CHAIRMAN_ROLE_CODE)
+               .values_list("entity_id", flat=True))
 
 
 def _manages_users(request):
@@ -66,11 +61,22 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
     filter_horizontal = ()
 
     def scope_queryset(self, request, qs):
-        """Users holding a grant in an entity the viewer manages, plus users with no grant yet."""
+        """Users holding a grant in an entity the viewer manages, plus users with no grant yet.
+        D19: a Chairman also sees the Managing Partners of the entities where he is Chairman."""
         managed = self.erp_entities(request)
-        if not managed.exists():
-            return qs.none()
-        return qs.filter(Q(entity_access__entity__in=managed) | Q(entity_access__isnull=True)).distinct()
+        chaired = _chaired_entities(request)
+        q = Q(pk__in=[])
+        if managed.exists():
+            q |= Q(entity_access__entity__in=managed) | Q(entity_access__isnull=True)
+        if chaired:
+            q |= Q(entity_access__entity__in=chaired, entity_access__role__code=access.MP_ROLE_CODE,
+                   entity_access__revoked_at__isnull=True)
+        return qs.filter(q).distinct()
+
+    def has_view_permission(self, request, obj=None):
+        if obj is None and request.user.is_authenticated and request.user.is_active and _chaired_entities(request):
+            return True
+        return super().has_view_permission(request, obj)
 
     actions = ["unlock_selected"]
 
@@ -84,6 +90,8 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
             return ro + ([] if setup_mode(request) else ["is_superuser"])
         if not setup_mode(request) or obj.pk == request.user.pk:
             ro += ["is_superuser", "user_type", "agent_name"]  # user_type changes are setup-only (review B)
+        if obj.pk == request.user.pk and not setup_mode(request):
+            ro += sorted(IDENTITY_FIELDS)  # nobody renames themselves or changes their own identity link
         if not self._may_manage(request, obj):
             ro += ["is_staff", "is_active"]  # own privileges, or a user outside the editor's entities
         return sorted(set(ro))
@@ -93,7 +101,7 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
 
     def has_change_permission(self, request, obj=None):
         if obj is None:
-            return setup_mode(request) or _manages_users(request)
+            return setup_mode(request) or _manages_users(request) or bool(_chaired_entities(request))
         if obj.pk == request.user.pk:
             return True  # own profile (name, email, language); privileges stay read-only
         return self._may_manage(request, obj)
@@ -101,6 +109,9 @@ class UserAdmin(ScopedAdmin, BaseUserAdmin):
     def save_model(self, request, obj, form, change):
         if change:
             stored = User.objects.get(pk=obj.pk)
+            if obj.pk == request.user.pk and not setup_mode(request) and any(
+                    getattr(stored, f) != getattr(obj, f) for f in IDENTITY_FIELDS):
+                raise PermissionDenied("You cannot change your own username or Keycloak ID.")
             changed = {f for f in PRIVILEGE_FIELDS if getattr(stored, f) != getattr(obj, f)}
             if changed:
                 if obj.pk == request.user.pk:
@@ -162,13 +173,13 @@ class RoleAdmin(ScopedAdmin):
             return True
         if not _manages_globally(request):
             return False
-        return obj is None or not _mp_held(obj) or _is_chairman(request)
+        return obj is None or access.can_edit_role(request.user, obj)
 
     def has_delete_permission(self, request, obj=None):
         return (obj is None or not obj.is_system) and self.has_change_permission(request, obj)
 
     def save_model(self, request, obj, form, change):
-        if change and not setup_mode(request) and _mp_held(obj) and not _is_chairman(request):
+        if change and not access.can_edit_role(request.user, obj, setup=setup_mode(request)):
             raise PermissionDenied("Roles held by a Managing Partner change only through the Chairman (D19).")
         super().save_model(request, obj, form, change)
 

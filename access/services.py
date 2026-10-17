@@ -255,10 +255,7 @@ def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ct
             f"لا يمكن لوكلاء الخدمة حمل الدور {role.code}.",
         )
     if granter is not None:
-        if is_protected_mp(user):
-            require_manage_user(granter, user, setup=setup)  # D19
-        else:
-            require_perm(granter, entity, "access.entity_access.manage")
+        _require_grant_rights(granter, user, entity, role, setup)
     grant, created = EntityAccess.objects.get_or_create(
         user=user, entity=entity, role=role,
         defaults={"valid_from": valid_from or timezone.localdate(), "valid_to": valid_to, "granted_by": granter},
@@ -277,15 +274,39 @@ def grant_access(granter, user, entity, role, valid_from=None, valid_to=None, ct
 
 @transaction.atomic
 def revoke_access(revoker, grant, ctx=None, setup=False):
-    if is_protected_mp(grant.user):
-        require_manage_user(revoker, grant.user, setup=setup)  # D19
-    else:
-        require_perm(revoker, grant.entity, "access.entity_access.manage")
+    if revoker is None:
+        raise AccessDenied("permission_denied", "A revoke needs an acting user.", "يتطلب السحب مستخدماً منفذاً.")
+    _require_grant_rights(revoker, grant.user, grant.entity, grant.role, setup)
     before = snapshot(grant)
     grant.revoked_at = timezone.now()
     grant.save(update_fields=["revoked_at"])
     audit(revoker, "access.revoke", grant, entity=grant.entity, before=before, after=snapshot(grant), ctx=ctx)
     return grant
+
+
+def _require_grant_rights(actor, user, entity, role, setup):
+    """Who may grant or revoke `role` for `user` in `entity` (an acting user; operator commands pass none).
+
+    - Nobody grants or revokes their own roles, in any mode (closes self-promotion to Chairman).
+    - D19: only a holder of the Chairman role in that entity grants or revokes the Chairman role, so
+      nobody can create a Chairman to get around the Managing Partner protection. Setup mode excepted.
+    - D19: roles of a Managing Partner change only through a Chairman in all of their MP entities.
+    - Otherwise access.entity_access.manage in the entity.
+    """
+    if actor.pk == user.pk:
+        raise AccessDenied("self_grant", "You cannot grant or revoke your own roles.",
+                           "لا يمكنك منح أدوارك أو سحبها بنفسك.")
+    if role.code == CHAIRMAN_ROLE_CODE and not setup:
+        if not (actor.is_active and actor.is_human and has_role(actor, entity, CHAIRMAN_ROLE_CODE)):
+            raise AccessDenied(
+                "chairman_role_protected",
+                f"Only a Chairman of {entity.code} can grant or revoke the Chairman role (D19).",
+                f"لا يحق إلا لرئيس مجلس الإدارة في {entity.code} منح دور رئيس مجلس الإدارة أو سحبه (D19).",
+            )
+    if is_protected_mp(user):
+        require_manage_user(actor, user, setup=setup)  # D19
+    elif role.code != CHAIRMAN_ROLE_CODE or setup:
+        require_perm(actor, entity, "access.entity_access.manage")
 
 
 def _can_manage_users(actor):
@@ -339,6 +360,27 @@ def can_manage_user(actor, target, setup=False):
         EntityAccess.objects.filter(user=target, revoked_at__isnull=True).values_list("entity_id", flat=True)
     )
     return target_entities <= managed
+
+
+def mp_holders(role):
+    """Managing Partners holding `role` (any non-revoked grant)."""
+    holders = User.objects.filter(entity_access__role=role, entity_access__revoked_at__isnull=True).distinct()
+    return [u for u in holders if is_protected_mp(u)]
+
+
+def can_edit_role(actor, role, setup=False):
+    """D19 for role edits: changing a role held by a Managing Partner changes that MP's privileges, so
+    the editor must be able to manage every MP holding it (Chairman in each of their MP entities,
+    see can_manage_user). The managing_partner role itself always needs a Chairman. The normal
+    role-edit right is checked separately (admin). Setup mode excepted."""
+    if setup:
+        return True
+    holders = mp_holders(role)
+    if role.code != MP_ROLE_CODE and not holders:
+        return True
+    if actor is None or not active_grants(actor).filter(role__code=CHAIRMAN_ROLE_CODE).exists():
+        return False
+    return all(can_manage_user(actor, mp) for mp in holders)
 
 
 def require_manage_user(actor, target, setup=False):
