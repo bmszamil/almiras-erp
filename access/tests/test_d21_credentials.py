@@ -51,10 +51,10 @@ def user_manager(make_user, alm):
     return make_user("ua", (alm, "user_admin_test"))
 
 
-def self_enrol(username, password, new_password=OWN_PW):
+def self_enrol(username, password, new_password=OWN_PW, code_=""):
     """Run the enrolment page as the user: prove password, set own password if asked, enrol. Returns device."""
     c = Client()
-    resp = c.post(ENROL, {"username": username, "password": password})
+    resp = c.post(ENROL, {"username": username, "password": password, "code": code_})
     assert "no-store" in resp["Cache-Control"]
     if "new_password1" in resp.content.decode():
         resp = c.post(ENROL, {"new_password1": new_password, "new_password2": new_password})
@@ -118,9 +118,9 @@ def test_scenario_a_user_manager_initial_password_never_yields_chairman_2fa(alm,
     assert "otpauth://" not in Client().post(ENROL, {"username": "x", "password": UA_PW}).content.decode()
     # Credentials are re-established only by CFO + MP: initial password, then X sets his own and enrols.
     change = access.request_chairman_change(mp, A.PASSWORD, target=x, payload={"password": INIT_PW})
-    access.approve_chairman_change(cfo, change)
+    _, one_time = access.approve_chairman_change(cfo, change)
     assert not can_sign_in("x", INIT_PW)  # sign-in refused until he set his own password and enrolled
-    device = self_enrol("x", INIT_PW)
+    device = self_enrol("x", INIT_PW, code_=one_time)
     x.refresh_from_db()
     assert not x.totp_enrolment_required and not x.password_set_by_others and device.confirmed
     assert can_sign_in("x", OWN_PW) and not can_sign_in("x", INIT_PW)

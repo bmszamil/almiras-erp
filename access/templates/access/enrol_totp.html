@@ -34,6 +34,8 @@
   <form method="post">{% csrf_token %}
     <label for="username">Username / اسم المستخدم</label> <input id="username" name="username" autocomplete="username" required>
     <label for="password">Password / كلمة المرور</label> <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <label for="code">One-time enrolment code, if you were given one / رمز التسجيل لمرة واحدة إن أُعطي لك</label>
+    <input id="code" name="code" autocomplete="off">
     <button type="submit">Continue / متابعة</button>
   </form>
 {% endif %}

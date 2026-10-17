@@ -187,6 +187,8 @@ MESSAGE_STORAGE = "django.contrib.messages.storage.session.SessionStorage"
 
 # D21: dual-control requests to change a Chairman's account expire after this many days.
 ERP_CHAIRMAN_CHANGE_EXPIRY_DAYS = int(os.environ.get("ERP_CHAIRMAN_CHANGE_EXPIRY_DAYS", "7"))
+# D21 split knowledge: one-time enrolment codes issued with a dual-controlled initial password expire after this.
+ERP_ENROLMENT_CODE_HOURS = int(os.environ.get("ERP_ENROLMENT_CODE_HOURS", "72"))
 
 # Reverse proxies whose X-Forwarded-For header is trusted for the client IP (comma-separated IPs).
 ERP_TRUSTED_PROXIES = [p for p in os.environ.get("ERP_TRUSTED_PROXIES", "").split(",") if p.strip()]

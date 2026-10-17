@@ -406,14 +406,27 @@ class ChairmanChangeAdmin(ScopedAdmin):
 
     @admin.action(description="Approve selected (dual control) / اعتماد المحدد")
     def approve_selected(self, request, queryset):
+        codes = []
         for change in queryset:
             try:
                 change, result = access.approve_chairman_change(request.user, change, ctx=admin_ctx(request))
                 change.refresh_from_db()
-                # D21 (b): never a secret here; a 2FA reset only asks the Chairman to enrol himself.
+                # D21 (b): never a secret in messages.
                 self.message_user(request, f"Request {change.pk}: approved; status {change.status}.")
+                if isinstance(result, access.EnrolmentCode):
+                    codes.append((change, result))
             except BilingualError as exc:
                 self.message_user(request, f"Request {change.pk}: {exc}", messages.ERROR)
+        if codes:
+            # Split knowledge: shown once, only to the approver whose approval applied it, never stored.
+            from django.template.response import TemplateResponse
+            from django.utils.cache import add_never_cache_headers
+
+            response = TemplateResponse(request, "access/enrolment_code.html", {
+                **self.admin_site.each_context(request), "codes": codes, "title": "One-time enrolment code"})
+            response.render()
+            add_never_cache_headers(response)
+            return response
 
     @admin.action(description="Reject selected / رفض المحدد")
     def reject_selected(self, request, queryset):

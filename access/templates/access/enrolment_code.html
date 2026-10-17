@@ -1,0 +1,10 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+<p>Give this one-time code to the Chairman in person. It is shown only now and is not stored; the requester
+knows the initial password, so the Chairman needs both to enrol. It expires and works once.<br>
+<span lang="ar" dir="rtl">سلّم هذا الرمز لرئيس مجلس الإدارة شخصياً. يظهر الآن فقط ولا يُحفظ؛ يعرف مقدّم الطلب كلمة المرور المبدئية، فيحتاج رئيس مجلس الإدارة إلى الاثنين للتسجيل. الرمز صالح لمرة واحدة ولمدة محدودة.</span></p>
+<ul>{% for change, code in codes %}
+  <li>{{ change.target }}: <code dir="ltr">{{ code }}</code> (until {{ change.target.enrolment_code_expires_at }})</li>
+{% endfor %}</ul>
+<p><a href="../">Back / رجوع</a></p>
+{% endblock %}

@@ -183,7 +183,7 @@ def snapshot(obj, fields=None):
     for f in obj._meta.concrete_fields:
         if fields is not None and f.name not in fields:
             continue
-        if f.name == "password":
+        if f.name in ("password", "enrolment_code_hash"):
             continue
         data[f.attname] = to_json(getattr(obj, f.attname))
     return data
@@ -842,7 +842,8 @@ def _require_factors_apart(action, target):
         raise RuleError("factors_apart", "The Chairman must first change the password he was given; only then can "
                         "his authenticator app be reset.", "يجب أن يغيّر رئيس مجلس الإدارة كلمة المرور المعطاة له "
                         "أولاً، ثم يمكن إعادة تعيين تطبيق المصادقة.")
-    if action == CC.Action.PASSWORD and target.totp_enrolment_required and target.has_usable_password():
+    if (action == CC.Action.PASSWORD and target.totp_enrolment_required and target.has_usable_password()
+            and not target.enrolment_code_required):
         # (An unusable password after a role grant must be replaced by an initial password; the Chairman
         # then sets his own on the enrolment page before enrolling.)
         raise RuleError("factors_apart", "The Chairman must first enrol his new authenticator app; only then can his "
@@ -966,9 +967,17 @@ def _apply_chairman_change(actor, change, ctx):
             before = {"has_usable_password": target.has_usable_password()}
             target.password = p["password_hash"]
             target.password_set_by_others = True
-            target.save(update_fields=["password", "password_set_by_others"])
+            fields = ["password", "password_set_by_others"]
+            if target.totp_enrolment_required:
+                # Split knowledge: the requester knows the initial password; the approver who completes the
+                # pair alone receives a one-time code. Enrolment needs both (D21 review).
+                result = _issue_enrolment_code(target)
+                fields += ["enrolment_code_required", "enrolment_code_hash", "enrolment_code_expires_at"]
+            target.save(update_fields=fields)
             audit(actor, "access.user.password_change", target, before=before,
-                  after={"chairman_change": change.pk, "password_set_by_others": True}, ctx=ctx)
+                  after={"chairman_change": change.pk, "password_set_by_others": True,
+                         "enrolment_code_issued": result is not None,
+                         "enrolment_code_expires_at": target.enrolment_code_expires_at if result else None}, ctx=ctx)
         elif change.action == CC.Action.TOTP_RESET:
             from django_otp.plugins.otp_totp.models import TOTPDevice
 
@@ -1042,8 +1051,50 @@ def set_own_password(user, new_password, ctx=None):
         raise RuleError("invalid_password", " ".join(exc.messages), "كلمة المرور غير مقبولة.")
     with transaction.atomic():
         user.set_password(new_password)
-        user.save(update_fields=["password", "password_set_by_others"])
+        user.enrolment_code_required = False  # only he knows the password now
+        user.save(update_fields=["password", "password_set_by_others", "enrolment_code_required"])
         password_changed_by_self(user, ctx=ctx)
+
+
+class EnrolmentCode(str):
+    """The plain one-time code, returned once to the applying approver. Never stored or logged."""
+
+
+def _issue_enrolment_code(user):
+    import secrets
+
+    from django.conf import settings
+    from django.contrib.auth.hashers import make_password
+
+    code = EnrolmentCode("-".join(secrets.token_hex(3).upper() for _ in range(3)))  # 18 hex chars, 72 bits
+    user.enrolment_code_required = True
+    user.enrolment_code_hash = make_password(code)
+    user.enrolment_code_expires_at = timezone.now() + datetime.timedelta(
+        hours=getattr(settings, "ERP_ENROLMENT_CODE_HOURS", 72))
+    return code
+
+
+def redeem_enrolment_code(user, code, ctx=None):
+    """Enrolment step 0 for a user with a dual-controlled initial password: check the one-time code. Single
+    use: a correct code is consumed. Wrong codes count as failed sign-ins (lockout) and are audited; an
+    expired or used code needs a new dual-control password change. Returns True when accepted."""
+    from django.contrib.auth.hashers import check_password
+
+    if not user.enrolment_code_required:
+        return True
+    username = {"username": user.username}
+    if not user.enrolment_code_hash or user.enrolment_code_expires_at is None \
+            or user.enrolment_code_expires_at <= timezone.now():
+        audit(system_user(), "access.enrolment_code.expired", user, after=username, ctx=ctx)
+        return False
+    if not check_password(code or "", user.enrolment_code_hash):
+        audit(system_user(), "access.sign_in_failed", None, object_type="access.user", object_id=str(user.pk),
+              after={**username, "reason": "enrolment_code"}, ctx=ctx)  # counted by the lockout
+        return False
+    User.objects.filter(pk=user.pk).update(enrolment_code_hash="", enrolment_code_expires_at=None)
+    user.enrolment_code_hash, user.enrolment_code_expires_at = "", None
+    audit(user, "access.enrolment_code.redeemed", user, after=username, ctx=ctx)
+    return True
 
 
 def start_self_enrolment(user, ctx=None):

@@ -32,7 +32,7 @@ def _start_device(request, user):
 
 
 @never_cache
-@sensitive_post_parameters("password", "new_password1", "new_password2", "token")
+@sensitive_post_parameters("password", "code", "new_password1", "new_password2", "token")
 def enrol_totp(request):
     pending = request.session.get(SESSION_KEY) or {}
     user = User.objects.filter(pk=pending.get("user"), is_active=True).first() if pending else None
@@ -79,6 +79,10 @@ def enrol_totp(request):
         user = None
     if user is None or not user.is_human or not user.totp_enrolment_required:
         return _page(request, error=NOT_PENDING)  # same message either way: reveals nothing
+    if user.enrolment_code_required and user.password_set_by_others:
+        # D21 split knowledge: the initial password alone is not enough; the one-time code is needed too.
+        if not services.redeem_enrolment_code(user, request.POST.get("code", "").strip(), ctx=_ctx(request)):
+            return _page(request, error=NOT_PENDING)
     request.session.cycle_key()
     if user.password_set_by_others:
         request.session[SESSION_KEY] = {"user": user.pk, "stage": "password"}

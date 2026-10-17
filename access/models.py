@@ -88,6 +88,11 @@ class User(AbstractUser):
     totp_enrolment_required = models.BooleanField(
         default=False, help_text="Set by a dual-controlled 2FA reset (D21): the user enrols a new device himself "
                                  "at next sign-in (password + one-time enrolment).")
+    enrolment_code_required = models.BooleanField(
+        default=False, help_text="D21 split knowledge: enrolment needs the initial password (known to the requester) "
+                                 "and a one-time code (shown only to the approver who applied it).")
+    enrolment_code_hash = models.CharField(max_length=128, blank=True, help_text="Hash only; never the code")
+    enrolment_code_expires_at = models.DateTimeField(null=True, blank=True)
     password_set_by_others = models.BooleanField(
         default=True, help_text="The current password was set by someone other than the user (account creation, "
                                 "admin, commands, D21 dual control). Cleared only when the user changes it himself. "
