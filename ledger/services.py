@@ -242,7 +242,8 @@ def _currency_problems(entry, lines):
                 current = _lookup_rate(entity, cur.code, functional, entry.date)
                 if current is None or current.row.pk != line.exchange_rate_id or current.rate != line.fx_rate:
                     # A document entry may use the rate row its document pinned at approval, if that row is
-                    # still a valid rate for the entry date (the type's validate_lines checked it is the pinned one).
+                    # still a valid rate for the entry date. Only a type's build_lines names such a row: caller
+                    # lines with exchange_rate are refused (create_entry, _document_lines).
                     pinned = (_pinned_rate(entity, line.exchange_rate, cur.code, functional, entry.date)
                               if entry.document_type else None)
                     if pinned is None or pinned.rate != line.fx_rate:
@@ -743,6 +744,17 @@ def _document_lines(doc_type, document, lines):
         lines = list(doc_type.build_lines(document))
     elif lines is None:
         raise error("An entry needs its lines.", "يحتاج القيد إلى بنوده.")
+    else:
+        lines = list(lines)
+        # A pinned rate row may book at a rate older than the entry date's (_pinned_rate): only the document's
+        # own build_lines, which reads the row the document stored at approval, may name one (review item 4).
+        if any(isinstance(spec, dict) and "exchange_rate" in spec for spec in lines):
+            raise error(
+                f"{doc_type.label}: a pinned rate row comes only from the document's own build_lines, never from "
+                "lines passed by the caller.",
+                f"المستند {doc_type.label}: سجل السعر المثبت يأتي من بناء المستند لبنوده فقط، لا من بنود يمررها المستدعي.",
+                code="pinned_rate_not_allowed",
+            )
     if doc_type.validate_lines is None:
         return lines, None
 
