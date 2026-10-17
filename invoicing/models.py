@@ -1286,6 +1286,7 @@ class PurificationTransfer(Tracked, Guarded):
     class Status(models.TextChoices):
         DRAFT = "draft", bi("Draft", "مسودة")
         POSTED = "posted", bi("Posted", "مرحّل")
+        REVERSED = "reversed", bi("Reversed", "معكوس")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     kind = models.CharField(bi("Kind", "النوع"), max_length=8, choices=Kind.choices)
@@ -1305,6 +1306,12 @@ class PurificationTransfer(Tracked, Guarded):
     posted_at = models.DateTimeField(bi("Posted at", "تاريخ الترحيل"), null=True, blank=True)
     journal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
                                       related_name="+", verbose_name=bi("Journal entry", "القيد اليومي"))
+    reversal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                       related_name="+", verbose_name=bi("Reversal entry", "قيد العكس"))
+    reversed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="+", verbose_name=bi("Reversed by", "عكسه"))
+    reversed_at = models.DateTimeField(bi("Reversed at", "تاريخ العكس"), null=True, blank=True)
+    reversal_reason = models.CharField(bi("Reversal reason", "سبب العكس"), max_length=300, blank=True)
 
     class Meta:
         verbose_name = bi("purification transfer", "تحويل مبالغ التطهير")

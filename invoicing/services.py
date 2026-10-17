@@ -2745,6 +2745,47 @@ def post_purification_transfer(transfer, *, user):
     return doc
 
 
+def reverse_purification_transfer(transfer, *, user, reason, date=None):
+    """Reverse a posted purification transfer (E14) or payout (E15) (R54, review finding 8): through
+    ``ledger.services.reverse_entry`` with ``invoicing.reverse_document`` (registered for the type), by a person,
+    with a reason. The row becomes ``reversed`` and stops counting towards the limits. A transfer is not reversed
+    while the payouts after it would then exceed what is left on 2600 (reverse the payout first). The reversal is
+    dated on the original date if its period is open, else at the start of the first open period after it (R32).
+    """
+    doc = PurificationTransfer.objects.select_related("entity").get(pk=transfer.pk)
+    if access_services.kind_of(user) != Kind.HUMAN:  # R54: never an agent or a system job
+        access.deny(user, doc.entity, "invoicing.reverse_document", "agent_forbidden")
+    grant = access.require(user, doc.entity, "invoicing.reverse_document", document=doc)
+    if not (reason or "").strip():
+        raise error("The reason for the reversal is required.", "سبب العكس مطلوب.", code="reason_required")
+    with transaction.atomic():
+        _lock_purification(doc.entity)
+        doc = PurificationTransfer.objects.select_for_update(of=("self",)).select_related(
+            "entity", "journal_entry").get(pk=doc.pk)
+        if doc.status != PurificationTransfer.Status.POSTED or doc.journal_entry_id is None:
+            raise error("Only posted purification rows are reversed.", "تُعكس قيود التطهير المرحّلة فقط.",
+                        code="not_posted")
+        if doc.kind == PurificationTransfer.Kind.TRANSFER:
+            left, at = _purification_room(doc.entity, PurificationTransfer.Kind.PAYOUT, doc.date, exclude_pk=doc.pk)
+            if left < ZERO:
+                raise error(f"Without this transfer the payouts would exceed the charity payable (2600) by {-left} "
+                            f"on {at}; reverse the payout first (R54).",
+                            f"بدون هذا التحويل تتجاوز المبالغ المصروفة رصيد مستحقات التطهير بمقدار {-left} بتاريخ "
+                            f"{at}؛ اعكس الصرف أولًا.", code="purification_invalid")
+        on = _reversal_date(doc.entity, doc.journal_entry.date, date)
+        try:
+            reversal = ledger.reverse_entry(doc.journal_entry, grant, date=on, reason=reason.strip()[:200])
+        except LedgerError as exc:
+            raise _problems_error(exc.messages, getattr(exc, "code", None) or "reversal_refused") from None
+        doc.status = PurificationTransfer.Status.REVERSED
+        doc.reversal_entry, doc.reversed_by, doc.reversed_at = reversal, user, timezone.now()
+        doc.reversal_reason = reason.strip()[:300]
+        doc._service_write = True
+        doc.save(update_fields=["status", "reversal_entry", "reversed_by", "reversed_at", "reversal_reason",
+                                "updated_at"])
+    return doc
+
+
 def _purification_lines(document):
     """Registered ``build_lines`` for PurificationTransfer: E14 (Dr 4900 / Cr 2600) or E15 (Dr 2600 / Cr bank)."""
     _require_posting_context(document, PurificationTransfer.Status.POSTED)

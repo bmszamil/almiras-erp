@@ -56,3 +56,18 @@ def test_final_documents_change_only_for_anonymisation_after_retention(w):
                        "WHERE id = %s", [doc.retention_until.replace(year=doc.retention_until.year + 1).isoformat()
                                          + "T12:00:00+03:00", doc.pk])
     _refused("UPDATE invoicing_salesdocument SET buyer_name_en = 'again' WHERE id = %s", [doc.pk])  # once only
+
+
+def test_purification_reversal_only_with_its_own_reversal_entry(w):
+    flagged_invoice(w)
+    t = services.post_purification_transfer(services.create_purification_transfer(
+        w.alm, user=w.accountant, kind="transfer", date=date(2027, 1, 31), amount="100.00"), user=w.cfo)
+    other = services.post_purification_transfer(services.create_purification_transfer(
+        w.alm, user=w.accountant, kind="transfer", date=date(2027, 1, 31), amount="50.00"), user=w.cfo)
+    _refused("UPDATE invoicing_purificationtransfer SET status = 'reversed', reversal_entry_id = %s, "
+             "reversed_by_id = %s, reversed_at = now() WHERE id = %s",
+             [other.journal_entry_id, w.accountant.pk, t.pk])  # not a reversal of its own entry
+    r = services.reverse_purification_transfer(t, user=w.accountant, reason="خطأ")
+    _refused("UPDATE invoicing_purificationtransfer SET reversal_reason = 'x' WHERE id = %s", [r.pk])
+    _refused("UPDATE invoicing_purificationtransfer SET status = 'posted' WHERE id = %s", [r.pk])
+    _refused("DELETE FROM invoicing_purificationtransfer WHERE id = %s", [r.pk])

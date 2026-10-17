@@ -41,9 +41,11 @@ class InvoicingConfig(AppConfig):
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._payment_lines, validate_lines=services._check_document_rate,
         )
-        # R54: E14 by a second person with invoicing.post_purification_transfer; E15 approved by the CFO.
+        # R54: E14 by a second person with invoicing.post_purification_transfer; E15 approved by the CFO. Both are
+        # corrected by reversal (reverse_purification_transfer) with invoicing.reverse_document.
         documents.register(
             PurificationTransfer,
             post_permissions={"invoicing.post_purification_transfer", "invoicing.approve_purification_payout"},
+            reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._purification_lines,
         )

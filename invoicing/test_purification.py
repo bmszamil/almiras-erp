@@ -187,3 +187,58 @@ def test_r54_posting_locks_the_entity_row(w):
         assert any("FOR NO KEY UPDATE" in sql for sql in entity_reads)
     else:
         assert entity_reads  # the lock read runs (SQLite has no row locks)
+
+
+# --- review finding 8: reversal of transfers and payouts --------------------------------------------------------
+
+def _posted(w, kind, amount, on, **extra):
+    doc = services.create_purification_transfer(w.alm, user=w.accountant, kind=kind, date=on, amount=amount, **extra)
+    return services.post_purification_transfer(doc, user=w.cfo)
+
+
+def test_r54_reversed_transfer_goes_through_the_ledger_and_stops_counting(w):
+    flagged_invoice(w, "1000.00")
+    t = _posted(w, "transfer", "1000.00", date(2027, 1, 31))
+    with pytest.raises(InvoicingError) as exc:
+        services.reverse_purification_transfer(t, user=w.accountant, reason=" ")
+    assert exc.value.code == "reason_required"
+    for user in (w.clerk, w.cfo, make_agent("purifier")):  # invoicing.reverse_document, people only
+        with pytest.raises(access.AccessDenied):
+            services.reverse_purification_transfer(t, user=user, reason="خطأ في المبلغ")
+    r = services.reverse_purification_transfer(t, user=w.accountant, reason="خطأ في المبلغ")
+    assert (r.status, r.reversed_by, r.reversal_reason) == ("reversed", w.accountant, "خطأ في المبلغ")
+    assert r.reversal_entry.reversal_of_id == r.journal_entry_id and r.reversal_entry.status == "posted"
+    assert r.reversal_entry.date == date(2027, 1, 31)
+    assert balance(w, "4900") == D("1000.00") and balance(w, "2600") == D("0")  # back on 4900
+    pos = services.purification_position(w.alm, user=w.accountant)
+    assert (pos["transferred"], pos["to_transfer"]) == (D("0"), D("1000.00"))
+    assert _posted(w, "transfer", "1000.00", date(2027, 2, 1)).status == "posted"  # the room is back
+    with pytest.raises(InvoicingError) as exc:
+        services.reverse_purification_transfer(r, user=w.accountant, reason="مرة أخرى")
+    assert exc.value.code == "not_posted"
+    stored = PurificationTransfer.objects.get(pk=t.pk)
+    stored.reversal_reason = "x"
+    with pytest.raises(InvoicingError):
+        stored.save()
+
+
+def test_r54_a_transfer_with_payouts_after_it_is_not_reversed_first(w):
+    flagged_invoice(w, "1000.00")
+    t = _posted(w, "transfer", "1000.00", date(2027, 1, 31))
+    p = _posted(w, "payout", "600.00", date(2027, 2, 5), bank_account="1100", recipient_ar="جمعية")
+    with pytest.raises(InvoicingError) as exc:
+        services.reverse_purification_transfer(t, user=w.accountant, reason="خطأ")
+    assert exc.value.code == "purification_invalid" and "600.00" in str(exc.value)
+    assert PurificationTransfer.objects.get(pk=t.pk).status == "posted"
+    p = services.reverse_purification_transfer(p, user=w.accountant, reason="صرف مكرر")
+    assert p.status == "reversed" and balance(w, "2600") == D("1000.00")
+    assert services.purification_position(w.alm, user=w.accountant)["payable"] == D("1000.00")
+    assert services.reverse_purification_transfer(t, user=w.accountant, reason="خطأ").status == "reversed"
+
+
+def test_r54_reversal_in_a_closed_period_moves_to_the_next_open_one(w):
+    flagged_invoice(w, "1000.00")
+    t = _posted(w, "transfer", "300.00", date(2027, 1, 31))
+    FiscalPeriod.objects.filter(entity=w.alm, name="2027-01").update(status="closed")
+    r = services.reverse_purification_transfer(t, user=w.accountant, reason="خطأ")
+    assert r.reversal_entry.date == date(2027, 2, 1)
