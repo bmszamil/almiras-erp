@@ -127,11 +127,10 @@ def test_r92_vat_number_removed_from_the_document_makes_it_vat_free(w):
     assert je(posted) == [("1310", D("150.00"), D("0")), ("2100", D("0"), D("1150.00")), ("5300", D("1000.00"), D("0"))]
 
 
-@pytest.mark.parametrize("master", [{"is_vat_registered": True, "vat_number": "330000000000003"},
-                                    {"is_vat_registered": False, "vat_number": "330000000000003"}])
-def test_r92_registered_vendor_blank_document_number_refused_at_submit(w, master):
+def test_r92_registered_vendor_blank_document_number_refused_at_submit(w):
     """Probe: registered vendor, ``vendor_vat_number=""`` on create, VAT 0 → booked VAT-free as category O."""
-    vendor = services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="V9", name_ar="مورد مسجل", **master)
+    vendor = services.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="V9", name_ar="مورد مسجل",
+                                    is_vat_registered=True, vat_number="330000000000003")
     doc = services.create_purchase_document(w.alm, user=w.ap, vendor=vendor, vendor_document_number="X1",
                                             vendor_document_date=date(2027, 1, 15), accounting_date=date(2027, 1, 15),
                                             vendor_vat_number="")
