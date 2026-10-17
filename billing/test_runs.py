@@ -340,13 +340,15 @@ def test_at46_command_twice_and_manual_run(w):
         call_command("billing_run", "--entity", "NOPE", stdout=StringIO())
 
 
-def test_r66_aborted_run_exits_non_zero(w):
+def test_r66_aborted_run_exits_non_zero(w, monkeypatch):
+    """An error outside the per-period loop (here: activating contracts) aborts the run; inside it, see
+    test_regressions.test_p3_*."""
     approved(w, start=date(2027, 3, 1))
 
-    def boom(period, user):
+    def boom(*args, **kwargs):
         raise RuntimeError("unexpected failure (test)")
 
-    w.fake.create_from_billing = boom
+    monkeypatch.setattr(services, "_prepare_contracts", boom)
     w.clock.set(date(2027, 3, 1))
     with pytest.raises(CommandError):
         call_command("billing_run", "--date", "2027-03-01", "--entity", "ALM", stdout=StringIO())
@@ -369,3 +371,19 @@ def test_runs_are_append_only_after_finish(w):
     assert BillingPeriod.objects.filter(status="generated").count() == 1
     with pytest.raises(InvoicingError):  # the invoice of a generated period is never deleted
         SalesDocument.objects.filter(pk=item.sales_document_id).delete()
+
+
+def test_r33_run_refused_inside_a_callers_transaction(w):
+    """Each period commits on its own (R33): a run inside another transaction would only make savepoints."""
+    from django.db import transaction
+
+    from billing.models import BillingError
+
+    approved(w, start=date(2027, 3, 1))
+    w.clock.set(date(2027, 3, 1))
+    with transaction.atomic():
+        with pytest.raises(BillingError) as exc:
+            services.run_billing(date(2027, 3, 1), entity=w.alm, user=w.sys)
+    assert exc.value.code == "run_in_transaction" and "معاملة" in str(exc.value)
+    assert not BillingRun.objects.exists()
+    assert run(w, date(2027, 3, 1)).generated_count == 1  # outside a transaction it runs

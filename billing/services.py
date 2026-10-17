@@ -15,7 +15,8 @@ from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 from django.core.exceptions import PermissionDenied, ValidationError
-from django.db import connection, transaction
+from django.conf import settings
+from django.db import OperationalError, connection, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -64,6 +65,11 @@ Event = ContractEvent.Action
 
 # Invoicing error codes that put a period on hold for a person (R54); every other refusal is retried next run.
 HELD_CODES = frozenset({"third_decimal_pending", "entity_not_vat_registered"})
+# Refusal code -> billing's own en/ar message (R54); any other code shows invoicing's message. Mapped by code only,
+# never by message text.
+REFUSAL_MESSAGES = {"rate_required": "rate_required", "permission_denied": "permission_denied",
+                    "invoicing_not_built": "invoicing_not_built", "third_decimal_pending": "third_decimal",
+                    "entity_not_vat_registered": "not_vat_registered"}
 
 MESSAGES = {
     "generated": ("Invoice {number} created.", "أُنشئت الفاتورة {number}."),
@@ -90,6 +96,15 @@ MESSAGES = {
                        "رفضت الهيئة الفاتورة {number}؛ عالج السبب ثم أطلق الفترة."),
     "run_in_progress": ("A billing run for {entity} is in progress; retry in a moment (R41).",
                         "دورة فوترة للكيان {entity} قيد التنفيذ؛ أعد المحاولة بعد قليل."),
+    "run_in_transaction": ("A billing run is never started inside another database transaction: each period is "
+                           "committed on its own (R33). Call it outside transaction.atomic (and from views marked "
+                           "non_atomic_requests).",
+                           "لا تبدأ دورة الفوترة داخل معاملة قاعدة بيانات أخرى: تُعتمد كل فترة وحدها. "
+                           "استدعِها خارج المعاملة."),
+    "unexpected": ("Unexpected error while billing this period ({detail}); nothing was created, retried next run.",
+                   "خطأ غير متوقع أثناء فوترة هذه الفترة؛ لم يُنشأ شيء، ويُعاد في الدورة التالية."),
+    "lock_timeout": ("This period was locked by another process for too long; nothing was created, retried next run.",
+                     "كانت هذه الفترة مقفلة من عملية أخرى مدة طويلة؛ لم يُنشأ شيء، ويُعاد في الدورة التالية."),
     "draft_failed": ("The draft note could not be created yet: {reason}", "تعذر إنشاء مسودة الإشعار بعد: {reason}"),
     "run_summary": ("Billing run {day} for {entity}: {generated} generated, {held} held, {failed} failed.",
                     "دورة الفوترة {day} للكيان {entity}: صدرت {generated}، علّقت {held}، تعثرت {failed}."),
@@ -177,17 +192,55 @@ def _entity_lock_now(entity):
             raise error(*_msg("run_in_progress", entity=entity.code), code="run_in_progress")
 
 
-def _run_lock(entity):
-    """R11: one runner per entity at a time; a second run waits for the first (session lock, AT-3)."""
+def _lock_timeout(name, default):
+    return str(getattr(settings, name, default))
+
+
+def _set_lock_timeout(value):
+    """``lock_timeout`` for the rest of the current transaction (PostgreSQL only): waiting for a row or advisory
+    lock longer than that raises instead of hanging the run (review nit 11)."""
     if connection.vendor == "postgresql":
         with connection.cursor() as cursor:
+            cursor.execute("SELECT set_config('lock_timeout', %s, true)", [value])
+
+
+def _lock_not_available(exc):
+    cause = exc.__cause__
+    return isinstance(exc, OperationalError) and (
+        getattr(cause, "sqlstate", None) or getattr(cause, "pgcode", None)) == "55P03"
+
+
+def _run_lock(entity):
+    """R11: one runner per entity at a time; a second run waits for the first (session lock, AT-3), at most
+    ``BILLING_RUN_LOCK_TIMEOUT`` (default 15 minutes), then gives up with ``run_in_progress``."""
+    if connection.vendor != "postgresql":
+        return
+    try:
+        with transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute("SELECT set_config('lock_timeout', %s, true)",
+                           [_lock_timeout("BILLING_RUN_LOCK_TIMEOUT", "15min")])
             cursor.execute("SELECT pg_advisory_lock(%s, %s)", [LOCK_CLASS, entity.pk])
+    except OperationalError as exc:
+        if _lock_not_available(exc):
+            raise error(*_msg("run_in_progress", entity=entity.code), code="run_in_progress") from None
+        raise
 
 
 def _run_unlock(entity):
     if connection.vendor == "postgresql":
         with connection.cursor() as cursor:
             cursor.execute("SELECT pg_advisory_unlock(%s, %s)", [LOCK_CLASS, entity.pk])
+
+
+def _refuse_inside_transaction():
+    """R33: every period commits in its own transaction, which is impossible inside a caller's transaction (the
+    "transactions" would be savepoints, rolled back with the caller). Django's durable check is used: it refuses
+    any enclosing atomic block except the test framework's own."""
+    try:
+        with transaction.atomic(durable=True):
+            pass
+    except RuntimeError:
+        raise error(*_msg("run_in_transaction"), code="run_in_transaction") from None
 
 
 # --- values and validation -----------------------------------------------------------------------------
@@ -1320,6 +1373,7 @@ def _is_billing_system_user(user):
 def run_billing(run_date=None, entity=None, user=None, *, trigger=BillingRun.Trigger.SCHEDULER, initiated_by=None):
     """R66: the daily run, as the billing system user. One ``BillingRun`` per entity (scoped, R2); entities where
     the system user has no ``system_billing`` membership are recorded as skipped (R67). Returns the runs."""
+    _refuse_inside_transaction()
     user = user or _system_user()
     run_date = run_date or _today()
     if entity is not None:
@@ -1357,8 +1411,10 @@ def _run_entity(entity, run_date, sys, trigger, initiated_by):
     run = _save(BillingRun(entity=entity, run_date=run_date, trigger=trigger, started_by=sys,
                            initiated_by=initiated_by))
     counts = defaultdict(int)
-    _run_lock(entity)
+    locked = False
     try:
+        _run_lock(entity)
+        locked = True
         with transaction.atomic():
             for c in Contract.objects.filter(entity=entity, status__in=[CStatus.APPROVED, CStatus.ACTIVE,
                                                                         CStatus.TERMINATED]):
@@ -1369,7 +1425,10 @@ def _run_entity(entity, run_date, sys, trigger, initiated_by):
                .select_related("contract").order_by("bill_date", "pk"))
         for p in list(due):
             if p.bill_date - timedelta(days=p.contract.bill_lead_days) <= run_date:
-                outcome = _bill_period(run, p.pk, sys, run_date)
+                try:
+                    outcome = _bill_period(run, p.pk, sys, run_date)
+                except Exception as exc:  # noqa: BLE001 - R33: one period's failure never stops the others
+                    outcome = _unexpected(run, p.pk, exc)
                 if outcome:
                     counts[outcome] += 1
         lookback = run_date - timedelta(days=SKIP_LOOKBACK_DAYS)
@@ -1385,12 +1444,13 @@ def _run_entity(entity, run_date, sys, trigger, initiated_by):
                 counts["skipped_already_billed"] += 1
         _close_contracts(entity, run_date, sys)
         run.status = (BillingRun.Status.COMPLETED_WITH_ERRORS if counts["failed"] else BillingRun.Status.COMPLETED)
-    except Exception as exc:  # noqa: BLE001 - the run is recorded as aborted; the command exits non-zero
+    except Exception as exc:  # noqa: BLE001 - outside the per-period loop: the run is aborted; the command exits 1
         en, ar = _split(_exc_text(exc))
         run.status = BillingRun.Status.ABORTED
         run.messages = [*run.messages, {"en": en, "ar": ar}]
     finally:
-        _run_unlock(entity)
+        if locked:
+            _run_unlock(entity)
     run.generated_count, run.held_count, run.failed_count = counts["generated"], counts["held"], counts["failed"]
     run.skipped_count, run.sync_count = counts["skipped_already_billed"], counts["sync"]
     run.finished_at = timezone.now()
@@ -1495,8 +1555,11 @@ def _set_outcome(p, status, code, en, ar):
 
 def _bill_period(run, period_id, sys, run_date):
     """One period in its own transaction (R33): lock, check, freeze the lines, call invoicing (R52), map the
-    outcome by error code (R54). Returns the outcome or None (nothing to do)."""
-    with transaction.atomic():
+    outcome by error code (R54). Returns the outcome or None (nothing to do). Row locks wait at most
+    ``BILLING_ROW_LOCK_TIMEOUT`` (default 30 seconds); a timeout or any unexpected error is recorded by
+    :func:`_unexpected` and the run goes on with the next period."""
+    with transaction.atomic(durable=True):
+        _set_lock_timeout(_lock_timeout("BILLING_ROW_LOCK_TIMEOUT", "30s"))
         p = BillingPeriod.objects.select_for_update(of=("self",)).select_related(
             "contract__currency", "contract__entity", "entity").get(pk=period_id)
         c = p.contract
@@ -1553,14 +1616,8 @@ def _refused(run, period_id, exc):
     """R54: nothing was created (the savepoint rolled back); the period is held or failed by error code."""
     p = BillingPeriod.objects.select_related("entity").get(pk=period_id)
     code = _error_code(exc)
-    if code in MESSAGES and code not in ("generated",):
-        en, ar = _msg(code)
-    elif code == "third_decimal_pending":
-        en, ar = _msg("third_decimal")
-    elif code == "entity_not_vat_registered":
-        en, ar = _msg("not_vat_registered")
-    else:
-        en, ar = _split(_exc_text(exc))
+    key = REFUSAL_MESSAGES.get(code)
+    en, ar = _msg(key) if key else _split(_exc_text(exc))
     if code in HELD_CODES:
         _set_outcome(p, PStatus.HELD, code, en, ar)
         _item(run, p, BillingRunItem.Outcome.HELD, en, ar, code=code)
@@ -1569,6 +1626,31 @@ def _refused(run, period_id, exc):
         p.status = PStatus.PLANNED
     _set_outcome(p, PStatus.FAILED, code, en, ar)
     _item(run, p, BillingRunItem.Outcome.FAILED, en, ar, code=code)
+    return "failed"
+
+
+def _unexpected(run, period_id, exc):
+    """R33, R54: an error that is not an invoicing refusal (a bug, a lost lock wait, a crash in invoicing). The
+    period's transaction was rolled back, so nothing was created and no number used; the period is ``failed``
+    with code ``unexpected`` (or ``lock_timeout``) and retried next run like any other failure (CFO alerted after
+    three runs, R34). The run itself continues."""
+    code = "lock_timeout" if _lock_not_available(exc) else "unexpected"
+    detail = f"{type(exc).__name__}: {_exc_text(exc)}"[:200]
+    en, ar = _msg(code, detail=detail) if code == "unexpected" else _msg(code)
+    try:
+        with transaction.atomic():
+            _set_lock_timeout(_lock_timeout("BILLING_ROW_LOCK_TIMEOUT", "30s"))
+            p = BillingPeriod.objects.select_for_update(of=("self",)).select_related("entity").get(pk=period_id)
+            if p.status not in (PStatus.PLANNED, PStatus.FAILED):
+                return None
+            _set_outcome(p, PStatus.FAILED, code, en, ar)
+            _item(run, p, BillingRunItem.Outcome.FAILED, en, ar, code=code)
+    except OperationalError as again:
+        if not _lock_not_available(again):
+            raise
+        # the period row is still locked by someone else: it stays as it was and is tried next run; the run says so
+        run.messages = [*run.messages, {"en": f"Period {period_id}: {en}", "ar": f"الفترة {period_id}: {ar}",
+                                        "code": code}]
     return "failed"
 
 

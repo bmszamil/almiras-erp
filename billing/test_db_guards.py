@@ -223,3 +223,80 @@ def test_at27_version_approval_waits_for_a_running_billing_run(monkeypatch):
     t.join(10)
     time.sleep(0.1)
     assert services.approve_version(v, user=w.c).status == "approved"
+
+
+# --- PostgreSQL: lock timeouts (review nit 11) --------------------------------------------------------------
+
+def _hold(sql_params, held, release):
+    """Another session holds a lock until ``release`` is set."""
+    try:
+        with transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute(*sql_params)
+            held.set()
+            release.wait(20)
+    finally:
+        connections.close_all()
+
+
+@postgres_only
+@pytest.mark.django_db(transaction=True)
+def test_row_lock_timeout_fails_the_period_and_the_run_goes_on(monkeypatch, settings):
+    from billing import invoicing_port
+    from billing.conftest import contract
+
+    from datetime import datetime, time as clock_time
+
+    from invoicing import services as inv
+
+    settings.BILLING_ROW_LOCK_TIMEOUT = "300ms"
+    w = _seeded_world()
+    monkeypatch.setattr(invoicing_port, "_override", w.fake)
+    monkeypatch.setattr(services, "_today", lambda: date(2027, 1, 1))
+    monkeypatch.setattr(inv, "_riyadh_now", lambda: datetime.combine(date(2027, 1, 1), clock_time(10),
+                                                                    tzinfo=services.RIYADH))
+    c1 = services.approve_contract(services.submit_contract(contract(w), user=w.s), user=w.c)
+    c2 = services.approve_contract(services.submit_contract(contract(w), user=w.s), user=w.c)
+    locked = BillingPeriod.objects.get(contract=c1, period_start=date(2027, 1, 1))
+    held, release = threading.Event(), threading.Event()
+    t = threading.Thread(target=_hold, args=(("SELECT id FROM billing_billingperiod WHERE id = %s FOR UPDATE",
+                                              [locked.pk]), held, release))
+    t.start()
+    try:
+        assert held.wait(10)
+        started = time.monotonic()
+        r = services.run_billing(date(2027, 1, 1), entity=w.alm, user=w.sys)[0]
+        assert time.monotonic() - started < 15  # never hangs on the lock
+    finally:
+        release.set()
+        t.join(20)
+    assert (r.status, r.generated_count, r.failed_count) == ("completed_with_errors", 1, 1)
+    assert any(m.get("code") == "lock_timeout" and "مقفلة" in m["ar"] for m in r.messages)
+    assert BillingPeriod.objects.get(pk=locked.pk).status == "planned"  # untouched, tried next run
+    assert BillingPeriod.objects.get(contract=c2, period_start=date(2027, 1, 1)).status == "generated"
+    again = services.run_billing(date(2027, 1, 1), entity=w.alm, user=w.sys)[0]
+    assert again.generated_count == 1 and BillingPeriod.objects.get(pk=locked.pk).status == "generated"
+
+
+@postgres_only
+@pytest.mark.django_db(transaction=True)
+def test_run_lock_timeout_aborts_the_second_run(monkeypatch, settings):
+    from billing import invoicing_port
+    from billing.conftest import contract
+
+    settings.BILLING_RUN_LOCK_TIMEOUT = "300ms"
+    w = _seeded_world()
+    monkeypatch.setattr(invoicing_port, "_override", w.fake)
+    monkeypatch.setattr(services, "_today", lambda: date(2027, 1, 1))
+    services.approve_contract(services.submit_contract(contract(w), user=w.s), user=w.c)
+    held, release = threading.Event(), threading.Event()
+    t = threading.Thread(target=_hold, args=(("SELECT pg_advisory_xact_lock(%s, %s)", [services.LOCK_CLASS,
+                                                                                         w.alm.pk]), held, release))
+    t.start()
+    try:
+        assert held.wait(10)
+        r = services.run_billing(date(2027, 1, 1), entity=w.alm, user=w.sys)[0]
+    finally:
+        release.set()
+        t.join(20)
+    assert r.status == "aborted" and "in progress" in r.messages[0]["en"] and "قيد التنفيذ" in r.messages[0]["ar"]
+    assert not BillingPeriod.objects.filter(status="generated").exists()

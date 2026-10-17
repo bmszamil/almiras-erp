@@ -82,3 +82,33 @@ def test_p7_note_issued_after_the_last_read_back_is_kept_and_counted(w, monkeypa
     assert sum(D(x["delta"]) for x in debit.lines) == D("500.00")  # 9,500 required − (10,000 − 1,000) billed
     notes = SalesDocument.objects.filter(original_document=march.sales_document)
     assert sorted(notes.values_list("doc_type", "status")) == [("credit_note", "final"), ("debit_note", "draft")]
+
+
+# --- P3 / finding 4: R33 (an unexpected error fails one period, the run goes on) -------------------------------
+
+def test_p3_unexpected_error_in_one_period_fails_it_and_the_run_continues(w, monkeypatch):
+    c1 = approved(w)
+    c2 = approved(w)
+    original = w.fake.create_from_billing
+    calls = {"n": 0}
+
+    def boom(p, user):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("unexpected (test)")
+        return original(p, user)
+
+    monkeypatch.setattr(w.fake, "create_from_billing", boom)
+    r = run(w, date(2027, 1, 1))
+    assert (r.status, r.generated_count, r.failed_count) == ("completed_with_errors", 1, 1)
+    statuses = {c.pk: period(c, date(2027, 1, 1)) for c in (c1, c2)}
+    failed = [p for p in statuses.values() if p.status == "failed"]
+    assert len(failed) == 1 and sorted(p.status for p in statuses.values()) == ["failed", "generated"]
+    p = failed[0]
+    assert (p.error_code, p.sales_document, p.invoice_lines) == ("unexpected", None, None)  # rolled back
+    assert "RuntimeError" in p.failure_reason_en and "غير متوقع" in p.failure_reason_ar
+    item = r.items.get(billing_period=p)
+    assert (item.outcome, item.error_code) == ("failed", "unexpected")
+    nxt = run(w, date(2027, 1, 2))  # retried automatically
+    assert nxt.generated_count == 1 and period(BillingPeriod.objects.get(pk=p.pk).contract,
+                                               date(2027, 1, 1)).status == "generated"
