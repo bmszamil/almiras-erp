@@ -1,6 +1,6 @@
 # Access: users, roles and permissions per entity (user × entity × role)
 
-Django app: `core` (package `core/access/`: `models.py`, `services.py`, `catalogue.py`, `backends.py`). Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (A11, A12: billing versions/corrections, unseal delegation). Amended 2026-10-16 (A13, R27, R30 to R33, AT-29 to AT-32: build decisions and reviewer hardening). Amended 2026-10-16 (A14, R23, R30, R32, R34 to R42, AT-33 to AT-40, OQ-19, OQ-20: ledger document registry, entity lifecycle, clearance approver; code on branch `claude/funny-davinci-7yd88s`, commits aad0126..b690c12). Amended 2026-10-16 (A15, 3.6 flag I, 3.7, R34, R35, R37 to R39, R43, R44, AT-33, AT-37, AT-41 to AT-46, OQ-21, OQ-22: registry creator and line hooks, reversal integrity, explicit reactivation, recovery command scope, SQLite limitation; commits b6ed6e1..497cb09). Amended 2026-10-17 (project-owner decisions A16 to A20: receipts posted by their recorder, `chairman` role and two-step Sharia switch-off, inactive subsidiaries, `zatca_admin` as add-on role, hierarchical ZATCA keys; 3.1, 3.6, R17, R19, R35, R38, R46 to R51, AT-28, AT-37, AT-49 to AT-55, OQ-18, OQ-19, OQ-21, OQ-23 to OQ-27).
+Django app: `core` (package `core/access/`: `models.py`, `services.py`, `catalogue.py`, `backends.py`). Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (A11, A12: billing versions/corrections, unseal delegation). Amended 2026-10-16 (A13, R27, R30 to R33, AT-29 to AT-32: build decisions and reviewer hardening). Amended 2026-10-16 (A14, R23, R30, R32, R34 to R42, AT-33 to AT-40, OQ-19, OQ-20: ledger document registry, entity lifecycle, clearance approver; code on branch `claude/funny-davinci-7yd88s`, commits aad0126..b690c12). Amended 2026-10-16 (A15, 3.6 flag I, 3.7, R34, R35, R37 to R39, R43, R44, AT-33, AT-37, AT-41 to AT-46, OQ-21, OQ-22: registry creator and line hooks, reversal integrity, explicit reactivation, recovery command scope, SQLite limitation; commits b6ed6e1..497cb09). Amended 2026-10-17 (project-owner decisions A16 to A20: receipts posted by their recorder, `chairman` role and two-step Sharia switch-off, inactive subsidiaries, `zatca_admin` as add-on role, hierarchical ZATCA keys; 3.1, 3.6, R17, R19, R35, R38, R46 to R51, AT-28, AT-37, AT-49 to AT-55, OQ-18, OQ-19, OQ-21, OQ-23 to OQ-27). Amended 2026-10-17 (project-owner HR/payroll decisions A21, A22: roles `hr_officer` and `payroll_officer`, HR officer approves payroll, MP approves loans and bai' ajel, overtime approval routing; 3.1, 3.6, R52 to R54, AT-55, AT-56, OQ-2, OQ-28; detail in hr.md H9 to H16 and payroll.md P8 to P15).
 Depended on by: `docs/specs/invoicing.md` (OQ-25, OQ-42), `docs/specs/billing.md` §7, `docs/specs/zatca.md` §7, R-41, OQ-14, OQ-25, `docs/specs/ledger-fx.md` §7. Gateway design: `docs/ai-agent-gateway.md`.
 Role names and permission codenames in this spec replace the provisional names in those four specs (reconciliation table in §3.1).
 
@@ -33,6 +33,9 @@ The access module decides who may do what, in which entity. It holds the role ca
 | A19 | ZATCA admin rights can be "activated" and added to any basic user, such as an accountant or the CFO: `zatca_admin` is an add-on role, granted as a second membership next to the user's main role, by the MP (or an `access_admin` where the catalogue allows it, OQ-2). Resubmitting to ZATCA (invoicing OQ-57) belongs to `zatca_admin` holders and the ZATCA queue system user. | Project owner | 2026-10-17 |
 | A20 | ZATCA keys are hierarchical: one **group super key** for the whole group, held by the Almiras Managing Partner; under it, one **master key per company**. The super key protects the per-entity master keys; each per-entity master key protects that entity's EGS signing keys. The MP may delegate custody of a per-entity master key. Supersedes the single-store unseal model of A12 (zatca D-12; resolves zatca OQ-32). | Project owner | 2026-10-17 |
 
+| A21 | Roles `hr_officer` and `payroll_officer` exist (entity, human), granted by the Managing Partner. "The HR officer approves the payroll (not the CFO)": the preparer (payroll officer) cannot approve; HR officer approves; posting automatic on approval. | Project owner (hr H15, payroll P14) | 2026-10-17 |
+| A22 | Employee loans and bai' ajel financing are all approved by the Managing Partner. Overtime is approved by the Managing Partner in Almiras and by the department head in other companies. | Project owner (payroll P11, P12) | 2026-10-17 |
+
 Not decided (in §9): who approves when the CFO is absent or is the creator (OQ-1), who may grant memberships (OQ-2), which entities group-wide roles cover (OQ-3), and others.
 
 ## 3. Data model
@@ -55,6 +58,9 @@ Roles are a group-wide catalogue, so a role means the same thing in every entity
 | `managing_partner` | Managing Partner | الشريك المدير | group | human | zatca D-3, ledger-fx: Managing Partner |
 | `chairman` | Chairman | رئيس مجلس الإدارة | group | human | new (A17). One active holder per group parent (R47). Holds only `core.disable_sharia_enforcement` (second approval); any other right: OQ-24 |
 | `group_treasury` | Group treasury | خزينة المجموعة | group | human | ledger-fx: Group treasury |
+| `hr_officer` | HR officer | مسؤول الموارد البشرية | entity | human | new (A21; hr.md §7). Approves payroll runs (`payroll.approve_run`, R52). Granted by `managing_partner` only |
+| `payroll_officer` | Payroll officer | مسؤول الرواتب | entity | human | new (A21; payroll.md §7). Prepares and submits runs; never approves them (R52). Granted by `managing_partner` only |
+| `department_head` | Department head | رئيس القسم | entity | human | **proposed**, not decided (OQ-28; A22). Holds only `payroll.approve_overtime` (and its view) for employees of the department the user heads (hr 3.11) |
 | `group_viewer` | Group / consolidation viewer | مطّلع على المجموعة (التوحيد) | group | human | new (consolidation reporting) |
 | `system_billing` | Billing system user | مستخدم نظام الفوترة | entity | system | invoicing: Billing system user; billing: Billing service user |
 | `system_zatca_queue` | ZATCA queue worker | مستخدم نظام طابور فاتورة | entity | system | zatca: Queue worker (system user) |
@@ -205,6 +211,17 @@ Flags: **A** = approval (creator ≠ approver, R14); **S!** = segregation that c
 | `ledger.view` / `ledger.view_rates` / `ledger.view_translation` | Ag (scoped) | all human roles, incl. group_viewer |
 | `ledger.change_functional_currency` | G | managing_partner (before first posting) |
 
+*Added 2026-10-17 (A21, A22).* HR and payroll codenames are listed in hr.md §7 and payroll.md §7; the ones carrying decided approval rights:
+
+| Codename | Flags | Holders (seed) |
+|---|---|---|
+| `payroll.prepare_run` / `payroll.submit_run` | | payroll_officer |
+| `payroll.approve_run` (R52) | A, P | hr_officer (not `approver`) |
+| `payroll.approve_loan` (R53) | A, P | managing_partner only |
+| `payroll.approve_deferred_sale_terms` / `payroll.approve_deferred_sale` (R53) | A / A, P | managing_partner only |
+| `payroll.approve_overtime` (R54) | A | managing_partner; proposed `department_head` (OQ-28) |
+| `hr.set_overtime_route` | | managing_partner |
+
 `managing_partner` also holds every **A** permission as fallback approver in the entities it covers (invoicing OQ-42 default; this spec's OQ-1).
 
 ### 3.7 Service API (`core/access/services.py`)
@@ -325,6 +342,11 @@ Enforcement: **S** = `core/access/services.py`; **M** = model `save`/`delete`/`c
 50. **`zatca_admin` add-on (A19).** A user may hold `zatca_admin` and another entity role (e.g. `accountant`, `approver`) in the same entity as two memberships. Each right is checked on the membership that carries it: `invoicing.services.resubmit_to_zatca` accepts `zatca.retry_failed` only through a `zatca_admin` membership in that entity (invoicing R79), plus the ZATCA queue system user with `zatca.process_queue`. Segregation rules (R14, R35) apply to the person whatever roles they hold. **[S; test AT-53]**
 51. **Per-entity key custody (A20).** A `KeyCustodianDelegation` always names one entity and covers only that entity's master key and EGS keys (zatca R-50). Granting needs `zatca.grant_key_delegation` (`managing_partner`) and an active `zatca_admin` membership of the custodian in that entity (R17). No delegation is recorded on the group parent for other entities; the group super key is not delegated through the ERP (zatca OQ-34). **[S in zatca + core; test AT-54]**
 
+**Project-owner decisions 2026-10-17 (A21, A22)**
+52. **Payroll approval (A21).** `hr_officer` and `payroll_officer` are seeded entity roles, granted only by `managing_partner` (an `access_admin` grant is refused). `payroll.approve_run` (A, P) sits on `hr_officer`, not on `approver`; the run's creator, submitter or last modifier is refused (R14, R35) whatever roles that person holds, so a user holding both roles cannot approve a run they prepared. Posting follows approval through the registry (R34). **[catalogue + S + ledger; test AT-55]**
+53. **MP approves loans and bai' ajel (A22).** `payroll.approve_loan`, `payroll.approve_deferred_sale_terms` and `payroll.approve_deferred_sale` are held only by `managing_partner` (group role; covers `full` descendants, R6; `equity` / `none` entities need an explicit MP membership, OQ-3). Never the creator (R14). **[catalogue + S; test AT-56]**
+54. **Overtime approval routing (A22).** `payroll.approve_overtime` (A) is checked with the employee's entity and `HrSettings.overtime_approval_route` (hr R55): route `managing_partner` accepts only a `managing_partner` grant; route `department_head` accepts only the user linked to the head of the employee's department, through a membership holding the permission in that entity (proposed role, OQ-28). The route is per entity data, never a code path. **[S in payroll + core; test payroll AT-28]**
+
 *Note 2026-10-17 (invoicing pending fixes):* personal-data masking (R29) also covers admin labels (invoicing R86); the FX settlement helper is removed from the public service functions scanned by R1 / AT-26 (invoicing R90).
 
 ## 5. Accounting
@@ -419,6 +441,8 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 | AT-52 | *Added 2026-10-17 (R48).* Approved request for SUB payload {sharia off, reason "X"} | M applies with reason "Y"; applies with `sharia_enforced=False, consolidation="none"`; applies after `expires_at`; H rejects a second request, M applies it; M creates entity NEW under ALM with `sharia_enforced=False` with no request; SUB is inactive and M applies an approved request | Payload mismatch, mixed change, expired and rejected all refused, SUB unchanged, en/ar messages; NEW refused; inactive SUB change applied (A18) |
 | AT-53 | *Added 2026-10-17 (A19, R50).* User A holds `accountant` and `zatca_admin` memberships in ALM; user C holds `approver` + `zatca_admin` in ALM; A's `zatca_admin` membership is then revoked | A resubmits an ALM document; C resubmits one; after the revocation A resubmits again; C approves a sales document C created | A and C allowed (each with `zatca_resubmit` row); after revocation A refused (`no_membership`) though A still holds `accountant`; C's approval of own document refused (R14) |
 | AT-54 | *Added 2026-10-17 (A20, R51; replaces AT-28).* ALM group parent, SUB child; K is `zatca_admin` in SUB only | MP grants K custody of SUB's master key; MP grants K custody of ALM's; MP grants a store-wide or `unseal` delegation on ALM; an `access_admin` grants K custody of SUB's | First allowed, `delegation_granted` row names SUB only; second refused (no `zatca_admin` in ALM); third refused (scope withdrawn); fourth refused (MP only) |
+| AT-55 | *Added 2026-10-17 (A21, R52).* MP; access_admin AA in ALM; P (`payroll_officer` ALM); H (`hr_officer` ALM); C (`approver` ALM); U holds both `payroll_officer` and `hr_officer` in ALM | MP grants P and H; AA grants a `payroll_officer`; P prepares and submits a run; P approves it; C approves it; H approves it; U prepares a run and approves it | MP grants logged; AA refused; P refused (A); C refused (no permission); H approves, entry posted; U refused (`self_approval`) (payroll AT-33) |
+| AT-56 | *Added 2026-10-17 (A22, R53).* Loan drafted by P in ALM; C (`approver`); MP; MIN (`equity`) loan | C approves; MP approves; MP approves the MIN loan without a MIN membership | C refused; MP allowed; MIN refused until an explicit MP membership exists (payroll AT-29) |
 
 ## 9. Open questions
 
@@ -427,7 +451,7 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 | # | Question | Who | Blocks? | Default |
 |---|---|---|---|---|
 | OQ-1 | Who approves when the CFO is absent or is the creator? (invoicing OQ-42) Is the Managing Partner fallback approver in every covered entity, including partly-owned ones? | Managing Partner | D | Named delegate per entity (R16); `managing_partner` holds **A** permissions in entities covered by R6 |
-| OQ-2 | Who grants memberships per entity? May an `access_admin` grant `approver` and `zatca_admin`? | Managing Partner | D | MP grants all roles; `access_admin` grants every entity role except `access_admin`, `approver`, `zatca_admin` |
+| OQ-2 | Who grants memberships per entity? May an `access_admin` grant `approver` and `zatca_admin`? | Managing Partner | D | MP grants all roles; `access_admin` grants every entity role except `access_admin`, `approver`, `zatca_admin`. *Amended 2026-10-17 (A21):* `hr_officer` and `payroll_officer` are granted by the MP only (decided) |
 | OQ-3 | Which entities do group roles (`managing_partner`, `group_viewer`, `group_treasury`) cover? Partly-owned and minority entities are separate companies (A4); other shareholders may limit what group staff may see. | Managing Partner + legal | **GL** for partly-owned/minority entities with real data | `full` descendants only; `equity`/`none` need explicit membership |
 | OQ-4 | Is MFA required, and for whom? | Managing Partner | GL | TOTP (open source, e.g. `django-otp`) required for `approver`, `zatca_admin`, `access_admin`, `managing_partner` and superusers |
 | OQ-5 | Manual journals: ledger-fx §7 lets the Accountant post directly; A1 says the CFO approves and posting follows. Which applies to manual and FX journals, revaluation and reversals? | Managing Partner / CFO | D | A1: `ledger.post_entry` = approver, not own; revaluation run by accountant creates drafts for approval |
@@ -453,6 +477,7 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 | OQ-25 | *Added 2026-10-17 (A19).* Must a `zatca_admin` membership sit next to another active role of the same user in that entity ("add-on"), or may a technical admin hold `zatca_admin` alone (OQ-13)? | Managing Partner | D | No prerequisite, as built |
 | OQ-26 | *Added 2026-10-17 (A16).* Does the receipt exception also cover customer refunds (money out, `CustomerReceipt.kind = refund`) and refunds received from vendors (`VendorPayment.kind = refund_received`, money in)? | Managing Partner | D | No: only customer receipts (`kind = receipt`); refunds keep a second person |
 | OQ-27 | *Added 2026-10-17 (A19).* The catalogue still gives `accountant` the `zatca.retry_failed` permission (zatca §7 "manually retry `failed_*`"), but resubmission is for `zatca_admin` holders only. Remove it from `accountant`, or keep it for zatca retries other than resubmission? | Managing Partner | D | Keep as built until zatca is built; resubmit refuses it (R50) |
+| OQ-28 | *Added 2026-10-17 (A22).* Overtime in non-Almiras companies is approved by the department head: is a `department_head` entity role (only `payroll.approve_overtime` for the department the user heads) acceptable, who grants it, and what if the head is absent or it is their own overtime (hr OQ-30)? | Managing Partner | D | Proposed role as 3.1, granted by `managing_partner`; absent → request waits (R18); own overtime → `managing_partner` |
 
 **Blocking:** OQ-13 blocks wiring zatca onboarding permissions (not the access module itself). **Go-live:** OQ-3, OQ-4, OQ-10, and requirement R45 (application database role privileges, AT-47; added 2026-10-17). This spec also unblocks invoicing OQ-25 (views/APIs) once built.
 

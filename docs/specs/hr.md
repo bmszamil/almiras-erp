@@ -1,16 +1,17 @@
 # HR: employees, contracts, secondments, leave, termination and end-of-service
 
-Django app: `hr`. Status: **draft spec**. Written 2026-10-17 by the spec-writer agent.
+Django app: `hr`. Status: **draft spec**. Written 2026-10-17 by the spec-writer agent. Amended 2026-10-17 (project-owner decisions H9 to H16: employment basis per person, currency, cut-off, departments/grades and overtime approval, loans, annual leave 21/30, `hr_officer` / `payroll_officer` roles, salary banks; 3.1, 3.2, 3.4, 3.11, 3.12, R5, R18, R21, R49 to R57, AT-26 to AT-32, OQ-1, OQ-2, OQ-3, OQ-5, OQ-26 to OQ-31).
 Depends on: `core` (Entity, Currency, access: `docs/specs/access.md`), `docs/specs/billing.md` 3.6 (SecondmentAssignment interface this spec fills), `docs/specs/payroll.md` (pay, GOSI, final settlement, all postings). Companion: `docs/specs/payroll.md`.
 **[CC-verify]** = Saudi regulatory figure or statement (Labour Law, GOSI, Mudad/Qiwa, PDPL) written from memory, not checked against gosi.gov.sa, hrsd.gov.sa, mudad.com.sa or sdaia.gov.sa (not reachable from this environment). The compliance-checker must verify each one before module-builder relies on it. Every such figure is stored as a `StatutoryParameter` row (3.9), never a code constant, so a correction is data.
 
 ## 1. Purpose
 
 The HR module keeps the employee master and employment records for **every entity** in the group (Almiras, subsidiaries, partly-owned entities, and any entity added later as an `Entity` row): employees (Saudi and non-Saudi), versioned employment contracts with salary components, assignments and secondments to other group entities (feeding billing's `SecondmentAssignment` and its `end_secondment` event), leave entitlements and balances, terminations, the end-of-service benefit (EOSB) calculation, and expiry tracking of iqama, passport and work-permit documents. Statutory figures are dated data per jurisdiction; only the Saudi (`SA`) jurisdiction is built. HR posts no journal entries: payroll (`docs/specs/payroll.md`) turns HR data into pay, GOSI, EOSB accruals and final settlements through `ledger.services`. Personal data is handled under PDPL (masked, encrypted, logged). Every record has an `entity`; no HR record is visible across entities; every user-facing text is in English and Arabic.
+*Amended 2026-10-17 (H9):* every person has an **employment basis**: `ksa_employee` (Saudi rules), `local_entity_employee` (employee of a group company registered outside KSA, that country's rules, never Saudi rules) or `remuneration` (cross-border person paid a monthly remuneration net of WHT by a Saudi entity; no labour regulation). Non-SA statutory parameters are not yet supplied (OQ-26).
 
 ## 2. Decisions
 
-No HR- or payroll-specific business decision has been recorded yet. The decisions that apply come from existing documents:
+H1 to H8 come from existing documents; H9 to H16 are the project owner's HR/payroll decisions of 2026-10-17 (same numbers as payroll P8 to P15).
 
 | # | Decision | Source | Date |
 |---|---|---|---|
@@ -22,8 +23,16 @@ No HR- or payroll-specific business decision has been recorded yet. The decision
 | H6 | Subsidiaries are separate companies; partly-owned and minority entities are separate legal persons (so each is its own employer). | Project owner (access A4; invoicing D11) | 2026-10-16 |
 | H7 | All hosting (DB, backups, logs, secret store) is in KSA. | Project owner (invoicing D12) | 2026-10-16 |
 | H8 | Proposed account codes stay proposed until the accountant/CFO reviews them. | Project owner (ledger-fx D10; invoicing D29) | 2026-10-17 |
+| H9 | "All group companies have employees, not all in Saudi Arabia." Staff outside KSA are either (a) employees of a locally registered group company, under that country's labour law and local payroll, held per entity with country-specific statutory parameters; Saudi rules never apply to them; or (b) "remuneration" staff paid from a Saudi entity as a monthly remuneration with withholding tax considered: no labour regulation (no GOSI, no EOSB, no Saudi leave), just a monthly remuneration net of WHT. Basis per person: `ksa_employee`, `local_entity_employee`, `remuneration`. Egypt/China/UAE parameters to be supplied. | Project owner | 2026-10-17 |
+| H10 | Foreign-currency pay: no for locally registered entities (they pay in their own functional currency); yes for remuneration staff (paid in a foreign currency from the Saudi entity). | Project owner | 2026-10-17 |
+| H11 | Pay cycle monthly for all. Cut-off for changes: the 27th of the month for local (in-country) payroll; the 6th of the following month for out-of-country payroll. | Project owner | 2026-10-17 |
+| H12 | Overtime only in very special circumstances; not allowed for certain grades (e.g. middle management and management); approved by the Managing Partner in Almiras and by the department head in other companies. | Project owner | 2026-10-17 |
+| H13 | Loans: all approved by the Managing Partner; profit-free loan up to 3 basic monthly salaries; larger amounts by Sharia-compliant bai' ajel (deferred-payment sale) secured by salary and EOSB. Interest and late fees never allowed. Detail in payroll P12. | Project owner | 2026-10-17 |
+| H14 | Annual leave: statutory minimum 21 days; some employees get 30; never more than 30. | Project owner | 2026-10-17 |
+| H15 | The HR officer approves the payroll (not the CFO); the preparer (payroll officer) cannot approve; posting automatic on approval. Roles `hr_officer` and `payroll_officer` exist; the Managing Partner grants them. | Project owner | 2026-10-17 |
+| H16 | Salary banks: Riyad Bank, Saudi National Bank (SNB), Al Rajhi Bank, Bank AlJazira, Alinma Bank; WPS/salary file per bank. | Project owner | 2026-10-17 |
 
-Everything else (approvers for HR records, leave policy, which entities employ staff, non-Saudi jurisdictions, alert thresholds, PDPL retention) is in section 9 with a safe default.
+Everything else (approvers for contracts, assignments and terminations, leave policy beyond H14, non-Saudi parameters, alert thresholds, PDPL retention) is in section 9 with a safe default.
 
 ## 3. Data model
 
@@ -33,8 +42,9 @@ Conventions: every model has `entity` FK → `core.Entity` (`PROTECT`, required)
 | Field | Type | Req | Bi | Notes |
 |---|---|---|---|---|
 | entity | OneToOne Entity | Y | | |
-| jurisdiction | Char(2) ISO 3166 | Y | | Default = `entity.country`. Only `SA` has parameters (R5, OQ-1) |
-| has_employees | Bool | Y | | Default False; HR records refused while False (OQ-1) |
+| jurisdiction | Char(2) ISO 3166 | Y | | Default = `entity.country`. Only `SA` has parameters (R5, OQ-26) |
+| has_employees | Bool | Y | | HR records refused while False. *Amended 2026-10-17 (H9):* every group company has employees; `hr_setup_entity` sets True |
+| overtime_approval_route | Choice `managing_partner`, `department_head` | Y | | *Added 2026-10-17 (H12, R55).* Set by `hr_setup_entity`: `managing_partner` for Almiras (ALM), `department_head` for every other entity; changed only by `managing_partner`, logged |
 | employee_code_prefix | Char(8) | Y | | Default `entity.code` (OQ-13) |
 | alert_days | JSON list of int | Y | | Default `[90, 60, 30, 7, 0]` (OQ-10) |
 | work_week_days / standard_daily_hours | PositiveSmallInt / Decimal(4,2) | Y | | Defaults 5 / 8.00 (business choice, OQ-22) |
@@ -56,7 +66,9 @@ Conventions: every model has `entity` FK → `core.Entity` (`PROTECT`, required)
 | hire_date | Date | Y | | Start of continuous service (rehire: OQ-14) |
 | status | Choice `draft`, `active`, `on_notice`, `terminated` | Y | | R14 |
 | document_flag | Choice `ok`, `expiring`, `expired` | computed | | From 3.8 (R46) |
-| user | OneToOne auth.User, null | N | | Self-service later (OQ-4) |
+| user | OneToOne auth.User, null | N | | Self-service later (OQ-4). Required for a department head who approves overtime (R55) |
+| employment_basis | Choice `ksa_employee`, `local_entity_employee`, `remuneration` | Y | | *Added 2026-10-17 (H9, R49).* Fixed once a contract is approved (OQ-27) |
+| country_of_residence | Char(2) ISO 3166 | Y if `remuneration` | | PD. ≠ `SA` for `remuneration` (default, OQ-28); used for WHT (payroll R43) |
 
 No religion, marital status, health or family fields are stored (PDPL minimisation; OQ-11, OQ-22).
 
@@ -87,9 +99,11 @@ No religion, marital status, health or family fields are stored (PDPL minimisati
 | job_title | Char(200) | Y | Bi | |
 | occupation_code | Char(20) | N | | Official occupation classification **[CC-verify]** which list Qiwa/GOSI use |
 | weekly_hours / daily_hours | Decimal(5,2) / Decimal(4,2) | Y | | R19 |
-| annual_leave_days | PositiveSmallInt | Y | | ≥ statutory (R21) |
-| notice_days_employer / notice_days_employee | PositiveSmallInt | Y | | R37 |
-| currency | FK Currency | Y | | Must equal `entity.base_currency` (R18; OQ in payroll OQ-4) |
+| annual_leave_days | PositiveSmallInt | Y | | ≥ statutory (R21). *Amended 2026-10-17 (H14):* 21 or 30 for `ksa_employee`, never > 30; 0 for `remuneration` (R56) |
+| notice_days_employer / notice_days_employee | PositiveSmallInt | Y | | R37 (statutory check only for `ksa_employee`) |
+| currency | FK Currency | Y | | Must equal `entity.base_currency` (R18). *Amended 2026-10-17 (H10):* any active currency for `remuneration` (R53) |
+| department | FK Department, null | Y unless `remuneration` | | *Added 2026-10-17 (H12, R54).* Same entity |
+| grade | FK Grade, null | Y unless `remuneration` | | *Added 2026-10-17 (H12, R54).* Same entity; drives overtime eligibility |
 | status | Choice `draft`, `submitted`, `approved`, `rejected`, `withdrawn` | Y | | R15 |
 | submitted_by / approved_by / approved_at / rejected_reason (Bi) | | | | |
 | qiwa_contract_ref | Char(40) | N | | Recorded only (OQ-21) |
@@ -164,6 +178,28 @@ No religion, marital status, health or family fields are stored (PDPL minimisati
 
 `EosbCalculation` (append-only snapshot): entity, employee, termination (null for provision runs from payroll), as_of, service_start, service_end, service_days, excluded_days (unpaid leave per parameter), wage_basis (Money), wage_components (JSON), full_award (Money), fraction (Decimal(5,4)), award (Money), parameter_ids (JSON), contract_version, computed_by, supersedes (FK self, null).
 
+*Added 2026-10-17 (H9):* `Termination.kind` adds `end_of_remuneration` (only kind allowed for `remuneration`; no EOSB, R52).
+
+### 3.11 `Department` (unique `(entity, code)`) *(added 2026-10-17, H12)*
+| Field | Type | Req | Bi | Notes |
+|---|---|---|---|---|
+| code | Slug(20) | Y | | |
+| name | Char(150) | Y | Bi | |
+| head | FK Employee, null | N | | Same entity, `active`, with `user` set (R54) |
+| parent | FK self, null | N | | Optional hierarchy |
+| is_active | Bool | Y | | |
+
+### 3.12 `Grade` (unique `(entity, code)`) *(added 2026-10-17, H12)*
+| Field | Type | Req | Bi | Notes |
+|---|---|---|---|---|
+| code | Slug(20) | Y | | |
+| name | Char(150) | Y | Bi | e.g. "Middle management / الإدارة الوسطى" [AR-review] |
+| overtime_eligible | Bool | Y | | No default value: must be set explicitly on creation (R54) |
+| sort_order | PositiveSmallInt | Y | | Display only |
+| is_active | Bool | Y | | |
+
+No grade list is seeded (which grades exist: OQ-29).
+
 ## 4. Rules
 
 Enforcement: **svc** = `hr/services.py`; **M** = model `save`/`clean`/`delete`; **DB** = constraint/trigger; **Q** = `core.access.scope`; **T** = code/data scan test; **job** = scheduled command.
@@ -174,6 +210,7 @@ Enforcement: **svc** = `hr/services.py`; **M** = model `save`/`clean`/`delete`; 
 3. A person employed by two group entities is two `Employee` rows; no service reads or matches employees across entities (OQ-14). **[svc; T; AT-2]**
 4. A new entity uses HR with no code change: `hr_setup_entity <code>` (setup data) creates `HrSettings`, the seeded `SalaryComponent` and `LeaveType` rows for its jurisdiction. **[svc + command; AT-3]**
 5. Statutory calculations (leave accrual, sick tiers, EOSB, probation and hours limits) exist only for jurisdiction `SA`. An entity with another jurisdiction (e.g. Egypt, China, UAE subsidiaries) may hold employees and documents, but contract approval, leave accrual, termination approval and EOSB are refused with a bilingual "jurisdiction not configured" message (OQ-1). HR records are refused while `has_employees` is False. **[svc; AT-3]**
+    *Amended 2026-10-17 (H9):* the question "which entities, which rules" is decided (R49 to R52): SA calculations apply to `ksa_employee` only; `local_entity_employee` uses the entity's own jurisdiction's parameters, and this refusal stays only until those parameters exist and are verified (OQ-26); `remuneration` has no statutory calculations at all.
 
 ### Statutory parameters
 6. Every regulatory figure used by HR or payroll is read from `StatutoryParameter` valid on the relevant date (contract date, leave date, termination date). No regulatory figure appears as a code literal. **[svc `param(jurisdiction, code, on)`; T scans `hr/` and `payroll/` for known literals; AT-4]**
@@ -193,9 +230,11 @@ Enforcement: **svc** = `hr/services.py`; **M** = model `save`/`clean`/`delete`; 
 16. `fixed` needs `end_date` > `start_date`; `unlimited` has no `end_date`. A non-Saudi on an `unlimited` contract gets a warning (fixed-term rule for non-Saudis **[CC-verify]**, changed by the 2025 Labour Law amendments **[CC-verify]**). **[M clean + svc; AT-10]**
 17. `probation_days` ≤ parameter `probation.max_days` (90 days **[CC-verify]**), or ≤ `probation.max_days_extended` (180 days **[CC-verify]**) only when `probation_extended_in_writing`. **[svc; AT-10]**
 18. Components: exactly one `BASIC` > 0; components from the entity's active catalogue; amounts `Decimal` 2 dp; float refused; `currency` = `entity.base_currency` (payroll OQ-4). **[svc + M; AT-10]**
+    *Amended 2026-10-17 (H9, H10):* applies to `ksa_employee` and `local_entity_employee`. For `remuneration`, R52 and R53 replace the component and currency parts.
 19. `daily_hours` ≤ `hours.max_daily` (8 **[CC-verify]**) and `weekly_hours` ≤ `hours.max_weekly` (48 **[CC-verify]**). Reduced Ramadan hours (6/36 for Muslim workers **[CC-verify]**) are not computed (OQ-22). **[svc; AT-10]**
 20. The terms on a day are those of the approved version with the latest `effective_date` ≤ that day (ties: higher `version_no`). `effective_date` ≥ `start_date`; it may be in the past: payroll then computes a retro difference in its next run (payroll R14). Amendments cannot change `employee` or `entity` (a transfer is a termination + new hire, OQ-14). **[svc `terms_on(employee, day)`; AT-11]**
 21. `annual_leave_days` ≥ the statutory entitlement for the employee's service length (R30). **[svc; AT-10]**
+    *Amended 2026-10-17 (H14):* kept as the minimum check for `ksa_employee`; the allowed values and the 30-day ceiling are R56.
 
 ### Assignments and secondments (billing.md 3.6 interface)
 22. `receiving_entity` ≠ `entity`, and both have the same top-level group parent; or no `receiving_entity` and a bilingual third-party name. The assignment lies within an approved contract's dates. No two `secondment` assignments of one employee overlap (default, OQ-15). **[svc; AT-12]**
@@ -245,8 +284,19 @@ Notice period (60 days employer / 30 days employee for monthly-paid unlimited co
 
 ### Language, Sharia, permissions
 46. Every label, choice, message, alert, letter and report exists in English and Arabic; the user's `preferred_language` is used for messages. **[T; AT-24]**
-47. HR posts nothing and touches no Sharia-flagged account; `SalaryComponent.expense_account` must not be Sharia-prohibited where the entity enforces Sharia (checked at save; the ledger checks again at posting). Employee loans (interest-free) are in payroll R26. **[svc; AT-25]**
+47. HR posts nothing and touches no Sharia-flagged account; `SalaryComponent.expense_account` must not be Sharia-prohibited where the entity enforces Sharia (checked at save; the ledger checks again at posting). Employee loans (interest-free) are in payroll R26. *Amended 2026-10-17 (H13):* loan cap and bai' ajel financing are payroll R46 to R49. **[svc; AT-25]**
 48. Every service calls `require(user, entity, permission)` (access R1); approval services pass `document=` so segregation is checked on the stored row (access R14, R35). **[svc; T access AT-26]**
+
+### Project-owner decisions 2026-10-17 (H9 to H16)
+49. **Employment basis (H9).** Every `Employee` has `employment_basis`. Allowed: entity jurisdiction `SA` → `ksa_employee` or `remuneration`; any other jurisdiction → `local_entity_employee` only. The basis cannot change once a contract version is approved (a change is a termination plus a new `Employee` row, default OQ-27). **[M clean + svc; AT-26]**
+50. **`ksa_employee`.** All Saudi statutory rules of this spec (R6, R7, R9, R16, R17, R19, R21, R29 to R41, R42) apply, with `SA` parameters. **[svc; existing ATs]**
+51. **`local_entity_employee`.** Statutory figures are read only from `StatutoryParameter` rows of the employing entity's jurisdiction; `param()` refuses an `SA` row for such an employee, so a Saudi rule can never apply. Until the entity's jurisdiction has verified parameters for a calculation (contract checks, leave, termination benefit), that calculation is refused as in R5 (OQ-26). Master data, documents, departments and grades are kept. Contract currency = `entity.base_currency` (H10). **[svc `param(jurisdiction, code, on)`; AT-26]**
+52. **`remuneration`.** Held only in an `SA` entity. No labour regulation applies: the contract version has exactly one component `REMUNERATION` (seeded per entity: earning; `counts_for_gosi`, `counts_for_eosb`, `counts_for_overtime_base`, `deducted_for_unpaid_leave` all False); `probation_days` 0; `annual_leave_days` 0; no statutory probation, hours, notice or fixed-term checks; leave requests, `calculate_eosb`, sick tiers and statutory leave types are refused; termination only as `end_of_remuneration` (no `EosbCalculation`; the draft final settlement has no EOSB, leave or GOSI lines). Iqama and work permit are not required and the R42 warning does not apply; `id_type` `passport` is allowed. `country_of_residence` required and ≠ `SA` (default, OQ-28). **[M clean + svc; AT-27]**
+53. **Currency (H10).** `ksa_employee` and `local_entity_employee` contracts are in `entity.base_currency`. A `remuneration` contract may be in any active currency; its amount is stored with that currency's own decimals (up to 3, CLAUDE.md rule 7); more decimals than the currency allows, or a float, is refused. **[M clean + svc; AT-27, AT-28]**
+54. **Departments and grades (H12).** `Department` and `Grade` are per-entity catalogues (3.11, 3.12) maintained by `hr.manage_org`. Every approved contract version of a `ksa_employee` or `local_entity_employee` names an active department and grade of the same entity. A department head is an `active` employee of the same entity with a linked `user`; a head from another entity, a terminated head or a head with no user is refused. `Grade.overtime_eligible` must be set explicitly; payroll refuses overtime for a grade where it is False (payroll R45). **[M clean + svc; AT-29]**
+55. **Overtime approval route (H12).** `HrSettings.overtime_approval_route` decides who approves overtime (payroll R45): `managing_partner` (seeded for ALM) or `department_head` (seeded for every other entity, also for new entities created as data). Only `managing_partner` changes the route, logged in `AccessLog` (en/ar). **[svc + setup command; AT-30]**
+56. **Annual leave (H14).** For `ksa_employee`, `annual_leave_days` is 21 or 30 (any other value refused). Entitlement on a day = the higher of the contract value and the statutory value for the service length (21, or 30 after 5 years' continuous service **[CC-verify]**, R30), and never more than 30. No adjustment, accrual or contract can give more than 30 days for one service year. `remuneration`: 0 and no leave. `local_entity_employee`: per that jurisdiction's parameters (whether the 30-day ceiling applies: OQ-31). **[M clean + svc + job; AT-31]**
+57. **Roles (H15).** `hr_officer` and `payroll_officer` are seeded roles (access 3.1, A21), granted only by `managing_partner` (an `access_admin` grant is refused; access R52). Holders as §7. **[seed migration + access R8; AT-32]**
 
 ## 5. Accounting
 
@@ -268,7 +318,9 @@ None in HR. HR creates no journal entries. All HR-driven postings (salaries, GOS
 
 ## 7. Permissions
 
-New roles **proposed** (access catalogue change, Managing Partner to approve, OQ-2): `hr_officer` (entity, human) and `payroll_officer` (entity, human); `name_ar` [AR-review]: مسؤول الموارد البشرية / مسؤول الرواتب. No HR permission is **Ag** (R13). Flags as access 3.6.
+Roles `hr_officer` (entity, human) and `payroll_officer` (entity, human); `name_ar` [AR-review]: مسؤول الموارد البشرية / مسؤول الرواتب. *Amended 2026-10-17 (H15):* **decided**, no longer proposed; granted by `managing_partner` (R57, access A21). `hr_officer` also approves payroll runs (payroll R50). No HR permission is **Ag** (R13). Flags as access 3.6.
+
+*Added 2026-10-17 (H12):* `hr.manage_org` (departments, grades, department heads): hr_officer. `hr.set_overtime_route`: managing_partner only, per entity (R55). Overtime approval itself is `payroll.approve_overtime` (payroll §7).
 
 | Codename | Flags | Holders (default) |
 |---|---|---|
@@ -328,6 +380,13 @@ Fixtures: ALM (parent, SA, SAR, Sharia enforced), SUB (child, `full`, SA, SAR), 
 | AT-23 | Iqama expiring in 59 days; passport expired; `alert_days` default | Run alert job twice the same day; renew the iqama | One 60-day alert (en/ar) to ALM hr_officers only, no number in text; nothing on second run; employee `document_flag=expired`; after renewal, old row superseded and silent (R42 to R45) |
 | AT-24 | Arabic-preference user | Render employee, contract, leave, termination, alerts, errors | Arabic shown; every choice and message has en/ar (R46) |
 | AT-25 | ALM Sharia enforced | Set a component's `expense_account` to 5610 | Refused (R47) |
+| AT-26 | *Added 2026-10-17 (H9).* ALM (SA), EGY (EG, `has_employees=True`) | Create in ALM a `ksa_employee`, a `remuneration` (residence EG) and a `local_entity_employee`; in EGY a `ksa_employee` and a `local_entity_employee`; approve the EGY local contract; change the ALM `ksa_employee`'s basis after contract approval | ALM ksa and remuneration saved; ALM local refused; EGY ksa refused; EGY local saved; its contract approval refused "jurisdiction not configured" (en/ar) and no `SA` parameter is read (test spies on `param`); basis change refused (R49, R51) |
+| AT-27 | *Added 2026-10-17 (H9, H10).* ALM remuneration employee R1, residence EG | Contract with `REMUNERATION` USD 5,000.00; add `HOUSING`; amount USD 5,000.005; a KWD contract 1,250.125; R1 requests annual leave; `calculate_eosb(R1)`; record `resignation` for R1; record and approve `end_of_remuneration` | USD contract approved without probation/hours/notice checks and no iqama warning; HOUSING refused; USD 3 dp refused; KWD 3 dp accepted; leave refused; EOSB refused; `resignation` refused; `end_of_remuneration` approved with no `EosbCalculation`, draft final settlement without EOSB/leave/GOSI lines (R52, R53) |
+| AT-28 | *Added 2026-10-17 (H10).* ALM `ksa_employee`; EGY `local_entity_employee` (EGP base) | Contract in USD for each; EGY contract in EGP | Both USD refused (en/ar); EGP accepted at master-data level (R53) |
+| AT-29 | *Added 2026-10-17 (H12).* ALM departments FIN (head = E1 with user), OPS; grades G-STAFF (`overtime_eligible` True), G-MGMT (False) | Approve a ksa contract with no grade; with no department; set FIN head to a SUB employee, to a terminated employee, to an employee without user; create a grade without `overtime_eligible` | First two refused; the three head changes refused; grade without the flag refused; valid contract with FIN / G-MGMT approved (R54) |
+| AT-30 | *Added 2026-10-17 (H12).* | `hr_setup_entity` for ALM, SUB and NEW (created as data); H changes SUB's route; MP changes it | ALM `managing_partner`, SUB and NEW `department_head`; H refused; MP change applied with an `AccessLog` row (R55) |
+| AT-31 | *Added 2026-10-17 (H14).* ALM ksa employees | Contract with `annual_leave_days` 25; 31; 30; employee on 21 days hired 2022-01-01, accrual for 2027-02; employee on 30 days after 5 years; adjustment that would make one service year exceed 30 days | 25 and 31 refused; 30 accepted; 21-day employee accrues 2.50 (30/12) for 2027-02 **[CC-verify]**; 30-day employee stays at 2.50/month; adjustment refused (R56) |
+| AT-32 | *Added 2026-10-17 (H15).* MP, access_admin AA in ALM | MP grants H `hr_officer` and P `payroll_officer` in ALM; AA grants another user `hr_officer`; render role names in Arabic | MP grants logged; AA refused; names en/ar present (R57; access R52) |
 
 ## 9. Open questions
 
@@ -335,11 +394,11 @@ Fixtures: ALM (parent, SA, SAR, Sharia enforced), SUB (child, `full`, SA, SAR), 
 
 | # | Question | Owner | Blocks? | Default |
 |---|---|---|---|---|
-| OQ-1 | Which entities have employees? Which jurisdictions apply (Egypt, China, UAE subsidiaries): local labour law, leave, end-of-service, social insurance? Is HR for them in this ERP at all? | Managing Partner | **B** for any non-SA entity's calculations | `has_employees` False for all; only SA calculations; non-SA entities hold master data only (R5) |
-| OQ-2 | Approve new roles `hr_officer`, `payroll_officer` and the permission catalogue in §7 (access catalogue change). | Managing Partner | D | As §7 |
-| OQ-3 | Who approves contracts, salary changes, secondment starts and terminations: CFO, an HR manager, or the Managing Partner? | Managing Partner | D | Entity `approver` (CFO), per H2 |
+| OQ-1 | Which entities have employees? Which jurisdictions apply (Egypt, China, UAE subsidiaries): local labour law, leave, end-of-service, social insurance? Is HR for them in this ERP at all? | Managing Partner | — | **Resolved by H9 (2026-10-17)** at decision level: all group companies have employees; per-person basis (R49 to R52); the ERP holds local employees per entity with country parameters. Parameters themselves: OQ-26 |
+| OQ-2 | Approve new roles `hr_officer`, `payroll_officer` and the permission catalogue in §7 (access catalogue change). | Managing Partner | — | **Resolved by H15 (2026-10-17)** at decision level: both roles exist, MP grants them, `hr_officer` approves payroll. The permission-by-permission list in §7 is still the spec default |
+| OQ-3 | Who approves contracts, salary changes, secondment starts and terminations: CFO, an HR manager, or the Managing Partner? | Managing Partner | D | Entity `approver` (CFO), per H2. *Note 2026-10-17:* H12 decides only overtime approval (R55), H13 loans, H15 payroll runs; the items in this question stay open |
 | OQ-4 | Leave approval by line manager? Employee self-service (requests, payslips, documents)? | Managing Partner | D | hr_officer records and approves; no self-service |
-| OQ-5 | Leave policy beyond the statutory minimum: extra days, carry-forward, forfeiture, negative balance, encashment during service. | Managing Partner / CFO | D | Statutory only; no forfeiture; no negative balance; encashment only at exit |
+| OQ-5 | Leave policy beyond the statutory minimum: extra days, carry-forward, forfeiture, negative balance, encashment during service. | Managing Partner / CFO | D | Statutory only; no forfeiture; no negative balance; encashment only at exit. *Partly resolved by H14 (2026-10-17):* entitlement 21 or 30, never above 30 (R56). Who gets 30 days (criterion) and carry-forward, forfeiture, negative balance, encashment stay open |
 | OQ-6 | Is unused annual leave accrued in the books monthly (compensated absences, IFRS for SMEs s28 **[CC-verify]**)? | Accountant | D | Not posted; liability report only (payroll OQ-12 has proposed accounts) |
 | OQ-7 | Attendance and time tracking: in scope? | Managing Partner | D | Out of scope; overtime and absences entered as payroll inputs |
 | OQ-8 | Allowance structure per entity (which components; which count for GOSI, EOSB, overtime, unpaid deduction **[CC-verify]** for the statutory parts). | CFO + compliance-checker | D | BASIC, HOUSING, TRANSPORT, OTHER with seed flags (3.3) |
@@ -360,5 +419,11 @@ Fixtures: ALM (parent, SA, SAR, Sharia enforced), SUB (child, `full`, SA, SAR), 
 | OQ-23 | Mutual-agreement terminations (fraction), withdrawal of an approved termination. | Managing Partner + legal | D | Fraction 1 unless approver enters another with reason; withdrawal per R41 |
 | OQ-24 | Must both English and Arabic names be entered for every employee? | HR | D | Yes |
 | OQ-25 | Records about the approver themself (own contract, leave, termination): who approves? | Managing Partner | D | Refused for self; `managing_partner` fallback (access OQ-1) |
+| OQ-26 | *Added 2026-10-17 (H9).* Local statutory parameters for Egypt, China and UAE entities (labour law, leave, end-of-service/gratuity, social insurance, income tax, hours, probation), with sources, and who verifies them (local adviser). Shared with payroll OQ-28. | Managing Partner + local advisers + compliance-checker | **B** for `local_entity_employee` calculations in those entities only; not for KSA | R5 refusal stays for those calculations; master data kept |
+| OQ-27 | *Added 2026-10-17 (H9).* A person changes basis (e.g. remuneration → KSA employee on relocation, or transfer to a local entity): service continuity, settlement? | Managing Partner | D | Termination + new `Employee` row; no continuity (as OQ-14) |
+| OQ-28 | *Added 2026-10-17 (H9).* Remuneration staff: must they live outside KSA? Saudi nationals possible? Termination/notice terms, agreement template, PDPL cross-border transfer of their data. | Managing Partner + legal | D | Residence ≠ SA required; notice per agreement, not checked; data handled as other PD (OQ-11) |
+| OQ-29 | *Added 2026-10-17 (H12).* Grade list per entity; which grades are "middle management and management"; do grades drive anything else (leave 30 days, loans)? | Managing Partner / HR | D | Each entity defines grades with an explicit `overtime_eligible`; no other effect |
+| OQ-30 | *Added 2026-10-17 (H12).* Department head absent, approving their own overtime, department without a head; is a `department_head` access role acceptable (access OQ-28)? | Managing Partner | D | Request waits (access R18); own overtime and no-head cases go to `managing_partner`; proposed role `department_head` |
+| OQ-31 | *Added 2026-10-17 (H14).* Does the 30-day ceiling also apply to local entity employees where local law gives more? Which criterion gives 30 days in KSA (grade, contract, seniority)? | Managing Partner | D | Ceiling for `ksa_employee` only; 30 days set per contract and approved with it |
 
-**Blocking:** OQ-1 (non-SA entities), OQ-16 (billing interface wiring). **Go-live:** OQ-11 (PDPL), OQ-18 (EOSB), every [CC-verify] parameter verified. **Before building:** the compliance-checker verifies every [CC-verify] item; the MP approves the role additions (OQ-2).
+**Blocking:** OQ-26 (non-SA local calculations; replaces OQ-1, resolved by H9), OQ-16 (billing interface wiring). **Go-live:** OQ-11 (PDPL), OQ-18 (EOSB), every [CC-verify] parameter verified. **Before building:** the compliance-checker verifies every [CC-verify] item. (Role additions approved by H15, 2026-10-17.)
