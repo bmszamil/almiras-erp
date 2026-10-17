@@ -319,8 +319,17 @@ class Customer(Tracked, Address):
         if problems:
             raise ValidationError(problems)
 
-    def __str__(self):
+    def display_name(self, *, personal=False):
+        """Code and name. An individual's name is personal data (R51, PDPL): it is shown only when the caller
+        has checked ``invoicing.view_personal_data`` in the customer's entity and passes ``personal=True``."""
+        if self.customer_kind == self.Kind.INDIVIDUAL and not personal:
+            return self.code
         return f"{self.code} — {self.name_ar or self.name_en}"
+
+    def __str__(self):
+        """Everywhere an object label is rendered (admin titles, breadcrumbs, history, choices): never an
+        individual's name (verification review item 1)."""
+        return self.display_name()
 
 
 class CustomerIdentifier(models.Model):

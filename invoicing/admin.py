@@ -7,7 +7,9 @@ VAT number, also as the buyer snapshot on documents and in list columns) and
 vendor IBANs are hidden or masked unless the user holds
 ``invoicing.view_personal_data`` in that entity (R51, PDPL; review item 11).
 Names of individuals are searchable only by users with that right; others
-find individuals by code or number. Access logging per view is not built in
+find individuals by code or number. ``Customer.__str__`` never includes an
+individual's name, so admin titles, breadcrumbs and history pages show only
+the code; list columns use ``Customer.display_name`` after the check. Access logging per view is not built in
 slice 1.
 """
 from django.contrib import admin
@@ -58,7 +60,15 @@ class ReadOnlyScopedAdmin(EntityScopedAdmin):
 
 
 def _may_see_personal(request, entity):
-    return access.has(request.user, entity, "invoicing.view_personal_data")
+    """``invoicing.view_personal_data`` in ``entity``, checked once per request and entity (a changelist asks
+    for every row)."""
+    cache = getattr(request, "_invoicing_personal_data", None)
+    if cache is None:
+        cache = request._invoicing_personal_data = {}
+    key = getattr(entity, "pk", entity)
+    if key not in cache:
+        cache[key] = access.has(request.user, entity, "invoicing.view_personal_data")
+    return cache[key]
 
 
 def _masked_customer(request, customer):
@@ -72,7 +82,10 @@ def _customer_column(request, path, field, label):
         customer = getattr(obj, path) if path else obj
         if _masked_customer(request, customer):
             return MASK
-        return getattr(customer, field) if field else str(customer)
+        if field:
+            return getattr(customer, field)
+        return customer.display_name(personal=customer.customer_kind != Customer.Kind.INDIVIDUAL
+                                     or _may_see_personal(request, customer.entity))
     column.short_description = label
     return column
 
