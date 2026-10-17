@@ -1374,7 +1374,7 @@ def _sick_plan(use, jurisdiction, req, terms):
     rule = use.get(jurisdiction, "leave.sick", req.start_date)
     year_days = _year_days(use, jurisdiction, terms.calendar_basis, req.start_date)
     prior = set(SickLeaveDay.objects.filter(employee=req.employee, leave_request__status__in=(LR.APPROVED, LR.TAKEN))
-                .exclude(leave_request=req).values_list("date", flat=True))
+                .exclude(leave_request_id=req.pk).values_list("date", flat=True))
     new = list(_days(req.start_date, req.end_date))
     cycles = _sick_cycles(prior | set(new), year_days)
     bounds, acc = [], 0
@@ -1921,11 +1921,11 @@ def _compute_eosb(employee, as_of, kind, use, additional_wage=ZERO):
         raise error("Remuneration staff have no end-of-service benefit (R52).", "لا مكافأة نهاية خدمة لأصحاب المكافأة الشهرية.",
                     code="remuneration_no_eosb")
     jurisdiction = _jurisdiction(emp, "end-of-service benefit", "مكافأة نهاية الخدمة")
+    table = use.get(jurisdiction, "eosb.award_table", as_of, "end-of-service benefit", "مكافأة نهاية الخدمة")
+    fractions = use.get(jurisdiction, "eosb.fraction_table", as_of, "end-of-service benefit", "مكافأة نهاية الخدمة")
     terms = _terms_on(emp, as_of)
     if terms is None:
         raise error(f"No approved contract is in force on {as_of}.", f"لا يوجد عقد معتمد ساري في {as_of}.", code="no_terms")
-    table = use.get(jurisdiction, "eosb.award_table", as_of, "end-of-service benefit", "مكافأة نهاية الخدمة")
-    fractions = use.get(jurisdiction, "eosb.fraction_table", as_of, "end-of-service benefit", "مكافأة نهاية الخدمة")
     if kind not in fractions:
         raise error(f"No end-of-service fraction for {kind}.", f"لا توجد نسبة مكافأة لنوع الإنهاء {kind}.", code="eosb_kind")
     year_days = _year_days(use, jurisdiction, terms.calendar_basis, as_of)
