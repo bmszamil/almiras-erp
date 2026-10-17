@@ -642,6 +642,19 @@ def employees(user, entity=None):
     return qs.filter(entity=entity) if entity is not None else qs
 
 
+def employee_counts(user, entity):
+    """hr.md §7: head counts of ``entity`` by status and employment basis, no record and no personal data. For
+    viewers (``hr.view_counts``) and every ``hr.view`` holder."""
+    if not access.has(user, entity, "hr.view"):
+        access.require(user, entity, "hr.view_counts")
+    rows = Employee.objects.filter(entity=entity).values_list("status", "employment_basis")
+    by_status, by_basis = {}, {}
+    for status, basis in rows:
+        by_status[status] = by_status.get(status, 0) + 1
+        by_basis[basis] = by_basis.get(basis, 0) + 1
+    return {"entity": entity.code, "total": len(rows), "by_status": by_status, "by_basis": by_basis}
+
+
 def get_employee(user, pk):
     """One employee through scope: another entity's employee is 404 (R2, AT-1)."""
     return access.get_scoped_or_404(Employee.objects.all(), user, "hr.view", pk=pk)

@@ -166,6 +166,7 @@ _PERMS = [
     # hr (hr.md §7; A21). No HR permission is Ag (hr R13). hr.maintain_statutory_parameter is not G: the spec's
     # holder is the group parent's hr_officer (an entity role); hr.services checks it on the group parent entity.
     _p("hr.view", "View HR records (personal data masked)", "عرض سجلات الموارد البشرية (البيانات الشخصية مخفية)"),
+    _p("hr.view_counts", "View HR head counts only", "عرض أعداد الموظفين فقط"),
     _p("hr.view_personal_data", "View employees' personal data", "عرض البيانات الشخصية للموظفين"),
     _p("hr.manage_employee", "Create and edit employees and their documents", "إنشاء الموظفين ومستنداتهم وتعديلها"),
     _p("hr.edit_contract_draft", "Edit draft employment contracts", "تعديل مسودات عقود العمل"),

@@ -171,8 +171,16 @@ ROLE_SEED_V4 = {
         ("hr.view", "hr.view_personal_data", "hr.calculate_eosb", *_LEDGER_VIEW),
     ),
 }
+# V5 (migration core.0014, hr.md §7): viewers see HR counts only (``hr.view`` holders: hr_officer, payroll_officer,
+# approver; viewer: counts only). The accountant keeps the masked ``hr.view``: hr AT-6 and the §7 action table have
+# the accountant open an employee and see masked values.
+ROLE_SEED_V5 = {
+    **ROLE_SEED_V4,
+    "viewer": (*ROLE_SEED_V4["viewer"][:5],
+               tuple(p for p in ROLE_SEED_V4["viewer"][5] if p != "hr.view") + ("hr.view_counts",)),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V4
+ROLE_SEED = ROLE_SEED_V5
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {

@@ -166,10 +166,15 @@ def test_r9_iban_checked(w):
 def test_at6_masking_logging_export_and_ciphertext(w):
     e1 = hired(w, iban="GB82WEST12345698765432", bank_name="Test Bank")
     before = AccessLog.objects.filter(event="personal_data_viewed").count()
-    for user in (w.a, w.v):
-        rec = services.employee_record(e1, user=user)
-        assert rec["full_name_en"] == services.MASK and rec["id_number"] == services.MASK
-        assert rec["employee_code"] == e1.employee_code
+    rec = services.employee_record(e1, user=w.a)
+    assert rec["full_name_en"] == services.MASK and rec["id_number"] == services.MASK
+    assert rec["employee_code"] == e1.employee_code
+    # §7: the viewer sees counts only (OQ-11 default), never a record, masked or not.
+    with pytest.raises(access.AccessDenied):
+        services.employee_record(e1, user=w.v)
+    assert not services.employees(w.v).exists()
+    assert services.employee_counts(w.v, w.alm) == {"entity": "ALM", "total": 1, "by_status": {"active": 1},
+                                                    "by_basis": {"ksa_employee": 1}}
     assert AccessLog.objects.filter(event="personal_data_viewed").count() == before
     rec = services.employee_record(e1, user=w.h)
     assert rec["full_name_en"] == "Test Person" and rec["iban"] == "GB82WEST12345698765432"
@@ -346,3 +351,18 @@ def test_at24_errors_are_bilingual_and_follow_the_language(w):
     with pytest.raises(access.AccessDenied) as denied:
         services.employee_record(hired(w), user=ar_user)
     assert ARABIC.search(str(denied.value))
+
+
+def test_s7_counts_are_per_entity_and_need_a_right(w):
+    hired(w)
+    hired(w, w.sub)
+    assert services.employee_counts(w.h, w.alm)["total"] == 1  # hr.view holders get counts too
+    assert services.employee_counts(w.a, w.alm)["total"] == 1
+    with pytest.raises(access.AccessDenied):
+        services.employee_counts(w.v, w.sub)  # the viewer's role is in ALM only
+    with pytest.raises(access.AccessDenied):
+        services.employee_counts(w.agent, w.alm)
+    from core.access.seed import ROLE_SEED
+
+    assert "hr.view" not in ROLE_SEED["viewer"][5] and "hr.view_counts" in ROLE_SEED["viewer"][5]
+    assert "hr.view" in ROLE_SEED["accountant"][5]  # AT-6: the accountant opens employees, masked
