@@ -4,7 +4,9 @@ from hr import services
 
 
 class Command(BaseCommand):
-    help = "Deliver pending secondment end events to billing (hr R25), every 5 minutes."
+    help = ("Deliver pending secondment end events to billing (hr R25), every 5 minutes. / تسليم أحداث نهاية "
+            "الإعارة المعلقة إلى الفوترة كل 5 دقائق.")
 
     def handle(self, *args, **opts):
-        self.stdout.write(f"{services.deliver_assignment_events()} event(s) delivered.")
+        n = services.deliver_assignment_events()
+        self.stdout.write(f"{n} event(s) delivered. / سُلّم {n} حدث.")

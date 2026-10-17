@@ -384,3 +384,21 @@ def test_seed_rows_fit_their_columns():
     rows.update({code: v[2] for code, v in {**statutory_seed.GOSI_PARAMETERS,
                                             **statutory_seed.GOSI_MAP_PARAMETERS}.items()})
     assert all(len(ref) <= StatutoryParameter._meta.get_field("source_reference").max_length for ref in rows.values())
+
+
+def test_seed_refresh_migration_is_frozen_and_matches_the_seed(w):
+    """Nit 20/21: 0017 carries its own data (no live seed import), adds missing rows, leaves entered rows alone."""
+    import importlib
+
+    from django.apps import apps
+
+    mig = importlib.import_module("hr.migrations.0017_seed_refresh_eid_gosi")
+    assert "statutory_seed" not in Path(mig.__file__).read_text(encoding="utf-8")
+    by_code = {r[1]: r for r in mig.ROWS}
+    assert by_code["calendar.official_holidays"][3] == statutory_seed.SA_PARAMETERS["calendar.official_holidays"][0]
+    legal = StatutoryParameter.objects.get(code="gosi.legal_age")
+    services.supersede_statutory_parameter(legal, user=w.h, value={"new_m273": {"years": "65", "article": "x"}},
+                                           source_url=legal.source_url, source_reference="entered by H")
+    mig.forward(apps, None)
+    assert StatutoryParameter.objects.get(code="gosi.legal_age", status="unverified").value["new_m273"]["article"] == "x"
+    assert StatutoryParameter.objects.filter(code="gosi.exclusion_reason_map").count() == 1

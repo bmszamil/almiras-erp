@@ -75,3 +75,17 @@ def test_stable_hash_key_survives_rotation(w, settings):
     assert Employee.objects.get(pk=emp.pk).full_name_en == "Test Person"  # re-encrypted under the new key
     with pytest.raises(HrError):
         employee(w, id_number="1999999992")
+
+
+def test_nit22_hr_commands_speak_english_and_arabic(w):
+    import re
+
+    for name in ("hr_accrue_leave", "hr_document_alerts", "hr_refresh_status", "hr_deliver_assignment_events",
+                 "hr_resignation_deadlines", "hr_gosi_exclusion_reminders"):
+        out = StringIO()
+        args = ["--month", "2027-01"] if name == "hr_accrue_leave" else []
+        call_command(name, *args, stdout=out)
+        assert re.search(r"[؀-ۿ]", out.getvalue()) and re.search(r"[A-Za-z]", out.getvalue()), name
+    out = StringIO()
+    call_command("hr_setup_entity", "ALM", stdout=out)
+    assert re.search(r"[؀-ۿ]", out.getvalue())
