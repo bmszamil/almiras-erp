@@ -211,7 +211,8 @@ def _eligible_others(request, step, exclude_id):
 
 
 def _mp_sole_approver(request, step, principal):
-    """The D10 situation: the MP created, submitted or edited the document and nobody else is eligible."""
+    """The D10 situation: the MP created, submitted or edited the document and nobody else is eligible.
+    D22: this includes an MP who submitted an AI agent's or integration's draft (the submitter is involved)."""
     return (
         principal.pk in _involved(request)
         and principal.is_human
