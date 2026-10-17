@@ -142,6 +142,30 @@ def _raw(sql, params=()):
         cursor.execute(sql, params)
 
 
+def test_item3_purification_flag_of_a_posted_bill_never_changes_through_django(w):
+    """AT-90 on every database: the service, a model save and QuerySet.update are all refused."""
+    from invoicing.models import InvoicingError
+
+    draft = bill(w, submit=False)
+    with pytest.raises(InvoicingError) as exc:  # not even a draft sets it: it is derived at posting
+        services.update_purchase_document(draft, user=w.ap, requires_purification=True)
+    assert exc.value.code == "unknown_field"
+    b = services.approve_purchase_document(bill(w, number="A-18"), user=w.cfo)
+    flag = b.requires_purification
+    with pytest.raises(InvoicingError) as exc:
+        services.update_purchase_document(b, user=w.ap, requires_purification=not flag)
+    assert exc.value.code == "not_draft"
+    with pytest.raises(InvoicingError) as exc:
+        PurchaseDocument.objects.filter(pk=b.pk).update(requires_purification=not flag)
+    assert exc.value.code == "service_only"
+    stored = PurchaseDocument.objects.get(pk=b.pk)
+    stored.requires_purification = not flag
+    with pytest.raises(InvoicingError) as exc:
+        stored.save()
+    assert exc.value.code == "service_only"
+    assert PurchaseDocument.objects.get(pk=b.pk).requires_purification == flag
+
+
 @postgres_only
 def test_item3_purification_flag_of_a_posted_bill_never_flips_in_the_database(w):
     """Reviewer probe p11: raw SQL flipped requires_purification on a posted bill."""
