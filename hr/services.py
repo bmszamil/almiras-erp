@@ -1128,8 +1128,8 @@ def approve_contract(contract, *, user):
     use = ParamUse()
     problems, warnings = _contract_problems(c, statutory=emp.employment_basis != Basis.REMUNERATION, use=use)
     if emp.employment_basis == Basis.KSA_EMPLOYEE and not c.qiwa_contract_ref.strip():
-        problems.append("The Qiwa contract reference is required: contracts are documented on the Ministry's platform "
-                        "(Regs Art. 18). / مرجع العقد في منصة قوى مطلوب: توثَّق العقود إلكترونيًا عبر منصة الوزارة.")
+        warnings.append(QIWA_MISSING[0] + " The employee becomes active only once it is recorded (R61). / "
+                        + QIWA_MISSING[1] + " ولا يصبح الموظف نشطًا إلا بعد تسجيله.")
     if problems:
         raise _problems(problems, "contract_invalid")
     use.check_verified()
@@ -1206,14 +1206,68 @@ def contract_end_date(contract, *, user):
     return _contract_end(contract)
 
 
+QIWA_MISSING = ("The Qiwa contract reference is missing: contracts are documented on the Ministry's platform (Regs "
+                "Art. 18).", "مرجع العقد في منصة قوى غير مسجل: توثَّق العقود إلكترونيًا عبر منصة الوزارة (المادة 18 من "
+                "اللائحة التنفيذية).")
+
+
+def _activation_problem(emp, today):
+    """R8, R61: why ``emp`` cannot become active on ``today`` (None when it can). A ``ksa_employee`` needs the
+    Qiwa reference on the approved version in force (Regs Art. 18; default refusal, OQ-21)."""
+    first = _approved_versions(emp).order_by("version_no").first()
+    terms = _terms_on(emp, today)
+    if first is None or terms is None or first.start_date > today:
+        return error("An employee becomes active with an approved contract that has started (R8).",
+                     "يصبح الموظف نشطًا بعقد معتمد بدأ سريانه.", code="not_started")
+    if emp.employment_basis == Basis.KSA_EMPLOYEE and not (terms.qiwa_contract_ref or "").strip():
+        return error(*QIWA_MISSING, code="qiwa_required")
+    return None
+
+
 def _activate_if_started(emp):
     emp = _lock(Employee, emp.pk)
-    if emp.status == Employee.Status.DRAFT and _terms_on(emp, _today()) is not None:
-        first = _approved_versions(emp).order_by("version_no").first()
-        if first.start_date <= _today():
-            emp.status = Employee.Status.ACTIVE
-            _save(emp, update_fields=["status"])
+    if emp.status == Employee.Status.DRAFT and _activation_problem(emp, _today()) is None:
+        emp.status = Employee.Status.ACTIVE
+        _save(emp, update_fields=["status"])
     return emp
+
+
+@transaction.atomic
+def activate_employee(employee, *, user):
+    """R8, R61 / AT-39: make a draft employee active; refused (en/ar, naming Regs Art. 18) while the approved
+    version of a ``ksa_employee`` has no Qiwa reference."""
+    emp = _lock(Employee, employee.pk)
+    access.require(user, emp.entity, "hr.manage_employee")
+    if emp.status != Employee.Status.DRAFT:
+        raise error("Only a draft employee is activated.", "لا يُفعَّل إلا الموظف المسودة.", code="employee_status")
+    problem = _activation_problem(emp, _today())
+    if problem is not None:
+        raise problem
+    emp.status = Employee.Status.ACTIVE
+    return _save(emp, update_fields=["status"])
+
+
+@transaction.atomic
+def record_qiwa_reference(contract, reference, *, user):
+    """R61: record the Qiwa documentation reference of a contract version. On an approved version it may only be
+    filled in once (the only change to an approved version besides ``ended_on``; the PostgreSQL trigger agrees);
+    a draft employee whose version has started then becomes active."""
+    c = _lock(EmploymentContract, contract.pk)
+    access.require(user, c.entity, "hr.edit_contract_draft")
+    reference = (reference or "").strip()
+    if not reference or len(reference) > EmploymentContract._meta.get_field("qiwa_contract_ref").max_length:
+        raise error("Enter the Qiwa contract reference (at most 40 characters).",
+                    "أدخل مرجع العقد في منصة قوى (40 حرفًا بحد أقصى).", code="qiwa_reference")
+    if c.status in (CStatus.REJECTED, CStatus.WITHDRAWN) or (c.status == CStatus.APPROVED and c.qiwa_contract_ref):
+        raise error("The Qiwa reference of this version is already recorded or the version is closed.",
+                    "مرجع قوى لهذه النسخة مسجل مسبقًا أو النسخة مغلقة.", code="qiwa_reference")
+    c.qiwa_contract_ref, c.modified_by, c.modified_at = reference, user, timezone.now()
+    if c.status == CStatus.APPROVED:
+        _save(c, update_fields=["qiwa_contract_ref"])  # the approval's own warnings stay as they were
+        _activate_if_started(c.employee)
+    else:
+        _save(c, update_fields=["qiwa_contract_ref", "modified_by", "modified_at"])
+    return c
 
 
 # =====================================================================================================
@@ -2486,8 +2540,7 @@ def refresh_statuses(*, today=None):
     changed = 0
     for emp in Employee.objects.filter(status=Employee.Status.DRAFT):
         with transaction.atomic():
-            first = _approved_versions(emp).order_by("version_no").first()
-            if first is not None and first.start_date <= today:
+            if _activation_problem(emp, today) is None:  # R8, R61 (Qiwa reference)
                 e = _lock(Employee, emp.pk)
                 e.status = Employee.Status.ACTIVE
                 _save(e, update_fields=["status"])

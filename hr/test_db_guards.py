@@ -28,6 +28,18 @@ def test_approved_contract_and_components_are_immutable(w):
     _refused("DELETE FROM hr_contractcomponent WHERE contract_id = %s", [c.pk])
     with connection.cursor() as cur:  # the one allowed change: ended_on (termination)
         cur.execute("UPDATE hr_employmentcontract SET ended_on = '2027-06-30' WHERE id = %s", [c.pk])
+    # R61: a set Qiwa reference never changes on an approved version.
+    _refused("UPDATE hr_employmentcontract SET qiwa_contract_ref = 'OTHER' WHERE id = %s", [c.pk])
+
+
+@pg
+def test_approved_contract_gets_its_qiwa_reference_once(w):
+    c = contract(w, employee(w), qiwa_contract_ref="")
+    _refused("UPDATE hr_employmentcontract SET qiwa_contract_ref = 'Q-1', job_title_en = 'X' WHERE id = %s", [c.pk])
+    with connection.cursor() as cur:
+        cur.execute("UPDATE hr_employmentcontract SET qiwa_contract_ref = 'Q-1' WHERE id = %s", [c.pk])
+    _refused("UPDATE hr_employmentcontract SET qiwa_contract_ref = '' WHERE id = %s", [c.pk])
+    _refused("UPDATE hr_employmentcontract SET qiwa_contract_ref = 'Q-2' WHERE id = %s", [c.pk])
 
 
 @pg

@@ -135,12 +135,55 @@ def test_r17_amendment_cannot_add_probation(w):
         contract(w, emp, approve=False, effective_date=date(2027, 4, 1), probation_periods=[60])
 
 
-def test_regs_art18_qiwa_reference_required_for_ksa(w):
-    emp = employee(w)
-    c = _submit(w, emp, qiwa_contract_ref="")
+def test_at39_qiwa_reference_is_required_for_activation_not_approval(w):
+    w.clock.set(date(2027, 1, 1))
+    emp = employee(w)  # hire and start 2027-01-01 = today
+    c = services.approve_contract(_submit(w, emp, qiwa_contract_ref=""), user=w.c)
+    assert c.status == "approved" and any("Regs Art. 18" in x for x in c.warnings)
+    emp.refresh_from_db()
+    assert emp.status == "draft"
     with pytest.raises(HrError) as exc:
-        services.approve_contract(c, user=w.c)
-    assert "Qiwa" in exc.value.messages[0]
+        services.activate_employee(emp, user=w.h)
+    assert exc.value.code == "qiwa_required"
+    assert "Regs Art. 18" in exc.value.messages[0] and "قوى" in exc.value.messages[0]
+    assert services.refresh_statuses(today=date(2027, 1, 1)) == 0  # the daily job refuses it as well
+    services.record_qiwa_reference(c, "QIWA-2027-0001", user=w.h)
+    emp.refresh_from_db()
+    assert emp.status == "active"  # the started version now has its reference
+    c.refresh_from_db()
+    assert c.qiwa_contract_ref == "QIWA-2027-0001" and c.status == "approved"
+    with pytest.raises(HrError):  # filled in once only
+        services.record_qiwa_reference(c, "QIWA-OTHER", user=w.h)
+
+
+def test_r61_activate_employee_after_reference(w):
+    w.clock.set(date(2027, 1, 1))
+    emp = employee(w)
+    c = services.approve_contract(_submit(w, emp, qiwa_contract_ref=""), user=w.c)
+    with pytest.raises(access.AccessDenied):
+        services.record_qiwa_reference(c, "QIWA-1", user=w.p)
+    services.record_qiwa_reference(c, "QIWA-1", user=w.h)
+    emp.refresh_from_db()
+    assert emp.status == "active"
+    with pytest.raises(HrError) as exc:
+        services.activate_employee(emp, user=w.h)
+    assert exc.value.code == "employee_status"
+
+
+def test_r61_activation_waits_for_the_start_date(w):
+    emp = employee(w, hire_date=date(2027, 9, 1))
+    contract(w, emp)
+    with pytest.raises(HrError) as exc:
+        services.activate_employee(emp, user=w.h)
+    assert exc.value.code == "not_started"
+
+
+def test_r61_remuneration_staff_need_no_qiwa_reference(w):
+    w.clock.set(date(2027, 1, 1))
+    emp = employee(w, basis="remuneration")
+    contract(w, emp)
+    emp.refresh_from_db()
+    assert emp.status == "active"
 
 
 def test_r21_annual_leave_below_statutory_after_five_years(w):
