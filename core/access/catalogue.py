@@ -222,6 +222,12 @@ _PERMS = [
     _p("banking.reopen_reconciliation", "Reopen an approved bank reconciliation", "إعادة فتح تسوية بنكية معتمدة",
        SEGREGATED),
     _p("banking.manage_settings", "Manage banking settings and CSV layouts", "إدارة إعدادات البنوك وتنسيقات ملفات CSV"),
+    # migration (migration.md §7): legacy (Falcon) exports into opening balances and replayed journals. Drafting the
+    # entries also needs ledger.create_entry; posting them needs ledger.post_entry (a second person).
+    _p("migration.view", "View account maps and imports", "عرض خرائط الحسابات وعمليات الاستيراد"),
+    _p("migration.manage_account_map", "Draft and edit legacy account maps", "إعداد خرائط حسابات النظام السابق وتعديلها"),
+    _p("migration.approve_account_map", "Approve legacy account maps", "اعتماد خرائط حسابات النظام السابق", APPROVAL),
+    _p("migration.import", "Validate legacy exports and draft their entries", "فحص ملفات النظام السابق وإعداد مسودات قيودها"),
 ]
 
 CATALOGUE = {p.codename: p for p in _PERMS}

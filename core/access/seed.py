@@ -232,8 +232,18 @@ ROLE_SEED_V8 = {
     "accountant": _plus(ROLE_SEED_V7, "accountant", "invoicing.manage_charity_recipient"),
     "managing_partner": _plus(ROLE_SEED_V7, "managing_partner", "invoicing.approve_charity_recipient"),
 }
+# V9 (migration core.0018, migration.md §7): legacy data migration (Falcon). The accountant drafts account maps and
+# imports; the approver (or the Managing Partner, every A permission) approves maps; the approver posts the import
+# drafts with ledger.post_entry, which it already holds; viewers see maps and imports.
+ROLE_SEED_V9 = {
+    **ROLE_SEED_V8,
+    "accountant": _plus(ROLE_SEED_V8, "accountant", "migration.view", "migration.manage_account_map", "migration.import"),
+    "approver": _plus(ROLE_SEED_V8, "approver", "migration.view", "migration.approve_account_map"),
+    "viewer": _plus(ROLE_SEED_V8, "viewer", "migration.view"),
+    "managing_partner": _plus(ROLE_SEED_V8, "managing_partner", "migration.view", "migration.approve_account_map"),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V8
+ROLE_SEED = ROLE_SEED_V9
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
