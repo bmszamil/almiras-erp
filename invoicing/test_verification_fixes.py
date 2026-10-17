@@ -3,12 +3,14 @@ from datetime import date
 from unittest import mock
 
 import pytest
+from django.db import DatabaseError, connection, transaction
 
 from core import access
 from invoicing import admin as invoicing_admin
 from invoicing import services
 from invoicing.conftest import ADDRESS, approve, invoice
-from invoicing.models import Customer
+from invoicing.models import Customer, PurchaseDocument
+from invoicing.test_purchases import bill
 
 pytestmark = pytest.mark.django_db
 
@@ -102,3 +104,43 @@ def test_item9_personal_data_right_cached_per_request_and_entity(w, client):
     with mock.patch.object(invoicing_admin.access, "has", side_effect=counting_has):
         assert client.get("/admin/invoicing/customer/").status_code == 200
     assert calls == [w.alm.pk]
+
+
+# --- item 3: the purification flag of a posted bill (PostgreSQL trigger, migration 0008) -------------
+
+postgres_only = pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL triggers")
+
+
+def _raw(sql, params=()):
+    with transaction.atomic(), connection.cursor() as cursor:
+        cursor.execute(sql, params)
+
+
+@postgres_only
+def test_item3_purification_flag_of_a_posted_bill_never_flips_in_the_database(w):
+    """Reviewer probe p11: raw SQL flipped requires_purification on a posted bill."""
+    b = services.approve_purchase_document(bill(w), user=w.cfo)
+    assert b.journal_entry_id is not None
+    for sql in ("UPDATE invoicing_purchasedocument SET requires_purification = NOT requires_purification WHERE id = %s",
+                "UPDATE invoicing_purchasedocument SET requires_purification = NOT requires_purification, "
+                "journal_entry_id = journal_entry_id WHERE id = %s"):
+        with pytest.raises(DatabaseError, match="purification flag"):
+            _raw(sql, [b.pk])
+    assert PurchaseDocument.objects.get(pk=b.pk).requires_purification == b.requires_purification
+
+
+@postgres_only
+def test_item3_purification_flag_is_written_with_the_entry_and_equals_its_lines(w):
+    """A write that records the entry with a flag its lines do not carry is refused; the posting rolls back."""
+    real_save = PurchaseDocument.save
+
+    def wrong_flag(self, *args, **kwargs):
+        if "journal_entry" in (kwargs.get("update_fields") or ()):
+            self.requires_purification = not self.requires_purification
+        return real_save(self, *args, **kwargs)
+
+    doc = bill(w)
+    with mock.patch.object(PurchaseDocument, "save", wrong_flag):
+        with pytest.raises(DatabaseError, match="entry's lines"):
+            services.approve_purchase_document(doc, user=w.cfo)
+    assert PurchaseDocument.objects.get(pk=doc.pk).status == "submitted"
