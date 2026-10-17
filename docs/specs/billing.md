@@ -1,7 +1,7 @@
 # Billing: contract-based recurring and automatic invoicing
 
-Django app: `billing`. Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (project-owner decisions D8 to D10: auto-issue, retroactive amendment/termination with correction notes, no mirror bill). Amended 2026-10-17 (project-owner decisions D11, D12: 3-decimal contract currencies, correction notes dated and taxed on the note date; §3 conventions, R37, R42, R43, R45, AT-37, AT-38, OQ-25, OQ-29).
-Depends on: `core` (Entity), `docs/specs/invoicing.md` (sales documents, customers, VAT; being revised in parallel, so concepts are referenced, not copied), `docs/specs/zatca.md` (clearance and reporting), `docs/specs/ledger-fx.md` (currencies and rates; parallel spec, **not in the repo yet**), HR module (does not exist; interface defined in 3.6).
+Django app: `billing`. Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (project-owner decisions D8 to D10: auto-issue, retroactive amendment/termination with correction notes, no mirror bill). Amended 2026-10-17 (project-owner decisions D11, D12: 3-decimal contract currencies, correction notes dated and taxed on the note date; §3 conventions, R37, R42, R43, R45, AT-37, AT-38, OQ-25, OQ-29). Amended 2026-10-17 (Track C build prep: reconciled with what is built in `invoicing` slice 1, `ledger` + ledger-fx, `core.access` and `hr`; interface rules R52 to R69, intercompany reconciliation report, scheduler, notes on D6, R13, R27, R32, R35, R37, R43, R44, R46, R47, §5, §6, §7, AT-11, AT-37, new AT-39 to AT-52, OQ status and OQ-30 to OQ-35).
+Depends on: `core` (Entity), `core.access` (built; `docs/specs/access.md`), `docs/specs/invoicing.md` (sales documents, customers, VAT; slice 1 built, billing hooks are stubs that raise), `docs/specs/zatca.md` (clearance and reporting; reached only through `invoicing.zatca_port`), `docs/specs/ledger-fx.md` (built: currencies, rates, `JournalLine` currency), `docs/specs/hr.md` (built: `hr/billing_port.py`, `AssignmentEvent` outbox), `docs/specs/payroll.md` (secondment cost report, not built).
 **[CC-verify]** = tax, ZATCA or regulatory statement not checked against official text. The compliance-checker must verify it before module-builder starts.
 
 ## 1. Purpose
@@ -17,7 +17,7 @@ The billing module holds customer contracts for **every entity** in the group (A
 | D3 | Multi-currency is needed (SAR, CNY, EGP, GBP, EUR, USD, AED, and others). Currencies and rates are covered by `docs/specs/ledger-fx.md`. | Project owner | 2026-10-16 |
 | D4 | A contract may have an advance, a security deposit, both, or neither. | Project owner | 2026-10-16 |
 | D5 | Roles: accounting staff create; the CFO approves; posting is automatic on approval. Sales documents post only after ZATCA clearance or reporting. | Project owner | 2026-10-16 |
-| D6 | Until the HR module exists, accounting staff record the secondment end date. | Project owner (task brief) | 2026-10-16 |
+| D6 | Until the HR module exists, accounting staff record the secondment end date. *(Note 2026-10-17: HR is built. D6 still applies to secondments **not** linked to an HR assignment; for linked ones HR is the only source of the end date (R59, from hr R26 / hr OQ-16 default; owner confirmation in OQ-33).)* | Project owner (task brief) | 2026-10-16 |
 | D7 | Rules fixed by CLAUDE.md apply: `entity` FK on every record; queries filtered by entity and permission; new subsidiaries are data; en/ar text; `Decimal` money with explicit currency; posting only via `ledger.services`; open source only. *(Rule 7 amended 2026-10-16: SAR 2 dp, foreign transaction amounts up to 3 dp; effect here: OQ-29.)* | CLAUDE.md | in repo as of 2026-10-16 |
 | D8 | Invoices auto-generated from a CFO-approved contract need **no per-invoice approval** (resolves OQ-1; invoicing OQ-36). | Project owner | 2026-10-16 |
 | D9 | A contract must stay modifiable and cancellable after approval, **including retroactively**, because staff may forget to tell the ERP that a contract or service was cancelled, cut short or modified. So: (a) contract amendments are versioned, CFO-approved, and the effective date may be in the past; (b) early termination or cancellation may have a past effective date; (c) for periods already billed, issued invoices are **never edited or deleted**: the system generates **draft** credit notes for over-billed amounts (debit notes for increases), a person reviews them and the CFO approves them; (d) posted-period rules still apply: corrections are dated in an open period. | Project owner | 2026-10-16 |
@@ -28,6 +28,7 @@ The billing module holds customer contracts for **every entity** in the group (A
 ## 3. Data model
 
 Conventions (same as invoicing.md): every model has `entity` FK → `core.Entity` (`on_delete=PROTECT`, required); money is `DecimalField(18, 2)` (*amended 2026-10-17, D11:* contract-currency amounts are `DecimalField(21, 3)`, decimals limited to the currency's `minor_units`; SAR amounts 2 dp); every model has `created_by`, `created_at`, `updated_at`, `source` (`human` / `import` / `agent:<name>` / `system`). "Bi" = field exists as `_en` and `_ar`.
+*Amended 2026-10-17 (as built):* `source` takes the value of `core.access` `UserProfile.source` for the acting user: `human`, `import`, `agent:<name>`, or `system:billing` for the billing system user (`system_user("billing")`). "`source="system"`" in this spec and in invoicing R60/R73 means `system:billing`.
 
 ### 3.1 Contract (unique `(entity, number)`)
 
@@ -75,6 +76,7 @@ Conventions (same as invoicing.md): every model has `entity` FK → `core.Entity
 | vat_exemption_reason | FK invoicing.VatExemptionReason | Y if Z/E/O | | |
 | income_account | FK ledger.Account (same entity, income, postable, not Sharia-prohibited where enforced) | Y | | Defaults in R27 |
 | secondment | FK SecondmentAssignment, null | Y if contract type `secondment` | | One line per seconded person |
+| income_type | FK invoicing.IncomeType | Y | | *Added 2026-10-17 (as built: every `SalesDocumentLine` needs one).* Prefills `vat_category`, exemption reason and `income_account` (R27 amended); drives Art. 51 class and the real-estate retention class (R28) inside invoicing |
 
 ### 3.3 ContractPriceStep (escalation)
 
@@ -108,6 +110,7 @@ Only explicit stepped amounts are supported until escalation types are decided (
 | superseded_documents | M2M invoicing.SalesDocument | N | ZATCA-rejected earlier attempts (R12) |
 | credit_document | *Withdrawn — see D9* (corrections are `BillingAdjustment` rows, 3.10; a period may have several) | | |
 | billed_version | FK ContractVersion, null | Y when `generated` | Version in force when the invoice was generated. Never changed afterwards (R41). Added 2026-10-16 (D9) |
+| invoice_lines | JSON, null | Y when `generated` | *Added 2026-10-17 (R52).* Frozen input handed to `create_from_billing`: per `line_key`: `line_no`, `description_en/ar` (with period text), `net` (contract currency, string `Decimal`), `unit_code`, `vat_category`, `vat_exemption_reason` code, `income_type` code, `income_account` code, `employee_ref` (secondment lines only). Written in the generating transaction; read-only afterwards |
 
 ### 3.6 SecondmentAssignment (HR interface)
 
@@ -123,6 +126,7 @@ Only explicit stepped amounts are supported until escalation types are decided (
 
 Interface the HR module must call (until then, the accounting-staff UI calls it):
 `billing.services.end_secondment(entity, assignment, end_date, user, source)`. It is idempotent: the same end date twice is a no-op. A different end date applies the earlier or later date per R49 (was R20, withdrawn by D9).
+*Amended 2026-10-17 (HR built):* HR does not call billing directly; it calls the port in `hr/billing_port.py` (`linked_assignment(entity, hr_assignment_ref)`, `end_secondment(entity, billing_assignment, end_date, user, source)`, `assignment_id(billing_assignment)`), chosen by setting `HR_BILLING_PORT`. Billing ships `billing.hr_port.BillingHrPort` implementing it on top of `billing.services.end_secondment` (R56 to R61). `source` is `manual` or `hr_event`; `end_date` may be `start_date − 1` (HR cancellation before start, R60). Fields added: `hr_linked_at` / `hr_linked_by` (set once by R61); `last_hr_end_date` (Date, null: last end date received with `source="hr_event"`, for audit).
 
 ### 3.7 BillingRun and BillingRunItem
 
@@ -130,6 +134,8 @@ Interface the HR module must call (until then, the accounting-staff UI calls it)
 |---|---|---|
 | BillingRun | entity (null = all entities the runner may bill, one item set per entity), run_date (Asia/Riyadh), trigger (`scheduler` / `manual`), started_by (system or human user), started_at, finished_at, status (`running`, `completed`, `completed_with_errors`, `aborted`), counts (generated, skipped, held, failed) | Append-only after finish |
 | BillingRunItem | entity, run, billing_period, outcome (`generated`, `skipped_already_billed`, `held`, `failed`), sales_document (null), message_en / message_ar | One row per period attempted. Append-only |
+
+*Amended 2026-10-17 (access R22, as built):* `started_by` is always the billing system user; a manual run also stores `initiated_by` (FK User, the human). Added fields: `BillingRun.sync_counts` (documents whose status was read back, R55); `BillingRunItem.error_code` (invoicing error code, R54) and `warnings` (JSON, en/ar invoicing warnings such as the late-invoice warning, invoicing R84).
 
 ### 3.8 ContractEvent (audit, append-only)
 
@@ -171,6 +177,19 @@ Unique: one non-terminal (`waiting_original`, `drafted`, `submitted`) adjustment
 
 `billed_net(period, line_key)` = net of that line on the period's current invoice + Σ net on its debit notes − Σ net on its credit notes, counting notes with status `issued` or `final`, plus adjustments in `waiting_original`, `drafted` or `submitted` (so a pending correction is never computed twice, R46). Notes that ZATCA rejected do not count.
 
+### 3.12 Intercompany reconciliation row (computed, not stored; added 2026-10-17, R64)
+
+| Field | Notes |
+|---|---|
+| as_of | Date |
+| seller / buyer | Entity codes of the pair (each unordered pair shown once, seller = the lower code) |
+| currency | Transaction currency (ledger-fx R29) |
+| seller_position | Seller's net intercompany position with buyer, from `ledger.services.intercompany_balances(as_of, user=, group=, by_currency=True)` (debit − credit on accounts flagged `intercompany`: 1210, 1220, 2110) |
+| buyer_position | Buyer's net position with seller, same source; null + "not visible" (en/ar) if the user cannot see the buyer |
+| difference | `seller_position + buyer_position` (0 when the pair mirrors) |
+| billing_open | Gross of billing-originated documents (invoices and notes, `final`) from seller to buyer in that currency, open in the seller's sub-ledger at `as_of` (information, helps find unbooked bills) |
+| billing_unposted | Gross of billing-originated documents still `issued` (awaiting ZATCA) — booked in neither entity yet |
+
 ## 4. Rules
 
 "svc" = `billing.services`; "DB" = database constraint; "inv" = enforced by invoicing services; "ledger" = existing ledger code; "Q" = queryset/permission filter.
@@ -193,6 +212,7 @@ Unique: one non-terminal (`waiting_original`, `drafted`, `submitted`) adjustment
 11. A period is billed at most once. The generator locks the `BillingPeriod` row (`select_for_update`) and skips it unless the status is `planned`. Runs also take a PostgreSQL advisory lock per entity, so two runners never work on the same entity at once. A re-run, or a crash and re-run, creates no second invoice. **[svc + DB unique + lock; AT-2, AT-3]**
 12. If ZATCA rejects a generated invoice (invoicing R42: document `rejected`), the period goes to `failed` and the document moves to `superseded_documents`. Re-generation needs a human release after the cause is fixed. It creates a new document with a new number. **[svc callback; AT-17]**
 13. The generator creates and issues documents only through `invoicing.services` (the create and issue functions named in invoicing.md, OQ-2 there), with `source="system"` and the billing service user. It never writes `SalesDocument` or `JournalEntry` rows directly. **[svc; code-reviewer; AT-4]**
+    *Amended 2026-10-17 (as built):* the functions are `invoicing.services.create_from_billing(billing_item, user)` (invoice; `billing_item` = the `BillingPeriod`) and `invoicing.services.create_adjustment_from_billing(adjustment, user)` (draft note; `adjustment` = the `BillingAdjustment`), both called with `user=core.access.services.system_user("billing")`. Both are stubs today that raise `NotImplementedError`; invoicing implements them per R52 to R55 and the invoicing R60/R73 notes. Billing is built and tested against a fake of these two functions until then. **[svc; code-reviewer; AT-39]**
 
 ### Dates and amounts
 14. `bill_date`: `advance` → `period_start`; `arrears` → day after `period_end`. A period is due when `bill_date - bill_lead_days ≤ run_date`. **[svc; AT-4]**
@@ -215,6 +235,7 @@ Unique: one non-terminal (`waiting_original`, `drafted`, `submitted`) adjustment
 25. Vehicle rental and secondment lines default to `S`. Other categories need an exemption reason (invoicing R10). **[svc + inv]**
 26. Intercompany contracts produce normal VAT invoices with the counterparty entity (D2). Invoicing posts AR to 1210 with `counterparty = counterparty_entity` (invoicing R4). **[inv + ledger; AT-11]**
 27. Default income accounts by type: lease and vehicle → 4100 (third party) / 4110 (intercompany); secondment and consulting → 4200 / 4210; IP licence → 4300 (third party). Intercompany IP has no account yet (invoicing OQ-22), so an intercompany IP line is rejected until it exists. Staff may choose another postable income account of the same entity. **[svc; AT-11]**
+    *Amended 2026-10-17 (as built):* the default comes from the line's `income_type` (invoicing `IncomeType.default_account_code`, or `default_intercompany_account_code` when the contract is intercompany): commercial rent and car rental 4100 / 4110; residential rent 4120 / 4110; secondment 4200 / 4210; management fee, service charge, service fee 4220 / 4230 / 4240, intercompany 4210; IP licence 4300 / 4310. 4310 now exists in `ledger/coa_template.py` (proposed, accountant to review, invoicing D29), so intercompany IP lines are **accepted** on 4310; the "rejected until it exists" sentence is withdrawn. Income type `other` has no default: staff choose. **[svc; AT-11, AT-50]**
 28. Rent invoices on investment property are handed to invoicing with `retention_class=capital_asset_real_estate` (zatca.md R-38). **[svc → inv]**
 
 ### Sharia
@@ -226,14 +247,17 @@ Unique: one non-terminal (`waiting_original`, `drafted`, `submitted`) adjustment
 
 ### Currency
 32. The invoice currency is the contract currency. When it differs from `entity.base_currency`, the rate and base-currency amounts come from ledger-fx services. The default rate date is the invoice issue date (OQ-16). If no rate exists, or ledger-fx / invoicing multi-currency is not built yet (invoicing OQ-6), the item fails with a bilingual message and no document is created. **[svc + ledger-fx + inv; AT-19]**
+    *Amended 2026-10-17 (ledger-fx and invoicing built):* billing does not look up rates. Invoicing fixes the rate to the functional currency and the SAR rate for ZATCA on the document's `issue_date` (the run date) at issue, from the ledger rate table (entity rate first, then group; up to `FX_MAX_RATE_AGE_DAYS`, default 5, before), pins the rate row on the document, and books at that rate when ZATCA clears it (invoicing R56, R77). Correction notes take the rate on their own issue date. A missing rate makes `create_from_billing` raise `rate_required`; the period is `failed` and retried next run (R54). A contract-fixed rate or a supply-date rate is **not** supported (OQ-16 status). **[inv; AT-19]**
 
 ### Runs, notifications, approval of generated invoices
 33. Each period is generated in its own transaction. One failure never stops the others or rolls them back. Every attempt writes a `BillingRunItem` with an en/ar message. **[svc; AT-17]**
 34. After each run, the entity's accounting staff get a summary (generated, held, failed) in the app, in their language. Failures still unresolved after 3 consecutive runs are also sent to the CFO (default, OQ-17). **[svc; AT-17]**
 35. Generated invoices are issued without per-invoice approval: the CFO's contract approval covers them (D8; was default OQ-1). This applies to invoices only, never to correction notes (R44). *(Amended 2026-10-16.)* **[svc; AT-4, AT-35]**
+    *Amended 2026-10-17 (as built):* "no per-invoice approval" still means the full issue path: invoicing validation, gap-free number, ZATCA hand-off after commit, and posting only on ZATCA clearance/reporting by the ZATCA queue system user (`post_cleared_document`). The approver recorded on the invoice is the CFO who approved `billed_version` (R53). With `InvoicingSettings.auto_issue_from_approved_contract = False` the invoice is created `submitted` and waits for the CFO (invoicing R60); the period is still `generated`. **[inv; AT-39]**
 36. Agents (gateway service users) may draft contracts if granted. They cannot approve, release, terminate, end secondments or start runs. The billing service user is a system user, not an agent, and it acts only on `active` contracts. **[Q + svc; AT-20]**
 37. All amounts are `Decimal` with 2 dp, and the currency is stored on every money field's parent record. Contracts in a currency whose `minor_units` ≠ 2 are rejected at save until OQ-29 is decided (default). *(Amended 2026-10-16 after CLAUDE.md rule 7 change.)* **[svc + DB; AT-5]**
     *Amended 2026-10-17 (D11; resolves OQ-29):* "with 2 dp" and the `minor_units` ≠ 2 refusal are withdrawn for 3-decimal currencies: contract amounts are stored with the contract currency's decimals (2 or 3, never more), and proration and corrections (R16, R42) round half-up to those decimals. 0-decimal currencies stay refused (invoicing OQ-58, default). Float input stays refused. **[svc + DB; AT-5, AT-37]**
+    *Amended 2026-10-17 (invoicing D27 as built, OQ-62 default):* invoicing refuses to issue a sales document in a 3-decimal currency while any amount (line net, VAT, totals, breakdown) has a third decimal other than 0, until ZATCA confirms 3-dp XML (invoicing `_third_decimal_problems`, OQ-62). Billing does **not** change contract amounts to avoid this (rounding a price is a business decision, OQ-35). Instead: (a) at contract or version approval in a 3-decimal currency, the CFO sees a bilingual warning that invoices whose amounts have a non-zero third decimal will be held; (b) when `create_from_billing` refuses for this reason, nothing is created, no number is used, and the period goes to `held` (not `failed`) with reason "3-decimal amounts await ZATCA confirmation (invoicing OQ-62)" (en/ar); (c) a human releases it after OQ-62 is resolved or after a version changes the amount. Correction notes in such currencies stay `submitted` when the CFO's approval is refused (invoicing behaviour); their adjustment stays `submitted` and counts in `billed_net` (R46). **[svc + inv; AT-37, AT-45]**
 
 ### Amendments, termination, cancellation and corrections (added 2026-10-16, D9)
 38. Every approved contract has versions 1..n. The terms that apply to a day are those of the approved version with the latest `effective_date` ≤ that day (equal dates: higher `version_no`). Approved versions, their lines and price steps are never edited or deleted. **[model `save/delete` guard + svc `terms_on(contract, day)`; AT-22]**
@@ -244,15 +268,59 @@ Unique: one non-terminal (`waiting_original`, `drafted`, `submitted`) adjustment
     *Amended 2026-10-17 (D11):* `round(…, 2)` means rounding to the contract currency's decimals (3 for KWD, BHD, OMR, JOD).
 43. For each adjustment, billing calls `invoicing.services.create_adjustment_from_billing(adjustment, user=<billing system user>)` (invoicing R73), which creates a **draft** credit note (`credit`) or debit note (`debit`), `source="system"`, in the contract currency, referencing the period's invoice (`original_document`), supply period = `supply_start`..`supply_end`, lines from the adjustment, `reason_ar`/`reason_en` from the version, `adjustment_event_date` = the version's `effective_date` (OQ-25). Billing never writes `SalesDocument` or journal rows itself (R13). **[svc → inv; AT-23]**
     *Amended 2026-10-17 (D12; resolves OQ-25):* billing no longer sets `adjustment_event_date` to the version's effective date. The note is dated, and its VAT counted, on its own issue date (invoicing R95); the effective date stays on the version and the supply period on the note. No 15-day warning arises from a backdated effective date. **[svc → inv; AT-38]**
+    *Amended 2026-10-17 (as built):* exact call `invoicing.services.create_adjustment_from_billing(adjustment, user=system_user("billing"))`; the draft has `source="system:billing"`, `billing_adjustment` set, `adjustment_event_date` empty, and its lines are read-only for every user (only header fields such as `payment_means_code`, `reason_code` may be completed, R56). It never issues. Idempotent: a second call for the same adjustment returns the existing non-terminal note. **[inv; AT-48]**
 44. Correction notes are **never issued automatically**, whatever `InvoicingSettings.auto_issue_from_approved_contract` says. A human reviewer (accounting staff) checks the draft, completes the fields invoicing requires (e.g. `payment_means_code`, invoicing R18) and submits it; the CFO approves (= issues) it under invoicing R57, not being the reviewer. The computed amounts are read-only for the reviewer (OQ-26). Agents and the billing system user cannot submit or approve. **[inv R57 + `core.access` R14; AT-23, AT-35]**
+    *Amended 2026-10-17 (as built):* submit is `invoicing.services.submit_sales_document(document, user=)`; issue is `approve_sales_document(document, user=)` (`invoicing.approve_sales_document`, flags A + P). As built the approver is never the creator (the billing system user), submitter or last modifier, so a reviewer who submitted or completed the note can never approve it. The note is dated on the approval day (Asia/Riyadh) and taxed on that date (D12, invoicing R78, R95), goes to ZATCA, and posts on clearance with `posted_by` = that CFO.
 45. Issued invoices and notes are never edited, cancelled or deleted (invoicing R13, R17). Notes are dated on their actual issue date in an open fiscal period; the supply period they refer to may lie in a closed period. If no open period covers the issue date, CFO approval fails and the note stays `submitted` (invoicing R28). Billing never reopens or backdates a period (R15, R23). **[inv + ledger `_find_open_period`; AT-28]**
     *Confirmed 2026-10-17 (D12):* the note's own date is its tax date (invoicing R95).
 46. No double billing: (a) a `generated` period is never billed again (R11, R41c); (b) `billed_net` includes pending adjustments, so re-running the pass with no new version creates nothing; (c) when a later version is approved, every adjustment of the contract still `waiting_original`, `drafted` or `submitted` becomes `superseded` and its draft note is deleted (drafts only) before the pass recomputes; `issued`/`final` notes are kept and counted; (d) after all notes are final, for every generated period and line, invoice + debit notes − credit notes = `required_net`. Credit-note caps of invoicing R18 still apply. **[svc + DB unique 3.10; AT-26]**
+    *Amended 2026-10-17 (as built):* (c) deletes superseded notes only through an invoicing service for billing drafts (name proposed: `invoicing.services.discard_adjustment_draft(document, user)`, `invoicing.create_adjustment_from_billing`, system user only). A note in `submitted` is first returned to `draft` (`submitted → draft` is the only backward step, invoicing R96) and deleted in the same transaction; `issued`, `final` and `rejected` notes are never touched. **[inv; AT-48]**
 47. If the period's invoice is not yet `final` (awaiting ZATCA), the adjustment is created as `waiting_original` and its draft note is created when the invoice becomes `final` (credit/debit notes need a final original, invoicing R18/R19). If ZATCA rejects a correction note, the adjustment becomes `failed` and drops out of `billed_net`; the next pass (on the next version or on a human "recompute") creates a new one. **[svc callback; AT-29]**
+    *Amended 2026-10-17 (as built):* invoicing has no callback to billing; billing reads document status back (R55). "When the invoice becomes `final`" means at the first sync after it does.
 48. The reviewer may discard a draft (for example when the contract's terms forbid a refund) with a reason in Arabic (English optional). A discarded adjustment stays on the bilingual "unresolved billing differences" report for the entity and is not re-created by later passes for the same version; a later version or a human "recompute" may create a new one. **[svc + report; AT-30]**
 49. Secondment end (R19, `end_secondment`) needs no CFO approval (D6) and is a correction trigger like a version: an end date before already-billed days produces draft credit notes via R42 to R48; an end date moved later puts cancelled periods back to `planned` and produces draft debit notes for re-added days that had been credited. The notes themselves need review and CFO approval (R44). **[svc; AT-31]**
 50. Corrections stay inside the contract's entity; intercompany notes post to 1210 with `counterparty = counterparty_entity` (invoicing R4); nothing is created in the counterparty (R4, D10). Sharia checks of R29 run on every version line at save and approval; notes carry `requires_purification` from their lines. All version, adjustment and report texts are en/ar. **[svc + inv + ledger; AT-32, AT-36]**
 51. After a version is approved, the entity's accounting staff get an in-app summary (en/ar) of the adjustments created, waiting and superseded. **[svc; AT-23]**
+
+### Interface with invoicing as built (added 2026-10-17)
+52. **Invoice call.** For each due period the generator, inside the period's own transaction (R33) and after locking it (R11), writes `invoice_lines` and calls `create_from_billing(period, user=system_user("billing"))`. Invoicing reads only: `period.entity`, `period.contract.customer`, `contract.currency`, `period_start` / `period_end` (→ `supply_date` / `supply_end_date`), `contract.due_days`, `invoice_lines` (→ one line each: quantity 1, `unit_price` = `net`), `billed_version` (approval status and approver) and `contract.requires_purification`. The call is all-or-nothing: if invoicing refuses, it raises, nothing is created and no number is used; billing rolls back the period's transaction and records the outcome (R54). Idempotent: a second call for the same period returns the existing non-rejected document. **[svc + inv; AT-39, AT-40]**
+53. **Approval chain of an auto-issued invoice.** The invoice is issued by invoicing in the same call (R35), with `approved_by` = `billed_version.approved_by` (for version 1, the contract approver). Posting on clearance as built (`ledger._clearance_approver`) accepts as `posted_by` only a human whose **`invoicing.approve_sales_document`** grant for that document was used; an auto-issued invoice has none. So invoicing and ledger must accept, for documents with `source="system:billing"` and `billing_item` set, the CFO's used **`billing.approve_contract` / `billing.approve_version`** grant for `billed_version` as the recorded approval (still a human, not the document's creator, logged as `post_on_clearance`). Until that change exists, auto-issued invoices cannot post and billing must not be switched on in production (OQ-22, BLOCKING). **[inv + ledger + access; code-reviewer; AT-39]**
+54. **Outcome mapping.** Billing maps invoicing's result by error code, never by message text:
+
+    | Invoicing result | Period | Retry |
+    |---|---|---|
+    | document returned (`issued` or `submitted`) | `generated`, `sales_document` set | — |
+    | `rate_required` (no rate, R32) | `failed` | automatic, next run |
+    | open-period problem (invoicing R28; R23 here) | `failed` | automatic, next run |
+    | third-decimal problem (OQ-62; code to be added by invoicing, e.g. `third_decimal_pending`) | `held` (R37) | human release |
+    | `entity_not_vat_registered` (invoicing R94) | `held` | human release (OQ-34) |
+    | `permission_denied` (e.g. no `system_billing` membership in the entity) | `failed` | automatic, next run |
+    | any other `InvoicingError` | `failed` | automatic; CFO alerted after 3 runs (R34) |
+
+    Invoicing warnings returned with the document (late-invoice warning R84, issue-date warning) are stored on the `BillingRunItem` (en/ar) and shown in the run summary. **[svc; AT-40, AT-45]**
+55. **Status read-back.** Every run first reads the current status of documents linked to the entity's `generated` periods that are not `final` and of non-terminal adjustments' notes: `rejected` invoice → R12; `final` invoice with `waiting_original` adjustments → R47 drafts; note `issued`/`final`/`rejected` → adjustment status (R47). A human "recompute" does the same for one contract. No invoicing callback is needed. **[svc; AT-17, AT-29]**
+56. **Correction drafts are read-only in their amounts.** Invoicing refuses any line change (add, delete, edit) on a draft whose `billing_adjustment` is set, for every user; the reviewer completes header fields only (OQ-26 default). **[inv; AT-48]**
+
+### Interface with HR as built (added 2026-10-17)
+57. **Port.** Billing provides `billing.hr_port.BillingHrPort` and the deployment sets `HR_BILLING_PORT = "billing.hr_port.BillingHrPort"`. `linked_assignment(entity, ref)` returns the `SecondmentAssignment` of that entity with `hr_assignment_ref = ref`, or None; `assignment_id(a)` returns `str(a.pk)`; `end_secondment(...)` calls `billing.services.end_secondment(..., source="hr_event")`. Any exception means "not delivered": HR keeps the event `pending` and retries (hr R25); billing therefore raises (never swallows) on lock timeout, validation failure or permission refusal, and has no side effect when it raises. **[svc; AT-42]**
+58. **Who may send `hr_event`.** HR calls with `user` = the HR user who ended the assignment (`AssignmentEvent.actor`). For `source="hr_event"` billing requires `hr.end_assignment` in the assignment's entity (hr OQ-16 default) instead of `billing.record_contract_event`; for `source="manual"` it requires `billing.record_contract_event`. Agents and system users are refused for both. The call is access-logged with source and HR reference. **[svc + `core.access.require`; AT-42]**
+59. **No manual end once linked.** Once `hr_assignment_ref` is set, `end_secondment(..., source="manual")` is refused (en/ar: "This secondment is ended in HR"), whatever the user's role (hr R26). Unlinked assignments keep D6 (manual end by accounting staff). If HR delivery has `failed` (5 attempts, hr R25) the cause is fixed and HR re-delivers; billing still refuses a manual end (hr alert text and the HR re-queue step: OQ-32). **[svc; AT-42]**
+60. **Idempotency and order.** `end_secondment` with the end date already stored is a no-op (no event, no adjustment). HR delivers events per assignment in order (hr R25); billing applies each as R49 (earlier → credits; later → periods back to `planned` and debits). An `end_date` of `start_date − 1` (HR `cancelled` event) is accepted: nothing is billable, every planned period is cancelled and every billed day is credited through R42 to R48. Any other `end_date < start_date` is refused. On a `draft` contract only the assignment's `end_date` is stored. **[svc; AT-31, AT-43]**
+61. **Withdrawn termination.** When HR withdraws a termination it restores the previous end date and emits `end_changed` with that later date: billing applies it as a later end date (R49). When HR removes an end date entirely or reverses a cancellation, HR emits nothing (hr R41, warning). Billing then offers `reopen_secondment(assignment, *, user, reason_ar)` (`billing.record_contract_event`): allowed only for a linked assignment whose HR assignment (looked up by `hr_assignment_ref`; status and end date only, no personal data) is `approved`/`active` with no end date; it clears `end_date`, puts `cancelled` periods from the old end date back to `planned`, extends the rolling schedule and creates debit adjustments for re-added days that were credited (R42 to R48). Default until OQ-31 is answered. **[svc; AT-43]**
+62. **Linking.** `link_hr_assignment(assignment, hr_assignment_ref, *, user)` (`billing.record_contract_event`) is allowed on draft contracts or in a draft version and is set once (never changed after the contract or version is approved). It requires an HR assignment of the same entity, kind `secondment`, status `approved`/`active`, whose `receiving_entity` equals `contract.counterparty_entity` (or, for a third-party receiver, the contract is not intercompany). It copies `employee_ref` (= HR `employee_code`), `role_title_en/ar`, `start_date` and `end_date` from HR's billing view; never names, ID numbers or salary (hr R28, OQ-12). **[svc; AT-49]**
+
+### Intercompany, Track C (added 2026-10-17)
+63. **Separate taxpayers.** Every group entity is its own VAT taxpayer (invoicing D11, access A4; D2 here). An intercompany contract bills through a normal standard VAT invoice: VAT per the line category, ZATCA clearance, buyer snapshot from the buyer entity's own §3.0 data (VAT number, address), AR on 1210 with `counterparty = counterparty_entity`, income on the intercompany account of R27 (4110, 4210, 4310). No automatic bill, draft or record in the buyer entity (D10, R4). The buyer's staff enter the vendor bill in the buyer entity (AP on 2110 with the seller as counterparty, invoicing). **[svc + inv + ledger; AT-11, AT-50]**
+64. **Intercompany reconciliation report.** `billing.services.intercompany_reconciliation(as_of, *, user, group)` returns 3.12 rows for every pair of entities in `group` with a non-zero position or billing-originated documents, per transaction currency. It uses `ledger.services.intercompany_balances(as_of, user=user, group=group, by_currency=True)` (user needs `ledger.view` on the group parent; rows limited to entities where the user holds `ledger.view`) plus `billing.view` for the billing columns, in the seller entity only. A pair whose other side the user cannot see shows that side as "not visible" (en/ar), never its amount. Default tolerance 0 (OQ-30); positions cover all accounts flagged `intercompany` (1210, 1220, 2110), not only billing. Export CSV/PDF, all labels en/ar. **[svc + ledger; AT-44]**
+65. **Secondment recharge.** A secondment line's `amount` is the agreed monthly recharge entered by accounting staff (payroll OQ-15 default: contract price). Billing reads no payroll data. When payroll is built, its monthly secondment cost report (payroll R35) is shown next to the contract for the accountant to check or amend the price through a version (R39); cost-plus or automatic cost pass-through is not built (OQ-30). Recharge lines are category `S` by default (R25) on 4210 (intercompany) or 4200. **[svc; AT-7, AT-51]**
+
+### Scheduler (added 2026-10-17; resolves OQ-19 for the build)
+66. **Command.** `python manage.py billing_run [--date YYYY-MM-DD] [--entity CODE]` calls `billing.services.run_billing(run_date, entity=None, user=system_user("billing"))`. Default date: today in Asia/Riyadh. Exit code 0 on `completed` and `completed_with_errors`, non-zero on `aborted`. It is run daily at 00:30 Asia/Riyadh by a systemd timer (`Persistent=true`, so a missed run catches up after downtime) or cron; both open source. Re-running is always safe (R11): same day twice creates nothing new. **[svc + command; AT-46]**
+67. **Run user.** Scheduled runs act as the billing system user, which holds only `billing.start_run`, `billing.issue_from_contract`, `invoicing.create_from_billing`, `invoicing.create_adjustment_from_billing` and the read rights `create_from_billing` needs (rates: `ledger.view_rates`, to be added to `SYSTEM_EXTRA["billing"]` in `core/access/catalogue.py`). It runs only for entities where it has an active `system_billing` membership (access R20); other entities are skipped with a run-level message. A manual run started by a person (`billing.start_run`) executes as the system user and stores `initiated_by` (access R22). Agents cannot start runs (R36). **[svc + access; AT-46]**
+
+### Build gates (added 2026-10-17)
+68. Contracts that need something not built are refused at **approval** (and at version approval) with a bilingual reason, never accepted and left unbillable: (a) `billing_timing=advance` with a frequency other than `monthly` (OQ-2); (b) an advance with `recovery=offset_against_invoices` (R30, OQ-20; invoicing has no 386 document type); (c) a currency with `minor_units` 0 (R37). Deposits and advances with `recovery=none` are recorded as memo only (R31). **[svc; AT-16, AT-47]**
+69. All new reports, warnings, hold reasons, run messages and port errors in R52 to R68 are stored and shown in English and Arabic, and every query in them is filtered by entity and the user's permissions. **[svc + Q; AT-21, AT-44]**
 
 ## 5. Accounting
 
@@ -265,7 +333,7 @@ Billing posts nothing. Each generated invoice is posted by invoicing (`create_en
 | 4100 Rental income | | 10,000.00 | |
 | 2200 VAT output | | 1,500.00 | |
 
-**B2. Residential lease, exempt** (rent 8,000.00, E): Dr 1200 8,000.00 / Cr 4100 8,000.00. No 2200 line.
+**B2. Residential lease, exempt** (rent 8,000.00, E): Dr 1200 8,000.00 / Cr 4100 8,000.00. No 2200 line. *(Amended 2026-10-17: income type `rent_residential` defaults to 4120 Residential rental income (proposed, invoicing D29): Cr 4120 8,000.00.)*
 
 **B3. Intercompany secondment, ALM → SUB, March in arrears, ended 2027-03-10** (31,000.00 × 10/31 = 10,000.00, S 15%)
 | Account | Dr | Cr | Counterparty |
@@ -276,7 +344,7 @@ Billing posts nothing. Each generated invoice is posted by invoicing (`create_en
 
 **B4. Intercompany vehicle rental or lease**: as B3 with 4110 Intercompany rental income.
 
-**B5. Foreign-currency contract** (USD 1,000.00 net, S 15%, fixture rate 3.75 SAR/USD from ledger-fx): Dr 1200 4,312.50 / Cr 4100 3,750.00 / Cr 2200 562.50. How the currency amount and rate are stored on the JE is defined by ledger-fx.md (`JournalLine` has no currency field today).
+**B5. Foreign-currency contract** (USD 1,000.00 net, S 15%, fixture rate 3.75 SAR/USD from ledger-fx): Dr 1200 4,312.50 / Cr 4100 3,750.00 / Cr 2200 562.50. How the currency amount and rate are stored on the JE is defined by ledger-fx.md (`JournalLine` has no currency field today). *(Amended 2026-10-17, ledger-fx built: each line carries `currency` USD and `txn_amount` (1,150.00 / 1,000.00 / 150.00) with the rate pinned on the invoice at issue; functional amounts as shown. Exchange differences arise only at settlement (invoicing R76, 4700 / 5750, proposed).)*
 
 **B6. Credit note after early end** (R40, R42 to R49; mirror of the invoice for the unused days): Dr 4100/4110/4200/4210, Dr 2200 (if S), Cr 1200 or 1210 (+ counterparty). Issued and posted by invoicing (invoicing E4) after CFO approval and ZATCA clearance.
 
@@ -296,9 +364,18 @@ Same for February and March: three notes, one per original invoice.
 | 2200 VAT output | | 154.84 | |
 A backdated decrease gives the B7 shape for the delta. Intercompany: 1210 + counterparty, 4110/4210 (R50).
 
-**No entry** for: contract approval, schedule creation, runs, held or failed periods, advance terms, deposit terms, contract versions, the correction pass, draft or discarded adjustments. Notes post only through invoicing (`post_entry` after ZATCA, invoicing R41).
+**B9. Intercompany IP licence, ALM → SUB** (added 2026-10-17, R27 amended; 20,000.00, S 15%)
+| Account | Dr | Cr | Counterparty |
+|---|---|---|---|
+| 1210 Due from group entities | 23,000.00 | | SUB |
+| 4310 Intercompany IP and licence income (proposed) | | 20,000.00 | |
+| 2200 VAT output | | 3,000.00 | |
 
-**Accounts missing** (not invented here; see invoicing OQ-22): deferred income for multi-month in-advance billing (OQ-2), customer advances, security deposits held, intercompany IP income, FX gain/loss.
+**B10. Buyer side, for the reconciliation (R64) only — not created by billing** (D10): SUB's staff enter ALM's B3 invoice as a vendor bill in SUB (invoicing E7): Dr expense (e.g. 5100 or 5300, SUB's choice) 10,000.00 / Dr 1310 VAT input 1,500.00 / Cr 2110 Due to group entities 11,500.00, counterparty ALM. The pair then mirrors: ALM +11,500.00 with SUB, SUB −11,500.00 with ALM, difference 0.
+
+**No entry** for: contract approval, schedule creation, runs, held or failed periods, advance terms, deposit terms, contract versions, the correction pass, draft or discarded adjustments, HR end events, links to HR, the reconciliation report. Notes post only through invoicing (`post_entry` after ZATCA, invoicing R41). *(Amended 2026-10-17, as built: sales documents post in one step on clearance, `create_entry(post=True)` from `post_cleared_document`, invoicing R41.)*
+
+**Accounts missing** (not invented here; see invoicing OQ-22): deferred income for multi-month in-advance billing (OQ-2), customer advances, security deposits held, intercompany IP income, FX gain/loss. *(Amended 2026-10-17: 4310 intercompany IP income and 4700 / 5750 FX gain/loss now exist in `coa_template.py` as proposed. 2310 Deferred income and 2320 Security deposits received are proposed in invoicing §5 but **not** in `coa_template.py`, so OQ-2 and OQ-20 stay blocking.)*
 
 ## 6. Integrations
 
@@ -313,6 +390,18 @@ A backdated decrease gives the B7 shape for the delta. Intercompany: 1210 + coun
 | Ejar (Saudi rental platform) | none yet | Lease registration, rent schedules | OQ-10 **[CC-verify]** whether registration is required |
 | Banks, GOSI, Mudad | none | Secondment payroll and GOSI stay with HR/payroll | n/a |
 | SAP B1 / Daftra | In (one-off) | Existing contracts at cutover, already-billed periods marked `generated` with `source=import` | migration-agent; OQ-18 |
+
+*Amended 2026-10-17 (as built):*
+| System | Direction | What flows | Status |
+|---|---|---|---|
+| `invoicing` | Out | `create_from_billing(period, user)` (R52, R53); `create_adjustment_from_billing(adjustment, user)` (R43); `discard_adjustment_draft(document, user)` (R46c, name proposed). `source="system:billing"` already exists (`UserProfile.source`); no new choice needed | Stubs raise `NotImplementedError`; invoicing to implement (R53 also needs a ledger change) |
+| `invoicing` | In | Document status read back by billing each run (R55); no callback | No invoicing change |
+| `invoicing` | In | `contract_allows(contract, purpose)` for advance/deposit receipts (invoicing R67): True only if the contract's approved version has that term | Provided by billing; invoicing refuses such receipts today |
+| ZATCA | via `invoicing.zatca_port` only | Hand-off after issue commit; result → `on_zatca_result` → `post_cleared_document` (ZATCA queue system user) | Port default `PendingZatcaPort`: documents stay `issued`, nothing posts |
+| `ledger` / ledger-fx | In | Rates (through invoicing only, R32); `intercompany_balances(..., by_currency=True)` for R64 | Built |
+| `hr` | In | `AssignmentEvent` outbox → `HR_BILLING_PORT` → `BillingHrPort.end_secondment(..., source="hr_event")` (R57 to R61); `billing_view` data at link time (R62); every 5 min plus on commit | Built on HR side; billing port to build |
+| `payroll` | In (report, later) | Secondment cost report (payroll R35) shown next to the contract (R65) | Payroll not built |
+| OS scheduler | — | systemd timer or cron → `billing_run` (R66) | Open source; replaces the option table above |
 
 **Scheduled job runner (options, not decisions; OQ-19).** All open source.
 | Option | Notes |
@@ -349,6 +438,29 @@ Granted **per entity**. The role model is missing from `core` (invoicing OQ-25).
 | View contracts, schedules, runs | Y | Y | Y | | Y | Scoped, if granted |
 | View `employee_ref` on secondments | Y | Y | Y | | Masked | No |
 
+*Amended 2026-10-17 (role model built; codes from `core/access/catalogue.py` and access.md 3.6).* Roles: accounting staff and accountant = `accountant`; CFO = `approver`; billing service user = `system_billing` (Sys:billing); viewer; agents per gateway. All grants per entity; a role in entity A gives nothing in B.
+
+| Action | Permission (flags) | Holders | Built in catalogue? |
+|---|---|---|---|
+| Create / edit draft contract | `billing.edit_contract_draft` (Ag) | accountant, approver, agent if granted | Yes |
+| Approve contract | `billing.approve_contract` (A) | approver, not creator/submitter | Yes |
+| Draft / submit version | `billing.edit_version_draft` | accountant, approver | **No — add** |
+| Approve version | `billing.approve_version` (A); termination/cancellation also `billing.approve_termination` (A) | approver, not creator/submitter | approve_version **No — add** |
+| Record secondment end (unlinked), link to HR, reopen (R59, R61, R62) | `billing.record_contract_event` | accountant, approver | Yes |
+| End secondment from HR (`hr_event`, R58) | `hr.end_assignment` (held by the HR actor) | HR roles | Yes |
+| Start run | `billing.start_run` | accountant, approver, system_billing | Yes |
+| Release held / failed period | `billing.release_period` | accountant, approver | Yes |
+| Generate and issue invoices | `billing.issue_from_contract` + `invoicing.create_from_billing` (Sys:billing) | system_billing only | Yes |
+| Create / discard correction drafts in invoicing | `invoicing.create_adjustment_from_billing` (Sys:billing) | system_billing only | **No — add** |
+| Review, complete, submit or discard a correction | `billing.review_correction` + `invoicing.submit_sales_document` | accountant, receivables_clerk | review_correction **No — add** |
+| Approve (= issue) a correction note | `invoicing.approve_sales_document` (A, P) | approver, not reviewer | Yes |
+| Recompute corrections | `billing.recompute_corrections` | accountant, approver | **No — add** |
+| Intercompany reconciliation (R64) | `ledger.view` on group parent + per entity, and `billing.view` | accountant, approver, viewer | Yes |
+| View billing / `employee_ref` | `billing.view` (Ag) / `billing.view_employee_ref` | as access.md 3.6 | Yes |
+| Rates for `create_from_billing` | `ledger.view_rates` | add to `SYSTEM_EXTRA["billing"]` | **No — add** |
+
+`billing.create_credit_note_draft` (catalogue, pre-D9) is replaced by `billing.review_correction` + `invoicing.create_adjustment_from_billing` and is to be removed from the catalogue. Catalogue changes are made by the billing builder with the access spec owner's review (access R13).
+
 ## 8. Acceptance tests
 
 Fixtures: entities ALM (parent, SAR, Sharia enforced, VAT number) and SUB (child, SAR, Sharia enforced), template chart, 2027 monthly periods open unless stated, invoicing and ZATCA stubs (stub returns `cleared`/`reported` unless stated), ledger-fx stub, anonymised customers. Users: S (accounting staff ALM), C (CFO ALM), C2 (CFO SUB). All amounts `Decimal`.
@@ -365,7 +477,7 @@ Fixtures: entities ALM (parent, SAR, Sharia enforced, VAT number) and SUB (child
 | AT-8 | *Withdrawn — see D9 (now AT-31).* | | |
 | AT-9 | Annual vehicle rental, monthly in arrears; termination version with `terminated_on` 2027-05-15 drafted by S | Before and after C approves | Before: billing unchanged. After: May prorated 15/31; June onward `cancelled`; status `terminated`, `termination_kind=early_termination` (R40; was R21). |
 | AT-10 | Fiscal period 2027-03 closed; March period due | Run 2027-03-02. Separately: run on 2027-04-01 with a catch-up period whose supply period is wholly in closed 2027-02 | First: item `failed` "period closed" (en/ar), no document or number consumed, retried next run. Second: period `held`, no invoice until released (R23). |
-| AT-11 | ALM customer with `group_entity=SUB`; IC rental contract 5,000.00 S | Approve and run | Contract `counterparty_entity=SUB` (not editable). Invoice is a standard VAT invoice; JE Dr 1210 5,750.00 (counterparty SUB) / Cr 4110 5,000.00 / Cr 2200 750.00. No record created in SUB. An IC IP line → rejected (R3, R4, R26, R27). |
+| AT-11 | ALM customer with `group_entity=SUB`; IC rental contract 5,000.00 S | Approve and run | Contract `counterparty_entity=SUB` (not editable). Invoice is a standard VAT invoice; JE Dr 1210 5,750.00 (counterparty SUB) / Cr 4110 5,000.00 / Cr 2200 750.00. No record created in SUB. An IC IP line → rejected (R3, R4, R26, R27). *Amended 2026-10-17:* the IC IP line is accepted on 4310 (AT-50). |
 | AT-12 | Residential lease line with category S; then E with exemption reason; commercial lease line with E | Save / approve | First and third rejected. Second accepted; invoice has no VAT; JE as B2 (R24). |
 | AT-13 | ALM line on an account flagged `sharia_prohibited`; line on 4900 | Save; approve and run | First rejected. Second accepted; contract and invoice `requires_purification=True` (R29). |
 | AT-14 | User with ALM rights only; SUB contract; ALM contract line on SUB's 4100; ALM contract with a SUB customer | List; save; run for ALM | Sees ALM only. Line and customer rejected. The ALM run creates nothing in SUB (R1, R2). |
@@ -396,8 +508,27 @@ Added 2026-10-16 (D8 to D10). Common fixture for AT-23 to AT-30: ALM commercial 
 | AT-34 | L1 with March invoiced | Versions: effective 2026-12-01 (before start); currency USD; customer changed; frequency `quarterly` effective 2027-02-01 | All rejected at submit with bilingual messages. Frequency change effective 2027-04-01 (after the last generated period): accepted (R39). |
 | AT-35 | ALM `auto_issue_from_approved_contract=True` | Run generates April invoice; a version creates a correction | Invoice issued with no per-invoice approval, `approved_by` = contract approver (D8). Correction note stays `draft`; the billing system user's submit or approve call is rejected (R35, R44). |
 | AT-36 | ALM Sharia enforced | Version adds a line on a `sharia_prohibited` account; a version line on 4900; render version, adjustment and report in `ar` | First rejected at save and approval. Second accepted; resulting notes `requires_purification=True`. Arabic text shown everywhere (R39, R50). |
-| AT-37 | *Added 2026-10-17 (D11, R37).* ALM (SAR) lease in KWD 1,000.000/month, S 15%, `calendar` anchor, start 2027-01-15; a JPY contract; a KWD line 1.2345 | Approve; run 2027-01-15; save the others | January net = round_half_up(1,000.000 × 17/31, 3) = 548.387; invoice in KWD with 3-dp amounts, SAR VAT 2 dp (invoicing R93). JPY contract and the 4-dp line refused (en/ar) |
+| AT-37 | *Added 2026-10-17 (D11, R37).* ALM (SAR) lease in KWD 1,000.000/month, S 15%, `calendar` anchor, start 2027-01-15; a JPY contract; a KWD line 1.2345 | Approve; run 2027-01-15; save the others | January net = round_half_up(1,000.000 × 17/31, 3) = 548.387; invoice in KWD with 3-dp amounts, SAR VAT 2 dp (invoicing R93). JPY contract and the 4-dp line refused (en/ar). *Amended 2026-10-17 (R37, OQ-62 default):* the January period is `held` "3-decimal amounts await ZATCA confirmation" (548.387 has a non-zero third decimal), no document, no number used; see AT-45 |
 | AT-38 | *Added 2026-10-17 (D12, R43).* L1 (AT-23 fixture), January invoiced; on 2027-03-20 S records a termination effective 2027-01-15; C approves; the credit note is approved on 2027-04-20 | Read the draft and the issued note | Draft `adjustment_event_date` empty; issued note dated 2027-04-20, VAT in the period of 2027-04-20; supply period 2027-01-15 to 2027-01-31; no 15-day warning |
+
+Added 2026-10-17 (build against what is built). Extra fixtures: system users `billing` and `zatca_queue` with memberships in ALM and SUB; `invoicing.zatca_port` fake returning `cleared` unless stated; `hr.testing.FakeBillingPort` replaced by `BillingHrPort` where stated; HR user H (`hr.end_assignment` in ALM); viewer V with `ledger.view` on ALM (group parent) and ALM only; SUB has its own VAT number and §3.0 data.
+
+| # | Given | When | Then |
+|---|---|---|---|
+| AT-39 | L1 approved by C; ALM `auto_issue_from_approved_contract=True` | Run 2027-01-01; ZATCA fake `cleared`; run again; same with the switch False | Invoice via `create_from_billing(period, user=system_user("billing"))`: `source="system:billing"`, `billing_item`=period, `approved_by`=C, `issued`, number used, port called after commit. On `cleared`: `post_cleared_document` by the queue user posts B1 with `posted_by`=C, document `final`. Second run: no new document. Switch False: document `submitted`, period `generated`; C approves it; posts on clearance (R13, R35, R52, R53) |
+| AT-40 | L1 due; (a) fiscal period closed; (b) invoicing fake raises `rate_required`; (c) `system_billing` has no SUB membership and a SUB contract is due | Run | (a), (b): period `failed`, `error_code` stored, no document, no number used, retried next run. (c): SUB skipped with a run message; ALM unaffected (R23, R54, R67) |
+| AT-41 | AT-39 invoice; ZATCA fake `rejected` | Next run; human releases; next run | Run sync sets period `failed`, document in `superseded_documents`; after release a new document with a new number; both documents link to the same period; DB allows it (one non-rejected document per period) (R12, R55) |
+| AT-42 | ALM → SUB secondment linked to `ALM-ASG-2027-000001`; `HR_BILLING_PORT=BillingHrPort` | H ends it in HR 2027-03-10; delivery job runs twice; S calls `end_secondment(..., source="manual")`; an unlinked assignment ended manually by S; an agent calls `end_secondment`; a user without `hr.end_assignment` sends `hr_event` | Billing end date 2027-03-10, `end_source=hr_event`, credit adjustments per R49; second delivery no-op; S's manual end on the linked one refused (en/ar); unlinked manual end accepted; agent refused; `hr_event` without the right refused and the HR event stays `pending` with the error (R57 to R60) |
+| AT-43 | Linked secondments; (a) one starting 2027-04-01, nothing billed yet, HR `cancelled` event with end 2027-03-31; (b) another with April invoiced: termination withdrawn: HR `end_changed` back to 2027-06-30 after an end 2027-04-10; (c) HR end date removed | Deliver; S calls `reopen_secondment` for (c); S calls it while HR still shows an end date | (a) accepted, every period `cancelled`, no adjustment. (b) later end: cancelled periods back to `planned`, debit adjustment for 11 to 30 April. (c) reopen accepted, end cleared, schedule extended; reopen while HR has an end date refused (R60, R61) |
+| AT-44 | ALM invoiced SUB 11,500.00 SAR (B3, final) and USD 1,150.00 (final); SUB booked a vendor bill for the SAR invoice only (B10) | C runs `intercompany_reconciliation(2027-03-31, group=ALM)`; V runs it | C: SAR row difference 0; USD row seller +1,150.00, buyer 0, difference 1,150.00, `billing_open` 1,150.00. V: ALM side only, SUB side "not visible" (en/ar), no SUB amount shown; Arabic and English labels (R64, R69) |
+| AT-45 | ALM KWD lease 1,000.000/month S 15%, start 2027-01-15 | C approves; runs 2027-01-15 and 2027-02-01; S releases January without change | Approval shows the 3-decimal warning. January `held` (548.387); February issued (net 1,000.000, VAT 150.000, all third decimals 0). Release: January `planned`, next run `held` again, no number used (R37, R54) |
+| AT-46 | ALM and SUB with due periods | `billing_run` twice on 2027-03-01; S starts a manual run; agent tries | One invoice per period; second run all `skipped_already_billed`; exit code 0. Manual run: `started_by` = system user, `initiated_by` = S. Agent refused (R11, R66, R67) |
+| AT-47 | Contract quarterly in advance; contract with an advance offset; JPY contract | C approves each | All refused at approval with bilingual reasons naming OQ-2, OQ-20 and 0-decimal currencies; nothing scheduled (R68) |
+| AT-48 | AT-25 drafts exist | S edits a line amount on a draft; S fills `payment_means_code` and submits; C approves a new version superseding it | Line edit refused; header edit accepted. On the version approval the submitted note is returned to draft and deleted through invoicing in one transaction; issued notes untouched (R43, R46, R56) |
+| AT-49 | HR assignment to SUB; ALM contract whose customer has `group_entity=PART` | S links it; S links a correct one; S changes the link after approval | First refused (receiving entity ≠ counterparty). Second: `employee_ref`, role titles, dates copied; no name or ID stored. Change after approval refused (R62) |
+| AT-50 | ALM → SUB IP licence 20,000.00 S, income type `ip_licence` | Approve and run; ZATCA `cleared` | Income account defaults to 4310; JE as B9 with counterparty SUB; nothing created in SUB (R27, R63) |
+| AT-51 | ALM → SUB secondment 31,000.00/month entered by S | Run; payroll absent | Invoice uses the contract amount; no payroll read; line S on 4210 (R65) |
+| AT-52 | ALM has no VAT number (fixture variant) | Run with a due period | Period `held` with the invoicing R94 reason (en/ar); no document (R54, OQ-34) |
 
 ## 9. Open questions
 
@@ -406,7 +537,7 @@ Added 2026-10-16 (D8 to D10). Common fixture for AT-23 to AT-30: ALM commercial 
 | # | Question | Owner | Status |
 |---|---|---|---|
 | OQ-1 | Do auto-generated invoices from a CFO-approved contract need per-invoice approval, e.g. above an amount, or for intercompany? | Project owner / CFO | **Resolved by D8**: no per-invoice approval (R35). Correction notes are not covered and always need CFO approval (D9, R44). |
-| OQ-2 | Revenue recognition for multi-month in-advance billing (quarterly/annual): invoicing credits income in full at issue, and there is no deferred income account (invoicing OQ-22). | Accountant | **BLOCKING** for `advance` timing with non-monthly frequency. Default: such contracts cannot be approved until the account and deferral method exist. |
+| OQ-2 | Revenue recognition for multi-month in-advance billing (quarterly/annual): invoicing credits income in full at issue, and there is no deferred income account (invoicing OQ-22). | Accountant | **BLOCKING** for `advance` timing with non-monthly frequency. Default: such contracts cannot be approved until the account and deferral method exist. *2026-10-17:* still blocking. 2310 Deferred income is proposed in invoicing §5 (for 386 advances) but is not in `coa_template.py`; whether 2310 is also used for billed-in-advance periods, and the release method (monthly straight-line JE by billing? by invoicing?), are undecided. Refused at approval (R68a). |
 | OQ-3 | Proration method (actual days vs 30/360 vs whole months) and period anchor (calendar vs contract start). | Accountant | Default: actual days; `calendar` anchor (R16, R17). |
 | OQ-4 | Escalation types: fixed %, fixed amount, compounding, index-linked (index-linked needs a Sharia check), mid-period effect. | Accountant + Sharia board | Default: explicit stepped amounts only, from the next period. |
 | OQ-5 | Billing date vs supply date for ZATCA/VAT: tax point for continuous supplies (rent, rentals, secondments), whether the issue date may precede the supply period (lead days), and the rule against backdating **[CC-verify]**. | compliance-checker / tax adviser | Default: issue on run date, `bill_lead_days=0`, supply = period. |
@@ -420,13 +551,13 @@ Added 2026-10-16 (D8 to D10). Common fixture for AT-23 to AT-30: ALM commercial 
 | OQ-13 | Billing for a supply period in a closed fiscal period: issue in the current period, or require a human decision? | Accountant | Default: `held` until released (R23). |
 | OQ-14 | Contract number format. | Accountant | Default `{entity.code}-CTR-{year}-{000001}`. |
 | OQ-15 | Mixed-use leases (residential + commercial in one contract) and VAT on lease service charges, utilities, parking **[CC-verify]**. | Tax adviser | Default: one `lease_use` per contract; separate lines with their own category for extras. |
-| OQ-16 | Foreign-currency contracts: rate on invoice date, on supply date, or a contract-fixed rate; which rate source (ledger-fx). | Accountant | Default: ledger-fx rate on issue date (R32). **BLOCKING** for non-base currencies until ledger-fx.md and invoicing OQ-6 are done. |
+| OQ-16 | Foreign-currency contracts: rate on invoice date, on supply date, or a contract-fixed rate; which rate source (ledger-fx). | Accountant | Default: ledger-fx rate on issue date (R32). **BLOCKING** for non-base currencies until ledger-fx.md and invoicing OQ-6 are done. *2026-10-17:* **no longer blocking.** ledger-fx and invoicing multi-currency are built: rate on the invoice issue date, pinned at issue (R32 amended). Default stays (accountant to confirm); a contract-fixed rate would need an invoicing change. |
 | OQ-17 | Notification channel (in-app, e-mail) and escalation recipients. | Accountant | Default: in-app to entity accounting staff; CFO after 3 failed runs. |
 | OQ-18 | Migration of existing contracts from Daftra/SAP B1, and how already-billed periods are marked. | Accountant + migration-agent | Default: `source=import`, past periods `generated` with no document link. |
-| OQ-19 | Scheduled job runner (section 6 options). | Dev | Default for build: management command; runner chosen before deployment. |
-| OQ-20 | Advance (386) and security deposit handling: accounts, VAT treatment of deposits, offset against invoices. **Needs tax adviser.** | Accountant / tax adviser | **BLOCKING** for advance offsets (R30). Deposits memo only (R31). |
+| OQ-19 | Scheduled job runner (section 6 options). | Dev | Default for build: management command; runner chosen before deployment. *2026-10-17:* resolved for the build by R66 (management command `billing_run`, systemd timer or cron). |
+| OQ-20 | Advance (386) and security deposit handling: accounts, VAT treatment of deposits, offset against invoices. **Needs tax adviser.** | Accountant / tax adviser | **BLOCKING** for advance offsets (R30). Deposits memo only (R31). *2026-10-17:* still blocking: invoicing has no 386 document type, refuses advance and deposit receipts, and 2310 / 2320 are not in `coa_template.py`; deposit VAT treatment awaits the tax adviser (invoicing D30c). Contracts with an advance offset are refused (R68b). |
 | OQ-21 | Vehicle rental extras (excess mileage, damage, traffic fines recharge). | Accountant | Default: out of scope; billed manually through invoicing. |
-| OQ-22 | Exact invoicing service names and the status callback (invoicing.md OQ-2); adding `source="system"` to invoicing. | invoicing spec author | **BLOCKING** for R13; build against a stub. Now also covers `create_adjustment_from_billing` (R43; invoicing R73). |
+| OQ-22 | Exact invoicing service names and the status callback (invoicing.md OQ-2); adding `source="system"` to invoicing. | invoicing spec author | **BLOCKING** for R13; build against a stub. Now also covers `create_adjustment_from_billing` (R43; invoicing R73). *2026-10-17:* names and signatures settled (R13 amended); `source` exists. Still **BLOCKING for go-live, not for building billing**: invoicing must implement R52 to R56 (both functions are stubs; FKs `billing_item` / `billing_adjustment`; one non-rejected document per period; distinct error codes; read-only correction lines; draft deletion service) and invoicing + ledger + access must accept the contract/version approval as the recorded approval for posting on clearance (R53). |
 | OQ-23 | *Added 2026-10-16 (D9).* Which terms may an amendment change retroactively: customer, currency, contract type, billing frequency/timing/anchor? | Accountant / Managing Partner | Default (R39): customer, currency, type never (new contract); frequency/timing/anchor only after the last generated period. |
 | OQ-24 | *Added 2026-10-16 (D9).* Mid-period effect of an amendment: actual days from the effective date (R42) or from the next period (as OQ-4 does for price steps)? | Accountant | Default: actual days by segment, rounded per segment. |
 | OQ-25 | *Added 2026-10-16 (D9).* VAT timing of backdated corrections: which date is the note's `adjustment_event_date` (effective date vs date the change was recorded) for the 15-day note rule (invoicing R71, TIR §7.2), and how far back corrections may go (prior VAT periods, prior audited fiscal years). **[Needs expert sign-off: tax]** | Tax adviser / accountant | Default: effective date; warning only (invoicing R71); no limit other than `start_date`. **Resolved by D12 (2026-10-17)** for the date: the note's own date counts (R43, invoicing R95). Still open, for the CFO's Word document: how far back corrections may go (prior VAT periods, prior audited years) **[Needs expert sign-off: tax]**; default: no limit other than `start_date`. |
@@ -435,4 +566,22 @@ Added 2026-10-16 (D8 to D10). Common fixture for AT-23 to AT-30: ALM commercial 
 | OQ-28 | *Added 2026-10-16 (D9).* May agents draft contract versions (R36 lets them draft contracts)? | Managing Partner | Default: no. |
 | OQ-29 | *Added 2026-10-16 (CLAUDE.md rule 7 amended).* Contracts in 3-decimal currencies (KWD, BHD, OMR, JOD) or 0-decimal (JPY): billing money fields are 2 dp; invoicing documents too (invoicing OQ-48). | Accountant + Dev | Default: contracts in currencies with `minor_units` ≠ 2 rejected (R37). **Resolved by D11 (2026-10-17)** for 3-decimal currencies (R37 amended); 0-decimal currencies: invoicing OQ-58. |
 
-**Blocking:** OQ-2 (multi-month in-advance), OQ-16 (non-base currency), OQ-20 (advance offsets), OQ-22 (invoicing interface, incl. R43), and invoicing OQ-25 (role model) for views. **Expert sign-off:** OQ-25 (tax). **Before building:** the compliance-checker verifies every [CC-verify] item (R15, R24, OQ-5, OQ-10, OQ-15).
+*Added 2026-10-17 (Track C build prep).*
+
+| # | Question | Owner | Status |
+|---|---|---|---|
+| OQ-30 | Intercompany pricing and reconciliation: (a) is a secondment recharged at the entered contract price, at actual payroll cost, or cost plus a markup (transfer pricing / Zakat view)? (b) what difference is tolerated in the reconciliation report (R64), and should it split per account (1210 vs 2110) rather than net positions? | Managing Partner + CFO | Default: contract price entered by staff (payroll OQ-15); tolerance 0; net positions from `intercompany_balances` |
+| OQ-31 | When HR removes a secondment's end date or reverses a cancellation (termination withdrawn), HR sends nothing to billing. Reopen in billing by accounting staff (R61 default), or should HR send a `reopened` event (hr change)? | Managing Partner + HR spec owner | Default: `reopen_secondment` in billing, checked against HR (R61) |
+| OQ-32 | HR delivery `failed` after 5 attempts: hr's alert says "record it in billing", but billing refuses a manual end on linked secondments (R59). HR needs a re-queue step for failed events (and the alert text changed). | HR spec owner / Dev | Default: R59 refusal stands; until HR adds re-queue, the event is fixed and re-queued by a developer through a reviewed data fix. Not blocking billing |
+| OQ-33 | Confirm that for secondments linked to HR only HR may end them (hr R26, R59 here), superseding D6 for linked ones. | Project owner | Default: yes (hr OQ-16 default) |
+| OQ-34 | Entities without a VAT number (invoicing R94, OQ-59): may they have billing contracts at all, and what document do they issue? | CFO (Word document) **[Needs expert sign-off: tax]** | Default: contracts allowed, periods `held` (R54) |
+| OQ-35 | 3-decimal contracts while ZATCA 3-dp XML is unconfirmed (invoicing OQ-62): hold invoices whose amounts have a non-zero third decimal (default), or agree prices/terms so amounts end in 0 (e.g. price per period chosen so net and VAT end in 0)? Billing never rounds a price on its own. | Project owner / CFO | Default: hold (R37 amended) |
+
+**Status 2026-10-17 (replaces the line below for the build).**
+- **Blocking parts of the build** (refused at approval, R68): OQ-2 (advance timing with non-monthly frequency; 2310 proposed only), OQ-20 (advance offsets; no 386, no 2310/2320). Everything else in billing can be built now.
+- **Blocking go-live, not building:** OQ-22 (invoicing implements R52 to R56; ledger/access accept contract approval for clearance posting, R53). Build billing against a fake of the two invoicing functions.
+- **No longer blocking:** OQ-16 (ledger-fx built), invoicing OQ-25 (role model built in `core.access`), OQ-19 (R66), OQ-29 (D11).
+- **Defaults in use (owner may change):** OQ-3, OQ-4, OQ-5, OQ-7 notice period, OQ-8, OQ-9, OQ-10, OQ-12, OQ-13, OQ-14, OQ-15, OQ-16, OQ-17, OQ-18, OQ-21, OQ-23, OQ-24, OQ-26, OQ-27, OQ-28, OQ-30 to OQ-35.
+- **Expert sign-off:** OQ-25 remainder (how far back corrections go, tax), OQ-34 (tax). **Before building:** the compliance-checker verifies every [CC-verify] item (R15, R24, OQ-5, OQ-10, OQ-15).
+
+*Superseded 2026-10-17:* **Blocking:** OQ-2 (multi-month in-advance), OQ-16 (non-base currency), OQ-20 (advance offsets), OQ-22 (invoicing interface, incl. R43), and invoicing OQ-25 (role model) for views. **Expert sign-off:** OQ-25 (tax). **Before building:** the compliance-checker verifies every [CC-verify] item (R15, R24, OQ-5, OQ-10, OQ-15).
