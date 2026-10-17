@@ -270,11 +270,21 @@ def _failed_hand_off(w):
     return doc
 
 
+def resubmit(doc, user):
+    """resubmit_to_zatca, then what its commit runs: the port call (R40, after commit)."""
+    before = len(connection.run_on_commit)
+    services.resubmit_to_zatca(doc, user=user)
+    for _, callback, _ in connection.run_on_commit[before:]:
+        callback()
+    del connection.run_on_commit[before:]
+    return SalesDocument.objects.get(pk=doc.pk)
+
+
 def test_item6_queue_user_resubmits_and_it_is_logged(w):
     from core.access.models import AccessLog
 
     doc = _failed_hand_off(w)
-    again = services.resubmit_to_zatca(doc, user=w.queue)
+    again = resubmit(doc, w.queue)
     assert again.zatca_status == "pending" and w.zatca.submitted[-1][0] == doc.pk
     assert AccessLog.objects.filter(actor=w.queue, details__action="zatca_resubmit").count() == 1
     with pytest.raises(InvoicingError) as exc:  # now pending: nothing to resubmit
@@ -297,7 +307,7 @@ def test_item6_only_zatca_admins_resubmit_by_hand_never_agents(w):
     assert exc.value.code == "agent_forbidden"
     admin = make_user("zadmin")
     member(admin, w.alm, "zatca_admin")
-    assert services.resubmit_to_zatca(doc, user=admin).zatca_status == "pending"
+    assert resubmit(doc, admin).zatca_status == "pending"
     assert AccessLog.objects.filter(actor=admin, details__action="zatca_resubmit").exists()
 
 

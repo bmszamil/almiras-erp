@@ -6,10 +6,11 @@ import pytest
 from django.db import DatabaseError, connection, transaction
 
 from core import access
+from core.access.models import AccessLog
 from invoicing import admin as invoicing_admin
 from invoicing import services
 from invoicing.conftest import ADDRESS, approve, final, invoice
-from invoicing.models import Customer, PurchaseDocument
+from invoicing.models import Customer, PurchaseDocument, SalesDocument
 from invoicing.test_purchases import bill
 
 pytestmark = pytest.mark.django_db
@@ -256,3 +257,55 @@ def test_item2_the_database_refuses_a_version_that_goes_down(w):
     b = bill(w, submit=False)
     with pytest.raises(DatabaseError, match="version only goes up"):
         _raw("UPDATE invoicing_purchasedocument SET version = 0 WHERE id = %s", [b.pk])
+
+
+# --- item 7: the resubmission's ZATCA hand-off runs only after commit (R40, R79) ----------------------
+
+def _never_handed_off(w):
+    with mock.patch.object(w.zatca, "submit_document", side_effect=RuntimeError("connection reset")):
+        with pytest.raises(RuntimeError):
+            approve(w, invoice(w))
+    doc = SalesDocument.objects.get(status="issued")
+    assert doc.zatca_status == "not_submitted"
+    return doc
+
+
+def _resubmit_logs(user):
+    return AccessLog.objects.filter(actor=user, details__action="zatca_resubmit").count()
+
+
+def test_item7_resubmit_inside_an_outer_transaction_calls_the_port_only_at_commit(w, django_capture_on_commit_callbacks):
+    doc = _never_handed_off(w)
+    sent = len(w.zatca.submitted)
+    with django_capture_on_commit_callbacks(execute=True) as callbacks:
+        with transaction.atomic():  # the caller's own transaction
+            returned = services.resubmit_to_zatca(doc, user=w.queue)
+            assert returned.zatca_status == "not_submitted"
+            assert len(w.zatca.submitted) == sent  # not before the outer transaction commits
+        assert len(w.zatca.submitted) == sent
+    assert len(callbacks) == 1
+    assert w.zatca.submitted[-1][0] == doc.pk and len(w.zatca.submitted) == sent + 1
+    assert SalesDocument.objects.get(pk=doc.pk).zatca_status == "pending"
+    assert _resubmit_logs(w.queue) == 1
+
+
+def test_item7_resubmit_rolled_back_by_the_caller_never_reaches_the_port(w, django_capture_on_commit_callbacks):
+    doc = _never_handed_off(w)
+    sent = len(w.zatca.submitted)
+    with django_capture_on_commit_callbacks(execute=True) as callbacks:
+        with pytest.raises(RuntimeError, match="caller fails"), transaction.atomic():
+            services.resubmit_to_zatca(doc, user=w.queue)
+            raise RuntimeError("caller fails")
+    assert callbacks == [] and len(w.zatca.submitted) == sent
+    assert _resubmit_logs(w.queue) == 0  # rolled back with the caller: nothing was handed off either
+    assert SalesDocument.objects.get(pk=doc.pk).zatca_status == "not_submitted"
+
+
+def test_item7_a_failing_port_after_commit_keeps_the_logged_resubmission(w, django_capture_on_commit_callbacks):
+    doc = _never_handed_off(w)
+    with mock.patch.object(w.zatca, "submit_document", side_effect=RuntimeError("still down")):
+        with pytest.raises(RuntimeError, match="still down"):
+            with django_capture_on_commit_callbacks(execute=True):
+                services.resubmit_to_zatca(doc, user=w.queue)
+    assert _resubmit_logs(w.queue) == 1
+    assert SalesDocument.objects.get(pk=doc.pk).zatca_status == "not_submitted"  # can be resubmitted again

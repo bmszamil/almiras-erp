@@ -1068,7 +1068,8 @@ def resubmit_to_zatca(document, *, user):
     Only documents ``issued`` with ``zatca_status = not_submitted`` (the hand-off never recorded a submission).
     Interim default until the owner decides (spec OQ-57): the ZATCA queue system user (automatic retry, with
     ``zatca.process_queue``) or a person holding the ``zatca_admin`` role in the entity (``zatca.retry_failed``
-    through that role); agents never. Every resubmission is logged in the AccessLog.
+    through that role); agents never. Every resubmission is logged in the AccessLog. The port is called after
+    commit (``transaction.on_commit``): inside an outer transaction, only when that one commits.
     """
     from core.access.models import Membership
 
@@ -1091,7 +1092,10 @@ def resubmit_to_zatca(document, *, user):
             AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity, permission=permission,
             details={"document": [doc._meta.label_lower, doc.pk], "action": "zatca_resubmit"},
         )
-    zatca_port.get_port().submit_document(SalesDocument.objects.get(pk=doc.pk), user)  # after commit, as R40
+        # R40: the port sees the document only once the logged resubmission is committed, also when the caller
+        # runs this inside its own transaction (which could still roll the log back).
+        port = zatca_port.get_port()
+        transaction.on_commit(lambda: port.submit_document(SalesDocument.objects.get(pk=doc.pk), user))
     return SalesDocument.objects.get(pk=doc.pk)
 
 
