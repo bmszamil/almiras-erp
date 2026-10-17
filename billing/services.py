@@ -959,10 +959,7 @@ def _version_problems(v):
                         f"تاريخ السريان قبل بداية العقد {c.start_date}.")
     if v.kind == ContractVersion.Kind.CANCELLATION and v.effective_date != c.start_date:
         problems.append("A cancellation is effective on the contract start (R40). / يسري الإلغاء من بداية العقد.")
-    if c.status == CStatus.TERMINATED and c.terminated_on is not None and v.effective_date > c.terminated_on \
-            and v.kind == ContractVersion.Kind.AMENDMENT:
-        problems.append("A terminated contract is only corrected up to its termination; extensions need a new "
-                        "contract (OQ-27). / يُصحَّح العقد المنهى حتى تاريخ إنهائه فقط؛ والتمديد بعقد جديد.")
+    problems += _after_end_problems(c, v, current)
     if c.termination_kind == Contract.TerminationKind.CANCELLATION:
         problems.append("A cancelled contract is not amended (OQ-27). / لا يُعدَّل العقد الملغى.")
     schedule_change = any(getattr(v, f) != getattr(current, f) for f in ("billing_frequency", "billing_timing",
@@ -983,6 +980,54 @@ def _version_problems(v):
             problems.append("An amendment keeps at least one line. / يبقى في التعديل بند واحد على الأقل.")
         for line in lines:
             problems += _line_problems(c, line)
+        if last_end is not None and v.effective_date <= last_end:
+            problems += _retro_vat_problems(current, lines, v.effective_date, last_end)
+    return problems
+
+
+def _after_end_problems(c, v, current):
+    """OQ-27 default: an ``ended`` or ``terminated`` contract takes versions only as corrections up to its last
+    billable day. An amendment effective after that day, or one that moves the end later (an extension), and a
+    termination later than the current one (an undo) are refused: they need a new contract (review finding 6,
+    probe P5: such an extension planned periods no run would ever bill)."""
+    if c.status not in (CStatus.ENDED, CStatus.TERMINATED) or c.termination_kind == Contract.TerminationKind.CANCELLATION:
+        return []
+    last = c.terminated_on if c.status == CStatus.TERMINATED else _billable_end(c, _version_terms(c))
+    if last is None:
+        return []
+    state_en, state_ar = ("terminated", "المنهى") if c.status == CStatus.TERMINATED else ("ended", "المنتهي")
+    refusal = [f"An {state_en} contract is only corrected up to its last billable day {last}; an extension, undo or "
+               f"re-activation needs a new contract (OQ-27). / يُصحَّح العقد {state_ar} حتى آخر يوم قابل للفوترة "
+               f"({last}) فقط؛ والتمديد أو الإلغاء أو إعادة التفعيل بعقد جديد."]
+    if v.kind == ContractVersion.Kind.AMENDMENT:
+        current_end = current.end_date if current is not None else None
+        extends = (v.end_date is None and current_end is not None) or (v.end_date is not None and v.end_date > last)
+        if v.effective_date > last or extends:
+            return refusal
+    if v.kind == ContractVersion.Kind.TERMINATION and v.effective_date - timedelta(days=1) > last:
+        return refusal
+    return []
+
+
+def _retro_vat_problems(current, lines, effective, last_end):
+    """Review nit 13: the correction pass compares nets per line key, so a retroactive change of a line's VAT
+    category with the same amount would never reach the invoices already issued (no delta, no note, wrong VAT).
+    Until corrections are keyed by category, such a change is refused inside billed periods: the line is removed
+    and added again as a new line (new key: the pass then credits the old and debits the new), or the change takes
+    effect after the last billed period."""
+    if current is None:
+        return []
+    before = {line.line_key: line.vat_category for line in current.lines.all()}
+    problems = []
+    for line in lines:
+        old = before.get(line.line_key)
+        if old is not None and old != line.vat_category:
+            problems.append(
+                f"Line {line.line_no}: its VAT category changes from {old} to {line.vat_category} from {effective}, "
+                f"inside periods already billed (to {last_end}). Remove the line and add it again as a new line, or "
+                f"make the change effective after {last_end}. / البند {line.line_no}: تتغير فئة ضريبته من {old} إلى "
+                f"{line.vat_category} من {effective} داخل فترات مفوترة (حتى {last_end}). احذف البند وأضفه بندًا جديدًا، "
+                f"أو اجعل التغيير يسري بعد {last_end}.")
     return problems
 
 

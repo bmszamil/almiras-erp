@@ -154,3 +154,59 @@ def test_r57_end_during_a_run_is_refused_as_retryable_and_changes_nothing(w, mon
     assert exc.value.code == "run_in_progress" and exc.value.retryable
     a.refresh_from_db()
     assert a.end_date is None and not BillingAdjustment.objects.filter(contract=c).exists()
+
+
+# --- P5 / finding 6: OQ-27 (ended or terminated contracts are corrected, never extended) ---------------------------
+
+def test_p5_ended_contract_refuses_an_extension_but_takes_a_correction(w):
+    c = approved(w, start=date(2027, 1, 1), end=date(2027, 2, 28))
+    for d in (date(2027, 1, 1), date(2027, 2, 1), date(2027, 3, 1)):
+        run(w, d)
+    c.refresh_from_db()
+    assert c.status == "ended"
+    with pytest.raises(BillingError) as exc:  # extension: end moved later
+        version(w, c, effective=date(2027, 2, 1), end_date=date(2027, 4, 30))
+    assert "OQ-27" in str(exc.value) and "عقد جديد" in str(exc.value)
+    services.withdraw_version(c.versions.order_by("-version_no").first(), user=w.s)
+    with pytest.raises(BillingError):  # effective after the last billable day
+        version(w, c, effective=date(2027, 3, 1), amount="9000.00")
+    services.withdraw_version(c.versions.order_by("-version_no").first(), user=w.s)
+    clear(w, period(c, date(2027, 2, 1)).sales_document)
+    v = services.approve_version(version(w, c, effective=date(2027, 2, 1), amount="9000.00"), user=w.c)
+    assert [(a.kind, a.billing_period.period_start) for a in v.adjustments] == [("credit", date(2027, 2, 1))]
+    run(w, date(2027, 4, 1))
+    assert not c.periods.filter(status="planned").exists()
+
+
+def test_oq27_terminated_contract_refuses_a_later_termination_or_amendment(w):
+    c = approved(w)
+    run(w, date(2027, 1, 1))
+    services.approve_version(version(w, c, kind="termination", effective=date(2027, 3, 1), reason_ar="إنهاء"),
+                             user=w.c)
+    for kind, effective in (("termination", date(2027, 5, 1)), ("amendment", date(2027, 4, 1))):
+        with pytest.raises(BillingError) as exc:
+            version(w, c, kind=kind, effective=effective, reason_ar="تمديد")
+        assert "OQ-27" in str(exc.value)
+        services.withdraw_version(c.versions.order_by("-version_no").first(), user=w.s)
+    earlier = services.approve_version(version(w, c, kind="termination", effective=date(2027, 2, 1),
+                                               reason_ar="إنهاء أبكر"), user=w.c)  # a correction: allowed
+    c.refresh_from_db()
+    assert earlier.status == "approved" and c.terminated_on == date(2027, 1, 31)
+
+
+# --- nit 13: retroactive VAT category change with the same amount ------------------------------------------------
+
+def test_retroactive_vat_category_change_refused_inside_billed_periods(w):
+    c = approved(w, contract_type="service", lease_use="", property_ref="", unit_ref="",
+                 lines=(("management_fee", "5000.00"),))
+    for m in (1, 2):
+        run(w, date(2027, m, 1))
+    w.clock.set(date(2027, 2, 10))
+    v = services.create_version(c, user=w.s, kind="amendment", effective_date=date(2027, 1, 15), reason_ar="تصحيح")
+    services.update_line(v.lines.get(), user=w.s, vat_category="E", vat_exemption_reason="VATEX-SA-29")
+    with pytest.raises(BillingError) as exc:
+        services.submit_version(v, user=w.s)
+    assert "VAT category changes from S to E" in str(exc.value) and "فئة ضريبته" in str(exc.value)
+    services.update_version(v, user=w.s, effective_date=date(2027, 3, 1))  # after the last billed period
+    v = services.approve_version(services.submit_version(v, user=w.s), user=w.c)
+    assert v.status == "approved" and v.adjustments == []
