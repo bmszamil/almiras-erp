@@ -241,10 +241,15 @@ def _currency_problems(entry, lines):
             elif not is_reversal:  # R15: a reversal copies the original rate
                 current = _lookup_rate(entity, cur.code, functional, entry.date)
                 if current is None or current.row.pk != line.exchange_rate_id or current.rate != line.fx_rate:
-                    problems.append(
-                        f"{where}: rate does not match entry date {entry.date}; re-rate the draft. / "
-                        f"السعر لا يطابق تاريخ القيد {entry.date}؛ أعد تسعير المسودة."
-                    )
+                    # A document entry may use the rate row its document pinned at approval, if that row is
+                    # still a valid rate for the entry date (the type's validate_lines checked it is the pinned one).
+                    pinned = (_pinned_rate(entity, line.exchange_rate, cur.code, functional, entry.date)
+                              if entry.document_type else None)
+                    if pinned is None or pinned.rate != line.fx_rate:
+                        problems.append(
+                            f"{where}: rate does not match entry date {entry.date}; re-rate the draft. / "
+                            f"السعر لا يطابق تاريخ القيد {entry.date}؛ أعد تسعير المسودة."
+                        )
         if line.line_kind == Kind_.SETTLEMENT or line.rate_source == Src.CARRYING or line.settles_line_id:
             problems += _settlement_problems(entry, line, where, is_reversal, consumed)
         elif cur.code != functional and amount != fx.convert(line.txn_amount, line.fx_rate):  # R7
@@ -668,7 +673,8 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
     the functional currency), ``txn_debit`` / ``txn_credit`` (transaction
     amount and side), ``rate`` + ``rate_reason`` (manual rate, needs
     ``ledger.use_manual_rate``), ``settles_line`` (clears that line at its
-    carrying rate) and ``line_kind="realised_fx"``. ``debit`` / ``credit`` are
+    carrying rate), ``exchange_rate`` (a rate row the document pinned at approval;
+    document postings only, valid for ``date``) and ``line_kind="realised_fx"``. ``debit`` / ``credit`` are
     functional amounts; for foreign lines they are computed when omitted (R7).
     A foreign line without a rate on ``date`` raises and nothing is created (R14).
     A rounding line on 5770 is added when the lines balance per currency but
@@ -702,6 +708,10 @@ def create_entry(entity, date, description, lines, user=None, reference="", post
         if grant is not None or posted_by is not None or document is not None:
             raise error("A grant, posted_by or document is only used with post=True.",
                         "يُستخدم التفويض أو المرحِّل أو المستند مع الترحيل المباشر فقط.")
+        lines = list(lines) if lines is not None else None
+        if lines and any("exchange_rate" in spec for spec in lines):
+            raise error("A pinned rate row is used only by a document's own posting (post=True).",
+                        "سجل السعر المثبت يُستخدم فقط في ترحيل المستند نفسه.", code="pinned_rate_not_allowed")
         # A draft is still a business record in ``entity``: ledger.create_entry there (access.md 3.6).
         access.require(user, entity, "ledger.create_entry")
     with transaction.atomic():
@@ -917,6 +927,16 @@ def _build_line(entity, on, spec, user):
         line.line_kind = Kind_.SETTLEMENT
         line.rate_source = Src.CARRYING
         line.fx_rate = item.fx_rate
+    elif spec.get("exchange_rate") is not None:  # a rate row pinned by the document (create_entry, post=True)
+        row = spec["exchange_rate"]
+        row = row if isinstance(row, ExchangeRate) else ExchangeRate.objects.get(pk=row)
+        found = None if cur.code == functional else _pinned_rate(entity, row, cur.code, functional, on)
+        if found is None:
+            raise error(
+                f"Rate row {row.pk} is not a valid {cur.code}->{functional} rate for {on}.",
+                f"سجل السعر {row.pk} ليس سعرًا صالحًا {cur.code}->{functional} بتاريخ {on}.", code="pinned_rate_invalid",
+            )
+        line.rate_source, line.fx_rate, line.exchange_rate = Src.TABLE, found.rate, row
     elif manual_rate not in (None, ""):
         access.require(user, entity, "ledger.use_manual_rate")  # R16; agents never hold it (table rates only)
         rate = fx.to_decimal(manual_rate, "rate")
@@ -1215,6 +1235,25 @@ def _lookup_rate(entity, from_code, to_code, on, rate_type=ExchangeRate.RateType
             if rows:
                 best = min(rows, key=lambda r: (-r.date.toordinal(), _source_rank(r.source), -r.pk))
                 return Rate(fx.inverse(best.rate) if inverted else best.rate, best, inverted)
+    return None
+
+
+def _pinned_rate(entity, row, from_code, to_code, on):
+    """A Rate from ``row`` if it is a valid spot rate for ``from_code`` -> ``to_code`` on ``on``, else None.
+
+    Valid means: the entity's own or a group-wide row, dated on ``on`` or up to the age limit before it,
+    in that direction or its inverse. Used for rate rows a document pinned at approval (invoicing review
+    item 2): the document books at its approved rate even when a later row for the date arrives.
+    """
+    if row is None or row.rate_type != ExchangeRate.RateType.SPOT or row.entity_id not in (None, entity.pk):
+        return None
+    if not (on - _max_rate_age() <= row.date <= on):
+        return None
+    pair = (row.from_currency_id, row.to_currency_id)
+    if pair == (from_code, to_code):
+        return Rate(row.rate, row)
+    if pair == (to_code, from_code):
+        return Rate(fx.inverse(row.rate), row, True)
     return None
 
 
@@ -1519,6 +1558,28 @@ def fx_settlement_lines(entity, on, settles, txn_amount, counter_account, *, use
         lines.append({"account": FX_LOSS_REALISED, "debit": -net_debit, "line_kind": Kind_.REALISED_FX,
                       "description": "Realised FX loss / خسائر فروقات العملة المحققة"})
     return lines
+
+
+def settlement_for_document(item, txn_amount, description=""):
+    """(line dict, functional amount) settling ``txn_amount`` of the open item ``item`` at its carrying rate (R18).
+
+    The final settlement clears exactly what is left. No counter line and no rights check: for the
+    ``build_lines`` hook of a registered document, which runs inside create_entry(post=True) once the
+    posting is authorised (so it does not depend on the rights of whoever approved the document); the
+    settlement is checked again at posting (_settlement_problems).
+    """
+    if item.entry.status != JournalEntry.Status.POSTED or item.line_kind != Kind_.NORMAL:
+        raise error("Only a posted normal line can be settled.", "لا يُسوّى إلا بند عادي مرحّل.")
+    amount = fx.to_decimal(txn_amount, "transaction amount")
+    open_txn, open_func = _open_item(item)
+    if amount <= ZERO or amount > open_txn:
+        raise error(f"Settle between 0 and the open {open_txn} {item.currency_id}.",
+                    f"المبلغ يجب أن يكون بين 0 والمفتوح {open_txn}.")
+    settled = open_func if amount == open_txn else fx.convert(amount, item.fx_rate)
+    side = "credit" if item.debit > 0 else "debit"
+    spec = {"account": item.account, "currency": item.currency_id, f"txn_{side}": amount, "settles_line": item,
+            "counterparty": item.counterparty_entity, "description": description}
+    return spec, settled
 
 
 def _account(entity, value):

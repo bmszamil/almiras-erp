@@ -201,3 +201,62 @@ def test_p2_bill_and_payment_approval_refused_when_changed_after_the_grant(w, ki
     assert exc.value.code == "grant_document_changed"
     doc.refresh_from_db()
     assert (doc.status, doc.number) == ("submitted", "")
+
+
+# --- 2. FX: a document books at the rate pinned at approval ----------------------------------------
+
+def test_p3_rate_added_between_approval_and_clearance_still_posts_at_the_approved_rate(w):
+    first = usd_rate(w, "3.75", on=date(2027, 1, 8))  # the latest rate on approval day is two days old
+    issued = approve(w, invoice(w, [("rent_commercial", "1", "1000.00")], currency="USD"))
+    assert (issued.fx_rate, issued.fx_exchange_rate_id) == (D("3.75"), first.pk)
+    usd_rate(w, "3.76", on=date(2027, 1, 10))  # the rate for the issue date arrives later
+    posted = w.zatca.clear(issued)
+    assert posted.status == "final"
+    lines = list(posted.journal_entry.lines.exclude(currency_id="SAR"))
+    assert lines and all((l.fx_rate, l.exchange_rate_id) == (D("3.75"), first.pk) for l in lines)
+    assert posted.journal_entry.lines.get(account__code="1200").debit == D("4312.50")  # USD 1,150 x 3.75
+
+
+def test_nit15_foreign_credit_note_settles_at_clearance_without_the_approvers_rights_or_todays_rates(w):
+    usd_rate(w, "3.75", on=date(2027, 1, 10))
+    inv = final(w, invoice(w, [("rent_commercial", "1", "1000.00")], currency="USD"))
+    usd_rate(w, "3.70", on=date(2027, 1, 20))
+    cn = approve(w, invoice(w, [("rent_commercial", "1", "400.00")], doc_type="credit_note", original_document=inv,
+                            issue_date=date(2027, 1, 20), payment_means_code="30", reason_ar="تخفيض"))
+    ledger.create_rate(user=w.accountant, entity=w.alm, from_currency="USD", to_currency="SAR", on=date(2027, 1, 20),
+                       rate=D("3.90"))  # an entity override entered later for the same date: not used
+    with mock.patch.object(ledger, "get_rate", side_effect=AssertionError("no rate lookup at clearance")), \
+            mock.patch.object(ledger, "fx_settlement_lines", side_effect=AssertionError("no approver rights")):
+        posted = w.zatca.clear(cn)
+    lines = sorted((l.account.code, l.debit, l.credit, l.line_kind) for l in posted.journal_entry.lines.all())
+    assert ("1200", D("0"), D("1725.00"), "settlement") in lines  # USD 460 at the carrying 3.75
+    assert ("4100", D("1480.00"), D("0"), "normal") in lines  # at the pinned 3.70, not 3.90
+    assert ("5750", D("23.00"), D("0"), "realised_fx") in lines
+
+
+def test_p3_the_document_line_check_names_the_pinned_rate_and_no_impossible_remedy(w):
+    usd_rate(w, "3.75", on=date(2027, 1, 10))
+    issued = approve(w, invoice(w, [("rent_commercial", "1", "1000.00")], currency="USD"))
+    other = ledger.create_rate(user=w.accountant, entity=w.alm, from_currency="USD", to_currency="SAR",
+                               on=date(2027, 1, 10), rate=D("3.80"))
+    line = mock.Mock(currency_id="USD", line_kind="normal", fx_rate=D("3.80"), exchange_rate_id=other.pk)
+    line.account.code = "1200"
+    problems = services._check_document_rate(issued, [line])
+    assert len(problems) == 1 and "approved at 3.75" in problems[0] and "draft" not in problems[0].lower()
+
+
+def test_pinned_rate_rows_are_for_document_postings_only_and_must_fit_the_date(w):
+    from ledger.models import LedgerError
+
+    row = usd_rate(w, "3.75", on=date(2027, 1, 1))
+    spec = [{"account": "1100", "currency": "USD", "txn_debit": D("10"), "exchange_rate": row},
+            {"account": "3100", "credit": D("37.50")}]
+    with pytest.raises(LedgerError) as exc:
+        ledger.create_entry(w.alm, date(2027, 1, 2), "x", spec, user=w.accountant)
+    assert exc.value.code == "pinned_rate_not_allowed"
+    with pytest.raises(LedgerError) as exc:  # more than the age limit (5 days) after the row
+        ledger._build_line(w.alm, date(2027, 1, 20), spec[0], w.accountant)
+    assert exc.value.code == "pinned_rate_invalid"
+    with pytest.raises(LedgerError):  # before the row's date
+        ledger._build_line(w.alm, date(2026, 12, 31), spec[0], w.accountant)
+    assert ledger._build_line(w.alm, date(2027, 1, 3), spec[0], w.accountant).fx_rate == D("3.75")

@@ -636,6 +636,12 @@ class SalesDocument(Tracked, Snapshot, Guarded):
     fx_rate = models.DecimalField(bi("Rate to functional currency", "سعر الصرف إلى العملة الوظيفية"), **RATE)
     fx_rate_date = models.DateField(bi("Rate date", "تاريخ السعر"), null=True, blank=True)
     fx_rate_source = models.CharField(bi("Rate source", "مصدر السعر"), max_length=10, blank=True)
+    fx_exchange_rate = models.ForeignKey(
+        "ledger.ExchangeRate", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Rate row used", "سجل السعر المستخدم"),
+        help_text=bi("Pinned at approval: the document books at this rate (review item 2)",
+                     "يُثبَّت عند الاعتماد: يُرحَّل المستند بهذا السعر"),
+    )
     sar_rate = models.DecimalField(bi("Rate to SAR (ZATCA)", "سعر الصرف إلى الريال (للهيئة)"), **RATE)
     payment_means_code = models.CharField(bi("Payment means", "وسيلة الدفع"), max_length=3, blank=True,
                                           choices=PaymentMeans.choices)
@@ -767,6 +773,12 @@ class PurchaseDocument(Tracked, Guarded):
     fx_rate = models.DecimalField(bi("Rate to functional currency", "سعر الصرف إلى العملة الوظيفية"), **RATE)
     fx_rate_date = models.DateField(bi("Rate date", "تاريخ السعر"), null=True, blank=True)
     fx_rate_source = models.CharField(bi("Rate source", "مصدر السعر"), max_length=10, blank=True)
+    fx_exchange_rate = models.ForeignKey(
+        "ledger.ExchangeRate", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Rate row used", "سجل السعر المستخدم"),
+        help_text=bi("Pinned at approval: the document books at this rate (review item 2)",
+                     "يُثبَّت عند الاعتماد: يُرحَّل المستند بهذا السعر"),
+    )
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     submitted_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                      related_name="+", verbose_name=bi("Submitted by", "قدّمه"))
@@ -852,6 +864,12 @@ class MoneyMovement(Tracked, Guarded):
     fx_rate = models.DecimalField(bi("Rate to functional currency", "سعر الصرف إلى العملة الوظيفية"), **RATE)
     fx_rate_date = models.DateField(bi("Rate date", "تاريخ السعر"), null=True, blank=True)
     fx_rate_source = models.CharField(bi("Rate source", "مصدر السعر"), max_length=10, blank=True)
+    fx_exchange_rate = models.ForeignKey(
+        "ledger.ExchangeRate", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Rate row used", "سجل السعر المستخدم"),
+        help_text=bi("Pinned at approval: the document books at this rate (review item 2)",
+                     "يُثبَّت عند الاعتماد: يُرحَّل المستند بهذا السعر"),
+    )
     bank_account = models.ForeignKey("ledger.Account", on_delete=models.PROTECT, related_name="+",
                                      verbose_name=bi("Bank account", "الحساب البنكي"))
     reference_en = models.CharField(bi("Reference (English)", "المرجع (بالإنجليزية)"), max_length=200, blank=True)

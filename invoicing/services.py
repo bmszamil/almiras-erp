@@ -217,16 +217,17 @@ def _rate_on(category, on):
 
 
 def _fx_for(entity, currency_code, on, user):
-    """(rate, rate_date, source) to the functional currency on ``on`` (ledger-fx R12); bilingual error if none."""
+    """(rate, rate_date, source, rate row) to the functional currency on ``on`` (ledger-fx R12); bilingual error
+    if none. The row is pinned on the document: its postings use that rate (review item 2)."""
     if currency_code == entity.base_currency_id:
-        return Decimal("1"), on, "functional"
+        return Decimal("1"), on, "functional", None
     try:
         found = ledger.get_rate(entity, currency_code, entity.base_currency_id, on, user=user)
     except LedgerError as exc:
         raise _problems_error(
             [f"An exchange rate is required for {currency_code} on {on}. / سعر الصرف مطلوب للعملة {currency_code} "
              f"بتاريخ {on}.", *exc.messages], "rate_required") from None
-    return found.rate, found.row.date if found.row else on, found.row.source if found.row else "table"
+    return found.rate, found.row.date if found.row else on, found.row.source if found.row else "table", found.row
 
 
 def _sar_rate(entity, currency_code, fx_rate, on, user):
@@ -910,7 +911,7 @@ def approve_sales_document(document, *, user):
         entity = doc.entity
         lines = list(doc.lines.select_related("vat_rate", "vat_exemption_reason", "income_account", "income_type"))
         on = doc.supply_date or doc.issue_date
-        fx_rate, rate_date, rate_source = _fx_for(entity, doc.currency_id, doc.issue_date, user)
+        fx_rate, rate_date, rate_source, rate_row = _fx_for(entity, doc.currency_id, doc.issue_date, user)
         sar_rate = _sar_rate(entity, doc.currency_id, fx_rate, doc.issue_date, user)
         for line in lines:
             _price_line(line, on)
@@ -932,6 +933,7 @@ def approve_sales_document(document, *, user):
         doc.total_net, doc.total_vat, doc.total_gross = net, vat, gross
         doc.total_vat_sar, doc.total_gross_sar, doc.vat_breakdown = vat_sar, gross_sar, breakdown
         doc.fx_rate, doc.fx_rate_date, doc.fx_rate_source, doc.sar_rate = fx_rate, rate_date, rate_source, sar_rate
+        doc.fx_exchange_rate = rate_row
         doc.requires_purification = any(
             line.income_account.requires_purification
             or (line.income_account.sharia_prohibited and not entity.sharia_enforced) for line in lines
@@ -1075,16 +1077,27 @@ def _control_line(document):
     return lines.order_by("pk").first()
 
 
-def _with_settlements(entity, on, currency, plain, settlements, user):
+def _pinned(document, specs):
+    """Foreign-currency lines of ``document`` use the rate row pinned at approval (review item 2, nit 15)."""
+    row = document.fx_exchange_rate
+    if row is None:
+        return list(specs)
+    return [{**spec, "exchange_rate": row} if spec.get("currency") and not spec.get("settles_line") else spec
+            for spec in specs]
+
+
+def _with_settlements(document, currency, plain, settlements):
     """Lines for an entry that settles earlier items (ledger-fx R18) in a foreign currency.
 
-    ``plain``: line dicts in the document currency (no functional amounts).
+    ``plain``: line dicts in the document currency, pinned to the document's approved rate.
     ``settlements``: (item JournalLine, transaction amount, description). Each
-    item is cleared at its carrying rate through ``ledger.services.fx_settlement_lines``;
-    plain lines get their functional amounts at the entry date's rate; the
-    difference goes to the realised FX gain (4700) or loss (5750) line.
+    item is cleared at its carrying rate (``ledger.services.settlement_for_document``);
+    plain lines get their functional amounts at the document's pinned rate; the
+    difference goes to the realised FX gain (4700) or loss (5750) line. Nothing
+    here depends on anyone's current rights or on the rate table today (nit 15).
     In the functional currency no settlement lines are needed: plain lines only.
     """
+    entity = document.entity
     functional = entity.base_currency_id
     if not settlements:
         return plain
@@ -1094,28 +1107,20 @@ def _with_settlements(entity, on, currency, plain, settlements, user):
             side = "credit" if item.debit > 0 else "debit"
             out.append(_line(item.account, side, amount, functional, functional, item.counterparty_entity, description))
         return out
-    rate = ledger.get_rate(entity, currency, functional, on, user=user).rate
+    rate = document.fx_rate
     out, debit, credit = [], ZERO, ZERO
     for spec in plain:
         side = "debit" if "txn_debit" in spec else "credit"
         amount = fx.convert(spec[f"txn_{side}"], rate)
-        spec = {**spec, side: amount}
-        out.append(spec)
+        out.append({**spec, side: amount})
         if side == "debit":
             debit += amount
         else:
             credit += amount
     for item, amount, description in settlements:
-        built = ledger.fx_settlement_lines(entity, on, item, amount, item.account, user=user, description=description)
-        counter_func = fx.convert(amount, rate)
-        fx_line = next((b for b in built if b.get("line_kind") == "realised_fx"), None)
-        gain = (fx_line.get("credit") or ZERO) - (fx_line.get("debit") or ZERO) if fx_line else ZERO
-        item_debit = item.debit > 0
-        # fx_settlement_lines: realised gain = counter - settled for a debit item, settled - counter for a credit item.
-        settled = counter_func - gain if item_debit else counter_func + gain
-        settle = built[1]
+        settle, settled = ledger.settlement_for_document(item, amount, description)
         out.append(settle)
-        if item_debit:
+        if item.debit > 0:
             credit += settled
         else:
             debit += settled
@@ -1158,19 +1163,23 @@ def _sales_document_lines(document):
             gross -= amount
     if gross:
         plain.append(_line(control, control_side, gross, cur, functional, counterparty, description=label))
-    return _with_settlements(entity, document.issue_date, cur, plain, settlements, user)
+    return _with_settlements(document, cur, _pinned(document, plain), settlements)
 
 
 def _check_document_rate(document, lines):
-    """Registered ``validate_lines``: the ledger rated the document's lines at the rate stored on the document."""
+    """Registered ``validate_lines``: every foreign-currency line books at the rate pinned on the document at
+    approval (its rate row and rate), never at a rate looked up later (review item 2)."""
     functional = document.entity.base_currency_id
     problems = []
     for line in lines:
-        if line.currency_id != functional and line.line_kind == "normal" and line.fx_rate != document.fx_rate:
+        if line.currency_id == functional or line.line_kind != "normal":
+            continue
+        if line.fx_rate != document.fx_rate or line.exchange_rate_id != document.fx_exchange_rate_id:
             problems.append(
-                f"Line {line.account.code} is rated {line.fx_rate}; the document was approved at {document.fx_rate}. "
-                f"Return it to draft and approve it again. / سعر البند {line.fx_rate} يختلف عن سعر الاعتماد "
-                f"{document.fx_rate}؛ أعده إلى مسودة واعتمده من جديد."
+                f"Line {line.account.code} is rated {line.fx_rate} (rate row {line.exchange_rate_id}); the document "
+                f"was approved at {document.fx_rate} (rate row {document.fx_exchange_rate_id}) and books only at that "
+                f"rate. / سعر البند {line.account.code} هو {line.fx_rate} (سجل السعر {line.exchange_rate_id})؛ "
+                f"اعتُمد المستند بسعر {document.fx_rate} (سجل السعر {document.fx_exchange_rate_id}) ولا يُرحَّل إلا به."
             )
     return problems
 
@@ -1581,7 +1590,8 @@ def approve_purchase_document(document, *, user):
             line.save()
         doc.vat_breakdown = breakdown
         doc.total_net, doc.total_vat, doc.total_gross, doc.reverse_charge_vat = net, charged, net + charged, rc_vat
-        doc.fx_rate, doc.fx_rate_date, doc.fx_rate_source = _fx_for(entity, doc.currency_id, doc.accounting_date, user)
+        doc.fx_rate, doc.fx_rate_date, doc.fx_rate_source, doc.fx_exchange_rate = _fx_for(
+            entity, doc.currency_id, doc.accounting_date, user)
         doc.is_intercompany = doc.vendor.group_entity_id is not None
         doc.number = _next_number(entity, doc.doc_type, doc.accounting_date.year)
         doc.status = PStatus.POSTED
@@ -1641,7 +1651,7 @@ def _purchase_document_lines(document):
             gross -= amount
     if gross:
         plain.append(_line(control, control_side, gross, cur, functional, counterparty, description=label))
-    return _with_settlements(entity, document.accounting_date, cur, plain, settlements, user)
+    return _with_settlements(document, cur, _pinned(document, plain), settlements)
 
 
 # --- receipts and payments (3.5) ---------------------------------------------------------------------
@@ -1771,8 +1781,8 @@ def _post_money(movement, *, user, grant, receivable):
         problems.append(period)
     if problems:
         raise _problems_error(problems, "document_invalid")
-    movement.fx_rate, movement.fx_rate_date, movement.fx_rate_source = _fx_for(entity, movement.currency_id,
-                                                                              movement.date, user)
+    movement.fx_rate, movement.fx_rate_date, movement.fx_rate_source, movement.fx_exchange_rate = _fx_for(
+        entity, movement.currency_id, movement.date, user)
     movement.number = _next_number(entity, "RCPT" if receivable else "PAY", movement.date.year)
     movement.status = "posted"
     movement.posted_by, movement.posted_at = user, timezone.now()
@@ -1814,8 +1824,9 @@ def _receipt_lines(document):
     control, counterparty = _control(document.customer, receivable=True)
     label = document.number
     if document.kind == CustomerReceipt.Kind.REFUND:  # E6
-        return [_line(control, "debit", document.amount, cur, functional, counterparty, label),
-                _line(document.bank_account, "credit", document.amount, cur, functional, description=label)]
+        return _pinned(document, [_line(control, "debit", document.amount, cur, functional, counterparty, label),
+                                  _line(document.bank_account, "credit", document.amount, cur, functional,
+                                        description=label)])
     plain = [_line(document.bank_account, "debit", document.amount - document.bank_charge, cur, functional,
                    description=label)]
     if document.bank_charge:  # OQ-23: booked gross to 5700, no VAT split
@@ -1830,7 +1841,7 @@ def _receipt_lines(document):
         return plain
     if document.amount - applied:
         plain.append(_line(control, "credit", document.amount - applied, cur, functional, counterparty, label))
-    return _with_settlements(entity, document.date, cur, plain, settlements, user)
+    return _with_settlements(document, cur, _pinned(document, plain), settlements)
 
 
 def _no_payment_without_wht(vendor, kind):
@@ -1913,8 +1924,9 @@ def _payment_lines(document):
     control, counterparty = _control(document.vendor, receivable=False)
     label = document.number
     if document.kind == VendorPayment.Kind.REFUND_RECEIVED:
-        return [_line(document.bank_account, "debit", document.amount, cur, functional, description=label),
-                _line(control, "credit", document.amount, cur, functional, counterparty, label)]
+        return _pinned(document, [_line(document.bank_account, "debit", document.amount, cur, functional,
+                                        description=label),
+                                  _line(control, "credit", document.amount, cur, functional, counterparty, label)])
     plain = [_line(document.bank_account, "credit", document.amount, cur, functional, description=label)]
     settlements, applied = [], ZERO
     for app in document.applications.select_related("target").order_by("pk"):
@@ -1925,7 +1937,7 @@ def _payment_lines(document):
         return plain
     if document.amount - applied:
         plain.append(_line(control, "debit", document.amount - applied, cur, functional, counterparty, label))
-    return _with_settlements(entity, document.date, cur, plain, settlements, user)
+    return _with_settlements(document, cur, _pinned(document, plain), settlements)
 
 
 # --- reversal (R24, R25, R32, R33; OQ-28) -------------------------------------------------------------

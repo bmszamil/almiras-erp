@@ -13,6 +13,7 @@ ALLOW = {
     "core/services.py:reactivate_entity_by_operator": "reactivate_entity recovery command only (operator, logged, R32)",
     "ledger/services.py:validate_entry": "pure validation, called inside post",
     "ledger/services.py:signed_purification": "pure sum over lines the caller has already read",
+    "ledger/services.py:settlement_for_document": "prices a settlement inside a document's build_lines, after create_entry authorised the posting",
     "ledger/services.py:rates_visible_to": "the scope mechanism for rate rows (entities_for + global rows, ledger-fx R28)",
     "core/access/services.py:now": "clock",
     "core/access/services.py:profile_of": "helper",
