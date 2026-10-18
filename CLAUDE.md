@@ -33,7 +33,7 @@ No Odoo, SAP, Microsoft Dynamics or paid SaaS as dependencies; we may *connect* 
 | test-engineer | Turns rules and specs into automated tests; finds untested paths |
 | code-reviewer | Independent review: accounting, security, entity separation (read-only) |
 | compliance-checker | Checks against ZATCA, VAT, Zakat, GOSI, Mudad, PDPL (read-only) |
-| migration-agent | Maps Daftra (or other) exports into opening balances and proves they tie out |
+| migration-agent | Maps Falcon (or other legacy) exports into opening balances and proves they tie out |
 
 Typical flow for a module: spec-writer → module-builder + test-engineer → code-reviewer + compliance-checker → human approval → merge.
 

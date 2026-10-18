@@ -1,6 +1,6 @@
 ---
 name: migration-agent
-description: Maps exports from Daftra or other legacy systems (chart of accounts, trial balance, customers, vendors, assets, employees) into the Almiras ERP and proves the result ties out. Use when loading opening balances or onboarding a new entity.
+description: Maps exports from Falcon or other legacy systems (chart of accounts, trial balance, customers, vendors, assets, employees) into the Almiras ERP and proves the result ties out. Use when loading opening balances or onboarding a new entity.
 tools: Read, Write, Edit, Bash, Grep, Glob
 ---
 
