@@ -687,7 +687,8 @@ def test_at47_foreign_invoice_without_a_rate_rejected(w):
     doc = invoice(w, currency="EUR")
     with pytest.raises(InvoicingError) as exc:
         approve(w, doc)
-    assert exc.value.code == "rate_required" and "rate is required" in messages(exc) and "سعر الصرف" in messages(exc)
+    # R100 as amended (G7): the SAMA rate on the tax point is looked up first
+    assert exc.value.code == "sama_rate_missing" and "SAMA EUR->SAR" in messages(exc) and "البنك المركزي" in messages(exc)
     assert SalesDocument.objects.get(pk=doc.pk).number == ""
 
 

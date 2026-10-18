@@ -203,6 +203,11 @@ def test_p2_bill_and_payment_approval_refused_with_a_grant_older_than_the_last_c
 
 def test_p3_rate_added_between_approval_and_clearance_still_posts_at_the_approved_rate(w):
     first = usd_rate(w, "3.75", on=date(2027, 1, 8))  # the latest rate on approval day is two days old
+    from ledger.models import NonPublicationDay
+
+    for day in (9, 10):  # test data: SAMA published nothing on 01-09 and 01-10, so the 01-08 row is the VAT rate
+        NonPublicationDay.objects.create(date=date(2027, 1, day), name_en="Closed", name_ar="عطلة",
+                                         created_by=w.cfo)
     issued = approve(w, invoice(w, [("rent_commercial", "1", "1000.00")], currency="USD"))
     assert (issued.fx_rate, issued.fx_exchange_rate_id) == (D("3.75"), first.pk)
     usd_rate(w, "3.76", on=date(2027, 1, 10))  # the rate for the issue date arrives later

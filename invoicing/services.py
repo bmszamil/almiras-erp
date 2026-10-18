@@ -312,17 +312,34 @@ def _fx_for(entity, currency_code, on, user):
     return found.rate, found.row.date if found.row else on, found.row.source if found.row else "table", found.row
 
 
-def _sar_rate(entity, currency_code, fx_rate, on, user):
-    """Rate from the document currency to SAR for the ZATCA VAT totals (R56)."""
+def _vat_sar_rate(entity, currency_code, tax_point, user):
+    """R100 as amended (G7; VAT IR Art. 61, TIR §4.2.2): (rate, SAMA row) from the document currency to SAR for
+    ``total_vat_sar`` and ``vat_breakdown.vat_sar``: the SAMA rate on the tax point, an earlier SAMA rate only
+    across weekends and public holidays (``ledger.get_sama_rate``). None of it: the document is not issued."""
     if currency_code == SAR:
-        return Decimal("1")
-    if entity.base_currency_id == SAR:
-        return fx_rate
+        return Decimal("1"), None
     try:
-        return ledger.get_rate(entity, currency_code, SAR, on, user=user).rate
+        found = ledger.get_sama_rate(currency_code, tax_point, user=user, entity=entity)
     except LedgerError as exc:
-        raise _problems_error([f"A {currency_code}->SAR rate is required for ZATCA on {on}. / سعر {currency_code} "
-                               f"إلى الريال مطلوب للهيئة بتاريخ {on}.", *exc.messages], "rate_required") from None
+        raise _problems_error(
+            [f"The SAMA {currency_code}->SAR rate on the tax point {tax_point} is required to issue this document "
+             f"(VAT in SAR, R100). / سعر البنك المركزي السعودي {currency_code} إلى الريال في تاريخ الاستحقاق "
+             f"الضريبي {tax_point} مطلوب لإصدار هذا المستند (الضريبة بالريال).", *exc.messages],
+            "sama_rate_missing") from None
+    return found.rate, found.row
+
+
+def _booking_rate(entity, doc, sama_row, user):
+    """(rate, rate date, source, row) the document books at (R77, OQ-65 default as amended by G7): in a
+    SAR-functional entity the SAMA tax-point row when the ledger accepts it as a pinned rate on the issue date
+    (``ledger._pinned_rate``: not older than ``FX_MAX_RATE_AGE_DAYS``), so 2200 equals ``total_vat_sar``; else the
+    ledger rate on the issue date (R12), the VAT return then explains the difference (tax-returns §10.5)."""
+    cur = doc.currency_id
+    if sama_row is not None and entity.base_currency_id == SAR and cur != SAR:
+        pinned = ledger._pinned_rate(entity, sama_row, cur, SAR, doc.issue_date)
+        if pinned is not None and not pinned.inverted:
+            return pinned.rate, sama_row.date, sama_row.source, sama_row
+    return _fx_for(entity, cur, doc.issue_date, user)
 
 
 # --- settings ----------------------------------------------------------------------------------------
@@ -520,6 +537,7 @@ SALES_HEADER_FIELDS = {
     "zatca_profile", "flag_third_party", "flag_nominal", "flag_export", "flag_summary", "flag_self_billed",
     "issue_date", "supply_date", "supply_end_date", "due_date", "payment_means_code", "reason_code", "reason_ar",
     "reason_en", "adjustment_event_date", "notes_en", "notes_ar", "document_discount",
+    "payment_received_date", "payment_order_date",  # R100 tax point (G6); R117 B2G payment order date (G1)
 }
 
 
@@ -540,6 +558,108 @@ def _apply_sales_header(doc, fields):
             doc.reason_ar = doc.reason_code.name_ar
         if "reason_en" not in fields:
             doc.reason_en = doc.reason_code.name_en
+    _refresh_tax_point(doc)
+
+
+# --- tax point (R100 as amended by G6 / G7) and B2G payment order date (R117, G1) -------------------------
+
+TaxPoint = SalesDocument.TaxPointBasis
+
+
+def computed_tax_point(doc):
+    """G6 (PSG §11.3; TIR §4.2.3): (date, basis) of a sales document's tax point.
+
+    An invoice: the earliest of its supply date (for a supply over a period, i.e. with ``supply_end_date``, the end
+    of the supply period: continuous supplies), its issue date and the date a payment or advance for it was
+    received. On equal dates the issue date is named. A credit or debit note: its own date (D30(a), X9).
+    """
+    if doc.doc_type != SalesDocument.DocType.INVOICE:
+        return doc.issue_date, TaxPoint.ISSUE
+    candidates = [(doc.issue_date, TaxPoint.ISSUE)]
+    if doc.supply_end_date:
+        candidates.append((doc.supply_end_date, TaxPoint.SUPPLY_END))
+    elif doc.supply_date:
+        candidates.append((doc.supply_date, TaxPoint.SUPPLY))
+    if doc.payment_received_date:
+        candidates.append((doc.payment_received_date, TaxPoint.PAYMENT))
+    return min(candidates, key=lambda c: c[0])  # min keeps the first of equal dates: the issue date
+
+
+def _refresh_tax_point(doc):
+    """Keep a draft's tax point computed (R100); a tax point entered by hand stays until it is cleared."""
+    if doc.tax_point_basis != TaxPoint.MANUAL:
+        doc.tax_point_date, doc.tax_point_basis = computed_tax_point(doc)
+        doc.tax_point_reason = ""
+
+
+@transaction.atomic
+def set_tax_point(document, *, user, tax_point_date, reason=""):
+    """Enter a draft invoice's tax point by hand, with a reason (R100, G6), or clear it (``tax_point_date=None``)
+    to go back to the computed one. Drafts only (R13); a credit or debit note always uses its own date (D30(a)).
+    The tax point is never after the issue date (it is the earliest of supply, issue and payment)."""
+    doc = _draft_sales(document, user)
+    if tax_point_date is None:
+        doc.tax_point_basis = ""
+    else:
+        if doc.doc_type != SalesDocument.DocType.INVOICE:
+            raise error("A credit or debit note is taxed on its own date; its tax point is not entered by hand "
+                        "(D30(a)).", "يُحتسب الإشعار الدائن أو المدين بتاريخه؛ ولا يُدخل تاريخ استحقاقه الضريبي يدويًا.",
+                        code="tax_point_note")
+        reason = (reason or "").strip()
+        if not reason:
+            raise error("A tax point entered by hand needs a reason.",
+                        "يحتاج تاريخ الاستحقاق الضريبي المُدخل يدويًا إلى سبب.", code="tax_point_reason")
+        if not isinstance(tax_point_date, date_type):
+            raise error("The tax point must be a date.", "يجب أن يكون تاريخ الاستحقاق الضريبي تاريخًا.",
+                        code="tax_point_date")
+        if tax_point_date > doc.issue_date:
+            raise error(_TAX_POINT_AFTER_ISSUE[0].format(tp=tax_point_date, issue=doc.issue_date),
+                        _TAX_POINT_AFTER_ISSUE[1].format(tp=tax_point_date, issue=doc.issue_date),
+                        code="tax_point_after_issue")
+        doc.tax_point_date, doc.tax_point_basis, doc.tax_point_reason = tax_point_date, TaxPoint.MANUAL, reason
+    _refresh_tax_point(doc)
+    _touch(doc, user)
+    doc.save()
+    _log_agent(user, doc.entity, "invoicing.create_sales_document", doc, "set_tax_point")
+    return doc
+
+
+_TAX_POINT_AFTER_ISSUE = (
+    "The tax point {tp} is after the issue date {issue}; it is the earliest of supply, issue and payment (R100).",
+    "تاريخ الاستحقاق الضريبي {tp} بعد تاريخ الإصدار {issue}؛ وهو الأسبق من التوريد والإصدار والدفع.",
+)
+
+
+def _tax_point_problems(doc):
+    """R100: a tax point entered by hand is never after the issue date (checked again at issue, when the issue
+    date becomes the approval day)."""
+    if doc.tax_point_basis == TaxPoint.MANUAL and doc.tax_point_date and doc.tax_point_date > doc.issue_date:
+        en, ar = _TAX_POINT_AFTER_ISSUE
+        return [f"{en.format(tp=doc.tax_point_date, issue=doc.issue_date)} / "
+                f"{ar.format(tp=doc.tax_point_date, issue=doc.issue_date)}"]
+    return []
+
+
+def is_b2g(doc):
+    """R117 (G1; zatca R-54): a standard invoice or note to a ``government`` customer (VAT IR Art. 20(5))."""
+    return (doc.zatca_profile == SalesDocument.Profile.STANDARD
+            and doc.customer.customer_kind == Customer.Kind.GOVERNMENT)
+
+
+PAYMENT_ORDER_REQUIRED = (
+    "A standard invoice or note to a government customer needs the payment order date before it is issued: it is "
+    "ZATCA's TaxPointDate (BR-KSA-92; VAT IR Art. 20(5)). Enter it on the draft.",
+    "تحتاج الفاتورة أو الإشعار القياسي لعميل حكومي إلى تاريخ أمر الدفع قبل الإصدار: وهو تاريخ الاستحقاق الضريبي "
+    "لدى الهيئة (BR-KSA-92؛ المادة 20(5) من اللائحة التنفيذية). أدخله في المسودة.",
+)
+
+
+def _payment_order_problems(doc):
+    """R117 (G1): no B2G standard document is issued without its payment order date; the ZATCA queue also holds
+    one that has none (zatca R-54, BR-KSA-92)."""
+    if is_b2g(doc) and not doc.payment_order_date:
+        return [" / ".join(PAYMENT_ORDER_REQUIRED)]
+    return []
 
 
 def create_sales_document(entity, *, user, customer, issue_date, doc_type=SalesDocument.DocType.INVOICE,
@@ -606,7 +726,8 @@ def _touch(doc, user):
 
 # R73 / billing R56 (OQ-26 default): on a document created from billing a reviewer completes these header fields
 # only; lines, amounts, dates and the supply period come from billing.
-BILLING_HEADER_FIELDS = {"payment_means_code", "reason_code", "reason_ar", "reason_en", "notes_en", "notes_ar"}
+BILLING_HEADER_FIELDS = {"payment_means_code", "reason_code", "reason_ar", "reason_en", "notes_en", "notes_ar",
+                         "payment_order_date"}  # R117: a government customer's payment order date
 
 
 def _refuse_billing_lines(doc):
@@ -775,7 +896,7 @@ def submit_sales_document(document, *, user):
     access.require(user, doc.entity, "invoicing.submit_sales_document")
     if doc.status != Status.DRAFT:
         raise error("Only drafts can be submitted.", "يمكن تقديم المسودات فقط.", code="not_draft")
-    problems = _issue_problems(doc, check_period=False)
+    problems = _issue_problems(doc, check_period=False) + _payment_order_problems(doc)
     if problems:
         raise _problems_error(problems, "document_invalid")
     doc.status = Status.SUBMITTED
@@ -1020,6 +1141,7 @@ def _issue_problems(doc, *, check_period=True, user=None):
     problems += _citizen_problems(doc, snap)
     if doc.doc_type in (SalesDocument.DocType.CREDIT_NOTE, SalesDocument.DocType.DEBIT_NOTE):
         problems += _note_problems(doc, gross)
+    problems += _tax_point_problems(doc)
     if check_period:
         period = _open_period(entity, doc.issue_date)
         if period:
@@ -1183,14 +1305,15 @@ def _issue_submitted(doc, *, rate_user, approved_by, approved_at):
     doc.requested_issue_date = doc.issue_date
     doc.issue_date = now.date()
     doc.issue_time = now.time().replace(microsecond=0)
-    problems = _issue_problems(doc, user=rate_user)
+    _refresh_tax_point(doc)  # R100 (G6): computed from the issue date of approval, unless entered by hand
+    problems = _issue_problems(doc, user=rate_user) + _payment_order_problems(doc)
     if problems:
         raise _problems_error(problems, "document_invalid")
     entity = doc.entity
     lines = list(doc.lines.select_related("vat_rate", "vat_exemption_reason", "income_account", "income_type"))
     on = doc.supply_date or doc.issue_date
-    fx_rate, rate_date, rate_source, rate_row = _fx_for(entity, doc.currency_id, doc.issue_date, rate_user)
-    sar_rate = _sar_rate(entity, doc.currency_id, fx_rate, doc.issue_date, rate_user)
+    sar_rate, sama_row = _vat_sar_rate(entity, doc.currency_id, doc.tax_point_date, rate_user)
+    fx_rate, rate_date, rate_source, rate_row = _booking_rate(entity, doc, sama_row, rate_user)
     with billing_line_writes() if doc.from_billing else nullcontext():  # the approval re-prices billing lines too
         for line in lines:
             _price_line(line, on, _doc_places(doc))
@@ -1212,7 +1335,7 @@ def _issue_submitted(doc, *, rate_user, approved_by, approved_at):
     doc.total_net, doc.total_vat, doc.total_gross = net, vat, gross
     doc.total_vat_sar, doc.total_gross_sar, doc.vat_breakdown = vat_sar, gross_sar, breakdown
     doc.fx_rate, doc.fx_rate_date, doc.fx_rate_source, doc.sar_rate = fx_rate, rate_date, rate_source, sar_rate
-    doc.fx_exchange_rate = rate_row
+    doc.fx_exchange_rate, doc.vat_sar_exchange_rate = rate_row, sama_row
     doc.requires_purification = any(
         line.income_account.requires_purification
         or (line.income_account.sharia_prohibited and not entity.sharia_enforced) for line in lines
@@ -4127,6 +4250,7 @@ def _save_billing_document(doc, field, obj):
     partial unique constraint, so a race cannot create two)."""
     from django.db import IntegrityError
 
+    _refresh_tax_point(doc)  # R100: billing drafts show their computed tax point too
     try:
         with transaction.atomic():
             doc.save()
@@ -4213,7 +4337,10 @@ def create_from_billing(period, user):
         doc.save()
         approved = version.status == "approved" and version.approved_by_id is not None
         warnings = []
-        if approved and _settings(entity).auto_issue_from_approved_contract:
+        held_b2g = _payment_order_problems(doc)  # R117 (G1): stays submitted until a person enters the date
+        if held_b2g:
+            warnings = held_b2g
+        elif approved and _settings(entity).auto_issue_from_approved_contract:
             _issue_submitted(doc, rate_user=user, approved_by=version.approved_by, approved_at=version.approved_at)
             access_services.log(
                 AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity, permission="invoicing.create_from_billing",

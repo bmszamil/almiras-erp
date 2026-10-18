@@ -498,3 +498,23 @@ def test_r56_billing_lines_are_read_only_in_the_database(bw):
             cursor.execute("UPDATE invoicing_salesdocumentline SET unit_price = 1 WHERE id = %s", [line.pk])
     assert note.lines.get().description_en == "by the hook"
     assert SalesDocument.objects.get(pk=note.pk).lines.count() == 1
+
+
+# --- R117 (G1): a billed B2G invoice waits for its payment order date -----------------------------------------
+
+def test_at150_billed_invoice_to_a_government_customer_waits_for_the_payment_order_date(bw):
+    from invoicing.conftest import ADDRESS
+
+    w = bw
+    gov = inv.create_customer(w.alm, user=w.s, code="G001", customer_kind="government", name_en="Test Ministry",
+                              name_ar="وزارة الاختبار", is_vat_registered=True, vat_number="310000000000003", **ADDRESS)
+    c = approved(w, customer=gov, start=date(2027, 3, 1))
+    run(w, date(2027, 3, 1))
+    doc = SalesDocument.objects.get(pk=period(c, date(2027, 3, 1)).sales_document_id)
+    assert (doc.status, doc.number) == ("submitted", "")  # not auto-issued: held for the date
+    assert doc.tax_point_date == date(2027, 3, 1)
+    doc = inv.return_to_draft(doc, user=w.s)
+    doc = inv.update_sales_document(doc, user=w.s, payment_order_date=date(2027, 2, 25))
+    doc = inv.submit_sales_document(doc, user=w.s)
+    issued = inv.approve_sales_document(doc, user=w.c)
+    assert (issued.status, issued.payment_order_date) == ("issued", date(2027, 2, 25))

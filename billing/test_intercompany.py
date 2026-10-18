@@ -75,7 +75,7 @@ def ic_books(w):
     treasurer = make_user("treasury")
     member(treasurer, w.alm, "group_treasury")
     ledger.create_rate(user=treasurer, from_currency="USD", to_currency="SAR", on=date(2027, 3, 1), rate=D("3.75"),
-                       group=w.alm)
+                       group=w.alm, source="sama", source_reference="SAMA test bulletin 2027-03-01")
     sar = approved(w, customer=w.ic_customer, contract_type="service", lease_use="", property_ref="", unit_ref="",
                    start=date(2027, 3, 1), lines=(("management_fee", "10000.00"),))
     usd = approved(w, customer=w.ic_customer, contract_type="service", lease_use="", property_ref="", unit_ref="",

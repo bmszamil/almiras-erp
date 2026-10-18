@@ -235,7 +235,8 @@ def _rate(w, code, rate, on=date(2027, 1, 10)):
 
     treasurer = make_user(f"treasury_{code.lower()}_{on:%m%d}")
     member(treasurer, w.alm, "group_treasury")
-    return ledger.create_rate(user=treasurer, from_currency=code, to_currency="SAR", on=on, rate=D(rate), group=w.alm)
+    return ledger.create_rate(user=treasurer, from_currency=code, to_currency="SAR", on=on, rate=D(rate), group=w.alm,
+                              source="sama", source_reference=f"SAMA test bulletin {on}")
 
 
 def _draft(w, currency, lines):

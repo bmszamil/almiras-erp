@@ -122,7 +122,7 @@ def test_refusals_have_distinct_codes(real):
     w = real
     eur = approved(w, start=date(2027, 3, 1), currency="EUR", lines=(("rent_commercial", "1000.00"),))
     w.clock.set(date(2027, 3, 1))
-    assert _refusal(w, eur, date(2027, 3, 1)) == "rate_required"
+    assert _refusal(w, eur, date(2027, 3, 1)) == "sama_rate_missing"  # invoicing R100 (G7)
     _rate(w, "KWD", "12.2", date(2027, 1, 15))
     kwd = approved(w, start=date(2027, 1, 15), currency="KWD", lines=(("rent_commercial", "1000.000"),))
     w.clock.set(date(2027, 1, 15))

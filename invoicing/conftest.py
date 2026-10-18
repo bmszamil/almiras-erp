@@ -116,11 +116,15 @@ ADDRESS = dict(street_en="Buyer Street", street_ar="شارع المشتري", bu
                district_ar="حي المشتري", city_en="Jeddah", city_ar="جدة", postal_code="23456", country="SA")
 
 
-def usd_rate(w, rate="3.75", on=date(2027, 1, 10), entity=None):
+def usd_rate(w, rate="3.75", on=date(2027, 1, 10), entity=None, source="sama", currency="USD"):
+    """A group-wide rate row; by default a SAMA row, so it is both the booking rate (R12) and the VAT SAR rate on
+    the tax point (R100, G7)."""
     from core.access.testing import member as m
 
     treasurer = make_user(f"treasury{ExchangeRate.objects.count()}")
     m(treasurer, w.alm, "group_treasury")
     from ledger import services as ledger
 
-    return ledger.create_rate(user=treasurer, from_currency="USD", to_currency="SAR", on=on, rate=D(rate), group=w.alm)
+    return ledger.create_rate(user=treasurer, from_currency=currency, to_currency="SAR", on=on, rate=D(rate),
+                              group=w.alm, source=source,
+                              source_reference=f"SAMA test bulletin {on}" if source == "sama" else "")

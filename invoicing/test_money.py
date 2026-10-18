@@ -239,7 +239,8 @@ def gbp_rate(w, rate, on):
 
     treasurer = make_user(f"gbp{on.isoformat()}")
     member(treasurer, w.alm, "group_treasury")
-    return ledger.create_rate(user=treasurer, from_currency="GBP", to_currency="SAR", on=on, rate=D(rate), group=w.alm)
+    return ledger.create_rate(user=treasurer, from_currency="GBP", to_currency="SAR", on=on, rate=D(rate), group=w.alm,
+                              source="sama", source_reference=f"SAMA test bulletin {on}")
 
 
 def test_f5_foreign_bill_paid_later_books_a_realised_loss(w):

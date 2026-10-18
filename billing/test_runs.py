@@ -38,7 +38,7 @@ def _rate(w, currency, rate, on):
     treasurer = make_user(f"treasury.{currency}.{on}")
     member(treasurer, w.alm, "group_treasury")
     return ledger.create_rate(user=treasurer, from_currency=currency, to_currency="SAR", on=on, rate=D(rate),
-                              group=w.alm)
+                              group=w.alm, source="sama", source_reference=f"SAMA test bulletin {on}")
 
 
 # --- AT-2, AT-4, R11, R13 to R15, R35, R53 ------------------------------------------------------------------------
@@ -291,7 +291,8 @@ def test_at19_foreign_currency_rate_on_issue_date_or_failed(w):
     assert sorted((ln.account.code, ln.debit, ln.credit) for ln in final.journal_entry.lines.all()) == [  # B5
         ("1200", D("4312.50"), D("0.00")), ("2200", D("0.00"), D("562.50")), ("4100", D("0.00"), D("3750.00"))]
     p = period(eur, date(2027, 3, 1))
-    assert (p.status, p.error_code, p.sales_document) == ("failed", "rate_required", None)
+    # no SAMA rate on the tax point (invoicing R100, G7): retried next run with invoicing's message
+    assert (p.status, p.error_code, p.sales_document) == ("failed", "sama_rate_missing", None)
     assert not SalesDocument.objects.filter(currency_id="EUR").exists()
 
 

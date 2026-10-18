@@ -710,6 +710,15 @@ class SalesDocument(Tracked, Snapshot, Guarded):
         REPORTED_WITH_WARNINGS = "reported_with_warnings", bi("Reported with warnings", "مُبلَّغ مع تحذيرات")
         REJECTED = "rejected", bi("Rejected", "مرفوض")
 
+    class TaxPointBasis(models.TextChoices):
+        # R100 as amended (G6, G7): which date the tax point was taken from.
+        SUPPLY = "supply", bi("Supply date", "تاريخ التوريد")
+        SUPPLY_END = "supply_end", bi("End of the supply period", "نهاية فترة التوريد")
+        PAYMENT = "payment", bi("Payment or advance received", "استلام الدفعة أو الدفعة المقدمة")
+        ISSUE = "issue", bi("Issue date", "تاريخ الإصدار")
+        MANUAL = "manual", bi("Entered by hand, with a reason", "مُدخل يدويًا مع السبب")
+        LEGACY = "legacy", bi("Issue date (set by migration, not computed)", "تاريخ الإصدار (من الترحيل، غير محسوب)")
+
     class Retention(models.TextChoices):
         STANDARD = "standard", bi("Standard (6 years)", "عادي (6 سنوات)")
         REAL_ESTATE = "capital_asset_real_estate", bi("Real estate capital asset (15 years)", "أصل عقاري (15 سنة)")
@@ -763,6 +772,29 @@ class SalesDocument(Tracked, Snapshot, Guarded):
     )
     supply_date = models.DateField(bi("Supply date", "تاريخ التوريد"), null=True, blank=True)
     supply_end_date = models.DateField(bi("Supply end date", "تاريخ نهاية التوريد"), null=True, blank=True)
+    payment_received_date = models.DateField(
+        bi("Payment or advance received on", "تاريخ استلام الدفعة أو الدفعة المقدمة"), null=True, blank=True,
+        help_text=bi("First payment or advance received for this supply, if before the invoice (tax point, R100)",
+                     "أول دفعة أو دفعة مقدمة مستلمة عن هذا التوريد إن سبقت الفاتورة (نقطة الاستحقاق الضريبي)"),
+    )
+    tax_point_date = models.DateField(
+        bi("Tax point date", "تاريخ الاستحقاق الضريبي"), null=True, blank=True,
+        help_text=bi("Earliest of supply (end of the supply period), issue and payment; notes: their own date. "
+                     "Decides the VAT return period and the SAMA rate for VAT in SAR (R100, G6, G7)",
+                     "الأسبق من التوريد (نهاية فترة التوريد) والإصدار والدفع؛ الإشعارات: تاريخها. يحدد فترة الإقرار "
+                     "وسعر البنك المركزي لضريبة القيمة المضافة بالريال"),
+    )
+    tax_point_basis = models.CharField(bi("Tax point taken from", "مصدر تاريخ الاستحقاق الضريبي"), max_length=10,
+                                       choices=TaxPointBasis.choices, blank=True)
+    tax_point_reason = models.TextField(
+        bi("Reason for the tax point entered by hand", "سبب إدخال تاريخ الاستحقاق الضريبي يدويًا"), blank=True)
+    payment_order_date = models.DateField(
+        bi("Payment order date", "تاريخ أمر الدفع"), null=True, blank=True,
+        help_text=bi("Government customers (B2G, VAT IR Art. 20(5)): ZATCA TaxPointDate (BR-KSA-92); required before "
+                     "a standard document is issued (G1)",
+                     "العملاء الحكوميون (المادة 20(5) من اللائحة التنفيذية): تاريخ الاستحقاق الضريبي لدى الهيئة؛ "
+                     "مطلوب قبل إصدار المستند القياسي"),
+    )
     due_date = models.DateField(bi("Due date", "تاريخ الاستحقاق"), null=True, blank=True)
     currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Currency", "العملة"))
@@ -776,6 +808,12 @@ class SalesDocument(Tracked, Snapshot, Guarded):
                      "يُثبَّت عند الاعتماد: يُرحَّل المستند بهذا السعر"),
     )
     sar_rate = models.DecimalField(bi("Rate to SAR (ZATCA)", "سعر الصرف إلى الريال (للهيئة)"), **RATE)
+    vat_sar_exchange_rate = models.ForeignKey(
+        "ledger.ExchangeRate", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("SAMA rate row for VAT in SAR", "سجل سعر البنك المركزي لضريبة القيمة المضافة بالريال"),
+        help_text=bi("Pinned at approval: the SAMA rate on the tax point (R100, G7)",
+                     "يُثبَّت عند الاعتماد: سعر البنك المركزي في تاريخ الاستحقاق الضريبي"),
+    )
     payment_means_code = models.CharField(bi("Payment means", "وسيلة الدفع"), max_length=3, blank=True,
                                           choices=PaymentMeans.choices)
     original_document = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT,
