@@ -75,7 +75,7 @@ def test_r14_signature_over_raw_hash_verifies_and_is_der():
 
 
 def _values(**over):
-    v = dict(seller_name="شركة", vat_number="311111111100003", timestamp="2026-10-15T07:00:00Z", total="115.00",
+    v = dict(seller_name="شركة", vat_number="311111111100003", timestamp="2026-10-15T10:00:00", total="115.00",
              vat_total="15.00", invoice_hash="A" * 44, signature_b64="B" * 96, public_key_der=b"\x30" * 88,
              certificate_signature=b"\x30" * 71)
     v.update(over)

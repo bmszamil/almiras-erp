@@ -161,8 +161,9 @@ def test_at14_simplified_qr_tags_1_to_9(live):
     assert tags[1].decode() == "شركة TST1 للاختبار"  # Arabic seller name
     assert tags[2] == b"311111111100003"
     xml = xml_of(einv)
-    # tag 3 = emitted (Riyadh) IssueDate "T" IssueTime "Z"; with or without "Z" is open (R-15, OQ-18; R3.4.8 §3.1)
-    assert tags[3].decode() == f"{text(xml, '/*/cbc:IssueDate')}T{text(xml, '/*/cbc:IssueTime')}Z"
+    # tag 3 = exactly the emitted (Riyadh) IssueDate "T" IssueTime, no "Z" (R-15; SDK R3.4.8 / R4.0.0, §7.3)
+    assert tags[3].decode() == f"{text(xml, '/*/cbc:IssueDate')}T{text(xml, '/*/cbc:IssueTime')}"
+    assert not tags[3].endswith(b"Z") and b"+" not in tags[3]
     assert tags[4].decode() == text(xml, "/*/cac:LegalMonetaryTotal/cbc:PayableAmount") == "115.00"  # BT-115
     assert tags[5] == b"15.00"
     assert tags[6].decode() == einv.invoice_hash and len(tags[6]) == 44
@@ -216,6 +217,8 @@ def test_at14_standard_qr_comes_from_the_cleared_xml(live):
     tags = qr.decode(einv.qr_tlv)
     assert sorted(tags) == list(range(1, 9)) and qr.missing_tags(tags, simplified=False) == []  # no tag 9
     assert einv.qr_tlv == ubl.qr_from_xml(einv.cleared_xml.encode())
+    xml = einv.cleared_xml.encode()  # the fake ZATCA builds tag 3 as the SDK does: no "Z" (R-15)
+    assert tags[3].decode() == f"{text(xml, '/*/cbc:IssueDate')}T{text(xml, '/*/cbc:IssueTime')}"
     doc.refresh_from_db()
     assert doc.zatca_qr == einv.qr_tlv
 

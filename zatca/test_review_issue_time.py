@@ -53,7 +53,7 @@ def test_f4_early_morning_riyadh_keeps_the_riyadh_date(live, at):
     xml = einv.signed_xml.encode()
     assert xml_text(xml, "/*/cbc:IssueDate") == TODAY.isoformat()
     assert xml_text(xml, "/*/cbc:IssueTime") == at.strftime("%H:%M:%S")  # KSA-25 in AST, no suffix
-    assert qr.decode(einv.qr_tlv)[3].decode() == f"{TODAY.isoformat()}T{at:%H:%M:%S}Z"  # R-15; "Z": open (R3.4.8 §3.1)
+    assert qr.decode(einv.qr_tlv)[3].decode() == f"{TODAY.isoformat()}T{at:%H:%M:%S}"  # R-15: no "Z" (§7.3)
     assert xml_text(xml, "//xades:SigningTime") == NOW.strftime("%Y-%m-%dT%H:%M:%SZ")  # SigningTime stays UTC
     name, _ = services.export_archive(einv, user=live.accountant)
     assert name.startswith(f"311111111100003_{TODAY:%Y%m%d}_{at:%H%M%S}_")
@@ -66,7 +66,7 @@ def test_f4_month_end_in_riyadh():
     for name in ("issue_local", "issue_date_text", "issue_time_text", "qr_timestamp"):
         setattr(data, name, getattr(ubl.InvoiceData, name).fget(data))
     assert (data.issue_date_text, data.issue_time_text) == ("2026-11-01", "00:15:00")
-    assert data.qr_timestamp == "2026-11-01T00:15:00Z"
+    assert data.qr_timestamp == "2026-11-01T00:15:00"
     assert rules.archive_file_name("3" * 15, data.issue_date_text, data.issue_time_text, "INV-1") == \
         "333333333333333_20261101_001500_INV-1.xml"
 
@@ -79,4 +79,4 @@ def test_f4_month_end_document_xml(live):
     assert einv.status == "cleared"
     assert xml_text(einv.signed_xml, "/*/cbc:IssueDate") == "2026-10-01"  # UTC would say 2026-09-30
     assert xml_text(einv.signed_xml, "/*/cbc:IssueTime") == "00:15:00"
-    assert qr.decode(einv.qr_tlv)[3] == b"2026-10-01T00:15:00Z"  # ZATCA's QR (fake) from the same fields
+    assert qr.decode(einv.qr_tlv)[3] == b"2026-10-01T00:15:00"  # ZATCA's QR (fake) from the same fields, no "Z"

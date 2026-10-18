@@ -143,12 +143,14 @@ class InvoiceData:
 
     @property
     def qr_timestamp(self):
-        """QR tag 3, built from the emitted IssueDate and IssueTime as R-15 writes it: ``IssueDate "T" IssueTime
-        "Z"``. SDK 2.0.3 accepts exactly that concatenation for an AST IssueTime and refuses the UTC time, the
-        bare local time and ``+03:00``. SDK R3.4.8's generator writes the form **without** ``Z``, but its validator
-        accepts both (SDK R3.4.8 findings §3.1), so the current form is kept; with or without ``Z`` is an open
-        question for the sandbox [SDK-confirm: sandbox] (R-15, OQ-18, OQ-28)."""
-        return f"{self.issue_date_text}T{self.issue_time_text}Z"
+        """QR tag 3 = ``IssueDate "T" IssueTime`` of the emitted XML, **without** ``Z`` (R-15).
+
+        Settled offline by SDK R3.4.8 and R4.0.0 (findings 2026-10-17 §7.3): both generators (``-sign``, ``-qr``)
+        write this form, and both validators print the warning ``timeStamp`` for anything else (``...Z``,
+        ``+03:00``, date only, another time). The warning is only printed when another QR check fails, so
+        ``zatca/test_sdk_offline.py`` forces one (broken tag 7) to make a mismatch visible. IssueTime is AST with no
+        suffix (KSA-25), so tag 3 is that AST text."""
+        return f"{self.issue_date_text}T{self.issue_time_text}"
 
 
 def subtype_code(category, flags):
