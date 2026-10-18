@@ -566,7 +566,7 @@ def _apply_sales_header(doc, fields):
 TaxPoint = SalesDocument.TaxPointBasis
 
 
-def computed_tax_point(doc):
+def _computed_tax_point(doc):
     """G6 (PSG §11.3; TIR §4.2.3): (date, basis) of a sales document's tax point.
 
     An invoice: the earliest of its supply date (for a supply over a period, i.e. with ``supply_end_date``, the end
@@ -588,7 +588,7 @@ def computed_tax_point(doc):
 def _refresh_tax_point(doc):
     """Keep a draft's tax point computed (R100); a tax point entered by hand stays until it is cleared."""
     if doc.tax_point_basis != TaxPoint.MANUAL:
-        doc.tax_point_date, doc.tax_point_basis = computed_tax_point(doc)
+        doc.tax_point_date, doc.tax_point_basis = _computed_tax_point(doc)
         doc.tax_point_reason = ""
 
 
@@ -640,7 +640,7 @@ def _tax_point_problems(doc):
     return []
 
 
-def is_b2g(doc):
+def _is_b2g(doc):
     """R117 (G1; zatca R-54): a standard invoice or note to a ``government`` customer (VAT IR Art. 20(5))."""
     return (doc.zatca_profile == SalesDocument.Profile.STANDARD
             and doc.customer.customer_kind == Customer.Kind.GOVERNMENT)
@@ -657,7 +657,7 @@ PAYMENT_ORDER_REQUIRED = (
 def _payment_order_problems(doc):
     """R117 (G1): no B2G standard document is issued without its payment order date; the ZATCA queue also holds
     one that has none (zatca R-54, BR-KSA-92)."""
-    if is_b2g(doc) and not doc.payment_order_date:
+    if _is_b2g(doc) and not doc.payment_order_date:
         return [" / ".join(PAYMENT_ORDER_REQUIRED)]
     return []
 
