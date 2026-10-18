@@ -54,7 +54,8 @@ BEGIN
             RAISE EXCEPTION 'charity recipient %: approved only with its own board approval, by a second person (C3, C5)', OLD.id;
         END IF;
         IF OLD.is_active AND NEW.is_active AND changed <@ approval_cols
-           AND board.kind = CASE WHEN OLD.approved_by_id IS NULL THEN 'approval' ELSE 'reapproval' END THEN
+           AND ((OLD.approved_by_id IS NULL AND board.kind = 'approval')
+                OR (OLD.approved_by_id IS NOT NULL AND board.kind = 'reapproval')) THEN
             RETURN NEW;
         END IF;
         IF NOT OLD.is_active AND NEW.is_active AND OLD.reactivation_requested_by_id IS NOT NULL

@@ -3315,7 +3315,8 @@ def approve_charity_recipient(recipient, *, user, board_minute_reference=None, b
     today = _today()
     reference, board_on, expires = _board_approval_fields(board_minute_reference, board_approved_on, today)
     with transaction.atomic():
-        recipient = CharityRecipient.objects.select_for_update().select_related("board_approval").get(pk=recipient.pk)
+        recipient = CharityRecipient.objects.select_for_update(of=("self",)).select_related("board_approval").get(
+            pk=recipient.pk)
         extra = {}
         if not recipient.is_active:
             if recipient.reactivation_requested_by_id is None:
