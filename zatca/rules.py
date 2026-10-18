@@ -281,4 +281,40 @@ def otp_ok(otp):
     return isinstance(otp, str) and len(otp) == 6 and otp.isascii() and otp.isdigit()
 
 
-SERIAL_RE = re.compile(r"^1-[^|]+\|2-[^|]+\|3-[^|]+\Z")
+# CSR serial ``1-...|2-...|3-...`` (SFIS p.16); no "=" anywhere (SDK R3.4.8 / R4.0.0, findings 2026-10-17 §7.3).
+SERIAL_RE = re.compile(r"^1-[^|=]+\|2-[^|=]+\|3-[^|=]+\Z")
+
+# CSR values: the SDK refuses any of these in CN, OU, O, location and industry ("specialCharacterRegex"
+# ``[!@#$%&*_<]``, findings 2026-10-17 §7.3). Arabic text is accepted.
+CSR_SPECIAL_CHARS = "!@#$%&*_<"
+CSR_SPECIAL_RE = re.compile(r"[!@#$%&*_<]")
+CSR_FIELDS = (  # (key, English label, Arabic label) in the order of the subject / SAN
+    ("common_name", "common name (CN, from the EGS code)", "الاسم الشائع (من رمز وحدة الفوترة)"),
+    ("org_unit", "branch name (OU)", "اسم الفرع"),
+    ("org_name", "entity legal name (O)", "الاسم القانوني للكيان"),
+    ("location", "location", "الموقع"),
+    ("industry", "industry", "النشاط"),
+)
+TIN_RE = re.compile(r"^[0-9]{10}\Z")
+
+
+def is_vat_group(vat_number):
+    """The organization identifier's 11th digit is 1 (SFIS Table 1 p.16; SDK CsrGenerationService)."""
+    return len(vat_number or "") == 15 and vat_number[10] == "1"
+
+
+def csr_value_problems(*, common_name, org_unit, org_name, location, industry, vat_number):
+    """Refusals ZATCA's CSR checks would give, checked before ``crypto.build_csr`` (findings 2026-10-17 §3.6, §7.3):
+    none of ``! @ # $ % & * _ <`` in CN, OU, O, location and industry; for a VAT group (11th digit 1) OU is the
+    member's 10-digit TIN. One message per field, naming it in English and Arabic."""
+    values = {"common_name": common_name, "org_unit": org_unit, "org_name": org_name, "location": location,
+              "industry": industry}
+    problems = []
+    for key, en, ar in CSR_FIELDS:
+        found = "".join(dict.fromkeys(c for c in (values[key] or "") if c in CSR_SPECIAL_CHARS))
+        if found:
+            code, msg_en, msg_ar = local("csr_chars", field_en=en, field_ar=ar, chars=" ".join(found))
+            problems.append((f"{code}_{key}", msg_en, msg_ar))
+    if is_vat_group(vat_number) and not TIN_RE.match(org_unit or ""):
+        problems.append(local("vat_group_ou"))
+    return problems

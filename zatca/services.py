@@ -404,13 +404,18 @@ def create_egs_unit(entity, *, user, code, name_en, name_ar, serial_number, indu
     if missing or not (supports_standard or supports_simplified):
         raise ZatcaError(f"All CSR fields are mandatory (DTG p.29): {', '.join(missing) or 'invoice type'}.",
                          f"جميع حقول طلب الشهادة إلزامية: {', '.join(missing) or 'نوع الفواتير'}.", code="egs_fields")
+    if "=" in (serial_number or ""):  # the SDK's first serial check (findings 2026-10-17 §7.3)
+        _, en, ar = local("serial_equals")
+        raise ZatcaError(en, ar, code="serial")
     if not rules.SERIAL_RE.match(serial_number or ""):
         raise ZatcaError("The EGS serial number is 1-<solution>|2-<model>|3-<serial> (SFIS p.16).",
                          "الرقم التسلسلي لوحدة الفوترة بالصيغة 1-الحل|2-الطراز|3-التسلسل.", code="serial")
-    return _save(EgsUnit(entity=entity, code=code, name_en=name_en, name_ar=name_ar, serial_number=serial_number,
-                         industry=industry, location=location, supports_standard=supports_standard,
-                         supports_simplified=supports_simplified, branch_name_en=branch_name_en,
-                         branch_name_ar=branch_name_ar, created_by=user, source=_source(user)))
+    egs = EgsUnit(entity=entity, code=code, name_en=name_en, name_ar=name_ar, serial_number=serial_number,
+                  industry=industry, location=location, supports_standard=supports_standard,
+                  supports_simplified=supports_simplified, branch_name_en=branch_name_en,
+                  branch_name_ar=branch_name_ar, created_by=user, source=_source(user))
+    _check_csr_values(egs, entity)  # at input time, so a bad value never waits until ZATCA refuses the CSR
+    return _save(egs)
 
 
 def _egs_transition(egs, new):
@@ -431,17 +436,30 @@ def _profile_of(entity):
     return profile
 
 
+def _csr_subject(egs, entity):
+    """CN, OU, O, location and industry of the unit's CSR (§3.2 mapping)."""
+    return {"common_name": f"EGS-{egs.code}-{entity.vat_number}",
+            "org_unit": egs.branch_name_en or egs.branch_name_ar or egs.name_en,
+            "org_name": entity.legal_name_en or entity.legal_name_ar, "location": egs.location,
+            "industry": egs.industry}
+
+
+def _check_csr_values(egs, entity):
+    """§3.2 / R-5: refuse what ZATCA's CSR checks refuse (special characters; VAT-group OU), en/ar, naming the
+    field. Run when the unit is created and again before every CSR (the entity's legal name may have changed)."""
+    problems = rules.csr_value_problems(vat_number=entity.vat_number, **_csr_subject(egs, entity))
+    if problems:
+        _raise_problems(problems, "csr_values")
+
+
 def _new_key_and_csr(egs, environment):
     """R-6 / R-10: a new key pair generated in the ERP; the private key goes only to the secret store."""
     entity = egs.entity
+    _check_csr_values(egs, entity)  # before any key is generated or written
     master = _master_ref(entity)
     key = crypto.generate_private_key()
-    csr = crypto.build_csr(
-        key, common_name=f"EGS-{egs.code}-{entity.vat_number}",
-        org_unit=egs.branch_name_en or egs.branch_name_ar or egs.name_en,
-        org_name=entity.legal_name_en or entity.legal_name_ar, serial_number=egs.serial_number,
-        vat_number=entity.vat_number, invoice_type=egs.invoice_type_flag, location=egs.location,
-        industry=egs.industry, environment=environment)
+    csr = crypto.build_csr(key, serial_number=egs.serial_number, vat_number=entity.vat_number,
+                           invoice_type=egs.invoice_type_flag, environment=environment, **_csr_subject(egs, entity))
     ref = keystore.get_store().write_private_key(keystore.private_key_path(entity.code, egs.code),
                                                  crypto.private_key_pem(key), master)
     del key

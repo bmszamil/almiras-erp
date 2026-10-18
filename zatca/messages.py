@@ -170,6 +170,24 @@ LOCAL = {
                          "sent; it is not issued or posted and needs attention (R-22).",
                          "تختلف تجزئة الفاتورة المعتمدة التي أعادتها الهيئة عن تجزئة المستند المرسل؛ لم يصدر ولم يُرحَّل "
                          "ويحتاج إلى متابعة."),
+    # CSR input checks (SDK R3.4.8 / R4.0.0 CsrGenerationService; findings 2026-10-17 §7.3), before build_csr.
+    "csr_chars": ("The {field_en} for the ZATCA certificate request contains {chars}; ZATCA refuses any of "
+                  "! @ # $ % & * _ < in CN, OU, O, location and industry. Change it before onboarding.",
+                  "يحتوي {field_ar} في طلب شهادة الهيئة على {chars}؛ ترفض الهيئة أيًا من الرموز ! @ # $ % & * _ < في "
+                  "الاسم الشائع والفرع واسم المنشأة والموقع والنشاط. عدّله قبل التسجيل."),
+    "serial_equals": ("The EGS serial number must not contain '=' (ZATCA: special characters ('=') are not allowed).",
+                      "يجب ألا يحتوي الرقم التسلسلي لوحدة الفوترة على الرمز '='."),
+    "vat_group_ou": ("The VAT number's 11th digit is 1 (VAT group): the branch name used as OU in the certificate "
+                     "request must be the 10-digit TIN of the group member whose unit is onboarded.",
+                     "الخانة الحادية عشرة من الرقم الضريبي 1 (مجموعة ضريبية): يجب أن يكون اسم الفرع المستخدم في طلب "
+                     "الشهادة هو الرقم المميز المكون من 10 أرقام لعضو المجموعة الذي تُسجَّل وحدته."),
+    # B2G under VAT IR Art. 20(5) (KSA-40, BT-7; R4.0.0 rules BR-KSA-91 / -92).
+    "buyer_legal_form": ("On a standard document the buyer's company legal form (KSA-40) can only be GOV, for a "
+                         "government buyer (BR-KSA-91).",
+                         "في المستند القياسي لا يكون الشكل القانوني للمشتري إلا GOV لجهة حكومية."),
+    "tax_point_date": ("A standard document to a government buyer (legal form GOV) needs the tax point date, i.e. the "
+                       "payment order date (BT-7, BR-KSA-92; VAT IR Art. 20(5)).",
+                       "يحتاج المستند القياسي لجهة حكومية إلى تاريخ نقطة الضريبة، وهو تاريخ أمر الدفع."),
     "no_egs": ("No active EGS unit of this entity can sign this category of document.",
                "لا توجد وحدة فوترة نشطة لهذا الكيان توقّع هذه الفئة من المستندات."),
 }
