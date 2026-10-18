@@ -1046,6 +1046,14 @@ class PurchaseDocument(Tracked, Guarded):
     vendor_total_vat = models.DecimalField(bi("VAT on the vendor document", "الضريبة في مستند المورد"), **DOC_MONEY)
     vendor_total_gross = models.DecimalField(bi("Total on the vendor document", "الإجمالي في مستند المورد"),
                                              **DOC_MONEY)
+    # tax-returns C12 (TIR §4.2.2): the VAT in SAR printed on a foreign-currency tax invoice; the VAT return reports
+    # it in box 7, and the booking-rate difference shows only in the return's tie-out.
+    vendor_vat_sar = models.DecimalField(
+        bi("VAT in SAR on the vendor document", "الضريبة بالريال في مستند المورد"), max_digits=18, decimal_places=2,
+        null=True, blank=True,
+        help_text=bi("Foreign-currency bills: the SAR VAT amount shown on the supplier's tax invoice",
+                     "فواتير العملات الأجنبية: مبلغ الضريبة بالريال كما في فاتورة المورد الضريبية"),
+    )
     reverse_charge = models.BooleanField(bi("Reverse charge", "احتساب عكسي"), default=False)
     total_net = models.DecimalField(bi("Total net", "الإجمالي الصافي"), **DOC_MONEY)
     total_vat = models.DecimalField(bi("VAT charged by the vendor", "الضريبة التي فرضها المورد"), **DOC_MONEY)

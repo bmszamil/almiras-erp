@@ -1758,7 +1758,7 @@ def _vat_free_category(doc, line):
 
 
 PURCHASE_HEADER_FIELDS = {"vendor_document_date", "accounting_date", "due_date", "vendor_total_vat",
-                          "vendor_total_gross", "vendor_vat_number"}
+                          "vendor_total_gross", "vendor_vat_number", "vendor_vat_sar"}
 
 
 @transaction.atomic
@@ -1770,6 +1770,8 @@ def update_purchase_document(document, *, user, **fields):
     for name, value in fields.items():
         if name in ("vendor_total_vat", "vendor_total_gross"):
             value = _money(value, name, currency=doc.currency)
+        elif name == "vendor_vat_sar" and value is not None:  # SAR, 2 decimals (tax-returns C12)
+            value = _money(value, name, currency="SAR")
         setattr(doc, name, value)
     _touch(doc, user)
     doc.save()
