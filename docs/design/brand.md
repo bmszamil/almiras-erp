@@ -64,7 +64,10 @@ So: orange is never used for small text. Primary buttons are **navy with white o
 
 - Arabic text right-aligned; line height 130 % for headings, 185 % for body text; natural letter spacing (no tracking).
 - The first line of a major title may be orange; the rest navy on light, sand on dark.
-- **Licensing:** Bricolage Grotesque is under the SIL Open Font License and may be self-hosted. **HT Rakik is a commercial typeface**: the ERP may use it only once Almiras confirms a web/app licence that allows self-hosting it on the ERP server. Until then the UI falls back to **IBM Plex Sans Arabic** (OFL) for Arabic and body text, keeping the same weights (Medium / Light). The font files are not committed to the repository.
+- **Licensing:** Bricolage Grotesque is under the SIL Open Font License and may be self-hosted. **HT Rakik (Hadi Type) is licensed to Almiras under Hadi Type's *Desktop Font License*** (licence PDF shared by the owner on 2026-10-18). It allows installing the font on up to 5 owned devices and making print, branding and PDF material, but **does not allow** converting it to web formats (WOFF/WOFF2) without a separate web licence, distributing or sharing the font files, or using it in open-source environments. The ERP is an open-source web application that serves fonts to every browser, so it **must not** ship or serve HT Rakik under this licence. The font files are therefore not in the repository or on the ERP servers.
+  - **Until Almiras buys a Hadi Type web (or app) licence** that covers self-hosting in this application, the UI uses **IBM Plex Sans Arabic** (OFL) in Medium and Light for Arabic and body text, plus Bricolage Grotesque Bold for English headlines and figures.
+  - Generated PDFs (invoices, reports) follow the same rule: they may embed HT Rakik only if the server holds a licensed copy, which the desktop licence does not permit; they use IBM Plex Sans Arabic as well.
+  - To switch: obtain the web licence from Hadi Type, place the licensed WOFF2 files on the server outside git (deployment secret/asset store), and set `--alm-font-ar` to HT Rakik first.
 
 ## Layout and shape
 
