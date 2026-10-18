@@ -134,6 +134,12 @@ _PERMS = [
        "إضافة الجهات الخيرية المستفيدة وإيقافها"),
     _p("invoicing.approve_charity_recipient", "Approve charity recipients", "اعتماد الجهات الخيرية المستفيدة",
        APPROVAL, SEGREGATED),
+    # Owner decisions 2026-10-18: C2, the CFO approves (= posts) the funding of the purification account, never its
+    # recorder; C4, an accounting user marks purification bank instructions exported or sent.
+    _p("invoicing.approve_purification_funding", "Approve purification account fundings",
+       "اعتماد تمويل حساب التطهير", APPROVAL, POSTS),
+    _p("invoicing.mark_purification_instruction_sent", "Mark purification bank instructions exported or sent",
+       "تعليم أوامر صرف التطهير البنكية كمُصدَّرة أو مُرسلة"),
     _p("invoicing.view", "View invoicing", "عرض الفوترة", AGENT_OK),
     _p("invoicing.view_personal_data", "View personal data", "عرض البيانات الشخصية"),
     # billing

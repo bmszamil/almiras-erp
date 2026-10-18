@@ -242,8 +242,17 @@ ROLE_SEED_V9 = {
     "viewer": _plus(ROLE_SEED_V8, "viewer", "migration.view"),
     "managing_partner": _plus(ROLE_SEED_V8, "managing_partner", "migration.view", "migration.approve_account_map"),
 }
+# V10 (migration core.0019, owner decisions 2026-10-18 C2 and C4; invoicing R54): the CFO (approver) approves the
+# funding of the purification account (the Managing Partner too, as fallback approver holding every A permission,
+# OQ-1); the accountant marks purification bank instructions exported or sent.
+ROLE_SEED_V10 = {
+    **ROLE_SEED_V9,
+    "approver": _plus(ROLE_SEED_V9, "approver", "invoicing.approve_purification_funding"),
+    "managing_partner": _plus(ROLE_SEED_V9, "managing_partner", "invoicing.approve_purification_funding"),
+    "accountant": _plus(ROLE_SEED_V9, "accountant", "invoicing.mark_purification_instruction_sent"),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V9
+ROLE_SEED = ROLE_SEED_V10
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
