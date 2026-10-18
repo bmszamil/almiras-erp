@@ -225,3 +225,15 @@ def test_at149_approval_refuses_a_b2g_document_without_the_date(w, monkeypatch):
         approve(w, doc)
     assert "BR-KSA-92" in messages(exc)
     assert SalesDocument.objects.get(pk=doc.pk).number == ""
+
+
+@pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL triggers")
+def test_at146_database_keeps_an_issued_tax_point_and_payment_order_date(w):
+    from django.db import DatabaseError, transaction
+
+    issued = approve(w, invoice(w, issue_date=date(2027, 1, 10)))
+    for column, value in (("tax_point_date", date(2027, 1, 1)), ("tax_point_basis", "manual"),
+                          ("payment_order_date", date(2027, 1, 1)), ("sar_rate", D("2"))):
+        with pytest.raises(DatabaseError), transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute(f"UPDATE invoicing_salesdocument SET {column} = %s WHERE id = %s", [value, issued.pk])
+    assert SalesDocument.objects.get(pk=issued.pk).tax_point_date == date(2027, 1, 10)
