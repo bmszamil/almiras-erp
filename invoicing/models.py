@@ -1413,12 +1413,15 @@ class PurificationTransfer(Tracked, Guarded):
 
     ``transfer`` (E14): Dr 4900 / Cr 2600 for flagged income still to purify (``ledger.purification_amount``).
     ``funding`` (D31b): Dr 1140 / Cr operating bank: the cash behind 2600 moves into the entity's designated
-    purification account (``banking.BankAccount.is_purification_account``), up to what was transferred and not yet
-    funded. ``payout`` (E15, D31b): Dr 2600 / Cr 1140 from the purification account to one approved, active
-    :class:`CharityRecipient`; it produces a :class:`PurificationInstruction` for the bank. Recorded by a person and
-    posted by a **second** person (the ledger refuses the recorder): transfers and fundings with
-    ``invoicing.post_purification_transfer``, payouts with ``invoicing.approve_purification_payout`` (CFO). Never by
-    an agent. Amount, timing and the recipient list's Sharia sign-off stay OQ-30. Amounts are in SAR (functional).
+    purification account (``banking.BankAccount.is_purification_account``), up to what is owed on 2600 and not yet
+    in 1140. Under IFRS 1140 is restricted cash (IAS 7): money in it never returns to the company; a funding is
+    reversed only to correct an error (owner decision C6). ``payout`` (E15, D31b): Dr 2600 / Cr 1140 from the
+    purification account to one approved, active, unexpired :class:`CharityRecipient`; it produces a
+    :class:`PurificationInstruction` for the bank. Recorded by a person and posted by a **second** person (the
+    ledger refuses the recorder): transfers with ``invoicing.post_purification_transfer``, fundings with
+    ``invoicing.approve_purification_funding`` (CFO, owner decision C2), payouts with
+    ``invoicing.approve_purification_payout`` (CFO). Never by an agent. The rules apply to every entity, Sharia-
+    enforcing or not (C1). Amounts are in SAR (functional).
     """
 
     class Kind(models.TextChoices):
@@ -1504,14 +1507,18 @@ def _stored_values(obj):
 
 
 class CharityRecipient(models.Model):
-    """An approved charity recipient of purification payouts (R54 amendment D31b), per entity.
+    """An approved charity recipient of purification payouts (R54 amendment D31b; owner decisions C3, C5), per entity.
 
     Added by the accountant (``invoicing.manage_charity_recipient``) and approved by a Managing Partner who did not
-    add it (``invoicing.approve_charity_recipient``, A + S!). Only approved, active recipients are paid. The Saudi
-    IBAN (``SA`` + 22 digits, valid mod-97) is stored encrypted with a keyed hash and its last four characters
-    (banking R4); lists show it masked, unmasked views need ``banking.view_iban`` and are logged. Once approved, a
-    recipient never changes; it can only be deactivated (then it is never used again). Sharia board sign-off of the
-    list stays OQ-30. PostgreSQL trigger: migration 0022.
+    add it (``invoicing.approve_charity_recipient``, A + S!), who records the **board** approval of the charity list
+    (:class:`CharityBoardApproval`: minute reference and date, C5). The approval expires 12 months after the board
+    approval (``approval_expires_on``, C3); an expired recipient receives no payout until the Managing Partner
+    records a new board approval (re-approval resets the clock). Alerts go out 30 and 7 days before expiry. A
+    deactivated recipient is reactivated, without re-entry, when the accountant requests it and a second person (the
+    Managing Partner, not the requester) records a board approval. The Saudi IBAN (``SA`` + 22 digits, valid mod-97)
+    is stored encrypted with a keyed hash and its last four characters (banking R4); lists show it masked, unmasked
+    views need ``banking.view_iban`` and are logged. Names, bank and IBAN never change. PostgreSQL triggers:
+    migrations 0022 and 0024.
     """
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
@@ -1536,11 +1543,27 @@ class CharityRecipient(models.Model):
                                        related_name="+", verbose_name=bi("Deactivated by", "أوقفه"))
     deactivated_at = models.DateTimeField(bi("Deactivated at", "تاريخ الإيقاف"), null=True, blank=True)
     deactivation_reason = models.CharField(bi("Deactivation reason", "سبب الإيقاف"), max_length=300, blank=True)
+    # C3, C5 (owner answers 2026-10-18): the last board approval recorded and when it expires (12 months after it).
+    board_approval = models.ForeignKey(
+        "invoicing.CharityBoardApproval", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Last board approval", "آخر اعتماد من مجلس الإدارة"))
+    approval_expires_on = models.DateField(
+        bi("Approval expires on", "تنتهي صلاحية الاعتماد في"), null=True, blank=True,
+        help_text=bi("12 months after the last board approval; no payout on or after this date",
+                     "بعد 12 شهرًا من آخر اعتماد لمجلس الإدارة؛ لا صرف في هذا التاريخ أو بعده"))
+    reactivation_requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Reactivation requested by", "طلب إعادة التفعيل"))
+    reactivation_requested_at = models.DateTimeField(bi("Reactivation requested at", "تاريخ طلب إعادة التفعيل"),
+                                                     null=True, blank=True)
+    reactivation_reason = models.CharField(bi("Reactivation reason", "سبب إعادة التفعيل"), max_length=300, blank=True)
 
     objects = _ServiceOnlyQuerySet.as_manager()
 
-    APPROVAL_FIELDS = frozenset({"approved_by_id", "approved_at"})
+    APPROVAL_FIELDS = frozenset({"approved_by_id", "approved_at", "board_approval_id", "approval_expires_on"})
     DEACTIVATION_FIELDS = frozenset({"is_active", "deactivated_by_id", "deactivated_at", "deactivation_reason"})
+    REACTIVATION_REQUEST_FIELDS = frozenset({"reactivation_requested_by_id", "reactivation_requested_at",
+                                             "reactivation_reason"})
 
     class Meta:
         base_manager_name = "objects"  # review fix 6: _base_manager.update/bulk writes are refused too
@@ -1555,11 +1578,21 @@ class CharityRecipient(models.Model):
                                    name="charity_recipient_approval_complete"),
             models.CheckConstraint(condition=~models.Q(approved_by=models.F("created_by")),
                                    name="charity_recipient_approver_not_creator"),
+            models.CheckConstraint(condition=models.Q(board_approval__isnull=True)
+                                   | models.Q(approved_by__isnull=False, approval_expires_on__isnull=False),
+                                   name="charity_recipient_board_approval_complete"),
+            models.CheckConstraint(condition=models.Q(reactivation_requested_by__isnull=True)
+                                   | models.Q(is_active=False, reactivation_requested_at__isnull=False),
+                                   name="charity_recipient_reactivation_request_inactive"),
         ]
 
     @property
     def is_approved(self):
         return self.approved_by_id is not None
+
+    def is_expired(self, on):
+        """C3: no board approval recorded, or its 12 months have run out on ``on``."""
+        return self.approval_expires_on is None or self.approval_expires_on <= on
 
     @property
     def masked_iban(self):
@@ -1575,22 +1608,130 @@ class CharityRecipient(models.Model):
                         "تتغير الجهات الخيرية المستفيدة من خلال خدمات الفوترة فقط.", code="service_only")
         stored = _stored_values(self)
         if stored is None and (self.approved_by_id is not None or self.approved_at is not None or not self.is_active
-                               or self.deactivated_by_id is not None or self.deactivated_at is not None):
+                               or self.deactivated_by_id is not None or self.deactivated_at is not None
+                               or self.board_approval_id is not None or self.approval_expires_on is not None
+                               or self.reactivation_requested_by_id is not None):
             raise error("A charity recipient is added unapproved and active; a second person approves it (D31b).",
                         "تُضاف الجهة الخيرية المستفيدة غير معتمدة ونشطة؛ ويعتمدها شخص آخر.", code="recipient_immutable")
         if stored is not None:
             changed = {name for name, value in stored.items() if getattr(self, name) != value}
-            approving = (stored["approved_by_id"] is None and changed <= self.APPROVAL_FIELDS
-                         and self.approved_by_id is not None and stored["is_active"])
+            board = (self.board_approval_id is not None and self.approved_by_id is not None
+                     and self.approval_expires_on is not None and self.board_approval_id != stored["board_approval_id"])
+            # first approval or re-approval (C3: resets the 12 months), with a new board approval (C5)
+            approving = (stored["is_active"] and self.is_active and changed <= self.APPROVAL_FIELDS and board)
             deactivating = stored["is_active"] and not self.is_active and changed <= self.DEACTIVATION_FIELDS
-            if changed and not (approving or deactivating):
-                raise error("A charity recipient never changes; it is approved once or deactivated (D31b).",
-                            "لا تتغير الجهة الخيرية المستفيدة؛ تُعتمد مرة واحدة أو تُوقف.", code="recipient_immutable")
+            requesting = (not stored["is_active"] and not self.is_active and stored["reactivation_requested_by_id"] is None
+                          and self.reactivation_requested_by_id is not None
+                          and changed <= self.REACTIVATION_REQUEST_FIELDS)
+            reactivating = (not stored["is_active"] and self.is_active and board
+                            and stored["reactivation_requested_by_id"] is not None
+                            and self.reactivation_requested_by_id is None and self.deactivated_by_id is None
+                            and changed <= self.APPROVAL_FIELDS | self.DEACTIVATION_FIELDS
+                            | self.REACTIVATION_REQUEST_FIELDS)
+            if changed and not (approving or deactivating or requesting or reactivating):
+                raise error("A charity recipient never changes; it is approved (again) with a board approval, "
+                            "deactivated or reactivated (D31b, C3).",
+                            "لا تتغير الجهة الخيرية المستفيدة؛ تُعتمد (من جديد) باعتماد مجلس الإدارة أو تُوقف أو يُعاد "
+                            "تفعيلها.", code="recipient_immutable")
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
         raise error("Charity recipients are never deleted; deactivate them.", "لا تُحذف الجهات الخيرية المستفيدة؛ أوقفها.",
                     code="recipient_immutable")
+
+
+class CharityBoardApproval(models.Model):
+    """The board's approval of a charity recipient (owner decision C5, 2026-10-18), recorded by the Managing Partner
+    (``invoicing.approve_charity_recipient``; never the person who added the recipient, nor, for a reactivation, the
+    person who asked for it). One row per first approval, re-approval (C3: every 12 months) and reactivation;
+    ``expires_on`` is 12 months after ``board_approved_on``. A reactivation keeps the deactivation it ended and the
+    request. Rows are written once and never change or go away (PostgreSQL trigger: migration 0024)."""
+
+    class Kind(models.TextChoices):
+        APPROVAL = "approval", bi("First approval", "الاعتماد الأول")
+        REAPPROVAL = "reapproval", bi("Re-approval (every 12 months)", "إعادة الاعتماد (كل 12 شهرًا)")
+        REACTIVATION = "reactivation", bi("Reactivation of a deactivated recipient", "إعادة تفعيل جهة موقوفة")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    recipient = models.ForeignKey(CharityRecipient, on_delete=models.PROTECT, related_name="board_approvals",
+                                  verbose_name=bi("Charity recipient", "الجهة الخيرية المستفيدة"))
+    kind = models.CharField(bi("Kind", "النوع"), max_length=12, choices=Kind.choices)
+    minute_reference = models.CharField(bi("Board minute reference", "مرجع محضر مجلس الإدارة"), max_length=100)
+    board_approved_on = models.DateField(bi("Approved by the board on", "تاريخ اعتماد مجلس الإدارة"))
+    expires_on = models.DateField(bi("Expires on", "تاريخ انتهاء الاعتماد"))
+    previous_expires_on = models.DateField(bi("Previous expiry", "تاريخ الانتهاء السابق"), null=True, blank=True)
+    recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                    verbose_name=bi("Recorded by (approver)", "سجّله (المعتمد)"))
+    recorded_at = models.DateTimeField(bi("Recorded at", "تاريخ التسجيل"), auto_now_add=True)
+    requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                     related_name="+", verbose_name=bi("Reactivation requested by", "طلب إعادة التفعيل"))
+    request_reason = models.CharField(bi("Reactivation reason", "سبب إعادة التفعيل"), max_length=300, blank=True)
+    ended_deactivation_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
+                                              on_delete=models.PROTECT, related_name="+",
+                                              verbose_name=bi("Deactivated by", "أوقفه"))
+    ended_deactivation_at = models.DateTimeField(bi("Deactivated at", "تاريخ الإيقاف"), null=True, blank=True)
+    ended_deactivation_reason = models.CharField(bi("Deactivation reason", "سبب الإيقاف"), max_length=300,
+                                                 blank=True)
+
+    objects = _ServiceOnlyQuerySet.as_manager()
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("charity board approval", "اعتماد مجلس الإدارة لجهة خيرية")
+        verbose_name_plural = bi("charity board approvals", "اعتمادات مجلس الإدارة للجهات الخيرية")
+        ordering = ["recipient", "-board_approved_on", "-pk"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(expires_on__gt=models.F("board_approved_on")),
+                                   name="charity_board_approval_expires_after"),
+            models.CheckConstraint(condition=models.Q(requested_by__isnull=True)
+                                   | ~models.Q(requested_by=models.F("recorded_by")),
+                                   name="charity_board_approval_second_person"),
+            models.CheckConstraint(condition=~models.Q(minute_reference=""), name="charity_board_approval_minute"),
+        ]
+
+    def __str__(self):
+        return f"{self.recipient_id} {self.kind} {self.minute_reference} {self.board_approved_on}"
+
+    def save(self, *args, **kwargs):
+        allowed, self._service_write = getattr(self, "_service_write", False), False
+        if not allowed or self.pk is not None:
+            raise error("Board approvals are recorded once through invoicing.services and never change (C5).",
+                        "يُسجَّل اعتماد مجلس الإدارة مرة واحدة من خلال خدمات الفوترة ولا يتغير.",
+                        code="board_approval_immutable")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error("Board approvals are never deleted (C5).", "لا تُحذف اعتمادات مجلس الإدارة.",
+                    code="board_approval_immutable")
+
+
+class CharityRecipientAlert(models.Model):
+    """In-app alert that a charity recipient's approval expires soon (owner decision C3: 30 and 7 days before), for
+    the entity's people who add or approve recipients. Written by the ``invoicing_charity_recipient_alerts`` job,
+    once per recipient, expiry, threshold and person. Text: the charity's name and the date, never its IBAN."""
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    charity_recipient = models.ForeignKey(CharityRecipient, on_delete=models.PROTECT, related_name="expiry_alerts",
+                                          verbose_name=bi("Charity recipient", "الجهة الخيرية المستفيدة"))
+    addressee = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                  verbose_name=bi("For", "إلى"))
+    expires_on = models.DateField(bi("Approval expires on", "تنتهي صلاحية الاعتماد في"))
+    days_before = models.PositiveSmallIntegerField(bi("Days before expiry", "أيام قبل الانتهاء"))
+    text_en = models.TextField(bi("Text (English)", "النص (بالإنجليزية)"))
+    text_ar = models.TextField(bi("Text (Arabic)", "النص (بالعربية)"))
+    language = models.CharField(bi("Language", "اللغة"), max_length=2, default="en")
+    created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
+
+    class Meta:
+        verbose_name = bi("charity recipient expiry alert", "تنبيه انتهاء اعتماد جهة خيرية")
+        verbose_name_plural = bi("charity recipient expiry alerts", "تنبيهات انتهاء اعتماد الجهات الخيرية")
+        ordering = ["-created_at", "-pk"]
+        constraints = [models.UniqueConstraint(fields=["charity_recipient", "addressee", "expires_on", "days_before"],
+                                               name="charity_recipient_alert_once")]
+
+    @property
+    def text(self):
+        return self.text_ar if self.language == "ar" else self.text_en
 
 
 class PurificationInstruction(models.Model):
@@ -1604,8 +1745,9 @@ class PurificationInstruction(models.Model):
     class Status(models.TextChoices):
         PENDING = "pending", bi("Pending (to send to the bank)", "معلقة (للإرسال إلى البنك)")
         CANCELLED = "cancelled", bi("Cancelled (payout reversed)", "ملغاة (عُكس الصرف)")
-        # Placeholders for the bank file (banking OQ-2, invoicing OQ-64(d)): nothing sets them yet. Once an
-        # instruction is exported its payout is never reversed.
+        # Owner decision C4 (2026-10-18): an accounting user marks an instruction exported (to a bank file) and/or
+        # sent (``invoicing.mark_purification_instruction_sent``); a bank connection may come later (banking OQ-2).
+        # Once an instruction is exported or sent its payout is never reversed.
         EXPORTED = "exported", bi("Exported to a bank file", "مُصدَّرة في ملف بنكي")
         SENT = "sent", bi("Sent to the bank", "مُرسلة إلى البنك")
 
@@ -1644,10 +1786,20 @@ class PurificationInstruction(models.Model):
                                      related_name="+", verbose_name=bi("Cancelled by", "ألغاه"))
     cancelled_at = models.DateTimeField(bi("Cancelled at", "تاريخ الإلغاء"), null=True, blank=True)
     cancel_reason = models.CharField(bi("Cancellation reason", "سبب الإلغاء"), max_length=300, blank=True)
+    exported_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="+", verbose_name=bi("Marked exported by", "علّمها مُصدَّرة"))
+    exported_at = models.DateTimeField(bi("Marked exported at", "تاريخ تعليمها مُصدَّرة"), null=True, blank=True)
+    sent_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                related_name="+", verbose_name=bi("Marked sent by", "علّمها مُرسلة"))
+    sent_at = models.DateTimeField(bi("Marked sent at", "تاريخ تعليمها مُرسلة"), null=True, blank=True)
+    bank_reference = models.CharField(bi("Bank reference (optional)", "مرجع البنك (اختياري)"), max_length=100,
+                                      blank=True)
 
     objects = _ServiceOnlyQuerySet.as_manager()
 
     CANCEL_FIELDS = frozenset({"status", "cancelled_by_id", "cancelled_at", "cancel_reason"})
+    EXPORT_FIELDS = frozenset({"status", "exported_by_id", "exported_at"})
+    SEND_FIELDS = frozenset({"status", "sent_by_id", "sent_at", "bank_reference"})
 
     class Meta:
         base_manager_name = "objects"  # review fix 6: _base_manager.update/bulk writes are refused too
@@ -1670,14 +1822,25 @@ class PurificationInstruction(models.Model):
                         "تُكتب الأوامر البنكية عند ترحيل الصرف أو عكسه فقط.", code="service_only")
         stored = _stored_values(self)
         if stored is None and (self.status != self.Status.PENDING or self.cancelled_by_id is not None
-                               or self.cancelled_at is not None):
+                               or self.cancelled_at is not None or self.exported_by_id is not None
+                               or self.sent_by_id is not None or self.bank_reference):
             raise error("A bank instruction is created pending when its payout posts (D31b).",
                         "يُنشأ الأمر البنكي معلقًا عند ترحيل الصرف.", code="instruction_immutable")
         if stored is not None:
             changed = {name for name, value in stored.items() if getattr(self, name) != value}
             cancelling = (stored["status"] == self.Status.PENDING and self.status == self.Status.CANCELLED
                           and changed <= self.CANCEL_FIELDS)
-            if changed and not cancelling:
+            # C4: pending -> exported -> sent, or pending -> sent; who and when are recorded; the payout stays posted
+            exporting = (stored["status"] == self.Status.PENDING and self.status == self.Status.EXPORTED
+                         and changed <= self.EXPORT_FIELDS and self.exported_by_id is not None
+                         and self.exported_at is not None)
+            sending = (stored["status"] in (self.Status.PENDING, self.Status.EXPORTED) and self.status == self.Status.SENT
+                       and changed <= self.SEND_FIELDS and self.sent_by_id is not None and self.sent_at is not None)
+            if (exporting or sending) and not PurificationTransfer._base_manager.filter(
+                    pk=self.payout_id, status=PurificationTransfer.Status.POSTED).exists():
+                raise error("Only the instruction of a posted payout is exported or sent (C4).",
+                            "يُصدَّر أو يُرسل أمر الصرف المرحّل فقط.", code="instruction_immutable")
+            if changed and not (cancelling or exporting or sending):
                 raise error("A bank instruction never changes; it is only cancelled with its payout's reversal.",
                             "لا يتغير الأمر البنكي؛ يُلغى فقط بعكس الصرف.", code="instruction_immutable")
             if cancelling and not PurificationTransfer._base_manager.filter(

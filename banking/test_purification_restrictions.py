@@ -96,10 +96,10 @@ def test_agents_never_draft_on_the_purification_account(w, accounts):
 
 def test_bank_charges_profit_and_interest_are_allowed_on_the_purification_account(w, accounts):
     pur = funded(w, "100.00")
-    posted_txn(w, pur, "islamic_profit", "20.00", date(2027, 1, 20))  # the account is Islamic (B3: to 4600)
+    posted_txn(w, pur, "islamic_profit", "20.00", date(2027, 1, 20))  # C5: a return on it goes to charity (2600)
     charge = posted_txn(w, pur, "bank_charge", "30.00", date(2027, 1, 25))
     assert bal(w, "1140") == D("90.00") and charge.status == "posted"
-    assert bal(w, "4600") == D("-20.00") and bal(w, "2600") == D("-100.00")
+    assert bal(w, "4600") == D("0") and bal(w, "2600") == D("-120.00")
 
 
 def test_bank_charge_on_an_empty_purification_account_is_refused_fund_first(w, accounts):

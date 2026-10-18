@@ -90,7 +90,7 @@ groups:
       - alert: DailyJobMissed
         expr: |
           time() - almiras_job_last_success_timestamp_seconds{
-            task=~"billing_run|zatca_daily|hr_refresh_status|hr_document_alerts|hr_resignation_deadlines|hr_gosi_exclusion_reminders"
+            task=~"billing_run|zatca_daily|hr_refresh_status|hr_document_alerts|hr_resignation_deadlines|hr_gosi_exclusion_reminders|invoicing_charity_recipient_alerts"
           } > 26 * 3600
         labels: {severity: critical}
         annotations:

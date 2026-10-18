@@ -113,7 +113,8 @@ jobs:
         working-directory: deploy
         run: |
           for c in zatca_process_queue zatca_daily billing_run hr_refresh_status hr_deliver_assignment_events \
-                   hr_document_alerts hr_resignation_deadlines hr_gosi_exclusion_reminders hr_accrue_leave; do
+                   hr_document_alerts hr_resignation_deadlines hr_gosi_exclusion_reminders hr_accrue_leave \
+                   invoicing_charity_recipient_alerts; do
             docker compose run --rm --no-deps -T web /opt/almiras/bin/run-job.sh "$c" -- python manage.py "$c"
           done
           docker compose run --rm --no-deps -T web python /opt/almiras/bin/zatca_deadline_check.py

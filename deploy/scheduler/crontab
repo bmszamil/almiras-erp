@@ -27,6 +27,11 @@
 # R65: GOSI exclusion reminders (the job itself acts on the 25th and the last day of the leaving month), daily.
 20   7    *   *   *     /opt/almiras/bin/run-job.sh hr_gosi_exclusion_reminders --timeout 1800 -- python manage.py hr_gosi_exclusion_reminders
 #
+# --- Invoicing (invoicing.md) ----------------------------------------------------------------------------------
+# R54, owner decision C3: charity recipient approvals expiring in 30 and 7 days, daily (morning, for the accountant
+# and the Managing Partner).
+30   7    *   *   *     /opt/almiras/bin/run-job.sh invoicing_charity_recipient_alerts --timeout 900 -- python manage.py invoicing_charity_recipient_alerts
+#
 # --- Billing (billing.md) -----------------------------------------------------------------------------------
 # R66: daily at 00:30 Asia/Riyadh; exit code non-zero when a run aborted. Missed runs: scheduler-start.sh catch-up.
 30   0    *   *   *     /opt/almiras/bin/run-job.sh billing_run --timeout 3300 -- python manage.py billing_run

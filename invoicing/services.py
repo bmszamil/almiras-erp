@@ -27,7 +27,7 @@ from django.utils import timezone
 
 from core import access
 from core.access import services as access_services
-from core.access.models import AccessLog, Kind
+from core.access.models import AccessLog, Kind, Membership
 from core.models import Currency, Entity, validate_country_code, validate_vat_number
 from core.services import entity_ready_to_issue
 from ledger import fx
@@ -43,7 +43,9 @@ from banking.models import Bank
 from . import zatca_port
 from .models import (
     BUYER_ID_PRIORITY,
+    CharityBoardApproval,
     CharityRecipient,
+    CharityRecipientAlert,
     CustomerReceipt,
     Customer,
     CustomerIdentifier,
@@ -90,7 +92,19 @@ AR, AR_GROUP, AP, AP_GROUP = "1200", "1210", "2100", "2110"
 VAT_OUTPUT, VAT_INPUT, BANK, BANK_CHARGES = "2200", "1310", "1100", "5700"
 WHT_PAYABLE, WHT_BORNE = "2220", "5920"  # PROPOSED accounts (§5, E20 to E22; D29)
 NON_COMPLIANT_INCOME, CHARITY_PAYABLE = "4900", "2600"  # E14, E15
-PURIFICATION_BANK = "1140"  # PROPOSED (D31b, D29): the purification account's GL; only purification rows use it
+PURIFICATION_BANK = "1140"  # approved (owner decision C7): the purification account's GL; only purification rows use it
+# Owner decision C6 (2026-10-18): the IFRS presentation of the purification account (restricted cash, IAS 7).
+PURIFICATION_CASH_NOTE_EN = (
+    "Restricted cash - purification account (1140): money set aside to be paid to charity (non-compliant income and "
+    "any return earned on the account). It is held for charity, cannot be returned to the company and is not "
+    "available for the company's use; it is presented apart from cash and bank and excluded from cash and cash "
+    "equivalents in the statement of cash flows (IAS 7 / IFRS for SMEs section 7), with this disclosure. The "
+    "matching obligation is the charity payable (2600).")
+PURIFICATION_CASH_NOTE_AR = (
+    "نقد مقيد - حساب التطهير (1140): أموال مجنبة لتُصرف للجهات الخيرية (الإيرادات غير المتوافقة وأي عائد على الحساب). "
+    "تُحفظ لصالح الجهات الخيرية ولا تعود إلى الشركة وليست متاحة لاستخدامها؛ تُعرض منفصلة عن النقد والبنوك وتُستبعد "
+    "من النقد وما في حكمه في قائمة التدفقات النقدية (معيار المحاسبة الدولي 7 / القسم 7 من المعيار الدولي للمنشآت "
+    "الصغيرة والمتوسطة) مع هذا الإفصاح. والالتزام المقابل هو المستحق للجهات الخيرية (2600).")
 CONTROL_ACCOUNTS = frozenset({AR, AR_GROUP, AP, AP_GROUP, VAT_OUTPUT, VAT_INPUT, WHT_PAYABLE, PURIFICATION_BANK})
 
 Status = SalesDocument.Status
@@ -2699,10 +2713,20 @@ def wht_return_data(entity, month, *, user):
 
 PURIFICATION_PERMISSION = {
     PurificationTransfer.Kind.TRANSFER: "invoicing.post_purification_transfer",
-    PurificationTransfer.Kind.FUNDING: "invoicing.post_purification_transfer",
+    # owner decision C2 (2026-10-18): the CFO approves the funding of the purification account, never its recorder
+    PurificationTransfer.Kind.FUNDING: "invoicing.approve_purification_funding",
     PurificationTransfer.Kind.PAYOUT: "invoicing.approve_purification_payout",
 }
 PKind = PurificationTransfer.Kind
+# Owner decision C3 (2026-10-18): a charity recipient's approval lasts 12 months from the last board approval;
+# alerts go out 30 and 7 days before it ends.
+CHARITY_APPROVAL_YEARS = 1
+CHARITY_ALERT_DAYS = (30, 7)
+
+
+def _today():
+    """Today in Asia/Riyadh (TIME_ZONE). A function so tests can move the clock."""
+    return timezone.localdate()
 
 
 def _require_person(user, entity, permission):
@@ -2727,7 +2751,9 @@ def _purification_series(entity, exclude_pk=None):
     Flagged lines are the ledger's (R6 amendment); transfers are posted E14 rows (reversed rows never count); the
     2600 Charity payable balance (credits less debits) and the 1140 purification account balance (debits less
     credits) are **all booked lines** on those accounts, so conventional interest credited to 2600 by banking B4
-    is payable, and bank charges or profit booked on 1140 count (review findings 3 and 4)."""
+    is payable, and bank charges booked on 1140 count (review findings 3 and 4). Any return on the purification
+    account itself (Islamic profit or conventional interest) is booked Dr 1140 / Cr 2600 (owner decision C5): it is
+    owed to charity, payable at once and does not change the funding room."""
     deltas = {}
 
     def add(day, index, value):
@@ -2838,8 +2864,9 @@ def _purification_account(entity, user, *, lock=False, recorded=None):
     return account
 
 
-def _purification_recipient(entity, value, *, lock=False):
-    """D31b: one approved, active charity recipient of ``entity``, or ``purification_recipient_not_approved``."""
+def _purification_recipient(entity, value, *, lock=False, on=None):
+    """D31b: one approved, active charity recipient of ``entity``, or ``purification_recipient_not_approved``; C3:
+    its board approval has not expired today nor on the payout date ``on`` (``charity_recipient_expired``)."""
     pk = getattr(value, "pk", value)
     qs = CharityRecipient.objects.filter(pk=pk) if pk else CharityRecipient.objects.none()
     if lock:
@@ -2848,6 +2875,19 @@ def _purification_recipient(entity, value, *, lock=False):
     if recipient is None or recipient.entity_id != entity.pk or not recipient.is_approved or not recipient.is_active:
         raise error("Payouts go only to an approved, active charity recipient of this entity (D31b).",
                     "يُصرف فقط لجهة خيرية مستفيدة معتمدة ونشطة لهذا الكيان.", code="purification_recipient_not_approved")
+    latest = max(filter(None, (_today(), on)))
+    if recipient.is_expired(latest):
+        if recipient.approval_expires_on is None:
+            raise error(f"{recipient.name_en} has no board approval recorded; the Managing Partner records the board's "
+                        "approval (minute reference and date) before it is paid (C5).",
+                        f"لم يُسجَّل اعتماد مجلس الإدارة لـ {recipient.name_ar}؛ يسجّل الشريك المدير اعتماد المجلس (مرجع "
+                        "المحضر وتاريخه) قبل الصرف لها.", code="charity_recipient_expired")
+        raise error(f"The approval of {recipient.name_en} expired on {recipient.approval_expires_on} (12 months after "
+                    "its last board approval); no payout goes to it on or after that date until the Managing Partner "
+                    "records a new board approval (C3).",
+                    f"انتهى اعتماد {recipient.name_ar} في {recipient.approval_expires_on} (بعد 12 شهرًا من آخر اعتماد "
+                    "لمجلس الإدارة)؛ لا يُصرف لها في ذلك التاريخ أو بعده حتى يسجّل الشريك المدير اعتمادًا جديدًا من المجلس.",
+                    code="charity_recipient_expired")
     return recipient
 
 
@@ -2885,7 +2925,7 @@ def _prepare_purification(doc, user, *, lock=False):
                     f"يُصرف فقط من حساب التطهير ({PURIFICATION_BANK}) وليس من {doc.bank_account.code}.",
                     code="purification_account_required")
     doc.bank_account = account.gl_account
-    recipient = _purification_recipient(entity, doc.recipient_id, lock=lock)
+    recipient = _purification_recipient(entity, doc.recipient_id, lock=lock, on=doc.date)
     doc.recipient, doc.recipient_en, doc.recipient_ar = recipient, recipient.name_en, recipient.name_ar
 
 
@@ -3011,10 +3051,12 @@ def _instruction_reference(doc):
 
 
 def post_purification_transfer(transfer, *, user):
-    """Post a recorded transfer or funding (``invoicing.post_purification_transfer``) or payout
+    """Post a recorded transfer (``invoicing.post_purification_transfer``), funding
+    (``invoicing.approve_purification_funding``, the CFO, owner decision C2) or payout
     (``invoicing.approve_purification_payout``, the CFO): E14 / funding / E15 in one step, numbered ``PUR``. The
-    recorder cannot post it (ledger segregation, access R35); agents never (R54). A payout is checked again against
-    the purification account and the recipient (both locked until commit) and produces its bank instruction."""
+    recorder cannot post it (ledger segregation, access R35; approval permissions refuse the recorder too); agents
+    never (R54). A payout is checked again against the purification account and the recipient (both locked until
+    commit; the recipient's board approval must not have expired, C3) and produces its bank instruction."""
     doc = PurificationTransfer.objects.select_related("entity").get(pk=transfer.pk)
     permission = PURIFICATION_PERMISSION[doc.kind]
     _require_person(user, doc.entity, permission)
@@ -3074,7 +3116,9 @@ def reverse_purification_transfer(transfer, *, user, reason, date=None):
     while the payouts or fundings after it would then exceed what was transferred; a funding is not reversed while
     the purification account would then hold less than nothing (reverse the payout first). A reversed payout's
     bank instruction is cancelled. The reversal is dated on the original date if its period is open, else at the
-    start of the first open period after it (R32).
+    start of the first open period after it (R32). Owner decision C6: money in the purification account (1140,
+    restricted cash) never flows back to the company; reversing a funding only corrects an error (wrong amount,
+    date or source account), always here, with a reason, through ``ledger.services.reverse_entry``.
     """
     doc = PurificationTransfer.objects.select_related("entity").get(pk=transfer.pk)
     _require_person(user, doc.entity, "invoicing.reverse_document")
@@ -3224,33 +3268,117 @@ def create_charity_recipient(entity, *, user, name_en, name_ar, iban, bank=None,
     return recipient
 
 
-def approve_charity_recipient(recipient, *, user):
-    """D31b: a Managing Partner (``invoicing.approve_charity_recipient``, A + S!) who did not add the recipient
-    approves it; only then can payouts go to it. People only."""
+def _board_approval_fields(minute_reference, board_approved_on, today):
+    """C5: the board approval the Managing Partner records: a minute reference and the board's date (not in the
+    future, and recent enough that its 12 months have not run out). Returns (reference, date, expires_on)."""
+    reference = (minute_reference or "").strip()
+    if not reference or board_approved_on in (None, ""):
+        raise error("The board approves the charity list: record the board minute reference and the date of the "
+                    "board's approval (C5).",
+                    "يعتمد مجلس الإدارة قائمة الجهات الخيرية: سجّل مرجع محضر المجلس وتاريخ اعتماده.",
+                    code="board_approval_required")
+    if len(reference) > 100:
+        raise error("The board minute reference has at most 100 characters.",
+                    "مرجع محضر مجلس الإدارة بحد أقصى 100 حرف.", code="board_approval_invalid")
+    if not isinstance(board_approved_on, date_type):
+        raise error("The board approval date must be a date.", "تاريخ اعتماد مجلس الإدارة يجب أن يكون تاريخًا.",
+                    code="board_approval_invalid")
+    if board_approved_on > today:
+        raise error(f"The board approval date {board_approved_on} is in the future.",
+                    f"تاريخ اعتماد مجلس الإدارة {board_approved_on} في المستقبل.", code="board_approval_invalid")
+    expires = _plus_years(board_approved_on, CHARITY_APPROVAL_YEARS)
+    if expires <= today:
+        raise error(f"A board approval of {board_approved_on} expired on {expires} (12 months, C3); record a newer "
+                    "board approval.",
+                    f"اعتماد مجلس الإدارة بتاريخ {board_approved_on} انتهى في {expires} (12 شهرًا)؛ سجّل اعتمادًا أحدث.",
+                    code="board_approval_invalid")
+    return reference, board_approved_on, expires
+
+
+def approve_charity_recipient(recipient, *, user, board_minute_reference=None, board_approved_on=None):
+    """D31b, C3, C5: a Managing Partner (``invoicing.approve_charity_recipient``, A + S!) who did not add the
+    recipient records the **board's** approval of it (minute reference and date, :class:`CharityBoardApproval`);
+    only then can payouts go to it, until 12 months after the board's date. People only.
+
+    - an unapproved, active recipient: first approval;
+    - an approved, active recipient (expired or not): re-approval with a later board approval; it resets the 12
+      months (C3);
+    - a deactivated recipient whose reactivation the accountant requested
+      (:func:`request_charity_recipient_reactivation`): reactivation, by a person other than the requester (C3: no
+      re-entry). The deactivation it ends and the request are kept on the board approval row.
+    """
     recipient = CharityRecipient.objects.select_related("entity").get(pk=getattr(recipient, "pk", recipient))
-    _require_person(user, recipient.entity, "invoicing.approve_charity_recipient")
-    access.require(user, recipient.entity, "invoicing.approve_charity_recipient", document=recipient)
+    entity = recipient.entity
+    permission = "invoicing.approve_charity_recipient"
+    _require_person(user, entity, permission)
+    access.require(user, entity, permission, document=recipient)
+    today = _today()
+    reference, board_on, expires = _board_approval_fields(board_minute_reference, board_approved_on, today)
     with transaction.atomic():
-        recipient = CharityRecipient.objects.select_for_update().get(pk=recipient.pk)
-        if recipient.is_approved:
-            raise error("This charity recipient is already approved.", "هذه الجهة الخيرية معتمدة مسبقًا.",
-                        code="already_approved")
+        recipient = CharityRecipient.objects.select_for_update().select_related("board_approval").get(pk=recipient.pk)
+        extra = {}
         if not recipient.is_active:
-            raise error("A deactivated charity recipient is not approved.", "لا تُعتمد جهة خيرية موقوفة.",
-                        code="recipient_inactive")
+            if recipient.reactivation_requested_by_id is None:
+                raise error("A deactivated charity recipient is reactivated only after the accountant asks for it "
+                            "(C3).", "يُعاد تفعيل الجهة الخيرية الموقوفة فقط بعد أن يطلب المحاسب ذلك.",
+                            code="recipient_inactive")
+            if recipient.reactivation_requested_by_id == user.pk:  # C3: a second person approves the reactivation
+                access.deny(user, entity, permission, "self_approval")
+            if CharityRecipient.objects.filter(entity=entity, iban_hash=recipient.iban_hash, is_active=True).exists():
+                raise error("This IBAN is already an active charity recipient of this entity.",
+                            "رقم الآيبان هذا مسجل لجهة خيرية نشطة لهذا الكيان.", code="charity_recipient_invalid")
+            kind = CharityBoardApproval.Kind.REACTIVATION
+            extra = dict(requested_by_id=recipient.reactivation_requested_by_id,
+                         request_reason=recipient.reactivation_reason,
+                         ended_deactivation_by_id=recipient.deactivated_by_id,
+                         ended_deactivation_at=recipient.deactivated_at,
+                         ended_deactivation_reason=recipient.deactivation_reason)
+        elif recipient.is_approved:
+            kind = CharityBoardApproval.Kind.REAPPROVAL
+        else:
+            kind = CharityBoardApproval.Kind.APPROVAL
+        last = recipient.board_approval
+        if kind == CharityBoardApproval.Kind.REACTIVATION:
+            deactivated_on = timezone.localdate(recipient.deactivated_at) if recipient.deactivated_at else None
+            if deactivated_on is not None and board_on < deactivated_on:
+                raise error(f"The recipient was deactivated on {deactivated_on}; its reactivation needs a board "
+                            "approval given on or after that date (C3, C5).",
+                            f"أوقفت الجهة في {deactivated_on}؛ تحتاج إعادة تفعيلها إلى اعتماد من مجلس الإدارة في ذلك "
+                            "التاريخ أو بعده.", code="board_approval_invalid")
+        elif last is not None and board_on <= last.board_approved_on:
+            raise error(f"The last board approval is of {last.board_approved_on}; record a later one to approve the "
+                        "recipient again (C3).",
+                        f"آخر اعتماد لمجلس الإدارة بتاريخ {last.board_approved_on}؛ سجّل اعتمادًا لاحقًا لإعادة "
+                        "الاعتماد.", code="board_approval_invalid")
         if _bank_from_iban(recipient.iban) != recipient.bank or keyed_hash(recipient.iban) != recipient.iban_hash:
             raise error("The recipient's bank is not the bank its IBAN names (positions 5-6); add it again.",
                         "بنك المستفيد ليس البنك الذي يدل عليه رقم الآيبان (الخانتان 5-6)؛ أضفه من جديد.",
                         code="charity_recipient_invalid")
+        board = CharityBoardApproval(entity=entity, recipient=recipient, kind=kind, minute_reference=reference,
+                                     board_approved_on=board_on, expires_on=expires,
+                                     previous_expires_on=recipient.approval_expires_on, recorded_by=user, **extra)
+        board._service_write = True
+        board.save()
+        fields = ["approved_by", "approved_at", "board_approval", "approval_expires_on"]
         recipient.approved_by, recipient.approved_at = user, timezone.now()
+        recipient.board_approval, recipient.approval_expires_on = board, expires
+        if kind == CharityBoardApproval.Kind.REACTIVATION:
+            recipient.is_active = True
+            recipient.deactivated_by = recipient.deactivated_at = None
+            recipient.deactivation_reason = ""
+            recipient.reactivation_requested_by = recipient.reactivation_requested_at = None
+            recipient.reactivation_reason = ""
+            fields += ["is_active", "deactivated_by", "deactivated_at", "deactivation_reason",
+                       "reactivation_requested_by", "reactivation_requested_at", "reactivation_reason"]
         recipient._service_write = True
-        recipient.save(update_fields=["approved_by", "approved_at"])  # never re-encrypts the IBAN
+        recipient.save(update_fields=fields)  # never re-encrypts the IBAN
     return recipient
 
 
 def deactivate_charity_recipient(recipient, *, user, reason):
-    """D31b: stop paying a charity recipient (``invoicing.manage_charity_recipient``). Final: add it again (and have
-    it approved) to pay it later. Payouts already posted keep it."""
+    """D31b: stop paying a charity recipient (``invoicing.manage_charity_recipient``). Payouts already posted keep
+    it. C3: it can be reactivated later without re-entry (:func:`request_charity_recipient_reactivation`, then a
+    board approval recorded by a second person)."""
     recipient = CharityRecipient.objects.select_related("entity").get(pk=getattr(recipient, "pk", recipient))
     _require_person(user, recipient.entity, "invoicing.manage_charity_recipient")
     access.require(user, recipient.entity, "invoicing.manage_charity_recipient")
@@ -3269,6 +3397,95 @@ def deactivate_charity_recipient(recipient, *, user, reason):
     return recipient
 
 
+def request_charity_recipient_reactivation(recipient, *, user, reason):
+    """C3: ask for a deactivated charity recipient to be paid again (``invoicing.manage_charity_recipient``, people
+    only), with a reason. Nothing is re-entered: names, bank and IBAN stay as approved. It becomes active only when a
+    second person records a board approval (:func:`approve_charity_recipient`)."""
+    recipient = CharityRecipient.objects.select_related("entity").get(pk=getattr(recipient, "pk", recipient))
+    _require_person(user, recipient.entity, "invoicing.manage_charity_recipient")
+    access.require(user, recipient.entity, "invoicing.manage_charity_recipient")
+    if not (reason or "").strip():
+        raise error("A reason is required.", "السبب مطلوب.", code="reason_required")
+    with transaction.atomic():
+        recipient = CharityRecipient.objects.select_for_update().get(pk=recipient.pk)
+        if recipient.is_active:
+            raise error("This charity recipient is active; only a deactivated one is reactivated.",
+                        "هذه الجهة الخيرية نشطة؛ يُعاد تفعيل الجهة الموقوفة فقط.", code="recipient_active")
+        if recipient.reactivation_requested_by_id is not None:
+            raise error("Its reactivation was already requested; it waits for the board approval.",
+                        "طُلبت إعادة تفعيلها مسبقًا؛ وهي بانتظار اعتماد مجلس الإدارة.", code="already_requested")
+        if CharityRecipient.objects.filter(entity=recipient.entity, iban_hash=recipient.iban_hash,
+                                           is_active=True).exists():
+            raise error("This IBAN is already an active charity recipient of this entity.",
+                        "رقم الآيبان هذا مسجل لجهة خيرية نشطة لهذا الكيان.", code="charity_recipient_invalid")
+        recipient.reactivation_requested_by, recipient.reactivation_requested_at = user, timezone.now()
+        recipient.reactivation_reason = reason.strip()[:300]
+        recipient._service_write = True
+        recipient.save(update_fields=["reactivation_requested_by", "reactivation_requested_at",
+                                      "reactivation_reason"])
+    return recipient
+
+
+def charity_board_approvals(recipient, *, user):
+    """C5: the board approvals recorded for a charity recipient, newest first (``invoicing.view`` or the approver's
+    right)."""
+    recipient = CharityRecipient.objects.select_related("entity").get(pk=getattr(recipient, "pk", recipient))
+    _require_recipient_view(user, recipient.entity)
+    return CharityBoardApproval.objects.filter(recipient=recipient, entity=recipient.entity)
+
+
+def _alert_addressees(entity):
+    """C3: the people of ``entity`` who add or approve charity recipients (accountant, Managing Partner)."""
+    at = timezone.now()
+    perms = ("invoicing.manage_charity_recipient", "invoicing.approve_charity_recipient")
+    users = {m.user for m in Membership.objects.active(at).filter(entity=entity, role__permission_rows__codename__in=perms)
+             .select_related("user")}
+    return sorted((u for u in users if access_services.kind_of(u) == Kind.HUMAN
+                   and any(access.has(u, entity, perm) for perm in perms)), key=lambda u: u.pk)
+
+
+def send_charity_recipient_alerts(*, today=None, entity=None):
+    """``invoicing_charity_recipient_alerts`` (daily; owner decision C3): for each active, approved charity recipient
+    whose approval expires within 30 days, the first run on or after (expiry − 30) and on or after (expiry − 7)
+    alerts the entity's accountants and Managing Partners once each (only the most urgent threshold reached).
+    Text en/ar with the charity's name and the date, never its IBAN. Returns the number of recipients alerted."""
+    today = today or _today()
+    horizon = today + timedelta(days=max(CHARITY_ALERT_DAYS))
+    qs = CharityRecipient.objects.filter(is_active=True, approved_by__isnull=False, approval_expires_on__gt=today,
+                                         approval_expires_on__lte=horizon).select_related("entity")
+    if entity is not None:
+        qs = qs.filter(entity=entity)
+    alerted = 0
+    for rec in qs.order_by("pk"):
+        days_left = (rec.approval_expires_on - today).days
+        threshold = min(t for t in CHARITY_ALERT_DAYS if days_left <= t)
+        with transaction.atomic():
+            if CharityRecipientAlert.objects.filter(charity_recipient=rec, expires_on=rec.approval_expires_on,
+                                                    days_before__lte=threshold).exists():
+                continue
+            en = (f"{rec.entity.code}: the approval of charity recipient {rec.name_en} expires on "
+                  f"{rec.approval_expires_on} (in {days_left} days). No payout goes to it from that date until the "
+                  "Managing Partner records a new board approval.")
+            ar = (f"{rec.entity.code}: ينتهي اعتماد الجهة الخيرية {rec.name_ar} في {rec.approval_expires_on} (بعد "
+                  f"{days_left} يومًا). لا يُصرف لها من ذلك التاريخ حتى يسجّل الشريك المدير اعتمادًا جديدًا من مجلس "
+                  "الإدارة.")
+            for person in _alert_addressees(rec.entity):
+                profile = access_services.profile_of(person)
+                CharityRecipientAlert.objects.get_or_create(
+                    charity_recipient=rec, addressee=person, expires_on=rec.approval_expires_on,
+                    days_before=threshold,
+                    defaults=dict(entity=rec.entity, text_en=en, text_ar=ar,
+                                  language=(getattr(profile, "preferred_language", "") or "en")))
+            alerted += 1
+    return alerted
+
+
+def charity_recipient_alerts(entity, *, user):
+    """The caller's own charity recipient expiry alerts in ``entity`` (C3), newest first."""
+    _require_recipient_view(user, entity)
+    return CharityRecipientAlert.objects.filter(entity=entity, addressee=user)
+
+
 def _require_recipient_view(user, entity):
     """Recipient lists: ``invoicing.view``, or the approver's own right (the Managing Partner reviews what they
     approve, review finding 8)."""
@@ -3279,10 +3496,12 @@ def _require_recipient_view(user, entity):
 def charity_recipients(entity, *, user, usable_only=False):
     """The entity's charity recipients (``invoicing.view`` or ``invoicing.approve_charity_recipient``); show them
     with :func:`charity_recipient_row` (masked). ``usable_only``: approved and active ones (the only ones a payout
-    accepts)."""
+    accepts: approved, active and not expired, C3)."""
     _require_recipient_view(user, entity)
     qs = CharityRecipient.objects.filter(entity=entity).select_related("bank")
-    return qs.filter(is_active=True, approved_by__isnull=False) if usable_only else qs
+    if usable_only:  # C3: the board approval has not expired
+        return qs.filter(is_active=True, approved_by__isnull=False, approval_expires_on__gt=_today())
+    return qs
 
 
 def charity_recipient_row(recipient, *, user):
@@ -3297,7 +3516,13 @@ def charity_recipient_row(recipient, *, user):
             "iban_bank_ar": getattr(derived, "name_ar", ""), "iban_bank_matches": derived == recipient.bank,
             "iban_bank_verified": bool(getattr(derived, "verified", False)),
             "platform_reference": recipient.platform_reference, "active": recipient.is_active,
-            "approved": recipient.is_approved}
+            "approved": recipient.is_approved,
+            # C3, C5: the board approval and its 12 months; a pending reactivation request
+            "board_minute_reference": getattr(recipient.board_approval, "minute_reference", ""),
+            "board_approved_on": getattr(recipient.board_approval, "board_approved_on", None),
+            "approval_expires_on": recipient.approval_expires_on,
+            "expired": recipient.is_approved and recipient.is_expired(_today()),
+            "reactivation_requested": recipient.reactivation_requested_by_id is not None}
 
 
 def _log_iban_view(user, entity, obj, last4):
@@ -3331,7 +3556,58 @@ def purification_instruction_row(instruction, *, user):
             "beneficiary_en": instruction.beneficiary_name_en,
             "beneficiary_ar": instruction.beneficiary_name_ar, "iban": instruction.masked_iban,
             "reference": instruction.reference, "execution_date": instruction.execution_date,
-            "status": instruction.status}
+            "status": instruction.status, "exported_at": instruction.exported_at, "sent_at": instruction.sent_at,
+            "bank_reference": instruction.bank_reference}
+
+
+def _mark_instruction(instruction, user, status, bank_reference=""):
+    permission = "invoicing.mark_purification_instruction_sent"
+    instruction = PurificationInstruction.objects.select_related("entity").get(
+        pk=getattr(instruction, "pk", instruction))
+    _require_person(user, instruction.entity, permission)
+    access.require(user, instruction.entity, permission)
+    bank_reference = (bank_reference or "").strip()
+    if len(bank_reference) > 100:
+        raise error("The bank reference has at most 100 characters.", "مرجع البنك بحد أقصى 100 حرف.",
+                    code="instruction_invalid")
+    S = PurificationInstruction.Status
+    allowed_from = {S.EXPORTED: (S.PENDING,), S.SENT: (S.PENDING, S.EXPORTED)}[status]
+    with transaction.atomic():
+        _lock_purification(instruction.entity)  # against a reversal of the payout running at the same time
+        instruction = PurificationInstruction.objects.select_for_update().get(pk=instruction.pk)
+        payout = PurificationTransfer.objects.select_for_update(of=("self",)).get(pk=instruction.payout_id)
+        if payout.status != PurificationTransfer.Status.POSTED or instruction.status not in allowed_from:
+            raise error(f"This instruction is {instruction.status} (payout {payout.status}); only a pending "
+                        "instruction is marked exported, and a pending or exported one sent, while its payout stands "
+                        "(C4).",
+                        f"حالة هذا الأمر {instruction.status} (الصرف {payout.status})؛ يُعلَّم الأمر المعلق فقط "
+                        "كمُصدَّر، والمعلق أو المُصدَّر كمُرسل، ما دام الصرف قائمًا.", code="instruction_status")
+        now = timezone.now()
+        instruction.status = status
+        if status == S.EXPORTED:
+            instruction.exported_by, instruction.exported_at = user, now
+            fields = ["status", "exported_by", "exported_at"]
+        else:
+            instruction.sent_by, instruction.sent_at = user, now
+            instruction.bank_reference = bank_reference
+            fields = ["status", "sent_by", "sent_at", "bank_reference"]
+        instruction._service_write = True
+        instruction.save(update_fields=fields)
+    return instruction
+
+
+def mark_purification_instruction_exported(instruction, *, user):
+    """C4: an accounting user (``invoicing.mark_purification_instruction_sent``, people only) marks a pending bank
+    instruction as exported to a bank file. From then on its payout is not reversed (``instruction_exported``).
+    Nothing is sent to a bank from here (an open-banking connection may come later, banking OQ-2)."""
+    return _mark_instruction(instruction, user, PurificationInstruction.Status.EXPORTED)
+
+
+def mark_purification_instruction_sent(instruction, *, user, bank_reference=""):
+    """C4: an accounting user (``invoicing.mark_purification_instruction_sent``, people only) marks a pending or
+    exported bank instruction as sent to the bank (e.g. paid through the bank's portal), with the bank's reference
+    if any. From then on its payout is not reversed."""
+    return _mark_instruction(instruction, user, PurificationInstruction.Status.SENT, bank_reference)
 
 
 def reveal_purification_instruction(instruction, *, user):

@@ -26,6 +26,7 @@ from invoicing.test_purification import (
     CHARITY_IBAN,
     PURIFY_IBAN,
     _posted,
+    board_approve,
     balance,
     cash,
     flagged_invoice,
@@ -287,7 +288,7 @@ def test_approval_refused_when_the_stored_bank_differs_from_the_iban(w):
                     [Bank.objects.get(code="riyad").pk, rec.pk])
         return
     models.QuerySet.update(CharityRecipient.objects.filter(pk=rec.pk), bank=Bank.objects.get(code="riyad"))
-    refused("charity_recipient_invalid", services.approve_charity_recipient, rec, user=managing_partner(w))
+    refused("charity_recipient_invalid", board_approve, w, rec)
 
 
 # --- 9: exported instructions -------------------------------------------------------------------------------------
@@ -296,8 +297,7 @@ def test_payout_with_an_exported_instruction_is_not_reversed(w):
     _, charity = ready(w, "1000.00")
     p = _posted(w, "payout", "100.00", FEB5, recipient=charity)
     instruction = PurificationInstruction.objects.get(payout=p)
-    # nothing sets ``exported`` yet (banking OQ-2, OQ-64(d)): the future bank-file export would
-    models.QuerySet.update(PurificationInstruction.objects.filter(pk=instruction.pk), status="exported")
+    services.mark_purification_instruction_exported(instruction, user=w.accountant)  # owner decision C4
     text = refused("instruction_exported", services.reverse_purification_transfer, p, user=w.accountant,
                    reason="wrong")
     assert "OQ-64(d)" in text
@@ -331,11 +331,15 @@ def test_db_exported_and_sent_are_status_only_steps_and_block_cancellation(w):
     _, charity = ready(w, "1000.00")
     p = _posted(w, "payout", "100.00", FEB5, recipient=charity)
     pk = PurificationInstruction.objects.get(payout=p).pk
-    _db_refused("UPDATE invoicing_purificationinstruction SET status = 'sent' WHERE id = %s", [pk])  # not yet exported
-    _db_refused("UPDATE invoicing_purificationinstruction SET status = 'exported', amount = 1 WHERE id = %s", [pk])
+    # owner decision C4 (invoicing 0024): each step records who and when; pending -> sent directly is allowed too
+    _db_refused("UPDATE invoicing_purificationinstruction SET status = 'sent' WHERE id = %s", [pk])  # who? when?
+    _db_refused("UPDATE invoicing_purificationinstruction SET status = 'exported', exported_by_id = %s, "
+                "exported_at = now(), amount = 1 WHERE id = %s", [w.accountant.pk, pk])
     with connection.cursor() as cursor:
-        cursor.execute("UPDATE invoicing_purificationinstruction SET status = 'exported' WHERE id = %s", [pk])
-        cursor.execute("UPDATE invoicing_purificationinstruction SET status = 'sent' WHERE id = %s", [pk])
+        cursor.execute("UPDATE invoicing_purificationinstruction SET status = 'exported', exported_by_id = %s, "
+                       "exported_at = now() WHERE id = %s", [w.accountant.pk, pk])
+        cursor.execute("UPDATE invoicing_purificationinstruction SET status = 'sent', sent_by_id = %s, "
+                       "sent_at = now() WHERE id = %s", [w.accountant.pk, pk])
     _db_refused("UPDATE invoicing_purificationinstruction SET status = 'pending' WHERE id = %s", [pk])
     refused("instruction_exported", services.reverse_purification_transfer, p, user=w.accountant, reason="wrong")
 

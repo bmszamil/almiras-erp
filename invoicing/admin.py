@@ -21,6 +21,7 @@ from core.admin import EntityScopedAdmin
 
 from . import services
 from .models import (
+    CharityBoardApproval,
     CharityRecipient,
     CustomerReceipt,
     Customer,
@@ -297,11 +298,12 @@ class CharityRecipientAdmin(ReadOnlyScopedAdmin):
     """D31b: IBANs masked here; ``invoicing.services.reveal_charity_recipient_iban`` shows them (logged)."""
 
     list_display = ["entity", "name_en", "name_ar", "bank", "iban_bank", "masked_iban", "platform_reference",
-                    "is_active", "created_by", "approved_by", "approved_at"]
+                    "is_active", "created_by", "approved_by", "approved_at", "approval_expires_on"]
     list_filter = [("entity", admin.RelatedOnlyFieldListFilter), "is_active"]
     fields = ["entity", "name_en", "name_ar", "bank", "iban_bank", "masked_iban", "platform_reference", "is_active",
-              "created_by", "created_at", "approved_by", "approved_at", "deactivated_by", "deactivated_at",
-              "deactivation_reason"]
+              "created_by", "created_at", "approved_by", "approved_at", "board_approval", "approval_expires_on",
+              "deactivated_by", "deactivated_at", "deactivation_reason", "reactivation_requested_by",
+              "reactivation_requested_at", "reactivation_reason"]
     readonly_fields = fields
     status_field = None
 
@@ -318,6 +320,15 @@ class CharityRecipientAdmin(ReadOnlyScopedAdmin):
         return obj.masked_iban
 
 
+class CharityBoardApprovalAdmin(ReadOnlyScopedAdmin):
+    """C5: the board's approvals of charity recipients, recorded by the Managing Partner (read-only)."""
+
+    list_display = ["recipient", "entity", "kind", "minute_reference", "board_approved_on", "expires_on",
+                    "recorded_by", "recorded_at"]
+    list_filter = [("entity", admin.RelatedOnlyFieldListFilter), "kind"]
+    status_field = None
+
+
 class PurificationTransferAdmin(ReadOnlyScopedAdmin):
     list_display = ["number", "entity", "kind", "date", "amount", "recipient", "status", "posted_by"]
     list_filter = [("entity", admin.RelatedOnlyFieldListFilter), "kind", "status"]
@@ -327,7 +338,7 @@ class PurificationInstructionAdmin(ReadOnlyScopedAdmin):
     """D31b: beneficiary IBANs masked; ``reveal_purification_instruction`` shows them (logged)."""
 
     list_display = ["reference", "entity", "amount", "currency", "beneficiary_name_en", "masked_iban",
-                    "execution_date", "status"]
+                    "execution_date", "status", "sent_at"]
     list_filter = [("entity", admin.RelatedOnlyFieldListFilter), "status"]
     exclude = ["beneficiary_iban"]
 
@@ -359,6 +370,7 @@ admin.site.register(ReceivableAllocation, AllocationAdmin)
 admin.site.register(PayableAllocation, AllocationAdmin)
 admin.site.register(InvoicingSettings, SettingsAdmin)
 admin.site.register(CharityRecipient, CharityRecipientAdmin)
+admin.site.register(CharityBoardApproval, CharityBoardApprovalAdmin)
 admin.site.register(PurificationTransfer, PurificationTransferAdmin)
 admin.site.register(PurificationInstruction, PurificationInstructionAdmin)
 for model in (VatRate, VatExemptionReason, NoteReason, IncomeType):

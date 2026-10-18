@@ -62,7 +62,7 @@ ZERO = Decimal("0")
 BOOKED = (JournalEntry.Status.POSTED, JournalEntry.Status.REVERSED)
 BANK_GL_ROOT = "1100"
 # invoicing R54 amendment D31b: the designated purification account is a SAR account with a Saudi IBAN on GL 1140
-# (PROPOSED per D29); GL 1140 is used by that account only.
+# (approved, owner decision C7); GL 1140 is used by that account only.
 PURIFICATION_GL, PURIFICATION_CURRENCY = "1140", "SAR"
 BANK_CHARGES, ISLAMIC_PROFIT, CHARITY_PAYABLE = "5700", "4600", "2600"
 # R28, R29: words by which a bank labels interest or penalties (English and Arabic). A credit so labelled is
@@ -1513,6 +1513,22 @@ DEFAULT_DESCRIPTIONS = {
 }
 
 
+# Owner decision C5 (2026-10-18): any return on the purification account goes to charity (2600), never income.
+PURIFICATION_RETURN_DESCRIPTION = ("Return on the purification account, to charity", "عائد حساب التطهير للجهات الخيرية")
+
+
+def _is_purification(account):
+    """The entity's purification account (D31b): designated, or booked on GL 1140 (used by no other account)."""
+    return account is not None and (account.is_purification_account or account.gl_account.code == PURIFICATION_GL)
+
+
+def _requires_purification(txn):
+    """R28 and owner decision C5: conventional interest anywhere, and any return (Islamic profit) credited on the
+    purification account, is owed to charity (2600) and listed on the purification report."""
+    return txn.kind == Kind_.CONVENTIONAL_INTEREST_CREDIT or (
+        txn.kind == Kind_.ISLAMIC_PROFIT and _is_purification(txn.bank_account))
+
+
 def available_kinds(statement_line, *, user):
     """The bank transaction kinds offered for an unmatched line (R26 to R32). A conventional interest or penalty
     debit has none (R29, OQ-7)."""
@@ -1739,6 +1755,8 @@ def create_bank_transaction(bank_account, *, user, kind, statement_line=None, am
     direction = direction or {Kind_.BANK_CHARGE: "out", Kind_.ISLAMIC_PROFIT: "in",
                               Kind_.CONVENTIONAL_INTEREST_CREDIT: "in"}.get(kind, "")
     en, ar = DEFAULT_DESCRIPTIONS.get(kind, ("Bank transaction", "عملية بنكية"))
+    if kind == Kind_.ISLAMIC_PROFIT and _is_purification(account):  # C5: the return goes to charity
+        en, ar = PURIFICATION_RETURN_DESCRIPTION
     txn = BankTransaction(entity=entity, bank_account=account, kind=kind, currency=account.currency,
                           created_by=user, source=_source(user))
     _apply_txn_fields(txn, dict(
@@ -1747,7 +1765,7 @@ def create_bank_transaction(bank_account, *, user, kind, statement_line=None, am
         intercompany_account=intercompany_account, settles_line=settles_line,
         description_en=(description_en or en)[:300], description_ar=(description_ar or ar)[:300],
     ))
-    txn.requires_purification = kind == Kind_.CONVENTIONAL_INTEREST_CREDIT
+    txn.requires_purification = _requires_purification(txn)
     problems = _txn_problems(txn, user)
     if problems:
         raise _problems(problems, "txn_invalid")
@@ -1811,7 +1829,7 @@ def update_bank_transaction(txn, *, user, **changes):
         if unknown:
             raise error(f"Unknown fields {sorted(unknown)}.", f"حقول غير معروفة {sorted(unknown)}.", code="fields")
         _apply_txn_fields(txn, changes)
-        txn.requires_purification = txn.kind == Kind_.CONVENTIONAL_INTEREST_CREDIT
+        txn.requires_purification = _requires_purification(txn)
         problems = _txn_problems(txn, user)
         if problems:
             raise _problems(problems, "txn_invalid")
@@ -2000,6 +2018,10 @@ def _bank_transaction_lines(document):
     if kind == Kind_.BANK_CHARGE:  # B1, B2: gross to 5700, no VAT split (B8, OQ-13)
         return _pinned(document, [_spec(BANK_CHARGES, "debit", amount, cur, functional, description=label),
                                   _spec(gl, "credit", amount, cur, functional, description=label)])
+    if kind == Kind_.ISLAMIC_PROFIT and _is_purification(account):  # B3a (owner decision C5): to charity, not income
+        return _pinned(document, [_spec(gl, "debit", amount, cur, functional, description=label),
+                                  _spec(CHARITY_PAYABLE, "credit", amount, cur, functional,
+                                        description=f"{label} purification / تطهير")])
     if kind == Kind_.ISLAMIC_PROFIT:  # B3
         return _pinned(document, [_spec(gl, "debit", amount, cur, functional, description=label),
                                   _spec(ISLAMIC_PROFIT, "credit", amount, cur, functional, description=label)])
@@ -2054,11 +2076,13 @@ def _check_bank_transaction_lines(document, lines):
         if acc.sharia_prohibited:
             problems.append(f"Account {acc.code} is Sharia-prohibited (R29). / الحساب {acc.code} محظور شرعًا.")
         if acc.type == Account.Type.INCOME:
-            allowed = (document.kind == Kind_.ISLAMIC_PROFIT and acc.code == ISLAMIC_PROFIT) or (
+            allowed = (document.kind == Kind_.ISLAMIC_PROFIT and acc.code == ISLAMIC_PROFIT
+                       and not _is_purification(document.bank_account)) or (
                 line.line_kind == JournalLine.LineKind.REALISED_FX and acc.code == ledger.FX_GAIN_REALISED)
             if not allowed:
-                problems.append(f"Income account {acc.code} is not a line of a {document.kind}; conventional interest is "
-                                "never income (R28). / حساب الإيراد {acc.code} ليس من بنود هذا النوع؛ الفوائد التقليدية "
+                problems.append(f"Income account {acc.code} is not a line of a {document.kind}; conventional interest, "
+                                "and any return on the purification account, is never income (R28, C5). / حساب "
+                                f"الإيراد {acc.code} ليس من بنود هذا النوع؛ الفوائد التقليدية وأي عائد على حساب التطهير "
                                 "ليست إيرادًا أبدًا.")
         if acc.is_intercompany and line.counterparty_entity_id != document.counterparty_entity_id:
             problems.append(f"Line {acc.code} carries the document's counterparty (rule 6). / البند {acc.code} يحمل الطرف المقابل للمستند.")
@@ -2075,6 +2099,10 @@ def _check_bank_transaction_lines(document, lines):
     if document.kind == Kind_.CONVENTIONAL_INTEREST_CREDIT and not any(
             l.account.code == CHARITY_PAYABLE and l.credit > ZERO for l in lines):
         problems.append("Conventional interest is credited to 2600 for purification (R28). / تُقيد الفوائد التقليدية في 2600 للتطهير.")
+    if document.kind == Kind_.ISLAMIC_PROFIT and _is_purification(document.bank_account) and not any(
+            l.account.code == CHARITY_PAYABLE and l.credit > ZERO for l in lines):
+        problems.append("Any return on the purification account is credited to 2600, payable to charity (C5). / "
+                        "يُقيد أي عائد على حساب التطهير في 2600 مستحقًا للجهات الخيرية.")
     return problems
 
 
@@ -2389,7 +2417,8 @@ def statement_lines(bank_account, *, user):
 
 
 def purification_report(entity, *, user):
-    """R28: posted bank credits of conventional interest booked to 2600 for purification (payout: invoicing E15)."""
+    """R28, C5: posted bank credits of conventional interest, and returns on the purification account, booked to
+    2600 for purification (payout: invoicing E15)."""
     access.require(user, entity, "banking.view")
     rows = BankTransaction.objects.filter(entity=entity, requires_purification=True,
                                           status=TStatus.POSTED).order_by("date", "number")

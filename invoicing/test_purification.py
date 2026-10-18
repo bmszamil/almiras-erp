@@ -51,7 +51,15 @@ def recipient(w, entity=None, *, iban=CHARITY_IBAN, approve=True, adder=None, na
     rec = services.create_charity_recipient(entity or w.alm, user=adder or w.accountant, name_en=name_en,
                                             name_ar=name_ar, bank="alrajhi", iban=iban,
                                             platform_reference="IHSAN-TEST-0001")
-    return services.approve_charity_recipient(rec, user=managing_partner(w)) if approve else rec
+    return board_approve(w, rec) if approve else rec
+
+
+def board_approve(w, rec, *, user=None, on=None, minute="BOARD-2026-07"):
+    """C5: the Managing Partner records the board's approval of ``rec`` (minute reference and date, default today)."""
+    from django.utils import timezone
+
+    return services.approve_charity_recipient(rec, user=user or managing_partner(w), board_minute_reference=minute,
+                                              board_approved_on=on or timezone.localdate())
 
 
 def ready(w, amount="1000.00", on=date(2027, 1, 31), *, fund=True):

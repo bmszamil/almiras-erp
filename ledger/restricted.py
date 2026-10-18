@@ -20,6 +20,10 @@ Registered by the apps that own the rules, from their ``AppConfig.ready()``; the
   must not go below zero); it runs under that lock.
 - ``predicate(entry)`` receives the first entry of the chain (never a reversal) and returns True to allow it.
   ``document_type=""`` allowances apply to entries that are not a document's posting.
+- ``restricted_cash=True`` marks the account as **restricted cash** for presentation (IAS 7 / IFRS for SMEs
+  section 7): reports show it apart and leave it out of cash and cash equivalents available for use;
+  ``presentation_en`` / ``presentation_ar`` is the disclosure note (e.g. 1140, the purification account, owner
+  decision C6). :func:`restricted_cash_codes` lists them for the reporting module.
 """
 from dataclasses import dataclass
 from typing import Callable
@@ -40,6 +44,9 @@ class RestrictedAccount:
     posted_by_ar: str
     lock: Callable | None = None
     check: Callable | None = None
+    restricted_cash: bool = False
+    presentation_en: str = ""
+    presentation_ar: str = ""
 
 
 @dataclass(frozen=True)
@@ -58,12 +65,18 @@ def _not_frozen():
         raise RestrictedAccountError("Restricted accounts are registered from AppConfig.ready() only.")
 
 
-def restrict(code, *, name_en, name_ar, posted_by_en, posted_by_ar, lock=None, check=None):
-    """``posted_by_en`` / ``posted_by_ar``: which entries may post to it, for the refusal message."""
+def restrict(code, *, name_en, name_ar, posted_by_en, posted_by_ar, lock=None, check=None, restricted_cash=False,
+             presentation_en="", presentation_ar=""):
+    """``posted_by_en`` / ``posted_by_ar``: which entries may post to it, for the refusal message.
+    ``restricted_cash``: shown as restricted cash, outside cash and cash equivalents (IAS 7); then the bilingual
+    ``presentation_en`` / ``presentation_ar`` disclosure note is required."""
     _not_frozen()
     if code in _ACCOUNTS:
         raise RestrictedAccountError(f"Account {code} is already restricted.")
-    _ACCOUNTS[code] = RestrictedAccount(code, name_en, name_ar, posted_by_en, posted_by_ar, lock, check)
+    if restricted_cash and not (presentation_en and presentation_ar):
+        raise RestrictedAccountError(f"Restricted cash {code} needs its disclosure note in English and Arabic.")
+    _ACCOUNTS[code] = RestrictedAccount(code, name_en, name_ar, posted_by_en, posted_by_ar, lock, check,
+                                        restricted_cash, presentation_en, presentation_ar)
 
 
 def allow(code, *, document_type, predicate=None):
@@ -73,6 +86,11 @@ def allow(code, *, document_type, predicate=None):
 
 def codes():
     return frozenset(_ACCOUNTS)
+
+
+def restricted_cash_codes():
+    """Account codes presented as restricted cash, excluded from cash and cash equivalents (IAS 7)."""
+    return frozenset(code for code, spec in _ACCOUNTS.items() if spec.restricted_cash)
 
 
 def get(code):

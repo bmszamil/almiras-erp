@@ -19,6 +19,7 @@ from invoicing.test_purification import (
     CHARITY_IBAN,
     PURIFY_IBAN,
     _posted,
+    board_approve,
     cash,
     flagged_invoice,
     managing_partner,
@@ -81,9 +82,8 @@ def test_at103_recipient_added_by_the_accountant_and_approved_by_a_managing_part
     assert exc.value.code == "self_approval"
     with pytest.raises(access.AccessDenied):
         services.approve_charity_recipient(rec, user=make_agent("purifier"))
-    approved = services.approve_charity_recipient(rec, user=managing_partner(w))
+    approved = board_approve(w, rec)
     assert approved.is_approved and approved.approved_by == w.mp
-    refused("already_approved", services.approve_charity_recipient, rec, user=w.mp)
     assert list(services.charity_recipients(w.alm, user=w.viewer, usable_only=True)) == [approved]
 
 
@@ -153,7 +153,7 @@ def test_at103_approved_recipients_never_change_only_deactivate(w):
     refused("recipient_inactive", services.deactivate_charity_recipient, rec, user=w.accountant, reason="again")
     unapproved = recipient(w, approve=False, iban=make_iban("80", "000000000000505555"))
     services.deactivate_charity_recipient(unapproved, user=w.accountant, reason="duplicate")
-    refused("recipient_inactive", services.approve_charity_recipient, unapproved, user=w.mp)
+    refused("recipient_inactive", board_approve, w, unapproved)
 
 
 def test_at103_recipient_lists_are_masked_and_unmasked_views_are_logged(w):

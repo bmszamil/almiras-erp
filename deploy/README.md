@@ -183,6 +183,7 @@ and ownership. Every statement must fail with SQLSTATE 42501; the transaction is
 | 01:15 | `zatca_daily` | zatca R-10, R-23, R-35 |
 | 01:45 on the 1st | `hr_accrue_leave` (previous month) | hr R30 |
 | 07:00 / 07:10 / 07:20 | `hr_document_alerts`, `hr_resignation_deadlines`, `hr_gosi_exclusion_reminders` | hr R43, R41, R65 |
+| 07:30 | `invoicing_charity_recipient_alerts` | invoicing R54 (owner decision C3) |
 | Sunday 05:40 | `bin/dbrole.py verify` | access R45 / AT-47 |
 | 02:00 / 02:30 / Fri 03:00 (backup service) | `pg-backup.sh`, `openbao-snapshot.sh`, `pg-basebackup.sh` | zatca OQ-3 |
 

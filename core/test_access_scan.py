@@ -43,6 +43,8 @@ ALLOW = {
     "invoicing/services.py:anonymise_expired_personal_data": "invoicing_anonymise operator job only (R52; off by "
                                                               "default, dry run unless applied)",
     "hr/services.py:employees": "the scope mechanism for employees (access.scope with hr.view, R2)",
+    "invoicing/services.py:send_charity_recipient_alerts": "invoicing_charity_recipient_alerts job only (owner "
+                                                            "decision C3: expiry alerts 30 and 7 days before)",
     "hr/services.py:get_employee": "the scope mechanism for one employee (get_scoped_or_404 with hr.view, R2)",
     "hr/services.py:param": "reads global statutory reference data (no entity, no personal data; hr R6)",
     # HR operator jobs (management commands, scheduled; hr R4, R25, R30, R43); no user action.

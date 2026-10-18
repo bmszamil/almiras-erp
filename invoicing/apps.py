@@ -41,11 +41,13 @@ class InvoicingConfig(AppConfig):
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._payment_lines, validate_lines=services._check_document_rate,
         )
-        # R54: E14 by a second person with invoicing.post_purification_transfer; E15 approved by the CFO. Both are
-        # corrected by reversal (reverse_purification_transfer) with invoicing.reverse_document.
+        # R54: E14 by a second person with invoicing.post_purification_transfer; the funding (owner decision C2) and
+        # E15 approved by the CFO. All are corrected by reversal (reverse_purification_transfer) with
+        # invoicing.reverse_document.
         documents.register(
             PurificationTransfer,
-            post_permissions={"invoicing.post_purification_transfer", "invoicing.approve_purification_payout"},
+            post_permissions={"invoicing.post_purification_transfer", "invoicing.approve_purification_funding",
+                              "invoicing.approve_purification_payout"},
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._purification_lines,
         )
@@ -60,6 +62,9 @@ class InvoicingConfig(AppConfig):
             posted_by_ar="تمويل حساب التطهير والصرف منه (الفوترة)، والرسوم البنكية والأرباح الإسلامية والفوائد "
                          "التقليدية على حساب التطهير (البنوك)، والأرصدة الافتتاحية المرحّلة، وعكسها",
             lock=services._lock_purification, check=services._purification_gl_check,
+            # owner decision C6: restricted cash under IFRS; it never returns to the company
+            restricted_cash=True, presentation_en=services.PURIFICATION_CASH_NOTE_EN,
+            presentation_ar=services.PURIFICATION_CASH_NOTE_AR,
         )
         restricted.allow(services.PURIFICATION_BANK, document_type="invoicing.purificationtransfer",
                          predicate=services._purification_gl_allowed)

@@ -16,8 +16,9 @@ TEMPLATE = [
     ("1000", "Assets", "الأصول", A, {"header": True}),
     ("1100", "Cash and bank", "النقد وما في حكمه", A, {"monetary": True}),
     ("1110", "Petty cash", "العهد النقدية", A, {"monetary": True}),
-    # PROPOSED (invoicing.md R54 amendment D31b, D29): the designated purification bank account (Saudi IBAN, SAR).
-    # A sub-account of 1100 so banking R5 accepts it as a bank GL account; only the purification account uses it.
+    # Approved by the project owner 2026-10-18 (C7; invoicing.md R54 amendment D31b): the designated purification
+    # bank account (Saudi IBAN, SAR). A sub-account of 1100 so banking R5 accepts it as a bank GL account; only the
+    # purification account uses it. Restricted cash under IFRS (IAS 7, owner decision C6; ledger.restricted).
     ("1140", "Bank – purification account", "البنك – حساب التطهير", A, {"monetary": True, "parent": "1100"}),
     ("1200", "Trade receivables", "الذمم المدينة التجارية", A, {"monetary": True}),
     ("1210", "Due from group entities", "مستحق من شركات المجموعة", A, {"intercompany": True, "monetary": True}),
