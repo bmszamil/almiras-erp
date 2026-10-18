@@ -573,19 +573,22 @@ def test_c10_sales_are_reported_by_tax_point_with_an_issue_date_fallback(t):
     assert services._tax_point(note) == (date(2027, 4, 2), True)  # notes: their own date (X9)
 
 
-@pytest.mark.skipif(__import__("django.db").db.connection.vendor == "postgresql",
-                    reason="clears a stored SAR rate behind invoicing's back; the invoicing triggers refuse it")
 def test_c11_a_foreign_sale_without_a_sar_rate_is_an_exception_not_the_booking_rate(t):
     from invoicing.conftest import usd_rate
     from invoicing.models import SalesDocument
-    from tax.conftest import box
 
     usd_rate(t, "3.75")
     doc = sale(t, [("rent_commercial", "1", "1000.00")], currency="USD")
-    SalesDocument._base_manager.filter(pk=doc.pk).update(sar_rate=None)
-    ret = services.compute_draft(t.alm, Q1, user=t.a1)
-    assert box(ret, 1) == (D("0"), D("0"), D("562.50"))  # no amount from fx_rate; the VAT in SAR stays
-    assert "sar_rate_missing" in {e["kind"] for e in services.exceptions(ret, user=t.a1)}
+    stored = SalesDocument.objects.select_related("original_document").get(pk=doc.pk)
+    stored.sar_rate = None  # in memory only: what the return sees for a document without a stored SAR rate
+    comp = services.Computation()
+    services._sales_sources(comp, t.alm, stored.journal_entry, stored, 1)
+    assert comp.boxes[1] == {"amount": D("0"), "adjustment": D("0"), "vat": D("562.50")}  # no fx_rate amount
+    assert [f["kind"] for f in comp.flags] == ["sar_rate_missing"]
+    stored.sar_rate = D("3.75")
+    comp = services.Computation()
+    services._sales_sources(comp, t.alm, stored.journal_entry, stored, 1)
+    assert comp.boxes[1]["amount"] == D("3750.00") and comp.flags == []
 
 
 def _usd_bill(t, vendor_vat_sar=None):
