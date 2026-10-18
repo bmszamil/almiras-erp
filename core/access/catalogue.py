@@ -234,6 +234,22 @@ _PERMS = [
     _p("migration.manage_account_map", "Draft and edit legacy account maps", "إعداد خرائط حسابات النظام السابق وتعديلها"),
     _p("migration.approve_account_map", "Approve legacy account maps", "اعتماد خرائط حسابات النظام السابق", APPROVAL),
     _p("migration.import", "Validate legacy exports and draft their entries", "فحص ملفات النظام السابق وإعداد مسودات قيودها"),
+    # tax, VAT slice (tax-returns.md §7, R8, R14). Agents may read and compute drafts only (R14). Preparer, reviewer
+    # and approver are three different people (R8, OQ-7: no exception); tax.services enforces reviewer != preparer
+    # and approver != reviewer, the access layer approver != creator / modifier / submitter (A). WHT, Zakat and
+    # income-tax rights (tax.prepare_zakat, tax.manage_shareholders) come with those parts.
+    _p("tax.view", "View tax returns", "عرض الإقرارات الضريبية", AGENT_OK),
+    _p("tax.prepare_return", "Prepare VAT returns and draft tax payments and records", "إعداد الإقرارات الضريبية "
+       "ومسودات الدفعات والسجلات الضريبية", AGENT_OK),
+    _p("tax.review_return", "Review VAT returns", "مراجعة الإقرارات الضريبية"),
+    _p("tax.approve_return", "Approve and lock VAT returns", "اعتماد الإقرارات الضريبية وإقفالها", APPROVAL, POSTS),
+    _p("tax.record_filing", "Record the filing of tax returns", "تسجيل تقديم الإقرارات الضريبية"),
+    _p("tax.approve_payment", "Approve and post tax payments, refunds and import VAT", "اعتماد الدفعات والاستردادات "
+       "الضريبية وضريبة الاستيراد وترحيلها", APPROVAL, POSTS),
+    _p("tax.reverse_document", "Reverse tax documents", "عكس المستندات الضريبية", POSTS),
+    _p("tax.change_settings", "Change tax settings", "تغيير إعدادات الضرائب", APPROVAL),
+    _p("tax.maintain_rates", "Verify statutory tax rates and VAT box definitions",
+       "التحقق من النسب الضريبية النظامية وتعريفات خانات الإقرار"),
 ]
 
 CATALOGUE = {p.codename: p for p in _PERMS}
@@ -274,10 +290,10 @@ SYSTEM_EXTRA = {
 # - create_entry(post=True, document=...): a sub-ledger P grant issued for that document, for a
 #   document type registered in ledger.documents with that permission.
 # - reverse_entry: ledger.reverse_entry for that entry, or invoicing.reverse_document /
-#   banking.reverse_bank_transaction for its document.
+#   banking.reverse_bank_transaction / tax.reverse_document for its document.
 #   Reversal grants only reverse: they never post a new entry.
 REVERSE_PERMISSIONS = frozenset({"ledger.reverse_entry", "invoicing.reverse_document",
-                                 "banking.reverse_bank_transaction"})
+                                 "banking.reverse_bank_transaction", "tax.reverse_document"})
 DRAFT_POST_PERMISSIONS = frozenset({"ledger.post_entry"})
 DOCUMENT_POST_PERMISSIONS = frozenset(c for c, p in CATALOGUE.items() if p.posts) - DRAFT_POST_PERMISSIONS - REVERSE_PERMISSIONS
 POST_PERMISSIONS = DRAFT_POST_PERMISSIONS | DOCUMENT_POST_PERMISSIONS

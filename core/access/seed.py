@@ -251,8 +251,24 @@ ROLE_SEED_V10 = {
     "managing_partner": _plus(ROLE_SEED_V9, "managing_partner", "invoicing.approve_purification_funding"),
     "accountant": _plus(ROLE_SEED_V9, "accountant", "invoicing.mark_purification_instruction_sent"),
 }
+# V11 (migration core.0020, tax-returns.md §7, VAT slice): the accountant prepares returns, payments, refunds and
+# import VAT records, reviews returns it did not prepare, records filings and reverses tax documents; the approver
+# (CFO) reviews, approves and locks returns, approves (posts) payments, refunds and import records, records filings,
+# changes tax settings and verifies box definitions (at the group parent); viewers read; the Managing Partner reads
+# and holds every A permission (fallback approver, OQ-1). No agent role is seeded: agents get tax.view and
+# tax.prepare_return through roles created as data (R14).
+_TAX_APPROVALS = ("tax.approve_return", "tax.approve_payment", "tax.change_settings")
+ROLE_SEED_V11 = {
+    **ROLE_SEED_V10,
+    "accountant": _plus(ROLE_SEED_V10, "accountant", "tax.view", "tax.prepare_return", "tax.review_return",
+                        "tax.record_filing", "tax.reverse_document"),
+    "approver": _plus(ROLE_SEED_V10, "approver", "tax.view", "tax.review_return", *_TAX_APPROVALS,
+                      "tax.record_filing", "tax.maintain_rates"),
+    "viewer": _plus(ROLE_SEED_V10, "viewer", "tax.view"),
+    "managing_partner": _plus(ROLE_SEED_V10, "managing_partner", "tax.view", *_TAX_APPROVALS),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V10
+ROLE_SEED = ROLE_SEED_V11
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
