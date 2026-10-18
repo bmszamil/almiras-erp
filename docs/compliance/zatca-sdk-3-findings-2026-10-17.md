@@ -16,7 +16,7 @@ SDK folders was changed; copies were used. SDK files are not committed (LGPL-3; 
 | Build | Jar | Rules (`Data/Rules/…`) | Usable |
 | --- | --- | --- | --- |
 | `zatca-einvoicing-sdk-Java-238-R3.4.8` | `zatca-einvoicing-sdk-238-R3.4.8.jar`, sha256 `48abeb82…5d530`, 23.9 MB; manifest `Build-Jdk-Spec: 11`, `Main-Class com.zatca.sdk.MainApp`; `application.properties` `sdk.version=3.4.8` (file dated 2025-12-21; ZATCA classes 2024-10 to 2025-03) | `20210819_ZATCA_E-invoice_Validation_Rules.xsl` sha256 `3312e193…0c4` (152 assertions), `CEN-EN16931-UBL.xsl` `378a7a4d…5b0` (105) | fully: validate, sign, generateHash, qr, invoiceRequest, csr |
-| `zatca-einvoicing-sdk-238-R4.0.0` | `zatca-einvoicing-sdk-238-R4.0.0.jar` is **0 bytes** in the share | same file names, sha256 `7dbcd013…8b3` (143) and `9a25eb15…d23` (105) | rules, XSD, samples, readme, config only. R4.0.0 rules were run **with the R3.4.8 jar** (config pointing at the R4.0.0 XSLs); that checks R4.0.0's schematron, not R4.0.0's Java code (QR, signature, hash, PIH checks) |
+| `zatca-einvoicing-sdk-238-R4.0.0` | `zatca-einvoicing-sdk-238-R4.0.0.jar` is **0 bytes** in the share | same file names, sha256 `7dbcd013…8b3` (143) and `9a25eb15…d23` (105) | rules, XSD, samples, readme, config only. R4.0.0 rules were run **with the R3.4.8 jar** (config pointing at the R4.0.0 XSLs); that checks R4.0.0's schematron, not R4.0.0's Java code (QR, signature, hash, PIH checks). **Complete jar received 2026-10-18: results in §7** |
 
 Tools: OpenJDK 21.0.12, Python 3.13, lxml, cryptography; `javap` for reading the jar's ZATCA classes
 (`com.zatca.sdk.*`, `com.gazt.einvoicing.*`).
@@ -73,7 +73,7 @@ Main rule changes relevant to us (R3.4.8 and R4.0.0 agree unless stated):
 
 **Samples.** Both builds: the same 19 valid samples (standard 388 incl. three "Advance Payment adjustments", export,
 exempt, out of scope, self-billing, summary, third party, document charge, payable rounding; simplified 388, nominal,
-zero rated; notes). R4.0.0 adds "Credit Note of a Simplified Tax Invoice" and seven `*_Error` samples. **No sample is a
+zero rated; notes). R4.0.0 adds "Credit Note of a Simplified Tax Invoice" and six `*_Error` samples (corrected 2026-10-18; first written as seven). **No sample is a
 386 itself**; the advance-payment samples are the final 388 that deducts a 386. PDF-A3 copies differ for five samples.
 
 ## 2. Validation results (R3.4.8 jar, SUN+BC; "R4 rules" = R3.4.8 jar with R4.0.0 XSLs)
@@ -83,7 +83,7 @@ Logs and per-file summaries: work dir `…/scratchpad/sdk3-work/out/` (`v348-*`,
 | Set | R3.4.8 | R4 rules |
 | --- | --- | --- |
 | R3.4.8 samples (19) | 19 PASSED (simplified: W BR-KSA-98) | 19 PASSED |
-| R4.0.0 samples (26) | 14 PASSED; 5 fail BR-KSA-EN16931-06 (price-level charge, allowed only in R4 rules); 7 `_Error` fail as intended (BR-CO-04, BR-KSA-84) | 19 PASSED, 7 `_Error` fail as intended (BR-CO-04, BR-KSA-84) |
+| R4.0.0 samples (26) | 16 PASSED; 4 valid samples fail BR-KSA-EN16931-06 (price-level charge, allowed only in R4 rules); 6 `_Error` fail as intended (BR-CO-04, BR-KSA-84) (counts corrected 2026-10-18) | 20 PASSED, 6 `_Error` fail as intended (BR-CO-04, BR-KSA-84) |
 | Kit 2.0.3 fake invoices, SDK-signed (20) | 18 PASSED. Fail: `std-381-noreason` BR-KSA-17 (expected), `std-388-pih2` KSA-13 (expected). `std-381-cnroot` (CreditNote root) fails XSD before signing. `std-386`/`simp-386` **PASS**. `std-tol-5.51` **PASS** with W BR-CO-17/BR-S-09 (2.0.3: error) | same |
 | New fake invoices `inv3/`, SDK-signed (12) | 9 PASSED (386 std/simp, final 388 std/simp, KWD 2-dp std/simp, seller name 127/128/200 bytes). Fail: `std-388-kwd3`, `simp-388-kwd3`, `std-388-kwd3-vat3`: **errors BR-CO-14, BR-CO-15** (+ W BR-DEC-*, BR-KSA-DEC-03/-04, BR-CO-10/-13/-16) | same |
 | **Our zatca code**, signed by the module with the SDK dummy key/cert, default QR layout (DTG), `rfc2253` issuer style (9) | **9 PASSED**: simplified 388, simplified 388 with 2 lines, simplified KWD, simplified with 127-byte Arabic seller name, standard 388, standard KWD, chained 388 → 381 → 383 (PIH checked against each document's own PIH; the SDK only knows one `pih.txt`) | 9 PASSED |
@@ -126,6 +126,8 @@ every SDK sample, SDK-signed kit invoices, and QR variants.
   without suffix (samples: `2022-09-07T15:23:55`, 19 bytes). The validator's mismatch goes to a warnings map that is
   only reported when another QR check fails, so the module's `…T10:00:00Z` and the SDK's no-`Z` form both pass.
   Not settled by the SDK; R-15 / OQ-18: align with the SDK form (no `Z`) unless the sandbox says otherwise.
+  **Update 2026-10-18 (§7.3): the hidden warning does fire for the `Z` form in both R3.4.8 and R4.0.0; the SDK
+  expects tag 3 without `Z`.**
 - **Tag 5** = first `/Invoice/TaxTotal/TaxAmount` (generator XPath). In the foreign-currency advance sample the SAR
   TaxTotal comes first, so tag 5 = 1068.75 SAR. The module puts the document-currency TaxTotal first (R-40), which
   the SDK accepts (`module-simp-388-kwd` PASSED). Which total ZATCA *intends* for FX simplified documents is open.
@@ -230,9 +232,7 @@ missing), §6 (Java provider order SUN, BC).
 
 ## 5. Not verified
 
-- **R4.0.0 Java code**: its jar is 0 bytes. Its QR generator/validator, signature validator, hashing, PIH and CSR
-  checks are unknown; only its schematron/XSD/samples were checked (with the R3.4.8 jar). Get a complete R4.0.0
-  jar (sha256 to record) and re-run `scripts/sdk3/` against it.
+- ~~**R4.0.0 Java code**: its jar is 0 bytes.~~ Done 2026-10-18 with the complete jar, see §7.
 - Which rule set ZATCA's sandbox/production runs (R3.4.8's 9-position KSA-2, BR-KSA-98 etc. vs R4.0.0's KSA-40 `GOV`,
   price-level charges).
 - QR tag 3 with or without `Z`; tag 5 for foreign-currency simplified documents; presence of tags 8/9 (SDK validator
@@ -247,3 +247,102 @@ Kit: `docs/compliance/zatca-sdk-kit/scripts/sdk3/` (see the kit README) and `inv
 then `SDK3_WORK=… scripts/sdk3/validate_all.sh OUT files…`. Module documents: copy
 `scripts/sdk3/sdk3_export_generator.py` as `zatca/test_sdk3_export.py` into a `git archive HEAD` export and run it with `ZATCA_SDK_DIR` and
 `SDK3_OUT` set; validate with `validate_ownpih.sh`.
+
+## 7. R4.0.0 jar results (2026-10-18)
+
+The complete R4.0.0 jar was shared on 2026-10-18 and re-run offline (`unshare -n`, fake data only) from a copy in a
+new work dir (`…/scratchpad/sdk4-work/`; logs and summaries in `out/`). Nothing in the SDK folder was changed. Module
+documents came from a fresh `git archive HEAD` export at **`34c40d1`** (includes 4d4fea6 BER/BT-115/all-tags QR,
+68b2663 prepayment validators, a0c59b9 `PREZATCA-`), generated with `scripts/sdk3/sdk3_export_generator.py`. Runner:
+`scripts/sdk3/fat400.sh` (the batch scripts take `FAT=…/fat400.sh`); new `qr_variants4.py`, `variants4.py`.
+
+### 7.1 The jar
+
+| | R4.0.0 | R3.4.8 (for comparison) |
+| --- | --- | --- |
+| Jar | `zatca-einvoicing-sdk-238-R4.0.0.jar`, 37,094,695 bytes, sha256 `336aad31a2c15fc8d28636b0ec1c75c040e8756dd0bd1ef59f73fbd201c58e85` | 23.9 MB, `48abeb82…5d530` |
+| Build | manifest `Build-Jdk-Spec: 21`; class files **version 65 (Java 21)**; `sdk.version=4.0.0`; ZATCA classes dated 2024-09-10 / 2024-10-22, `application.properties` 2024-09-18 | `Build-Jdk-Spec: 11`, class version 55; classes 2024-10 to 2025-03, properties 2025-12-21 |
+| Libraries | log4j 2.23.1 (log4j 1 gone), santuario xmlsec 4.0.2, ber-tlv 1.0-11, Saxon, BouncyCastle, jackson 2.17, ZATCA modules `*-3.0-SNAPSHOT` | log4j 1.x |
+| ZATCA classes | same 59 classes (one renamed: `InvoiceXmlXPath` → `signing.service.utils.InvoiceXmlXPathClass`); changes are refactoring (methods split out, log4j 2, XML hardening `FEATURE_SECURE_PROCESSING`) plus the points below | — |
+
+- **Java ≥ 21 is required** (class version 65). The bundled readme still says Java "≥11 and <15"; it is stale.
+  OpenJDK 21.0.12 used here.
+- The file dates make R4.0.0 **older** than R3.4.8 by build date (2024-10 vs 2025-12), although its number is
+  higher. Together with the rule differences of §1 (R4.0.0 has KSA-40 `GOV`, R3.4.8 the 9-position KSA-2) this
+  confirms they are different branches, not a superset. Which one ZATCA's servers run is still unverified.
+- **Schematron comes from the config, not the jar.** The jar embeds old leftovers (`schematrons/20210718_…xsl`, the
+  same files as in the R3.4.8 jar) that are not used: the R4.0.0 jar with a config pointing at R3.4.8's XSLs fails
+  the R4.0.0 samples with BR-KSA-EN16931-06 exactly as the R3.4.8 jar did. So "R4 rules" in §2 (R3.4.8 jar + R4.0.0
+  XSLs) and the R4.0.0 jar give **identical summaries on every set run with both** (R4.0.0 samples, R3.4.8 samples,
+  SDK-signed kit/`inv3`): the Java code changes nothing in XSD/EN/KSA results.
+
+### 7.2 Validation results (R4.0.0 jar, JDK default provider order)
+
+| Set | R4.0.0 jar | vs R3.4.8 jar (own rules) |
+| --- | --- | --- |
+| R4.0.0 samples (26) | **20 PASSED**; the 6 `_Error` samples fail as intended (3 simplified: BR-CO-04; 3 standard: BR-KSA-84) | R3.4.8 fails 4 more on BR-KSA-EN16931-06 (price-level charge) |
+| R3.4.8 samples (19) | 19 PASSED, no warnings | R3.4.8: same, plus W BR-KSA-98 on simplified (rule absent in R4.0.0) |
+| Kit 2.0.3 fake invoices, **signed by R4.0.0** (20) | 17 PASSED; expected fails `std-381-noreason` BR-KSA-17, `std-388-pih2` KSA-13; W BR-CO-17/BR-S-09 on `std-tol-5.50`/`-5.51`, W BR-KSA-56 on `std-381-noref`. `std-381-cnroot` (CreditNote root) is refused by `-sign` (QR XPath null; R3.4.8: XSD) | same |
+| `inv3/`, signed by R4.0.0 (12) | 9 PASSED (386 std/simp, final 388 std/simp, KWD 2-dp, seller names 127/128/200 bytes); KWD 3-dp fail **BR-CO-14, BR-CO-15** | same |
+| Kit + `inv3` signed by R3.4.8 (29) | same results as the R4.0.0-signed copies | — |
+| **Our zatca code at `34c40d1`** (9 documents of §2 plus AT-69's `module-simp-388`, `-std-388`, `-simp-388-name200`) | **all PASSED**, every stage, no warnings; chained 381/383 pass with their own PIH and fail KSA-13 against the seed `pih.txt` (as R3.4.8) | R3.4.8: all PASSED (W BR-KSA-98) |
+| `zatca/test_sdk_offline.py` (AT-69) run in the export with `ZATCA_SDK_CMD` → `fat400.sh -validate` | **3 passed** | R3.4.8: 3 passed |
+| QR variants (§3.1 set, rebuilt on R4.0.0-signed documents) | identical to R3.4.8: 2.0.3 layout, raw-DER tag 7 and 1-byte length for a 200-byte name fail; tags 1–6, 1–7, no tag 9, tag 3 `Z` pass; tag 4 = BT-112 passes with W `invoiceTotal` | same |
+| Signature mutations of `module-simp-388` | body change → `invoiceSignedDataDigestValue`/`signatureValue`/QR `hashedXml`; issuer without spaces or reversed → `X509IssuerName`; serial + 1 → `X509SerialNumber`; SignatureValue byte → `signatureValue` + QR `digital signature`; SigningTime edited → `xadesSignedPropertiesDigestValue` | same checks as R3.4.8 |
+
+**Hash (R-13).** R4.0.0 `-sign` hash = R3.4.8 hash = `pyhash.py` on **31/31** unsigned kit/`inv3` documents;
+`pyhash.py` of every R4.0.0-signed output = hash of its unsigned input. The new canonicaliser call
+(`canonicalize(bytes, OutputStream, boolean)`, santuario 4) gives the same bytes. R-13 confirmed for R4.0.0.
+
+**Signature / certificate (R-14).** `analyse3.py` on 66 R4.0.0-era signed documents (26 R4.0.0 samples, 31
+R4.0.0-signed kit/`inv3`, 9 module documents): 66/66 hash = `invoiceSignedData` digest; SignatureValue = DER
+SEQUENCE(r, s) over the raw 32-byte hash, secp256k1; CertDigest = base64(hex(SHA-256(base64 text))); SignedProperties
+digest = the dom4j `asXML()` form; X509IssuerName = `CN=PRZEINVOICESCA4-CA, DC=extgazt, DC=gov, DC=local`. SDK
+`-sign` SigningTime still has no `Z`; the validator still does not check it. The validator's checks are the same
+eight as R3.4.8 (invoice hash, SignedProperties digest, CertDigest, issuer name, serial, signature value,
+certificate, QR). Standard documents still get no signature/QR stage. §3.2/§3.3 hold for R4.0.0 unchanged.
+
+**PIH.** Unchanged: compared with the one configured `pih.txt` (seed literal, identical file).
+
+### 7.3 Items left "unverified because the R4.0.0 jar was missing" — now settled
+
+| Item | R4.0.0 result | Decision |
+| --- | --- | --- |
+| **Java provider order** | R4.0.0 adds BouncyCastle itself (`Security.addProvider(new BouncyCastleProvider())`, appended last) and asks for `Signature.getInstance("SHA256withECDSA", "BC")` explicitly. The **JDK default order passes everything** on Java 21 (all 26 samples, all module documents, AT-69); SUN-first + BC-second (`bc-second.security`) also passes; BC first still fails the 9 simplified samples with `wrong X509IssuerName`. | R4.0.0: plain Java 21, no security file. R3.4.8: keep SUN, BC (its jar does not register BC for verification). Never BC first. |
+| **QR rules** (tags, layout, BER, tag 4, presence) | `QrCodeValidator` and the generator keep R3.4.8's logic and messages; every variant gives the R3.4.8 result (table above). Missing tags 7–9 still pass (not enforced); 1-byte length for >127 bytes fails; tag 4 = BT-115 expected. | §3.1 holds for R4.0.0. Module already conforms (4d4fea6). |
+| **QR tag 3 `Z`** | The tag-3 mismatch goes to a warning map that is printed only when another QR check fails. With a broken tag 7 added (`qr_variants4.py`, `+bad7` twins) the SDK prints **W `timeStamp`** for the module's `…T10:00:00Z`, for `+03:00`, date only and a wrong time, and **no warning only for `IssueDate T IssueTime` without suffix**. R3.4.8 behaves the same (checked on the same pair). The generator (`-sign` and `-qr`) writes the no-suffix form; an `IssueTime` with `Z` is converted to the **JVM's local time** (with `TZ=Asia/Riyadh`, `15:23:55Z` → tag 3 `18:23:55`) and an `IssueTime` with `+03:00` or a 1-digit hour cannot be signed ("missing or invalid invoice issue date/time"). | **Tag 3 = `IssueDate "T" IssueTime`, no `Z`** (module IssueTime is AST without suffix, so tag 3 is that AST text). Settled as far as the SDK goes; the `Z` the module adds today is a mismatch both SDKs flag. |
+| **Tag 5 for foreign-currency simplified documents** | The validator **does not check tag 5 at all** (no `vatTotal` check; `0.01`, the KWD total and the SAR total all pass, with or without another QR error). The generator takes the **first** `/Invoice/TaxTotal/TaxAmount`: re-signing the module's KWD simplified document gives tag 5 = `150.00` (KWD, the module's first TaxTotal, R-40). The SDK's only FX sample (standard, USD) puts the **SAR TaxTotal first** (`1068.75` SAR, no subtotals; then `285` USD with subtotals), so its tag 5 is in SAR. | Not decidable from the SDK: it accepts both. The SDK sample's order suggests SAR first (tag 5 = BT-111). Owner/sandbox decision on R-40 order; no code change until then. |
+| **Signature / certificate checks** | Same checks, same results (§7.2). | §3.2, §3.3 hold. |
+| **Hash** | 31/31 equal to R3.4.8 and `pyhash.py`. | R-13 holds. |
+| **PIH** | Unchanged. | R-12 holds. |
+| **CSR template / CSR checks** | `-csr` → `ZATCA-Code-Signing`, `-nonprod` → `TSTZATCA-Code-Signing`, `-sim` → `PREZATCA-Code-Signing` (decoded from fake CSRs); subject `C, OU, O, CN`, SAN DirectoryName `SN, UID, title, registeredAddress, businessCategory`, ecdsa-with-SHA256, secp256k1 — as R3.4.8. Config checks (same in R3.4.8, now in separate methods; verified with fake configs on both jars): serial must match `1-(.+)\|2-(.+)\|3-(.+)` **and contain no `=`**; organization identifier 15 digits, first and last digit `3`; invoice type `^[01]{4}$`; country 2–3 chars; mandatory fields; for a VAT group (11th digit `1`) OU = 10-digit TIN; **CN, OU, O, location and industry must not contain any of `! @ # $ % & * _ <`** (e.g. `Test & Branch` refused). Arabic O accepted. | Template names: module already right (a0c59b9). Module lacks the `=` and special-character checks (below). |
+| **Prepayment (386)** | Java code has no type-specific path (types are only STANDARD/SIMPLIFIED by KSA-2). 386 std/simp and the final 388 deducting them pass all stages, signed by R4.0.0, simplified ones including QR and signature. | §3.4 holds for R4.0.0. |
+| **B2G (KSA-40 `GOV`)** | `variants4.py` on the kit's std-388: `GOV` without TaxPointDate → **W BR-KSA-92**; `GOV` + `cbc:TaxPointDate` → clean; `LLC` + TaxPointDate → **W BR-KSA-91**; R3.4.8's 9-position KSA-2 `010000001` → **error BR-KSA-06** in R4.0.0 (R3.4.8 instead: error BR-KSA-92, contract ID). The R3.4.8 rules ignore `CompanyLegalForm` (all three pass). Both are warnings, standard (01) documents only. | For Article 20(5) B2G supplies: emit buyer `PartyLegalEntity/cbc:CompanyLegalForm` = `GOV` and `cbc:TaxPointDate` = payment-order date; keep KSA-2 at 7 positions (never the 9-position form). Passes both rule sets. |
+| **Price-level charges (BG-29)** | `Price/AllowanceCharge` with `ChargeIndicator true` (amount 0.00 as in the samples, or 1.00 with BaseAmount 101.00) and with `false` (EN price discount) all pass R4.0.0; R3.4.8 rejects the `true` forms (BR-KSA-EN16931-06), accepts `false`. | Module emits line-level allowances (BG-27) only, no price-level element: nothing to change. Do not emit price-level charges while the server's rule set is unknown. |
+
+### 7.4 zatca code changes still needed (for module-builder; not made here)
+
+| File | Change | Reason |
+| --- | --- | --- |
+| `zatca/ubl.py` (`InvoiceData.qr_timestamp`) | return `f"{issue_date_text}T{issue_time_text}"` without `Z`; update the docstring (settled by R3.4.8 and R4.0.0) | §7.3 tag 3: both SDKs flag the `Z` form (W `timeStamp`); R-15, OQ-18, OQ-28 |
+| `zatca/testing.py` (`FakeZatcaClient`, tag 3 at line ~154) | build tag 3 without `Z` | keep the fake ZATCA consistent with the module |
+| `zatca/test_review_issue_time.py`, `zatca/test_crypto.py` and any test asserting `…Z` in tag 3 | expect the no-suffix form; add a test that tag 3 equals `IssueDate + "T" + IssueTime` of the emitted XML exactly | AT-14 / R-15 |
+| `zatca/test_sdk_offline.py` | docstring and comments: R3.4.8 **or R4.0.0**; with R4.0.0 the JDK default provider order is fine (Java ≥ 21 required), R3.4.8 needs SUN, BC; add `"timeStamp" not in out` to `_passed` and a check with a deliberately broken tag 7 (or parse the warning) so a tag-3 mismatch fails the test instead of hiding | §7.2, §7.3; AT-69 |
+| `zatca/services.py` (`create_egs_unit`) and/or `zatca/rules.py` (`SERIAL_RE`) | refuse `=` in the EGS serial number (SDK: "special characters ('=') are not allowed") | §7.3 CSR checks |
+| `zatca/services.py` (onboarding, before `crypto.build_csr`) or `zatca/rules.py` | refuse CSR values containing `! @ # $ % & * _ <` in CN, OU (branch name), O (`legal_name_en`/`_ar`), location and industry, with an EN/AR message naming the field (a legal name like "X & Co" would otherwise only fail at ZATCA) | §7.3 CSR checks |
+| `zatca/services.py` / `zatca/rules.py` | VAT-group onboarding: if the VAT number's 11th digit is `1`, OU must be the member's 10-digit TIN (today OU = branch name) — only when a VAT-group entity is onboarded | §3.6, §7.3 |
+| `zatca/ubl.py`, customer data (invoicing), `zatca/rules.py` | B2G under Article 20(5): emit buyer `cbc:CompanyLegalForm` `GOV` and `cbc:TaxPointDate` (payment-order date) on standard documents; local check that `GOV` implies BT-7; keep KSA-2 7 positions | §7.3 B2G (BR-KSA-91/-92 warnings; 9-position KSA-2 is an error in R4.0.0) — when the group invoices government buyers |
+| `zatca/ubl.py` (R-40 TaxTotal order) | **decision first, then maybe change**: SDK accepts either; its FX sample puts the SAR TaxTotal first (tag 5 = SAR). If the owner/sandbox chooses SAR, swap the order and take tag 5 from BT-111 | §7.3 tag 5; R-40, OQ-28 |
+| `zatca/qr.py`, `zatca/crypto.py` (docstrings) | mention R4.0.0 alongside R3.4.8 where they cite "settled by R3.4.8" | documentation only |
+
+No change needed for: hash (R-13), signature/XAdES encoding and issuer style (R-14), BER lengths, tags 1–9 and
+tag 4 = BT-115 (R-15, already built), 1000-character cap (R-37), 2-decimal amounts (R-51), CSR template names,
+prepayment validators (R-39), price-level charges.
+
+### 7.5 Still not verified
+
+- Which rule set / build ZATCA's sandbox and production run (R3.4.8 vs R4.0.0 differ in KSA-2 length, B2G rules,
+  BR-KSA-98, price-level charges); the module's documents pass both.
+- Tag 5 currency intent for FX simplified documents; whether 386 is a required compliance sample (OQ-29); OQ-30
+  paths; acceptance of the module's whitespace-free SignedProperties by ZATCA's servers — sandbox.
+- R4.0.0 on Java 11–20: not possible (class version 65); not tested on Java 22+.

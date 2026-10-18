@@ -30,3 +30,16 @@ Findings: `../zatca-sdk-3-findings-2026-10-17.md`. The 2.0.3 scripts above are k
 - `scripts/sdk3/xsl_rules.py` – extracts and diffs the executed schematron assertions of two rule files.
 - `scripts/sdk3/sdk3_export_generator.py` – scratch generator of module-signed documents; copy it as `zatca/test_sdk3_export.py` into a
   `git archive HEAD` export only (never into the repo's `zatca/`), set `ZATCA_SDK_DIR` and `SDK3_OUT`.
+
+R4.0.0 jar run (2026-10-18; findings §7 of the same file):
+
+- `scripts/sdk3/fat400.sh` – runs the R4.0.0 jar offline (`unshare -n`). Needs `SDK4_WORK` = a work dir holding a
+  **copy** of the SDK as `r400/` (with `r400/Configuration/config.json` in absolute paths; rules folder
+  `Data/Rules/schematrons`) and `out/`. Default `PROVIDERS=jdk` (the JDK's own order: R4.0.0 registers BouncyCastle
+  itself); `sunbc` / `bc` as for `fat348.sh`. The jar is Java 21 bytecode (class version 65): Java 21 or later.
+- `sign_all.sh`, `validate_all.sh`, `validate_ownpih.sh` take `FAT=…/fat400.sh` to use R4.0.0 (default `fat348.sh`);
+  for `validate_ownpih.sh` also set `BASE_CONFIG` to the R4.0.0 config.
+- `scripts/sdk3/qr_variants4.py` – QR tag 3 / tag 5 variants of a signed simplified document, each with a broken-tag-7
+  twin (`+bad7`) so the SDK prints the QR warnings it otherwise hides.
+- `scripts/sdk3/variants4.py` – fake B2G (KSA-40 `GOV`, BT-7), 9-position KSA-2 and price-level allowance/charge
+  variants of `inv/std-388.xml`.
