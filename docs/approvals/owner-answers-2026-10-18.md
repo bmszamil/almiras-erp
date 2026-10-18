@@ -70,3 +70,16 @@ Migration later. The journal export already sent is close to the final one. The 
 | F5 | Yes: add pytest-xdist. |
 | F6 | Hosting, domain and key holders: team to propose. |
 | F7 | ZATCA sandbox: team to explain how. |
+
+## G. Decisions taken on the team's recommendations (owner, 2026-10-18: "go with your recommendations on all open decisions")
+
+| # | Decision |
+| --- | --- |
+| G1 | Standard invoices to government customers (B2G, Art. 20(5)): add a **payment order date** field to sales documents; it fills ZATCA TaxPointDate (BR-KSA-92). Until it is entered the document stays held. The tax adviser confirms which government customers fall under Art. 20(5). |
+| G2 | QR tag 5 on foreign-currency simplified invoices: the **VAT total in SAR**, following ZATCA's SDK sample (SAR TaxTotal first). To be confirmed in the sandbox. |
+| G3 | VAT returns keep **three different people** (preparer, reviewer, approver); the top-authority self-approval (A3) does **not** apply to VAT returns. |
+| G4 | VAT returns in the ERP start from each entity's **VAT go-live date**; earlier periods are treated as filed outside the ERP (no overdue alerts, no import required). |
+| G5 | Purification choices confirmed as built: 12 months run from the board approval date; the Managing Partner is the fallback funding approver; an instruction may be marked sent without being exported first; reactivation starts with an accountant's request. |
+| G6 | VAT return period of a sale = its **tax point** (date of supply / earliest of supply, invoice, payment), per PSG §11.3. |
+| G7 | SAR exchange rate for VAT = **SAMA rate on the tax point date** (VAT IR Art. 61; TIR §4.2.2). This replaces B1 (invoice date) and needs no separate adviser opinion; when the tax point is the invoice date the two coincide. |
+| G8 | Group-level settings (global exchange rates, the Sharia switch under dual control) stay group-level; everything else is granted per company (A4). |
