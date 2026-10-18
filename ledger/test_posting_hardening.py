@@ -184,7 +184,7 @@ def test_a_document_books_once_also_with_a_second_grant(w):
         services.create_entry(w.alm, date(2027, 1, 10), "Bill again", CASH, user=w.clerk, post=True, grant=second,
                               document=bill)
     assert not GrantUse.objects.filter(log_id=second.log_id).exists()
-    services.reverse_entry(first, access.require(w.clerk, w.alm, "ledger.reverse_entry", document=first))
+    services.reverse_entry(first, access.require(w.clerk, w.alm, "invoicing.reverse_document", document=bill))
     with pytest.raises(LedgerError, match="already booked"):  # also after its reversal: correct by a new document
         services.create_entry(w.alm, date(2027, 1, 10), "Bill again", CASH, user=w.clerk, post=True, grant=second,
                               document=bill)
@@ -297,6 +297,42 @@ def test_reverse_document_grant_reverses_only_its_documents_entry(w):
     assert exc.value.code == "grant_wrong_document" and status(manual) == "posted"
     rev = services.reverse_entry(booked, grant)
     assert status(booked) == "reversed" and rev.document_ref == ("testdocs.bill", bill7.pk)
+
+
+def test_registered_document_entry_is_never_reversed_with_a_generic_grant(w):
+    """Tax review item 5: ledger.reverse_entry on a registered document's entry is refused (its module reverses it)."""
+    bill7 = doc(Bill, w.alm, created_by=w.clerk)
+    booked = services.create_entry(
+        w.alm, date(2027, 1, 10), "Bill 7", CASH, user=w.clerk, post=True, document=bill7,
+        grant=access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill7),
+    )
+    with pytest.raises(access.AccessDenied) as exc:
+        services.reverse_entry(booked, access.require(w.clerk, w.alm, "ledger.reverse_entry", document=booked))
+    assert exc.value.code == "document_reversal_only" and status(booked) == "posted"
+    assert "عكس المستند" in exc.value.message_ar
+
+
+def test_reverse_guard_lets_only_the_owning_module_reverse(w):
+    from ledger import documents
+
+    bill7 = doc(Bill, w.alm, created_by=w.clerk)
+    booked = services.create_entry(
+        w.alm, date(2027, 1, 10), "Bill 7", CASH, user=w.clerk, post=True, document=bill7,
+        grant=access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill7),
+    )
+    inside = SimpleNamespace(on=False)
+    with documents._registered_for_tests(Bill, post_permissions={"invoicing.approve_bill"},
+                                         reverse_permissions={"invoicing.reverse_document"},
+                                         validate_lines=validate_lines, reverse_guard=lambda d: inside.on):
+        with pytest.raises(access.AccessDenied) as exc:
+            services.reverse_entry(booked, access.require(w.clerk, w.alm, "invoicing.reverse_document", document=bill7))
+        assert exc.value.code == "reverse_through_owner" and status(booked) == "posted"
+        inside.on = True
+        services.reverse_entry(booked, access.require(w.clerk, w.alm, "invoicing.reverse_document", document=bill7))
+    assert status(booked) == "reversed"
+    with pytest.raises(documents.DocumentRegistryError):  # a guard without a reversal right makes no sense
+        documents._register(Receipt, post_permissions={"invoicing.post_receipt"}, validate_lines=validate_lines,
+                            reverse_guard=lambda d: True)
 
 
 def test_reverse_document_grant_needs_a_registered_reversal_right(w):

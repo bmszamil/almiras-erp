@@ -681,12 +681,18 @@ def reverse_entry(entry, grant=None, date=None, reason=""):
 
     ``grant`` is ``require(user, entity, "ledger.reverse_entry", document=entry)``,
     or a reversal permission registered for the entry's document type (e.g.
-    ``invoicing.reverse_document``), issued for that document.
+    ``invoicing.reverse_document``), issued for that document. An entry of a registered document type is
+    reversed only with that type's reversal permission (never ``ledger.reverse_entry``), and only while the
+    type's ``reverse_guard`` (if any) says its own module is reversing it (ledger/documents.py).
     """
     entry = JournalEntry.objects.select_related("entity").get(pk=entry.pk)
     if not isinstance(grant, access.Grant):
         _deny_grant(grant, entry.entity, "grant_missing")
     if grant.permission == "ledger.reverse_entry":
+        if entry.document_type and documents.get(entry.document_type) is not None:
+            # Review item 5: a registered document's entry is reversed only through its own module and
+            # reversal permission, which keeps the document's status in step (never by a generic grant).
+            _deny_grant(grant, entry.entity, "document_reversal_only")
         document = entry
     elif grant.permission in catalogue.REVERSE_PERMISSIONS:
         if entry.document_ref is None:
@@ -699,6 +705,8 @@ def reverse_entry(entry, grant=None, date=None, reason=""):
         document = doc_type.model._default_manager.filter(pk=entry.document_id).first()
         if document is None:
             _deny_grant(grant, entry.entity, "document_not_found")
+        if doc_type.reverse_guard is not None and doc_type.reverse_guard(document) is not True:
+            _deny_grant(grant, entry.entity, "reverse_through_owner")
     else:
         _deny_grant(grant, entry.entity, "grant_wrong_permission")
     user = access.verify_grant(grant, entry.entity, catalogue.REVERSE_PERMISSIONS, document=document, use=False)

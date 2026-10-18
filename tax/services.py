@@ -979,6 +979,24 @@ def _posting_document(document):
         _posting.reset(token)
 
 
+_reversing = ContextVar("tax_reversing_document", default=None)
+
+
+@contextmanager
+def _reversing_document(document):
+    token = _reversing.set((document._meta.label_lower, document.pk))
+    try:
+        yield
+    finally:
+        _reversing.reset(token)
+
+
+def _reverse_guard(document):
+    """Registered ``reverse_guard`` (review item 5): T2 to T4 are reversed only by ``reverse_tax_document``, which
+    keeps the document's and the return's status (settled / filed) in step with the ledger."""
+    return _reversing.get() == (document._meta.label_lower, document.pk)
+
+
 def _require_posting(document):
     if _posting.get() != (document._meta.label_lower, document.pk):
         raise error(f"{document._meta.label} posts only through tax.services.",
@@ -1483,7 +1501,8 @@ def reverse_tax_document(document, *, user, reason, date=None):
         # R17: the reversal counts negative in the return of its own period, never in the locked one.
         on = _reversal_date(doc.entity, doc.journal_entry.date, date)
         try:
-            reversal = ledger.reverse_entry(doc.journal_entry, grant, date=on, reason=reason.strip())
+            with _reversing_document(doc):
+                reversal = ledger.reverse_entry(doc.journal_entry, grant, date=on, reason=reason.strip())
         except LedgerError as exc:
             raise TaxError(exc.messages, code=getattr(exc, "code", None) or "reversal_refused") from None
         doc.status, doc.reversal_entry = DocStatus.REVERSED, reversal

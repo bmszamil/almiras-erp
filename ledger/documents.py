@@ -50,6 +50,17 @@ Optional contract-approval hook (billing.md R53; invoicing R60):
   permissions in ``CONTRACT_APPROVAL_PERMISSIONS``. Nobody approves the document in that person's name: the
   hook only names the approval that already exists.
 
+Optional reversal hook (tax-returns review item 5):
+
+- ``reverse_guard(document)`` returns True only while the document's own module is reversing it (its service
+  sets a marker around its ``reverse_entry`` call). ``reverse_entry`` refuses the reversal otherwise
+  (``reverse_through_owner``), so a reversal grant cannot undo the entry behind the module's back and leave the
+  document's own status (paid, settled) out of step with the ledger.
+
+An entry of a **registered** document type is never reversed with a ``ledger.reverse_entry`` grant: only with a
+reversal permission registered for that type (``document_reversal_only``). Types registered with no reversal
+permission (sales documents, the VAT return offset T1) are therefore never reversed.
+
 Optional period hook:
 
 - ``pending_documents(entity, start_date, end_date)`` returns descriptions of
@@ -107,6 +118,8 @@ class DocumentType:
     creator_may_post: Callable | None = None
     # billing R53: the contract approval recorded for a document auto-issued from approved terms.
     contract_approval: Callable | None = None
+    # tax-returns review item 5: True only while the owning module reverses the document itself.
+    reverse_guard: Callable | None = None
 
     def entity_id_of(self, document):
         return getattr(document, f"{self.entity_field}_id")
@@ -155,7 +168,7 @@ def _check_caller(model, module_name):
 
 def register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
              creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None,
-             creator_may_post=None, contract_approval=None):
+             creator_may_post=None, contract_approval=None, reverse_guard=None):
     """Register ``model`` as a document type that books journal entries. Idempotent for the same arguments.
 
     Call it from the ``AppConfig.ready()`` of the app that defines ``model``.
@@ -169,7 +182,7 @@ def register(model, *, post_permissions, reverse_permissions=(), entity_field="e
         model, post_permissions=post_permissions, reverse_permissions=reverse_permissions, entity_field=entity_field,
         changed_at_field=changed_at_field, creator_field=creator_field, build_lines=build_lines,
         validate_lines=validate_lines, pending_documents=pending_documents, creator_may_post=creator_may_post,
-        contract_approval=contract_approval,
+        contract_approval=contract_approval, reverse_guard=reverse_guard,
     )
 
 
@@ -182,7 +195,7 @@ def _field(model, name, label):
 
 def _register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
               creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None,
-              creator_may_post=None, contract_approval=None):
+              creator_may_post=None, contract_approval=None, reverse_guard=None):
     """Validate and store one registration (no caller or freeze check; tests use it through the helpers below)."""
     if not (isinstance(model, type) and issubclass(model, models.Model)) or model._meta.abstract:
         raise DocumentRegistryError(f"{model!r} is not a concrete Django model.")
@@ -208,7 +221,7 @@ def _register(model, *, post_permissions, reverse_permissions=(), entity_field="
         _field(model, changed_at_field, label)
     for name, hook in (("build_lines", build_lines), ("validate_lines", validate_lines),
                        ("pending_documents", pending_documents), ("creator_may_post", creator_may_post),
-                       ("contract_approval", contract_approval)):
+                       ("contract_approval", contract_approval), ("reverse_guard", reverse_guard)):
         if hook is not None and not callable(hook):
             raise DocumentRegistryError(f"{label}: {name} must be callable.")
     if build_lines is None and validate_lines is None:
@@ -217,11 +230,13 @@ def _register(model, *, post_permissions, reverse_permissions=(), entity_field="
     if creator_may_post is not None and label not in CREATOR_MAY_POST_TYPES:
         # access R46: the exception is for customer receipts only; every other type keeps creator != poster (R35).
         raise DocumentRegistryError(f"{label}: creator_may_post is allowed only for {sorted(CREATOR_MAY_POST_TYPES)}.")
+    if reverse_guard is not None and not reverse:
+        raise DocumentRegistryError(f"{label}: reverse_guard needs a reversal permission.")
     if contract_approval is not None and label not in CONTRACT_APPROVAL_TYPES:
         # billing R53: only invoices auto-issued from an approved contract post on a contract approval.
         raise DocumentRegistryError(f"{label}: contract_approval is allowed only for {sorted(CONTRACT_APPROVAL_TYPES)}.")
     doc_type = DocumentType(label, model, post, reverse, entity_field, changed_at_field, creator_field, build_lines,
-                            validate_lines, pending_documents, creator_may_post, contract_approval)
+                            validate_lines, pending_documents, creator_may_post, contract_approval, reverse_guard)
     existing = _REGISTRY.get(label)
     if existing is not None and existing != doc_type:
         raise DocumentRegistryError(f"{label} is already registered with other settings.")

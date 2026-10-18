@@ -141,6 +141,14 @@ MESSAGES = {
         "This kind of document cannot post to the ledger yet; its module has not registered it.",
         "لا يمكن لهذا النوع من المستندات الترحيل إلى دفتر الأستاذ بعد؛ لم تسجله الوحدة المختصة.",
     ),
+    "document_reversal_only": (
+        "This entry belongs to a document; reverse it through that document's own reversal.",
+        "هذا القيد يخص مستندًا؛ اعكسه من خلال عكس المستند نفسه.",
+    ),
+    "reverse_through_owner": (
+        "This document is reversed only through its own module, which keeps its status in step.",
+        "يُعكس هذا المستند من خلال وحدته فقط، حتى تبقى حالته متوافقة مع القيد.",
+    ),
     "document_not_found": (
         "The document this authorisation names does not exist.",
         "المستند الذي يحدده هذا التفويض غير موجود.",
