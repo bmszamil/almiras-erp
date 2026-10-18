@@ -142,8 +142,9 @@ def prepared(t, period_start=date(2027, 1, 1), entity=None, user=None):
 
 
 def confirm_tax_points(t, ret, reviewer=None):
-    """C10: invoicing stores no tax point yet, so the invoices of a return are put in the period of their issue
-    date and listed in one ``tax_point_fallback`` exception; the reviewer confirms it."""
+    """C10: legacy invoices (tax point not computed, invoicing migration 0026) are put in the period of their issue
+    date and listed in one ``tax_point_fallback`` exception; the reviewer confirms it. New invoices store their tax
+    point (invoicing R100), so for them this does nothing."""
     for e in services._exceptions(ret)[0]:
         if e["kind"] == "tax_point_fallback" and e["ack"] is None:
             services.acknowledge_exception(ret, user=reviewer or t.a2, kind=e["kind"], reference=e["reference"],

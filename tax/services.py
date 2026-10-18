@@ -438,6 +438,7 @@ class Computation:
     shifted_in: list = field(default_factory=list)  # entries dated outside the period, reported in it
     shifted_out: list = field(default_factory=list)  # entries dated in the period, reported in another one
     rate_differences: list = field(default_factory=list)  # C12: (entry id, booked 1310 - box 7 VAT)
+    output_rate_differences: list = field(default_factory=list)  # §10.5: (entry id, booked 2200 - box 1 VAT)
 
     def add(self, box_no, column, amount, source_type, *, source_id=None, number="", entry=None, on=None, note=""):
         amount = _q(amount)
@@ -489,21 +490,15 @@ def _sales_box(line):
     return None  # O (out of scope): not reported (R19)
 
 
-def _has_tax_point_field():
-    from invoicing.models import SalesDocument
-
-    return any(f.name == "tax_point_date" for f in SalesDocument._meta.concrete_fields)
-
-
 def _tax_point(doc):
-    """C10 / G6 (PSG §11.3, TIR §4.2.3): the return period of a sale is its tax point. Notes keep their own date
-    (X9, TIR §7.1.1). Invoicing stores no ``tax_point_date`` yet (invoicing R100, to build): until it does, an
-    invoice falls back to its issue date and is listed for the reviewer. Returns (date, known)."""
+    """C10 / G6 (PSG §11.3, TIR §4.2.3): the return period of a sale is its tax point, ``tax_point_date`` as
+    invoicing computed it (invoicing R100). Notes keep their own date (X9, TIR §7.1.1). Legacy invoices, whose
+    tax point migration 0026 set to the issue date without computing it (basis ``legacy``), or without one, fall
+    back to the issue date and are listed for the reviewer (``tax_point_fallback``). Returns (date, known)."""
     if doc.doc_type != "invoice":
         return doc.issue_date, True
-    tax_point = getattr(doc, "tax_point_date", None)
-    if tax_point:
-        return tax_point, True
+    if doc.tax_point_date and doc.tax_point_basis not in ("", "legacy"):
+        return doc.tax_point_date, True
     return doc.issue_date, False
 
 
@@ -545,6 +540,12 @@ def _sales_sources(comp, entity, entry, doc, sign):
                      entry=entry, on=entry.date)
     vat = sum((Decimal(g["vat_sar"]) for g in doc.vat_breakdown if g["category"] == "S"), ZERO)
     comp.add(1, Column.VAT, s * vat, "sales_document", source_id=doc.pk, number=doc.number, entry=entry, on=entry.date)
+    if doc.currency_id != SAR and rate is not None:
+        # §10.5 (G7): box 1 VAT is at the SAMA tax-point rate; a document booked at another rate (invoicing R100(d))
+        # leaves the difference on 2200, explained in the tie-out like C12 for bills.
+        booked = _ledger_entries(entity, ids={entry.pk}).get(entry.pk, {}).get("output", ZERO)
+        if booked != s * vat:
+            comp.output_rate_differences.append((entry.pk, booked - s * vat))
     if not entry.reversal_of_id and not _tax_point(doc)[1]:
         comp.fallback_documents.append(doc)
 
@@ -669,9 +670,7 @@ def _period_sources(entity, start, end):
     excluded = _correction_exclusions(entity)
     base = (JournalEntry.objects.filter(entity=entity, status__in=ledger.BOOKED, document_type__in=SOURCE_TYPES)
             .exclude(pk__in=excluded))
-    sales = Q(issue_date__gte=start, issue_date__lte=end)
-    if _has_tax_point_field():
-        sales |= Q(tax_point_date__gte=start, tax_point_date__lte=end)
+    sales = Q(issue_date__gte=start, issue_date__lte=end) | Q(tax_point_date__gte=start, tax_point_date__lte=end)
     sales_ids = SalesDocument.objects.filter(sales, entity=entity).values_list("pk", flat=True)
     note_ids = PurchaseDocument.objects.filter(entity=entity, doc_type="vendor_credit_note",
                                                vendor_document_date__gte=start, vendor_document_date__lte=end
@@ -1129,13 +1128,15 @@ def _exceptions(ret, comp=None):
     counted = [e for pk, e in entries.items() if pk not in not_relevant and pk not in shifted_out]
     counted += list(moves_in.values())
     rate_difference = sum((d for _, d in comp.rate_differences), ZERO)
-    ledger_output = sum((e["output"] for e in counted), ZERO)
+    output_rate_difference = sum((d for _, d in comp.output_rate_differences), ZERO)
+    ledger_output = sum((e["output"] for e in counted), ZERO) - output_rate_difference
     ledger_input = sum((e["input"] for e in counted), ZERO) - rate_difference
     tie = {"box_output": ret.output_vat_sar, "box_input": ret.input_vat_sar,
            "ledger_output": ledger_output, "ledger_input": ledger_input,
            "difference_output": ledger_output - ret.output_vat_sar,
            "difference_input": ledger_input - ret.input_vat_sar,
            "rate_difference_input": rate_difference,
+           "rate_difference_output": output_rate_difference,
            "shifted_in": sorted(moves_in), "shifted_out": sorted(shifted_out),
            "excluded_entries": sorted(not_relevant | (excluded & set(every)))}
     for account, diff in ((VAT_OUTPUT, tie["difference_output"]), (VAT_INPUT, tie["difference_input"])):
@@ -1159,7 +1160,8 @@ def tie_out(vat_return, *, user):
     period, without the return's own settlement entries (T1, T2, T4), correcting entries (R26) and journals the
     reviewer marked not relevant; plus entries reported here but dated in another period and minus those dated
     here but reported elsewhere (tax point, supplier note date: C9, C10), and minus the booking-rate difference of
-    foreign-currency bills (C12). Needs ``tax.view`` and ``ledger.view``."""
+    foreign-currency bills (C12) and of sales booked at another rate than their SAMA tax-point rate (§10.5).
+    Needs ``tax.view`` and ``ledger.view``."""
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     access.require(user, ret.entity, "tax.view")
     access.require(user, ret.entity, "ledger.view")

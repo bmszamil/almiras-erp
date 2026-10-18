@@ -552,25 +552,88 @@ def test_item13_import_cost_account_is_checked_for_sharia_and_restriction(t):
 
 # --- compliance ---------------------------------------------------------------------------------------------------
 
-def test_c10_sales_are_reported_by_tax_point_with_an_issue_date_fallback(t):
+def _make_legacy(doc):
+    """As migration 0026 leaves a document that existed before it: tax point = issue date, basis ``legacy``."""
+    from django.db import connection
+
+    from invoicing.models import SalesDocument
+
+    if connection.vendor == "postgresql":
+        with connection.cursor() as cursor:
+            cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+            cursor.execute("ALTER TABLE invoicing_salesdocument DISABLE TRIGGER invoicing_salesdocument_lock")
+            cursor.execute("UPDATE invoicing_salesdocument SET tax_point_date = issue_date, tax_point_basis = 'legacy' "
+                           "WHERE id = %s", [doc.pk])
+            cursor.execute("ALTER TABLE invoicing_salesdocument ENABLE TRIGGER invoicing_salesdocument_lock")
+            cursor.execute("SET CONSTRAINTS ALL DEFERRED")
+    else:
+        SalesDocument._base_manager.filter(pk=doc.pk).update(tax_point_date=doc.issue_date, tax_point_basis="legacy")
+
+
+def test_c10_sales_are_reported_by_tax_point_with_an_issue_date_fallback_for_legacy_rows(t):
+    """G6 as built: invoicing stores the tax point, so a new invoice is no fallback; a legacy row (migration 0026)
+    is still listed in ``tax_point_fallback`` for the reviewer."""
     from types import SimpleNamespace
 
     from tax.conftest import prepared
 
     sale(t)
     ret = prepared(t)
+    assert not [e for e in services.exceptions(ret, user=t.a2) if e["kind"] == "tax_point_fallback"]
+    services.return_to_draft(ret, user=t.a2, reason_ar="إعادة")
+    _make_legacy(sale(t, on=date(2027, 1, 12)))
+    ret = services.submit_for_review(services.recompute_draft(ret, user=t.a1), user=t.a1)
     found = [e for e in services.exceptions(ret, user=t.a2) if e["kind"] == "tax_point_fallback"]
-    assert len(found) == 1 and found[0]["reference"].startswith("tp:")
+    assert len(found) == 1 and found[0]["reference"].startswith("tp:") and len(found[0]["documents"]) == 1
     with pytest.raises(services.TaxError) as exc:
         services.acknowledge_exception(ret, user=t.a2, kind="tax_point_fallback", reference=found[0]["reference"],
                                        decision="not_return_relevant", reason_ar="سبب")
     assert exc.value.code == "decision_invalid"
-    invoice = SimpleNamespace(doc_type="invoice", issue_date=date(2027, 4, 2), tax_point_date=date(2027, 3, 28))
+    invoice = SimpleNamespace(doc_type="invoice", issue_date=date(2027, 4, 2), tax_point_date=date(2027, 3, 28),
+                              tax_point_basis="supply")
     assert services._tax_point(invoice) == (date(2027, 3, 28), True)
-    assert services._tax_point(SimpleNamespace(doc_type="invoice", issue_date=date(2027, 4, 2))) == (
-        date(2027, 4, 2), False)
-    note = SimpleNamespace(doc_type="credit_note", issue_date=date(2027, 4, 2), tax_point_date=date(2027, 1, 1))
+    legacy = SimpleNamespace(doc_type="invoice", issue_date=date(2027, 4, 2), tax_point_date=date(2027, 4, 2),
+                             tax_point_basis="legacy")
+    assert services._tax_point(legacy) == (date(2027, 4, 2), False)
+    assert services._tax_point(SimpleNamespace(doc_type="invoice", issue_date=date(2027, 4, 2), tax_point_date=None,
+                                               tax_point_basis="")) == (date(2027, 4, 2), False)
+    note = SimpleNamespace(doc_type="credit_note", issue_date=date(2027, 4, 2), tax_point_date=date(2027, 1, 1),
+                           tax_point_basis="issue")
     assert services._tax_point(note) == (date(2027, 4, 2), True)  # notes: their own date (X9)
+
+
+def test_g6_an_invoice_issued_after_the_quarter_counts_in_the_quarter_of_its_supply(t):
+    from tax.conftest import box
+
+    doc = sale(t, on=date(2027, 4, 2), supply_date=date(2027, 3, 28))
+    assert (doc.tax_point_date, doc.tax_point_basis) == (date(2027, 3, 28), "supply")
+    q1 = services.compute_draft(t.alm, Q1, user=t.a1)
+    assert box(q1, 1) == (D("10000.00"), D("0"), D("1500.00"))
+    tie = services.tie_out(q1, user=t.a1)
+    assert tie["difference_output"] == 0 and tie["shifted_in"] == [doc.journal_entry_id]
+    kinds = {e["kind"] for e in services.exceptions(q1, user=t.a1)}
+    assert "period_shift" in kinds and "tax_point_fallback" not in kinds
+    q2 = services.compute_draft(t.alm, Q2, user=t.a1)
+    assert box(q2, 1) == (D("0"), D("0"), D("0"))
+    tie = services.tie_out(q2, user=t.a1)
+    assert tie["difference_output"] == 0 and tie["shifted_out"] == [doc.journal_entry_id]
+
+
+def test_g7_box_1_uses_the_sama_tax_point_rate_and_the_tie_out_explains_the_booking_rate(t):
+    """invoicing AT-138: SAMA 3.7500 on the supply date, 3.7510 on the issue date 21 days later."""
+    from invoicing.conftest import usd_rate
+    from tax.conftest import box
+
+    usd_rate(t, "3.7500", on=date(2027, 3, 10))
+    usd_rate(t, "3.7510", on=date(2027, 3, 31))
+    doc = sale(t, [("rent_commercial", "1", "1000.00")], on=date(2027, 3, 31), currency="USD",
+               supply_date=date(2027, 3, 10))
+    assert (doc.sar_rate, doc.fx_rate) == (D("3.7500"), D("3.7510"))
+    q1 = services.compute_draft(t.alm, Q1, user=t.a1)
+    assert box(q1, 1) == (D("3750.00"), D("0"), D("562.50"))  # at the SAMA tax-point rate (C11, G7)
+    tie = services.tie_out(q1, user=t.a1)
+    assert tie["rate_difference_output"] == D("0.15")  # 2200 booked 562.65
+    assert tie["difference_output"] == 0
 
 
 def test_c11_a_foreign_sale_without_a_sar_rate_is_an_exception_not_the_booking_rate(t):
