@@ -261,7 +261,7 @@ def _period_end(start, frequency, quarter_start_month):
 
 
 def _due_date(period_end):
-    """Last day of the month after the period (PSG §13.2 p.52 [CC-verify]); no weekend shift (OQ-8)."""
+    """Last day of the month after the period (PSG §13.2 p.52; met, compliance C4); no weekend shift (OQ-8)."""
     nxt = period_end + timedelta(days=1)
     return _month_end(nxt.year, nxt.month)
 
