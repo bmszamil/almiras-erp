@@ -8,7 +8,8 @@ from invoicing import services as invoicing
 from invoicing.conftest import usd_rate
 from tax import art51_port, services
 from tax.conftest import (
-    D, approve_sales, bill, box, close_q1, filed, invoice, journal, pdf, prepared, reviewed, sale,
+    D, approve_sales, bill, box, close_q1, confirm_tax_points, filed, imported, invoice, journal, pdf, prepared,
+    reviewed, sale,
 )
 from tax.models import TaxError, VatExceptionAck
 
@@ -144,8 +145,8 @@ def test_at23_reverse_charge_services_in_box9_goods_not(t):
 
 
 def test_at24_totals_with_carried_credit(t):
-    services.import_filed_return(t.alm, user=t.a1, period_start=date(2026, 10, 1), zatca_filing_reference="OLD-Q4",
-                                 filed_on=date(2027, 1, 20), boxes={13: {"vat": "-4000.00"}, 16: {"vat": "-4000.00"}})
+    imported(t, date(2026, 10, 1), {13: {"vat": "-4000.00"}, 16: {"vat": "-4000.00"}}, ref="OLD-Q4",
+             filed_on=date(2027, 1, 20))
     sale(t)
     bill(t, [("5300", "1", "2000.00")])
     ret = compute(t)
@@ -192,6 +193,7 @@ def test_at15_untagged_journal_blocks_review_until_acknowledged(t):
                                    decision="not_return_relevant", reason_ar="قيد إعادة تصنيف لا يخص الإقرار",
                                    reason_en="Reclassification, not return relevant")
     assert services.tie_out(ret, user=t.a2)["difference_output"] == 0
+    confirm_tax_points(t, ret)
     assert services.complete_review(ret, user=t.a2).status == "reviewed"
 
 
@@ -252,9 +254,9 @@ def test_at46_art51_true_up_in_the_last_return_of_the_year(t, settings):
     create_monthly_periods(t.alm, 2028)
     t.today.set(date(2028, 1, 15))
     q4 = date(2027, 10, 1)
-    for start in (Q1, Q2, date(2027, 7, 1)):  # earlier returns of the year are approved first
-        services.import_filed_return(t.alm, user=t.a1, period_start=start, zatca_filing_reference=f"Z-{start}",
-                                     filed_on=date(2028, 1, 2), boxes={})
+    services.change_tax_settings(t.alm, user=t.c1, vat_golive_date=q4)  # Q1 to Q3 filed outside the ERP (G4)
+    for start in (Q1, Q2, date(2027, 7, 1)):
+        imported(t, start, ref=f"Z-{start}", filed_on=date(2027, 10, 20))
     entry = journal(t, date(2027, 12, 31), [{"account": "1310", "debit": "1000.00"},
                                             {"account": "5300", "credit": "1000.00"}])
     entries = ((entry, D("1000.00")),)

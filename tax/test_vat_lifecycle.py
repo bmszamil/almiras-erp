@@ -8,12 +8,14 @@ import pytest
 from django.utils import timezone
 
 from core import access
+from core import services as core_services
 from core.access.models import AccessLog, Membership, Role, RolePermission
 from core.access.testing import make_agent, make_user, member
 from invoicing import services as invoicing
 from invoicing.conftest import make_entity
 from tax import jobs, services
-from tax.conftest import D, approved, bill, box, close, close_q1, filed, pdf, prepared, reviewed, sale
+from tax.conftest import (D, approved, bill, box, close, close_q1, confirm_tax_points, filed, imported, pdf, prepared,
+                          reviewed, sale)
 from tax.models import TaxAlert, TaxError, VatBoxDefinition, VatReturn, VatReturnBox, VatReturnSchedule, VatReturnSourceLine
 
 pytestmark = pytest.mark.django_db
@@ -27,8 +29,12 @@ def test_at1_returns_are_scoped_and_other_entity_refused_and_logged(t):
     theirs = services.compute_draft(t.sub, Q1, user=t.sub_a)
     assert list(services.vat_returns(t.a1)) == [mine]
     assert services.get_return(mine.pk, user=t.a1) == mine
-    with pytest.raises(access.AccessDenied):
+    with pytest.raises(TaxError) as foreign:  # review item 12: the same answer for a foreign and an unknown id
         services.get_return(theirs.pk, user=t.a1)
+    with pytest.raises(TaxError) as unknown:
+        services.get_return(theirs.pk + 1000, user=t.a1)
+    assert foreign.value.code == unknown.value.code == "return_not_found"
+    assert str(foreign.value) == str(unknown.value)
     assert AccessLog.objects.filter(event="permission_denied", actor=t.a1, entity=t.sub, permission="tax.view").exists()
     with pytest.raises(access.AccessDenied):
         services.vat_returns(t.a1, entity=t.sub)
@@ -60,8 +66,8 @@ def test_at4_schedule_partial_first_period_frequency_change_and_no_overlap(t):
     rows = services.generate_schedule(new, user=acc, until=date(2027, 6, 30))
     assert [(r.period_start, r.period_end, r.due_date) for r in rows] == [
         (date(2027, 2, 10), date(2027, 3, 31), date(2027, 4, 30)), (date(2027, 4, 1), date(2027, 6, 30), date(2027, 7, 31))]
-    type(new).objects.filter(pk=new.pk).update(vat_return_period="monthly")  # switched on 2027-05-15 (R4)
     t.today.set(date(2027, 5, 15))
+    core_services.change_entity_settings(new, user=t.mp, reason="Above the threshold", vat_return_period="monthly")
     rows = services.generate_schedule(new, user=acc, until=date(2027, 8, 31))
     assert [(r.period_start, r.period_end, r.frequency) for r in rows][1:] == [
         (date(2027, 4, 1), date(2027, 6, 30), "quarterly"), (date(2027, 7, 1), date(2027, 7, 31), "monthly"),
@@ -94,8 +100,7 @@ def test_change_tax_settings_needs_the_approver_and_is_logged(t):
 def test_at5_quarterly_entity_above_40_million_is_warned(t):
     for start, amount in ((date(2026, 4, 1), "13330000.00"), (date(2026, 7, 1), "13330000.00"),
                           (date(2026, 10, 1), "13330000.01")):
-        services.import_filed_return(t.alm, user=t.a1, period_start=start, zatca_filing_reference=f"OLD-{start}",
-                                     filed_on=start + timedelta(days=100), boxes={1: {"amount": amount}})
+        imported(t, start, {1: {"amount": amount}}, ref=f"OLD-{start}", filed_on=start + timedelta(days=100))
     sale(t)
     ret = services.compute_draft(t.alm, Q1, user=t.a1)
     assert any("40,000,000" in w and "شهرية" in w for w in services.warnings(ret, user=t.c1))
@@ -110,8 +115,18 @@ def test_at6_unverified_definitions_are_marked_and_approval_allowed(t):
     assert "unverified / غير متحقق منه" in body.decode("utf-8-sig")
     definition = VatBoxDefinition.objects.get(box_no=1)
     with pytest.raises(access.AccessDenied):
-        services.verify_box_definition(definition, user=t.a1, entity=t.alm)
-    assert services.verify_box_definition(definition, user=t.c1, entity=t.alm).verified_at is not None
+        services.propose_box_verification(definition, user=t.a1, entity=t.alm)
+    with pytest.raises(TaxError) as exc:  # review item 12: two people, a proposal first
+        services.verify_box_definition(definition, user=t.c1, entity=t.alm)
+    assert exc.value.code == "verification_not_proposed"
+    services.propose_box_verification(definition, user=t.c1, entity=t.alm)
+    with pytest.raises(access.AccessDenied) as denied:
+        services.verify_box_definition(definition, user=t.c1, entity=t.alm)
+    assert denied.value.code == "self_approval"
+    c2 = make_user("c2")
+    member(c2, t.alm, "approver")
+    done = services.verify_box_definition(definition, user=c2, entity=t.alm)
+    assert (done.proposed_by, done.verified_by) == (t.c1, c2) and done.verified_at is not None
 
 
 # --- lifecycle and segregation (R7 to R10, R14) -------------------------------------------------------------
@@ -123,6 +138,7 @@ def test_at8_preparer_reviewer_approver_are_three_people(t):
     with pytest.raises(access.AccessDenied) as exc:
         services.complete_review(ret, user=t.a1)
     assert exc.value.code == "self_approval"
+    confirm_tax_points(t, ret, t.c1)
     ret = services.complete_review(ret, user=t.c1)
     with pytest.raises(access.AccessDenied) as exc:
         services.approve_return(ret, user=t.c1)
@@ -238,6 +254,12 @@ def test_at14_agent_drafts_only(t):
     Membership.objects.create(user=agent, entity=t.alm, role=role, valid_from=timezone.now() - timedelta(hours=1),
                               granted_by=t.mp, reason="pilot")
     sale(t)
+    with pytest.raises(access.AccessDenied) as exc:  # review item 12: agents never create or change periods
+        services.compute_draft(t.alm, Q1, user=agent)
+    assert exc.value.code == "agent_forbidden"
+    with pytest.raises(access.AccessDenied):
+        services.generate_schedule(t.alm, user=agent, until=Q1)
+    services.generate_schedule(t.alm, user=t.a1, until=Q1)
     ret = services.compute_draft(t.alm, Q1, user=agent)
     assert (ret.source, ret.created_by, box(ret, 1)[2]) == ("agent", agent, D("1500.00"))
     assert AccessLog.objects.filter(actor=agent, details__action="compute_draft").exists()
@@ -298,10 +320,15 @@ def test_earlier_open_return_blocks_approval(t):
     close_q1(t)
     close(t, "2027-04", "2027-05", "2027-06")
     t.today.set(date(2027, 7, 10))
-    q2 = reviewed(t, prepared(t, Q2))
+    q2 = prepared(t, Q2)
+    assert box(q2, 15)[2] == 0
+    with pytest.raises(TaxError) as exc:  # review item 13: box 15 needs the previous period's approved return
+        reviewed(t, q2)
+    assert exc.value.code == "exceptions_open" and "carry_forward_gap" in str(exc.value)
     with pytest.raises(TaxError) as exc:
-        services.approve_return(q2, user=t.c1)
-    assert exc.value.code == "earlier_return_open"
+        services.acknowledge_exception(q2, user=t.a2, kind="carry_forward_gap", reference="period:2027-03-31",
+                                       decision="not_return_relevant", reason_ar="سبب")
+    assert exc.value.code == "no_such_exception"
 
 
 # --- filing and imports (R12) -------------------------------------------------------------------------------
@@ -321,11 +348,10 @@ def test_filing_needs_reference_date_and_acknowledgement(t):
 
 
 def test_at12_imported_legacy_return_and_box15(t):
-    old = services.import_filed_return(t.alm, user=t.a1, period_start=date(2026, 10, 1),
-                                       zatca_filing_reference="FALCON-2026Q4", filed_on=date(2027, 1, 25),
-                                       boxes={1: {"amount": "20000.00", "vat": "3000.00"},
-                                              7: {"amount": "46666.67", "vat": "7000.00"},
-                                              13: {"vat": "-4000.00"}, 16: {"vat": "-4000.00"}})
+    old = imported(t, date(2026, 10, 1), {1: {"amount": "20000.00", "vat": "3000.00"},
+                                          7: {"amount": "46666.67", "vat": "7000.00"},
+                                          13: {"vat": "-4000.00"}, 16: {"vat": "-4000.00"}},
+                   ref="FALCON-2026Q4", filed_on=date(2027, 1, 25))
     assert (old.status, old.source, old.net_vat_sar, old.source_lines.count()) == ("filed", "import", D("-4000.00"), 0)
     ret = services.compute_draft(t.alm, Q1, user=t.a1)
     assert box(ret, 15)[2] == D("4000.00") and box(ret, 16)[2] == D("-4000.00")
@@ -336,9 +362,8 @@ def test_at12_imported_legacy_return_and_box15(t):
 
 
 def test_r25_refund_requested_claim_is_not_carried(t):
-    services.import_filed_return(t.alm, user=t.a1, period_start=date(2026, 10, 1), zatca_filing_reference="F",
-                                 filed_on=date(2027, 1, 25), refund_requested=True,
-                                 boxes={13: {"vat": "-4000.00"}, 16: {"vat": "-4000.00"}})
+    imported(t, date(2026, 10, 1), {13: {"vat": "-4000.00"}, 16: {"vat": "-4000.00"}}, ref="F",
+             filed_on=date(2027, 1, 25), refund_requested=True)
     assert box(services.compute_draft(t.alm, Q1, user=t.a1), 15)[2] == D("0")
 
 
@@ -356,9 +381,11 @@ def test_at13_deadline_alerts(t):
         (date(2027, 5, 1), "vat_overdue")]
     overdue = rows.last()
     assert overdue.exposure_sar == D("75.00") and "غير متحقق" in overdue.message_ar  # 1,500.00 x 5% x 1 month
-    assert len(services.alerts(t.alm, user=t.a1)) == len(services.alerts(t.alm, user=t.c1)) > 4  # earlier periods too
-    # periods since VAT registration (2024-01-01) that have no return yet are overdue as well, until imported (R12)
-    assert TaxAlert.objects.filter(entity=t.alm, kind="vat_overdue", schedule__period_start=date(2026, 10, 1)).exists()
+    assert (overdue.late_filing_min_sar, overdue.late_filing_max_sar) == (D("75.00"), D("375.00"))  # C17: 5% to 25%
+    assert "375.00" in overdue.message_en and "التقديم" in overdue.message_ar
+    assert len(services.alerts(t.alm, user=t.a1)) == len(services.alerts(t.alm, user=t.c1)) == 4
+    # G4: nothing before the VAT go-live date (2027-01-01); periods since registration were filed outside the ERP
+    assert not TaxAlert.objects.filter(entity=t.alm, schedule__period_start__lt=Q1).exists()
     with pytest.raises(access.AccessDenied):
         services.alerts(t.alm, user=t.v1)
     close_q1(t)
@@ -368,14 +395,16 @@ def test_at13_deadline_alerts(t):
                                           bank_account="1100")
     services.submit_tax_document(payment, user=t.a1)
     services.approve_tax_document(payment, user=t.c1)
-    assert [a for a in jobs.deadline_alerts(today=date(2027, 5, 5)) if a.schedule.period_start == Q1] == []
+    assert [a for a in jobs.deadline_alerts(today=date(2027, 5, 5))
+            if a.entity_id == t.alm.pk and a.schedule.period_start == Q1] == []
 
 
 def test_r13_payment_overdue_alert_after_filing(t):
     sale(t)
     close_q1(t)
     filed(t, approved(t))
-    alerts = [a for a in jobs.deadline_alerts(today=date(2027, 5, 2)) if a.schedule.period_start == Q1]
+    alerts = [a for a in jobs.deadline_alerts(today=date(2027, 5, 2))
+              if a.entity_id == t.alm.pk and a.schedule.period_start == Q1]
     assert [a.kind for a in alerts] == ["vat_payment_overdue"] and alerts[0].exposure_sar == D("75.00")
 
 

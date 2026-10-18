@@ -73,6 +73,8 @@ def t(db, zatca, today):
     for e in (alm, sub):
         member(queue, e, "system_zatca_queue")
     ns = SimpleNamespace(alm=alm, sub=sub, nov=nov, queue=queue, zatca=zatca, today=today, **users)
+    for e, approver in ((alm, ns.c1), (sub, ns.sub_c)):  # G4: VAT returns in the ERP start on 2027-01-01
+        services.change_tax_settings(e, user=approver, vat_golive_date=date(2027, 1, 1))
     ns.cfo = ns.c1  # invoicing helpers approve with w.cfo
     ns.customer = invoicing.create_customer(
         alm, user=ns.clerk, code="C001", name_en="Test Buyer LLC", name_ar="شركة المشتري التجريبية",
@@ -139,8 +141,31 @@ def prepared(t, period_start=date(2027, 1, 1), entity=None, user=None):
     return services.submit_for_review(ret, user=user or t.a1)
 
 
+def confirm_tax_points(t, ret, reviewer=None):
+    """C10: invoicing stores no tax point yet, so the invoices of a return are put in the period of their issue
+    date and listed in one ``tax_point_fallback`` exception; the reviewer confirms it."""
+    for e in services._exceptions(ret)[0]:
+        if e["kind"] == "tax_point_fallback" and e["ack"] is None:
+            services.acknowledge_exception(ret, user=reviewer or t.a2, kind=e["kind"], reference=e["reference"],
+                                           decision="tax_point_confirmed", reason_ar="تاريخ التوريد هو تاريخ الإصدار",
+                                           reason_en="Supply date is the issue date")
+    return ret
+
+
 def reviewed(t, ret, reviewer=None):
+    confirm_tax_points(t, ret, reviewer)
     return services.complete_review(ret, user=reviewer or t.a2)
+
+
+def imported(t, period_start, boxes=None, *, entity=None, ref=None, filed_on=None, **fields):
+    """R12 (review item 3): a legacy return entered by a1, reviewed by a2 and approved by c1 (filed)."""
+    entity = entity or t.alm
+    ret = services.import_filed_return(entity, user=t.a1, period_start=period_start, boxes=boxes or {},
+                                       zatca_filing_reference=ref or f"FALCON-{period_start}",
+                                       filed_on=filed_on or date(2026, 12, 20), **fields)
+    ret = services.submit_for_review(ret, user=t.a1)
+    ret = services.complete_review(ret, user=t.a2)
+    return services.approve_return(ret, user=t.c1)
 
 
 def approved(t, period_start=date(2027, 1, 1)):

@@ -40,6 +40,7 @@ from ledger.models import Account, FiscalPeriod, JournalEntry, JournalLine, Ledg
 from . import reference
 from .models import (
     FILED_STATUSES,
+    BLOCKING_EXCEPTIONS,
     LOCKED_STATUSES,
     Column,
     DocStatus,
@@ -54,6 +55,7 @@ from .models import (
     TaxRefund,
     TaxSettings,
     VatBoxDefinition,
+    VatFrequencyChange,
     VatCorrection,
     VatExceptionAck,
     VatManualAdjustment,
@@ -121,7 +123,22 @@ def _human(user, entity, permission):
 
 
 def _preparers(ret):
-    return {ret.created_by_id, ret.modified_by_id, ret.submitted_by_id} - {None}
+    """R8 (review item 10): whoever created, recomputed or submitted the return, chose the refund, or wrote one of
+    its manual adjustments prepared it, so cannot review or approve it."""
+    people = {ret.created_by_id, ret.modified_by_id, ret.submitted_by_id, ret.refund_requested_by_id}
+    if ret.pk:
+        people |= set(VatManualAdjustment.objects.filter(vat_return_id=ret.pk).values_list("created_by_id", flat=True))
+    return people - {None}
+
+
+def _add_months(day, months):
+    """``day`` plus ``months`` calendar months; a month-end date stays a month end, other days are clamped."""
+    index = day.year * 12 + day.month - 1 + months
+    year, month = divmod(index, 12)
+    last = calendar.monthrange(year, month + 1)[1]
+    if day.day == calendar.monthrange(day.year, day.month)[1]:
+        return date_type(year, month + 1, last)
+    return date_type(year, month + 1, min(day.day, last))
 
 
 # --- settings ----------------------------------------------------------------------------------------
@@ -141,11 +158,15 @@ def tax_settings(entity, *, user):
     return _settings(entity)
 
 
-SETTINGS_FIELDS = ("vat_quarter_start_month", "alert_days", "vat_correction_threshold_sar")
+SETTINGS_FIELDS = ("vat_quarter_start_month", "alert_days", "vat_correction_threshold_sar", "vat_golive_date")
 
 
 def change_tax_settings(entity, *, user, **changes):
-    """Change the VAT settings (3.1): ``tax.change_settings`` (approver, A), logged before / after (AccessLog)."""
+    """Change the VAT settings (3.1): ``tax.change_settings`` (approver, A), logged before / after (AccessLog).
+
+    ``vat_golive_date`` (owner decision G4): VAT returns in the ERP start on that date; it must be the start of a
+    return period, and no ERP return or alert may exist before it. Earlier periods are filed outside the ERP and
+    only imported (R12, review item 3)."""
     unknown = set(changes) - set(SETTINGS_FIELDS)
     if unknown:
         raise error(f"Not a tax setting: {', '.join(sorted(unknown))}.", "ليس من إعدادات الضرائب.", code="unknown_setting")
@@ -153,6 +174,7 @@ def change_tax_settings(entity, *, user, **changes):
         current = _settings(entity)
         access.require(user, entity, "tax.change_settings", document=current)
         _human(user, entity, "tax.change_settings")
+        Entity.objects.select_for_update().get(pk=entity.pk)  # the schedule lock (review item 13)
         current = TaxSettings.objects.select_for_update().get(pk=current.pk)
         before = {name: str(getattr(current, name)) for name in changes}
         if "vat_quarter_start_month" in changes:
@@ -169,12 +191,42 @@ def change_tax_settings(entity, *, user, **changes):
         if "vat_correction_threshold_sar" in changes:
             current.vat_correction_threshold_sar = _money(changes["vat_correction_threshold_sar"], "The threshold",
                                                           "الحد", positive=True)
+        if "vat_golive_date" in changes:
+            current.vat_golive_date = _check_golive(entity, current, changes["vat_golive_date"])
         current._service_write = True
         current.save()
+        if "vat_golive_date" in changes or "vat_quarter_start_month" in changes:
+            fresh = Entity.objects.get(pk=entity.pk)
+            rows = VatReturnSchedule.objects.filter(entity=entity)
+            if rows.exists() and _vat_ready(fresh):
+                _ensure_schedule(fresh, max(r.period_end for r in rows))
         access_services.log(AccessLog.Event.ENTITY_SETTINGS_CHANGED, actor=user, entity=entity, permission="tax.change_settings",
                    details={"tax_settings": {"before": before,
                                              "after": {name: str(getattr(current, name)) for name in changes}}})
     return current
+
+
+def _check_golive(entity, conf, value):
+    """G4: a go-live date is the start of a return period; nothing of the ERP's own exists before it."""
+    if value is None:
+        if VatReturn.objects.filter(entity=entity, source=VatReturn.Source.IMPORT).exists():
+            raise error("Imported legacy returns depend on the go-live date; it cannot be removed.",
+                        "تعتمد الإقرارات المستوردة على تاريخ البدء؛ لا يمكن حذفه.", code="golive_in_use")
+        return None
+    if not isinstance(value, date_type):
+        raise error("The go-live date is a date.", "تاريخ البدء يجب أن يكون تاريخًا.", code="setting_invalid")
+    entity = Entity.objects.get(pk=entity.pk)
+    _check_vat_entity(entity)
+    starts = {s for s, _, _ in _walk(entity, conf, value)}
+    if value not in starts:
+        raise error(f"The go-live date {value} is not the start of a VAT return period of {entity.code}.",
+                    f"تاريخ البدء {value} ليس بداية فترة إقرار للكيان {entity.code}.", code="golive_not_period_start")
+    if VatReturn.objects.filter(entity=entity, period_start__lt=value).exclude(source=VatReturn.Source.IMPORT).exists() \
+            or VatReturn.objects.filter(entity=entity, period_end__gte=value, source=VatReturn.Source.IMPORT).exists() \
+            or TaxAlert.objects.filter(entity=entity, schedule__period_start__lt=value).exists():
+        raise error("Returns or alerts of the ERP already exist on the other side of this go-live date.",
+                    "توجد إقرارات أو تنبيهات للنظام على الجانب الآخر من تاريخ البدء هذا.", code="golive_in_use")
+    return value
 
 
 # --- entity checks and the return schedule (R2 to R4) -------------------------------------------------
@@ -214,49 +266,114 @@ def _due_date(period_end):
     return _month_end(nxt.year, nxt.month)
 
 
-def _ensure_schedule(entity, until, today):
-    """Generate the entity's periods up to the one containing ``until`` (R3, R4).
+def _vat_ready(entity):
+    try:
+        _check_vat_entity(entity)
+    except TaxError:
+        return False
+    return True
 
-    Periods that started on or before ``today`` or that have a return are kept; later periods without a return
-    are regenerated with the entity's current frequency (R4: a change applies from the first period that starts
-    after it and has no return)."""
-    entity = Entity.objects.get(pk=entity.pk)  # the stored frequency (R4), not a caller's stale copy
+
+def _history(entity):
+    return list(VatFrequencyChange.objects.filter(entity=entity).order_by("changed_on", "pk"))
+
+
+def _frequency_at(entity, start, history):
+    """R4 (review item 6): the frequency that applies to a period starting on ``start``: the latest change made
+    before that day, else the frequency before the first change (else the entity's current one)."""
+    frequency = history[0].previous_frequency if history else entity.vat_return_period
+    for change in history:
+        if change.changed_on < start:
+            frequency = change.frequency
+    return frequency
+
+
+def _walk(entity, conf, until, fixed=None):
+    """Every return period from ``vat_effective_date`` up to the one containing ``until`` (and every ``fixed`` row,
+    i.e. a period that has a return and never changes): (start, end, frequency). Deterministic: the same result
+    whenever it runs (review item 6)."""
+    history = _history(entity)
+    fixed = fixed or {}
+    last_fixed = max((r.period_end for r in fixed.values()), default=None)
+    out, start = [], entity.vat_effective_date
+    while start <= until or (last_fixed is not None and start <= last_fixed):
+        row = fixed.get(start)
+        if row is not None:
+            end, frequency = row.period_end, row.frequency
+        else:
+            frequency = _frequency_at(entity, start, history)
+            end = _period_end(start, frequency, conf.vat_quarter_start_month)
+            later = [s for s in fixed if s > start]
+            if later and end >= min(later):
+                raise error("A frequency change conflicts with a period that already has a return.",
+                            "يتعارض تغيير الدورية مع فترة لها إقرار بالفعل.", code="schedule_conflict")
+        out.append((start, end, frequency))
+        start = end + timedelta(days=1)
+    if set(fixed) - {s for s, _, _ in out}:
+        raise error("A period that has a return does not fit the schedule.", "فترة لها إقرار لا تتوافق مع الجدول.",
+                    code="schedule_conflict")
+    return out
+
+
+def _ensure_schedule(entity, until, *, agent=None):
+    """Generate the entity's periods up to the one containing ``until`` (R3, R4, G4).
+
+    Periods start at the VAT go-live date (``TaxSettings.vat_golive_date``, else the VAT effective date). Each
+    period takes the frequency in force on its start (dated history, R4); a period that has a return never
+    changes. Rows that no longer fit are regenerated. Runs under a lock on the entity row, so two generations never
+    overlap (review item 13). ``agent``: an AI agent may only use existing rows (review item 12)."""
+    entity = Entity.objects.select_for_update().get(pk=entity.pk)
     _check_vat_entity(entity)
     conf = _settings(entity)
-    frequency = entity.vat_return_period
     rows = list(VatReturnSchedule.objects.filter(entity=entity).order_by("period_start"))
-    kept, start = [], entity.vat_effective_date
-    for i, row in enumerate(rows):
-        fixed = row.period_start <= today or row.returns.exists()
-        expected = row.period_start == start and row.frequency == frequency and \
-            row.period_end == _period_end(row.period_start, frequency, conf.vat_quarter_start_month)
-        if fixed or expected:
-            kept.append(row)
-            start = row.period_end + timedelta(days=1)
-            continue
-        for stale in rows[i:]:
-            if stale.returns.exists():
-                raise error("A later VAT period already has a return; the schedule cannot be regenerated.",
-                            "لفترة لاحقة إقرار ضريبي بالفعل؛ لا يمكن إعادة إنشاء الجدول.", code="schedule_has_return")
-            stale._service_write = True
-            stale.delete()
-        break
-    while start <= until:
-        end = _period_end(start, frequency, conf.vat_quarter_start_month)
+    if rows:
+        until = max(until, rows[-1].period_end)
+    fixed = {r.period_start: r for r in rows if r.returns.exists()}
+    first = conf.vat_golive_date or entity.vat_effective_date
+    expected = [p for p in _walk(entity, conf, until, fixed) if p[0] >= first or p[0] in fixed]
+    wanted = set(expected)
+    stale = [r for r in rows if (r.period_start, r.period_end, r.frequency) not in wanted]
+    have = {(r.period_start, r.period_end, r.frequency) for r in rows}
+    missing = [p for p in expected if p not in have]
+    if agent is not None and (stale or missing):
+        access.deny(agent, entity, "tax.prepare_return", "agent_forbidden")
+    for row in stale:
+        if row.returns.exists() or TaxAlert.objects.filter(schedule=row).exists():
+            raise error("A VAT period with a return or alerts would change; the schedule cannot be regenerated.",
+                        "ستتغير فترة لها إقرار أو تنبيهات؛ لا يمكن إعادة إنشاء الجدول.", code="schedule_has_return")
+        row._service_write = True
+        row.delete()
+    for start, end, frequency in missing:
         row = VatReturnSchedule(entity=entity, period_start=start, period_end=end, due_date=_due_date(end),
                                 frequency=frequency)
         row._service_write = True
         row.save()
-        kept.append(row)
-        start = end + timedelta(days=1)
-    return kept
+    return list(VatReturnSchedule.objects.filter(entity=entity).order_by("period_start"))
+
+
+def _on_entity_settings_changed(sender, *, entity, user, before, after, reason="", **kwargs):
+    """Receiver of ``core.signals.entity_settings_changed`` (review item 6): a VAT frequency change is dated
+    (``VatFrequencyChange``) and the schedule regenerated in the same transaction (R4)."""
+    if "vat_return_period" not in after or not before.get("vat_return_period"):
+        return
+    change = VatFrequencyChange(entity=entity, previous_frequency=before["vat_return_period"],
+                                frequency=after["vat_return_period"], changed_on=_today(),
+                                reason=str(reason or "")[:500], recorded_by=user, recorded_at=_now())
+    change._service_write = True
+    change.save()
+    fresh = Entity.objects.get(pk=entity.pk)
+    rows = VatReturnSchedule.objects.filter(entity=fresh)
+    if rows.exists() and _vat_ready(fresh):
+        _ensure_schedule(fresh, max(r.period_end for r in rows))
 
 
 def generate_schedule(entity, *, user, until):
-    """Generate the VAT return periods of ``entity`` up to ``until`` (R3, R4). Needs ``tax.prepare_return``."""
+    """Generate the VAT return periods of ``entity`` up to ``until`` (R3, R4). Needs ``tax.prepare_return`` and a
+    person: agents never regenerate or delete periods (review item 12)."""
     access.require(user, entity, "tax.prepare_return")
+    _human(user, entity, "tax.prepare_return")
     with transaction.atomic():
-        return _ensure_schedule(entity, until, _today())
+        return _ensure_schedule(entity, until)
 
 
 def schedule(entity, *, user):
@@ -277,10 +394,17 @@ def vat_returns(user, entity=None):
 
 
 def get_return(pk, *, user):
-    """One return by id; refused and logged when the user lacks ``tax.view`` in its entity (AT-1)."""
-    ret = VatReturn.objects.select_related("entity").get(pk=pk)
-    access.require(user, ret.entity, "tax.view")
-    return ret
+    """One return by id. Unknown ids and returns of entities where the user lacks ``tax.view`` give the same error
+    (review item 12); the refusal for another entity is logged (AT-1)."""
+    ret = VatReturn.objects.select_related("entity").filter(pk=pk).first()
+    if ret is not None:
+        try:
+            access.require(user, ret.entity, "tax.view")
+            return ret
+        except access.AccessDenied:
+            pass
+    raise error("No VAT return with this id is available to you.", "لا يوجد إقرار ضريبي بهذا الرقم متاح لك.",
+                code="return_not_found")
 
 
 def drill_down(vat_return, *, user, box_no, column=None):
@@ -308,6 +432,12 @@ class Computation:
     rc_output: Decimal = ZERO
     output_vat: Decimal = ZERO
     input_vat: Decimal = ZERO
+    # Review fixes: what the reviewer must see (exceptions) and what the tie-out must explain.
+    flags: list = field(default_factory=list)  # exception dicts (kind, reference, number, ...)
+    fallback_documents: list = field(default_factory=list)  # C10: invoices put in the period of their issue date
+    shifted_in: list = field(default_factory=list)  # entries dated outside the period, reported in it
+    shifted_out: list = field(default_factory=list)  # entries dated in the period, reported in another one
+    rate_differences: list = field(default_factory=list)  # C12: (entry id, booked 1310 - box 7 VAT)
 
     def add(self, box_no, column, amount, source_type, *, source_id=None, number="", entry=None, on=None, note=""):
         amount = _q(amount)
@@ -318,6 +448,10 @@ class Computation:
         self.lines.append({"box_no": box_no, "column": column, "source_type": source_type, "source_id": source_id,
                            "document_number": number or "", "journal_entry_id": getattr(entry, "pk", entry),
                            "date": on, "amount_sar": amount, "note": note[:200]})
+
+    def flag(self, kind, reference, **details):
+        if not any(f["kind"] == kind and f["reference"] == reference for f in self.flags):
+            self.flags.append({"kind": kind, "reference": reference, **details})
 
 
 def _box_definitions(on):
@@ -355,25 +489,64 @@ def _sales_box(line):
     return None  # O (out of scope): not reported (R19)
 
 
+def _has_tax_point_field():
+    from invoicing.models import SalesDocument
+
+    return any(f.name == "tax_point_date" for f in SalesDocument._meta.concrete_fields)
+
+
+def _tax_point(doc):
+    """C10 / G6 (PSG §11.3, TIR §4.2.3): the return period of a sale is its tax point. Notes keep their own date
+    (X9, TIR §7.1.1). Invoicing stores no ``tax_point_date`` yet (invoicing R100, to build): until it does, an
+    invoice falls back to its issue date and is listed for the reviewer. Returns (date, known)."""
+    if doc.doc_type != "invoice":
+        return doc.issue_date, True
+    tax_point = getattr(doc, "tax_point_date", None)
+    if tax_point:
+        return tax_point, True
+    return doc.issue_date, False
+
+
+def _note_column(entity, entry, original_date, note_date, boxes):
+    """R20 (TIR §7.1.1): a credit note goes to the Adjustment column when the original's return was filed before
+    the note's date, else the Amount column. A reversal of a note takes the column its note took (review item 11)."""
+    if entry.reversal_of_id:
+        taken = (VatReturnSourceLine.objects.filter(journal_entry_id=entry.reversal_of_id, box_no__in=boxes,
+                                                    column__in=[Column.AMOUNT, Column.ADJUSTMENT],
+                                                    vat_return__status__in=LOCKED_STATUSES)
+                 .values_list("column", flat=True).first())
+        if taken:
+            return taken
+    if original_date is not None and _filed_before(entity, original_date, note_date):
+        return Column.ADJUSTMENT
+    return Column.AMOUNT
+
+
 def _sales_sources(comp, entity, entry, doc, sign):
-    """R18 to R20: a sales document's lines by box; SAR at the document's SAR rate (OQ-11 as built: ``sar_rate``)."""
-    rate = ONE if doc.currency_id == SAR else (doc.sar_rate or doc.fx_rate)
+    """R18 to R20: a sales document's lines by box; SAR at the document's stored SAR rate (G7 / OQ-34: invoicing
+    stores it; no fallback to the booking rate, C11)."""
+    rate = ONE if doc.currency_id == SAR else doc.sar_rate
+    if rate is None:
+        comp.flag(ExceptionKind.SAR_RATE_MISSING, f"sales:{doc.pk}", document=doc.pk, number=doc.number,
+                  output=doc.total_vat_sar, input=ZERO)
     note = doc.doc_type == "credit_note"
     s = sign * (-1 if note else 1)
     column = Column.AMOUNT
-    if note and entry.reversal_of_id is None and doc.original_document_id and _filed_before(
-            entity, doc.original_document.issue_date, doc.issue_date):
-        column = Column.ADJUSTMENT
-    nets = defaultdict(lambda: ZERO)
-    for line in doc.lines.select_related("vat_exemption_reason"):
-        box = _sales_box(line)
-        if box is not None:
-            nets[box] += line.net_amount
-    for box, net in sorted(nets.items()):
-        comp.add(box, column, s * _sar(net, rate), "sales_document", source_id=doc.pk, number=doc.number, entry=entry,
-                 on=entry.date)
+    if note and doc.original_document_id:
+        column = _note_column(entity, entry, doc.original_document.issue_date, doc.issue_date, OUTPUT_BOXES)
+    if rate is not None:
+        nets = defaultdict(lambda: ZERO)
+        for line in doc.lines.select_related("vat_exemption_reason"):
+            box = _sales_box(line)
+            if box is not None:
+                nets[box] += line.net_amount
+        for box, net in sorted(nets.items()):
+            comp.add(box, column, s * _sar(net, rate), "sales_document", source_id=doc.pk, number=doc.number,
+                     entry=entry, on=entry.date)
     vat = sum((Decimal(g["vat_sar"]) for g in doc.vat_breakdown if g["category"] == "S"), ZERO)
     comp.add(1, Column.VAT, s * vat, "sales_document", source_id=doc.pk, number=doc.number, entry=entry, on=entry.date)
+    if not entry.reversal_of_id and not _tax_point(doc)[1]:
+        comp.fallback_documents.append(doc)
 
 
 def _purchase_box(resident, line):
@@ -408,15 +581,17 @@ def _recoverable(doc, lines, resident):
 
 
 def _purchase_sources(comp, entity, entry, doc, sign):
-    """R21, R23, R24: a bill or vendor credit note by box; SAR at its booking rate (functional SAR)."""
+    """R21, R23, R24: a bill or vendor credit note by box. Amounts at the booking rate; box 7 VAT of a
+    foreign-currency bill = the SAR VAT on the supplier's invoice (C12, TIR §4.2.2), the booking-rate difference
+    goes to the tie-out only."""
     rate = ONE if doc.currency_id == SAR else doc.fx_rate
     resident = doc.vendor.is_resident
     note = doc.doc_type == "vendor_credit_note"
     s = sign * (-1 if note else 1)
     column = Column.AMOUNT
-    if note and entry.reversal_of_id is None and doc.original_document_id and _filed_before(
-            entity, doc.original_document.accounting_date, doc.accounting_date):
-        column = Column.ADJUSTMENT
+    if note and doc.original_document_id:  # C9: the note's own (supplier) date decides
+        column = _note_column(entity, entry, doc.original_document.accounting_date, doc.vendor_document_date,
+                              INPUT_BOXES)
     lines = list(doc.lines.select_related("vat_rate"))
     unregistered = any(g.get("unregistered_vendor") for g in doc.vat_breakdown)
     nets = defaultdict(lambda: ZERO)
@@ -429,8 +604,18 @@ def _purchase_sources(comp, entity, entry, doc, sign):
                  entry=entry, on=entry.date)
     if unregistered:
         return
-    recoverable = _sar(_recoverable(doc, lines, resident), rate)
-    comp.add(7 if resident else 9, Column.VAT, s * recoverable, "purchase_document", source_id=doc.pk,
+    recoverable = _recoverable(doc, lines, resident)
+    booked = _sar(recoverable, rate)
+    reported = booked
+    if resident and doc.currency_id != SAR and recoverable:
+        if doc.vendor_vat_sar is not None and doc.total_vat:
+            reported = _q(doc.vendor_vat_sar * recoverable / doc.total_vat)
+            if reported != booked:
+                comp.rate_differences.append((entry.pk, s * (booked - reported)))
+        else:
+            comp.flag(ExceptionKind.PURCHASE_SAR_VAT_MISSING, f"purchase:{doc.pk}", document=doc.pk,
+                      number=doc.number, output=ZERO, input=booked)
+    comp.add(7 if resident else 9, Column.VAT, s * reported, "purchase_document", source_id=doc.pk,
              number=doc.number, entry=entry, on=entry.date)
     if not resident and doc.reverse_charge_vat:
         rc = s * _sar(doc.reverse_charge_vat, rate)
@@ -440,27 +625,87 @@ def _purchase_sources(comp, entity, entry, doc, sign):
 
 
 def _import_sources(comp, entry, rec, sign):
-    """R22: box 8 amount = customs value; VAT = the recoverable VAT (attribution ``taxable``)."""
+    """R22: box 8 amount = the import VAT base (customs value + duties + other charges, C13 [verify]); VAT = the
+    recoverable VAT (attribution ``taxable``)."""
     number = rec.customs_declaration_no
-    comp.add(8, Column.AMOUNT, sign * rec.customs_value_sar, "import_record", source_id=rec.pk, number=number,
+    comp.add(8, Column.AMOUNT, sign * rec.vat_base_sar, "import_record", source_id=rec.pk, number=number,
              entry=entry, on=entry.date)
     if rec.attribution == ImportVatRecord.Attribution.TAXABLE:
         comp.add(8, Column.VAT, sign * rec.vat_paid_sar, "import_record", source_id=rec.pk, number=number,
                  entry=entry, on=entry.date)
 
 
-def _source_entries(entity, start, end):
+def _source_document(entry, cache):
+    from invoicing.models import PurchaseDocument, SalesDocument
+
+    key = (entry.document_type, entry.document_id)
+    if key not in cache:
+        if entry.document_type == SALES_TYPE:
+            cache[key] = SalesDocument.objects.select_related("original_document").get(pk=entry.document_id)
+        elif entry.document_type == PURCHASE_TYPE:
+            cache[key] = PurchaseDocument.objects.select_related("vendor", "original_document").get(pk=entry.document_id)
+        else:
+            cache[key] = ImportVatRecord.objects.get(pk=entry.document_id)
+    return cache[key]
+
+
+def _period_date(entry, doc):
+    """R17 as amended (C9, C10): the date that decides the return period. A reversal: its own date. A sale: its
+    tax point. A vendor credit note: the supplier note's date. Bills and import records: the journal date."""
+    if entry.reversal_of_id:
+        return entry.date
+    if entry.document_type == SALES_TYPE:
+        return _tax_point(doc)[0]
+    if entry.document_type == PURCHASE_TYPE and doc.doc_type == "vendor_credit_note":
+        return doc.vendor_document_date
+    return entry.date
+
+
+def _period_sources(entity, start, end):
+    """(entries reported in the period, entries dated in it but reported in another period), each as
+    (entry, document). Correcting entries of live corrections are left out (R26)."""
+    from invoicing.models import PurchaseDocument, SalesDocument
+
     excluded = _correction_exclusions(entity)
-    return (JournalEntry.objects.filter(entity=entity, date__gte=start, date__lte=end, status__in=ledger.BOOKED,
-                                        document_type__in=SOURCE_TYPES)
-            .exclude(pk__in=excluded).order_by("date", "pk"))
+    base = (JournalEntry.objects.filter(entity=entity, status__in=ledger.BOOKED, document_type__in=SOURCE_TYPES)
+            .exclude(pk__in=excluded))
+    sales = Q(issue_date__gte=start, issue_date__lte=end)
+    if _has_tax_point_field():
+        sales |= Q(tax_point_date__gte=start, tax_point_date__lte=end)
+    sales_ids = SalesDocument.objects.filter(sales, entity=entity).values_list("pk", flat=True)
+    note_ids = PurchaseDocument.objects.filter(entity=entity, doc_type="vendor_credit_note",
+                                               vendor_document_date__gte=start, vendor_document_date__lte=end
+                                               ).values_list("pk", flat=True)
+    candidates = base.filter(Q(date__gte=start, date__lte=end)
+                             | Q(document_type=SALES_TYPE, document_id__in=list(sales_ids), reversal_of__isnull=True)
+                             | Q(document_type=PURCHASE_TYPE, document_id__in=list(note_ids),
+                                 reversal_of__isnull=True))
+    cache, inside, outside = {}, [], []
+    for entry in candidates.order_by("date", "pk"):
+        doc = _source_document(entry, cache)
+        on = _period_date(entry, doc)
+        if start <= on <= end:
+            inside.append((entry, doc))
+        elif start <= entry.date <= end:
+            outside.append((entry, doc))
+    return inside, outside
+
+
+def _previous_period(ret):
+    """The return of the period just before ``ret`` (latest approved or later, not amended), and whether that
+    period is in the ERP schedule without one (a gap, review item 13)."""
+    day_before = ret.period_start - timedelta(days=1)
+    prev = (VatReturn.objects.filter(entity=ret.entity, period_end=day_before,
+                                     status__in=[ReturnStatus.APPROVED, ReturnStatus.FILED, ReturnStatus.SETTLED])
+            .order_by("-version").first())
+    if prev is not None:
+        return prev, False
+    return None, VatReturnSchedule.objects.filter(entity=ret.entity, period_end=day_before).exists()
 
 
 def _carried_credit(ret):
-    """R25: box 15 = the latest earlier return's negative box 16 when no refund was requested (OQ-18)."""
-    prev = (VatReturn.objects.filter(entity=ret.entity, period_end__lt=ret.period_start,
-                                     status__in=[ReturnStatus.APPROVED, ReturnStatus.FILED, ReturnStatus.SETTLED])
-            .order_by("-period_start", "-version").first())
+    """R25: box 15 = the previous period's negative box 16 when no refund was requested (OQ-18), less refunds."""
+    prev, _ = _previous_period(ret)
     if prev is None or prev.net_vat_sar >= ZERO or prev.refund_requested:
         return None, ZERO
     refunded = TaxRefund.objects.filter(vat_return=prev, status=DocStatus.POSTED).aggregate(t=Sum("amount_sar"))["t"]
@@ -472,8 +717,12 @@ def _art51_port():
 
 
 def _last_return_of_year(ret):
-    year_end = date_type(ret.period_end.year, 12, 31)
-    return ret.period_start <= year_end <= ret.period_end
+    """R55 (review item 1): the year whose 31 December falls in the return period, else None. A quarter that
+    starts in November (quarter start month 2) holds 31 December of its first year."""
+    for year in range(ret.period_start.year, ret.period_end.year + 1):
+        if ret.period_start <= date_type(year, 12, 31) <= ret.period_end:
+            return year
+    return None
 
 
 def _totals(comp, ret):
@@ -488,27 +737,28 @@ def _totals(comp, ret):
 
 
 def _compute(ret):
-    """Recompute every box of ``ret`` from posted ledger and invoicing data (R15 to R27, R55)."""
+    """Recompute every box of ``ret`` from posted ledger and invoicing data (R15 to R27, R55). Reads only."""
     comp = Computation()
     entity = ret.entity
     if ret.version > 0:
         return _compute_amendment(ret, comp)
-    from invoicing.models import PurchaseDocument, SalesDocument
-
-    for entry in _source_entries(entity, ret.period_start, ret.period_end):
+    inside, outside = _period_sources(entity, ret.period_start, ret.period_end)
+    for entry, doc in inside:
         sign = -1 if entry.reversal_of_id else 1
         if entry.document_type == SALES_TYPE:
-            doc = SalesDocument.objects.select_related("original_document").get(pk=entry.document_id)
             _sales_sources(comp, entity, entry, doc, sign)
         elif entry.document_type == PURCHASE_TYPE:
-            doc = PurchaseDocument.objects.select_related("vendor", "original_document").get(pk=entry.document_id)
             _purchase_sources(comp, entity, entry, doc, sign)
         else:
-            _import_sources(comp, entry, ImportVatRecord.objects.get(pk=entry.document_id), sign)
-    if _last_return_of_year(ret):  # R55: the year's Art. 51 true-up in the last return of the year
-        status = _art51_port().year_status(entity, ret.period_end.year)
+            _import_sources(comp, entry, doc, sign)
+        if not ret.period_start <= entry.date <= ret.period_end:
+            comp.shifted_in.append(entry)
+    comp.shifted_out = [entry for entry, _ in outside]
+    year = _last_return_of_year(ret)
+    if year is not None:  # R55: the year's Art. 51 true-up in the last return of the year
+        status = _art51_port().year_status(entity, year)
         for entry, amount in (status.true_up_entries if status.applies else ()):
-            for column in (Column.ADJUSTMENT, Column.VAT):  # [CC-verify] placement (OQ-2); VAT keeps box 13 whole
+            for column in (Column.ADJUSTMENT, Column.VAT):  # [verify] placement (OQ-2); VAT keeps box 13 whole
                 comp.add(7, column, amount, "art51_true_up", source_id=entry.pk, number=entry.number, entry=entry,
                          on=entry.date, note="Art. 51 true-up / تسوية المادة 51")
     for corr in ret.assigned_corrections.exclude(status=VatCorrection.Status.CANCELLED).order_by("pk"):
@@ -599,18 +849,35 @@ def _store(ret, comp):
     ret.rc_output_vat_sar, ret.net_vat_sar = comp.rc_output, comp.boxes[16]["vat"]
 
 
+def _time_bar(corr):
+    """R27 / C7 (VAT IR Art. 63, PSG §13.5): an overstatement (any negative difference, below or above the
+    threshold) is corrected at the latest 5 years after the end of the calendar year of the original period, i.e.
+    the return carrying it must be filed by then."""
+    return date_type(corr.original_return.period_end.year + 5, 12, 31)
+
+
 def _assign_corrections(ret):
-    """R27: open next-return corrections of earlier periods go to box 14 of this (not yet approved) return."""
-    for corr in VatCorrection.objects.select_for_update().filter(
+    """R27: open next-return corrections of earlier periods go to box 14 of this (not yet approved) return; an
+    overstatement past its time bar is not taken (review item 13)."""
+    for corr in VatCorrection.objects.select_for_update(of=("self",)).select_related("original_return").filter(
             entity=ret.entity, status=VatCorrection.Status.OPEN, target_return__isnull=True,
             treatment__in=[VatCorrection.Treatment.NEXT_RETURN, VatCorrection.Treatment.OVERSTATEMENT_NEXT_RETURN],
             original_return__period_end__lt=ret.period_start):
+        if corr.tax_difference_sar < ZERO and ret.period_start > _time_bar(corr):
+            continue
         corr.target_return, corr.status = ret, VatCorrection.Status.ASSIGNED
         corr._service_write = True
         corr.save()
 
 
+def _not_import(ret):
+    if ret.source == VatReturn.Source.IMPORT:
+        raise error("An imported legacy return keeps the figures filed; it is never recomputed or adjusted (R12).",
+                    "يحتفظ الإقرار المستورد بالأرقام المقدَّمة؛ لا يُعاد احتسابه ولا يُعدَّل.", code="import_not_recomputed")
+
+
 def _recompute(ret, user):
+    _not_import(ret)
     ret.modified_by, ret.modified_at = user, _now()
     if ret.version == 0:
         _assign_corrections(ret)
@@ -626,12 +893,13 @@ def _recompute(ret, user):
 def compute_draft(entity, period_start, *, user):
     """Create or recompute the draft VAT return (version 0) of the period starting ``period_start`` (R14 to R27).
 
-    ``tax.prepare_return``; agents may call it (R14: the draft is marked ``source=agent``)."""
+    ``tax.prepare_return``; agents may call it (R14: the draft is marked ``source=agent``) but never change the
+    schedule (review item 12)."""
     access.require(user, entity, "tax.prepare_return")
     entity = Entity.objects.get(pk=entity.pk)
     _check_vat_entity(entity)
     with transaction.atomic():
-        rows = _ensure_schedule(entity, period_start, _today())
+        rows = _ensure_schedule(entity, period_start, agent=user if kind_of(user) == Kind.AGENT else None)
         row = next((r for r in rows if r.period_start == period_start), None)
         if row is None:
             raise error(f"No VAT return period of {entity.code} starts on {period_start}.",
@@ -678,10 +946,12 @@ def _locked_draft(vat_return, user, permission):
 
 
 def set_refund_requested(vat_return, *, user, requested):
-    """Whether a claim (negative box 16) is to be refunded instead of carried to box 15 (R25, OQ-18)."""
+    """Whether a claim (negative box 16) is to be refunded instead of carried to box 15 (R25, OQ-18). The person
+    making the choice counts as a preparer (review item 10)."""
     with transaction.atomic():
         ret = _locked_draft(vat_return, user, "tax.prepare_return")
-        ret.refund_requested = bool(requested)
+        _not_import(ret)
+        ret.refund_requested, ret.refund_requested_by = bool(requested), user
         return _recompute(ret, user)
 
 
@@ -721,11 +991,14 @@ def add_manual_adjustment(vat_return, *, user, box_no, column, amount_sar, reaso
 
 # --- exceptions and tie-out (R15, R16) -----------------------------------------------------------------
 
-def _ledger_entries(entity, start, end):
-    """Per entry in the period: (output = net credit on 2200, input = net debit on 1310), settlement entries out."""
-    rows = (JournalLine.objects.filter(entry__entity=entity, entry__date__gte=start, entry__date__lte=end,
-                                       entry__status__in=ledger.BOOKED, account__code__in=[VAT_OUTPUT, VAT_INPUT])
-            .exclude(entry__document_type__in=SETTLEMENT_TYPES)
+def _ledger_entries(entity, start=None, end=None, ids=None):
+    """Per entry: (output = net credit on 2200, input = net debit on 1310), settlement entries (T1, T2, T4) out.
+    Entries dated in [start, end], or the entries ``ids``."""
+    rows = JournalLine.objects.filter(entry__entity=entity, entry__status__in=ledger.BOOKED,
+                                      account__code__in=[VAT_OUTPUT, VAT_INPUT])
+    rows = rows.filter(entry_id__in=ids) if ids is not None else rows.filter(entry__date__gte=start,
+                                                                              entry__date__lte=end)
+    rows = (rows.exclude(entry__document_type__in=SETTLEMENT_TYPES)
             .values("entry_id", "entry__document_type", "entry__number", "account__code")
             .annotate(d=Sum("debit"), c=Sum("credit")))
     out = {}
@@ -741,20 +1014,73 @@ def _ledger_entries(entity, start, end):
 
 
 def _true_up_entry_ids(ret):
-    if ret.version > 0 or not _last_return_of_year(ret):
+    year = _last_return_of_year(ret)
+    if ret.version > 0 or year is None:
         return set()
-    status = _art51_port().year_status(ret.entity, ret.period_end.year)
+    status = _art51_port().year_status(ret.entity, year)
     return {e.pk for e, _ in status.true_up_entries} if status.applies else set()
 
 
-def _exceptions(ret):
-    """R15, R16: the exceptions of a return, each with its acknowledgement (if any), and the tie-out."""
+def _correction_net(corr):
+    """Net VAT effect of a correction's correcting entries and their reversals: 2200 credits - 1310 debits."""
+    ids = set(corr.correcting_entries.values_list("pk", flat=True))
+    if not ids:
+        return None
+    ids |= set(JournalEntry.objects.filter(reversal_of_id__in=ids).values_list("pk", flat=True))
+    moves = _ledger_entries(corr.entity, ids=ids)
+    return sum((m["output"] - m["input"] for m in moves.values()), ZERO)
+
+
+def _correction_flags(ret, acks):
+    """Review item 4: every correction in box 14 has correcting entries whose net 2200 - 1310 effect equals its
+    tax difference; else the reviewer decides (mismatch) or the return cannot proceed (no entry: 2200 would
+    drift when the return is paid)."""
+    found = []
+    for corr in ret.assigned_corrections.exclude(status=VatCorrection.Status.CANCELLED).order_by("pk"):
+        ref = f"corr:{corr.pk}"
+        net = _correction_net(corr)
+        if net is None:
+            found.append({"kind": ExceptionKind.CORRECTION_WITHOUT_ENTRY, "reference": ref, "correction": corr.pk,
+                          "number": f"COR-{corr.pk}", "difference": corr.tax_difference_sar, "ack": None})
+        elif net != corr.tax_difference_sar:
+            found.append({"kind": ExceptionKind.CORRECTION_MISMATCH, "reference": ref, "correction": corr.pk,
+                          "number": f"COR-{corr.pk}", "difference": corr.tax_difference_sar - net, "entries_net": net,
+                          "ack": acks.get((ExceptionKind.CORRECTION_MISMATCH, ref))})
+    return found
+
+
+def _unpaid_bills(ret, acks):
+    """C15 (VAT IR as amended 2025, unverified, OQ-43): input VAT on a bill still unpaid 12 months after its date
+    may have to be reversed. Listed for the reviewer in the return of the period in which the 12 months end; no
+    automatic reversal."""
+    from invoicing.models import PayableAllocation, PurchaseDocument
+
+    found = []
+    bills = PurchaseDocument.objects.filter(
+        entity=ret.entity, doc_type="bill", status="posted", vendor__is_resident=True, total_vat__gt=0,
+        accounting_date__gte=_add_months(ret.period_start, -12), accounting_date__lte=_add_months(ret.period_end, -12))
+    for doc in bills.order_by("accounting_date", "pk"):
+        paid = PayableAllocation.objects.filter(target=doc, date__lte=ret.period_end).aggregate(t=Sum("amount"))["t"]
+        if doc.total_gross - (paid or ZERO) > ZERO:
+            ref = f"purchase:{doc.pk}"
+            found.append({"kind": ExceptionKind.UNPAID_BILL_12_MONTHS, "reference": ref, "document": doc.pk,
+                          "number": doc.number, "output": ZERO, "input": doc.total_vat,
+                          "ack": acks.get((ExceptionKind.UNPAID_BILL_12_MONTHS, ref))})
+    return found
+
+
+def _exceptions(ret, comp=None):
+    """R15, R16 and the review fixes: the exceptions of a return, each with its acknowledgement (if any), and the
+    tie-out. ``comp``: the recomputation, when the caller has one."""
     from invoicing.models import SalesDocument
 
     acks = {(a.kind, a.reference): a for a in ret.exception_acks.all()}
-    found = []
+    if ret.source == VatReturn.Source.IMPORT:  # filed outside the ERP; reviewed against its filing
+        return [], None
+    found = _correction_flags(ret, acks)
     if ret.version > 0:  # an amendment restates a filed return; its sources were tied out then
         return found, None
+    comp = comp or _compute(ret)
     excluded = _correction_exclusions(ret.entity)
     tagged = _true_up_entry_ids(ret)
     every = _ledger_entries(ret.entity, ret.period_start, ret.period_end)
@@ -769,18 +1095,48 @@ def _exceptions(ret):
                       "number": e["number"], "output": e["output"], "input": e["input"], "ack": ack})
         if ack and ack.decision == VatExceptionAck.Decision.NOT_RETURN_RELEVANT:
             not_relevant.add(pk)
+    for pk in sorted(excluded & set(every)):  # review item 4: left out as correcting entries
+        ref = f"je:{pk}"
+        found.append({"kind": ExceptionKind.CORRECTING_ENTRY, "reference": ref, "entry": pk,
+                      "number": every[pk]["number"], "output": every[pk]["output"], "input": every[pk]["input"],
+                      "ack": acks.get((ExceptionKind.CORRECTING_ENTRY, ref))})
     for doc in SalesDocument.objects.filter(entity=ret.entity, status="rejected", issue_date__gte=ret.period_start,
                                             issue_date__lte=ret.period_end).order_by("pk"):
         ref = f"sales:{doc.pk}"
         found.append({"kind": ExceptionKind.REJECTED_DOCUMENT, "reference": ref, "document": doc.pk,
                       "number": doc.number, "output": doc.total_vat_sar, "input": ZERO,
                       "ack": acks.get((ExceptionKind.REJECTED_DOCUMENT, ref))})
-    ledger_output = sum((e["output"] for pk, e in entries.items() if pk not in not_relevant), ZERO)
-    ledger_input = sum((e["input"] for pk, e in entries.items() if pk not in not_relevant), ZERO)
+    if comp.fallback_documents:  # C10: one decision for the invoices dated by their issue date
+        ids = sorted(d.pk for d in comp.fallback_documents)
+        ref = "tp:" + hashlib.sha256(",".join(map(str, ids)).encode()).hexdigest()[:20]
+        found.append({"kind": ExceptionKind.TAX_POINT_FALLBACK, "reference": ref, "documents": ids,
+                      "number": ", ".join(d.number for d in comp.fallback_documents)[:500],
+                      "ack": acks.get((ExceptionKind.TAX_POINT_FALLBACK, ref))})
+    for flag in comp.flags:
+        found.append({**flag, "ack": acks.get((flag["kind"], flag["reference"]))})
+    for entry in comp.shifted_in + comp.shifted_out:
+        ref = f"je:{entry.pk}"
+        found.append({"kind": ExceptionKind.PERIOD_SHIFT, "reference": ref, "entry": entry.pk, "number": entry.number,
+                      "date": entry.date, "reported_here": entry in comp.shifted_in,
+                      "ack": acks.get((ExceptionKind.PERIOD_SHIFT, ref))})
+    _, gap = _previous_period(ret)
+    if gap:
+        ref = f"period:{ret.period_start - timedelta(days=1)}"
+        found.append({"kind": ExceptionKind.CARRY_FORWARD_GAP, "reference": ref, "ack": None})
+    found += _unpaid_bills(ret, acks)
+    shifted_out = {e.pk for e in comp.shifted_out}
+    moves_in = _ledger_entries(ret.entity, ids={e.pk for e in comp.shifted_in}) if comp.shifted_in else {}
+    counted = [e for pk, e in entries.items() if pk not in not_relevant and pk not in shifted_out]
+    counted += list(moves_in.values())
+    rate_difference = sum((d for _, d in comp.rate_differences), ZERO)
+    ledger_output = sum((e["output"] for e in counted), ZERO)
+    ledger_input = sum((e["input"] for e in counted), ZERO) - rate_difference
     tie = {"box_output": ret.output_vat_sar, "box_input": ret.input_vat_sar,
            "ledger_output": ledger_output, "ledger_input": ledger_input,
            "difference_output": ledger_output - ret.output_vat_sar,
            "difference_input": ledger_input - ret.input_vat_sar,
+           "rate_difference_input": rate_difference,
+           "shifted_in": sorted(moves_in), "shifted_out": sorted(shifted_out),
            "excluded_entries": sorted(not_relevant | (excluded & set(every)))}
     for account, diff in ((VAT_OUTPUT, tie["difference_output"]), (VAT_INPUT, tie["difference_input"])):
         if diff:
@@ -790,24 +1146,49 @@ def _exceptions(ret):
 
 
 def exceptions(vat_return, *, user):
-    """The return's exceptions and acknowledgements (R15, R16). Needs ``tax.view``."""
+    """The return's exceptions and acknowledgements (R15, R16). Needs ``tax.view`` and ``ledger.view`` (they show
+    journal entries, like the tie-out; review item 12)."""
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     access.require(user, ret.entity, "tax.view")
+    access.require(user, ret.entity, "ledger.view")
     return _exceptions(ret)[0]
 
 
 def tie_out(vat_return, *, user):
     """R15: output VAT in the boxes vs net credits on 2200, recoverable input VAT vs net debits on 1310, for the
     period, without the return's own settlement entries (T1, T2, T4), correcting entries (R26) and journals the
-    reviewer marked not relevant. Needs ``tax.view`` and ``ledger.view``."""
+    reviewer marked not relevant; plus entries reported here but dated in another period and minus those dated
+    here but reported elsewhere (tax point, supplier note date: C9, C10), and minus the booking-rate difference of
+    foreign-currency bills (C12). Needs ``tax.view`` and ``ledger.view``."""
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     access.require(user, ret.entity, "tax.view")
     access.require(user, ret.entity, "ledger.view")
     return _exceptions(ret)[1]
 
 
+ALLOWED_DECISIONS = {
+    ExceptionKind.UNTAGGED_VAT_JOURNAL: {VatExceptionAck.Decision.NOT_RETURN_RELEVANT,
+                                         VatExceptionAck.Decision.INCLUDED_BY_ADJUSTMENT},
+    ExceptionKind.REJECTED_DOCUMENT: {VatExceptionAck.Decision.TAGGED, VatExceptionAck.Decision.NOT_RETURN_RELEVANT,
+                                      VatExceptionAck.Decision.INCLUDED_BY_ADJUSTMENT},
+    ExceptionKind.TAX_POINT_FALLBACK: {VatExceptionAck.Decision.TAX_POINT_CONFIRMED,
+                                       VatExceptionAck.Decision.INCLUDED_BY_ADJUSTMENT},
+    ExceptionKind.PERIOD_SHIFT: {VatExceptionAck.Decision.TAX_POINT_CONFIRMED},
+    ExceptionKind.SAR_RATE_MISSING: {VatExceptionAck.Decision.INCLUDED_BY_ADJUSTMENT},
+    ExceptionKind.PURCHASE_SAR_VAT_MISSING: {VatExceptionAck.Decision.DIFFERENCE_EXPLAINED,
+                                             VatExceptionAck.Decision.INCLUDED_BY_ADJUSTMENT},
+    ExceptionKind.CORRECTING_ENTRY: {VatExceptionAck.Decision.CONFIRMED_CORRECTION},
+    ExceptionKind.CORRECTION_MISMATCH: {VatExceptionAck.Decision.DIFFERENCE_EXPLAINED},
+    ExceptionKind.UNPAID_BILL_12_MONTHS: {VatExceptionAck.Decision.NOT_RETURN_RELEVANT,
+                                          VatExceptionAck.Decision.INCLUDED_BY_ADJUSTMENT},
+}
+OUTPUT_KINDS = {ExceptionKind.REJECTED_DOCUMENT, ExceptionKind.TAX_POINT_FALLBACK, ExceptionKind.SAR_RATE_MISSING}
+
+
 def acknowledge_exception(vat_return, *, user, kind, reference, decision, reason_ar, reason_en=""):
-    """The reviewer's decision on an exception (R15, R16), while the return is in review; not by a preparer."""
+    """The reviewer's decision on an exception (R15, R16), while the return is in review; not by a preparer.
+    Blocking kinds (tie-out difference, correction without entry, earlier period without a return) are fixed at
+    their source, never acknowledged."""
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     access.require(user, ret.entity, "tax.review_return")
     _human(user, ret.entity, "tax.review_return")
@@ -822,23 +1203,22 @@ def acknowledge_exception(vat_return, *, user, kind, reference, decision, reason
             raise error("An Arabic reason is required.", "السبب بالعربية مطلوب.", code="reason_required")
         found = {(e["kind"], e["reference"]): e for e in _exceptions(ret)[0]}
         item = found.get((kind, reference))
-        if item is None or kind == ExceptionKind.TIE_OUT_DIFFERENCE:
-            raise error("No open exception with this reference; a tie-out difference is explained by adjustments or "
-                        "acknowledged journals, never acknowledged itself.",
-                        "لا يوجد استثناء مفتوح بهذا المرجع؛ يُفسَّر فرق المطابقة بالتعديلات أو بإقرار القيود.",
-                        code="no_such_exception")
-        allowed = {ExceptionKind.UNTAGGED_VAT_JOURNAL: {VatExceptionAck.Decision.NOT_RETURN_RELEVANT,
-                                                        VatExceptionAck.Decision.INCLUDED_BY_ADJUSTMENT},
-                   ExceptionKind.REJECTED_DOCUMENT: set(VatExceptionAck.Decision.values)}[kind]
-        if decision not in allowed:
+        if item is None or kind in BLOCKING_EXCEPTIONS:
+            raise error("No open exception with this reference; a tie-out difference, a correction without a "
+                        "correcting entry or a missing earlier return is fixed at its source, never acknowledged.",
+                        "لا يوجد استثناء مفتوح بهذا المرجع؛ يُعالَج فرق المطابقة أو التصحيح بلا قيد أو الإقرار السابق "
+                        "المفقود من مصدره ولا يُقَرّ.", code="no_such_exception")
+        if decision not in ALLOWED_DECISIONS.get(kind, set()):
             raise error("This decision does not apply to this exception.", "هذا القرار لا ينطبق على هذا الاستثناء.",
                         code="decision_invalid")
         if decision == VatExceptionAck.Decision.INCLUDED_BY_ADJUSTMENT:
             adjustments = ret.manual_adjustments.all()
             if kind == ExceptionKind.UNTAGGED_VAT_JOURNAL:
                 adjustments = adjustments.filter(journal_lines__entry_id=item["entry"])
-            else:
+            elif kind in OUTPUT_KINDS:
                 adjustments = adjustments.filter(box_no__in=OUTPUT_BOXES)
+            else:
+                adjustments = adjustments.filter(box_no__in=INPUT_BOXES)
             if not adjustments.exists():
                 raise error("No manual adjustment of this return covers it.", "لا يوجد تعديل يدوي في الإقرار يغطيه.",
                             code="adjustment_missing")
@@ -898,14 +1278,33 @@ SOURCES_CHANGED = ("The sources changed since the return was computed; it is bac
 
 
 def _refuse_changed_sources(ret):
-    """R10: if a recomputation differs from what is stored, the return goes back to draft and the step is refused."""
-    if _canonical_of_comp(_compute(ret)) == _canonical_of_stored(ret):
-        return
+    """R10: if a recomputation differs from what is stored, the return goes back to draft and the step is refused.
+    Returns the recomputation."""
+    if ret.source == VatReturn.Source.IMPORT:
+        return None
+    comp = _compute(ret)
+    if _canonical_of_comp(comp) == _canonical_of_stored(ret):
+        return comp
     with transaction.atomic():
         stored = VatReturn.objects.select_for_update().get(pk=ret.pk)
         if stored.status in (ReturnStatus.IN_REVIEW, ReturnStatus.REVIEWED):
             _back_to_draft(stored, *SOURCES_CHANGED)
     raise error(*SOURCES_CHANGED, code="sources_changed")
+
+
+def _refuse_open_exceptions(ret, comp):
+    """R15, R16 (review item 2): no step past review while an exception is unacknowledged or the VAT accounts do
+    not tie out to 0.00 (re-run at approval, so a journal posted after review is caught)."""
+    found, tie = _exceptions(ret, comp)
+    open_ = [e for e in found if e["ack"] is None]
+    if tie is not None and (tie["difference_output"] or tie["difference_input"]) and not any(
+            e["kind"] == ExceptionKind.TIE_OUT_DIFFERENCE for e in open_):
+        open_.append({"kind": ExceptionKind.TIE_OUT_DIFFERENCE, "reference": "tie-out"})
+    if open_:
+        listing = ", ".join(f"{e['kind']} {e['reference']}" for e in open_)
+        raise error(f"Exceptions are open or the VAT accounts do not tie out: {listing}.",
+                    f"توجد استثناءات مفتوحة أو لا تتطابق حسابات الضريبة: {listing}.", code="exceptions_open")
+    return found, tie
 
 
 def complete_review(vat_return, *, user):
@@ -918,14 +1317,10 @@ def complete_review(vat_return, *, user):
         access.deny(user, ret.entity, "tax.review_return", "self_approval")
     if ret.status != ReturnStatus.IN_REVIEW:
         raise error("Only a return in review is reviewed.", "تُراجَع الإقرارات قيد المراجعة فقط.", code="not_in_review")
-    _refuse_changed_sources(ret)
-    found, _ = _exceptions(ret)
-    open_ = [e for e in found if e["ack"] is None]
-    if open_:
-        listing = ", ".join(f"{e['kind']} {e['reference']}" for e in open_)
-        raise error(f"Review cannot complete while exceptions are open or the VAT accounts do not tie out: {listing}.",
-                    f"لا تكتمل المراجعة مع وجود استثناءات مفتوحة أو عدم مطابقة حسابات الضريبة: {listing}.",
-                    code="exceptions_open")
+    if ret.source == VatReturn.Source.IMPORT:
+        _check_import_allowed(ret.entity, ret.period_start, ret.period_end, existing=ret)
+    else:
+        _refuse_open_exceptions(ret, _refuse_changed_sources(ret))
     with transaction.atomic():
         ret = VatReturn.objects.select_for_update().get(pk=ret.pk)
         if ret.status != ReturnStatus.IN_REVIEW:
@@ -1003,18 +1398,44 @@ def _require_posting(document):
                     f"يُرحَّل المستند {document._meta.label} من خلال خدمات الضرائب فقط.", code="post_through_services")
 
 
+def _source_hash(ret):
+    """R10 (review item 2): SHA-256 of the canonical boxes and source lines plus every 2200 / 1310 movement of the
+    period (entry, output, input), so a later change to the VAT accounts of the period is visible."""
+    moves = _ledger_entries(ret.entity, ret.period_start, ret.period_end)
+    payload = _canonical_of_stored(ret) + json.dumps(
+        [[pk, str(m["output"]), str(m["input"])] for pk, m in sorted(moves.items())], separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _check_time_bars(ret, on):
+    for corr in ret.assigned_corrections.select_related("original_return").filter(
+            tax_difference_sar__lt=0).exclude(status=VatCorrection.Status.CANCELLED):
+        if on > _time_bar(corr):
+            raise error(f"The overstatement COR-{corr.pk} is time-barred on {on}: it had to be corrected by "
+                        f"{_time_bar(corr)} (VAT IR Art. 63).",
+                        f"انقضت مهلة تصحيح الزيادة COR-{corr.pk} في {on}: كان يجب تصحيحها قبل {_time_bar(corr)}.",
+                        code="correction_time_barred")
+
+
 def approve_return(vat_return, *, user):
     """reviewed -> approved (locked) by the CFO (R7 to R10, R33): ``tax.approve_return`` grant issued for this
-    return, not its creator, last modifier, submitter (access R14) or reviewer (R8); every overlapping fiscal period
-    closed (R9); earlier returns approved; the Art. 51 true-up posted in the last return of the year (R55); sources
-    unchanged (R10). Freezes the source lines (``source_hash``) and posts T1 dated today."""
+    return, not a preparer (R8, review item 10) or its reviewer; three different people always (owner decision G3:
+    no top-authority self-approval for VAT returns). Every overlapping fiscal period closed (R9); every earlier
+    period of the schedule has an approved return; the Art. 51 true-up posted in the last return of the year
+    (R55); sources unchanged (R10); exceptions acknowledged and the tie-out 0.00 (R15, review item 2). Freezes the
+    source lines (``source_hash``) and posts T1 dated today.
+
+    An imported legacy return (R12, review item 3) goes from reviewed straight to ``filed`` with the figures as
+    filed, if its period is still before the go-live date and has no posted ERP sources; nothing is posted."""
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     grant = access.require(user, ret.entity, "tax.approve_return", document=ret)
     _human(user, ret.entity, "tax.approve_return")
-    if ret.reviewed_by_id == user.pk:
+    if ret.reviewed_by_id == user.pk or user.pk in _preparers(ret):
         access.deny(user, ret.entity, "tax.approve_return", "self_approval")
     if ret.status != ReturnStatus.REVIEWED:
         raise error("Only a reviewed return is approved.", "يُعتمد الإقرار بعد مراجعته فقط.", code="not_reviewed")
+    if ret.source == VatReturn.Source.IMPORT:
+        return _approve_import(ret, user, grant)
     periods = _open_periods(ret)
     if periods:
         raise error(f"Close every fiscal period of the return first (R9): {', '.join(periods)} still open.",
@@ -1024,18 +1445,27 @@ def approve_return(vat_return, *, user):
     if earlier.exists():
         raise error("An earlier VAT return of the entity is not approved yet; approve it first (box 15).",
                     "إقرار سابق للكيان لم يُعتمد بعد؛ اعتمده أولًا (الخانة 15).", code="earlier_return_open")
-    if ret.version == 0 and _last_return_of_year(ret):
-        status = _art51_port().year_status(ret.entity, ret.period_end.year)
+    missing = [r.period_start for r in VatReturnSchedule.objects.filter(entity=ret.entity,
+                                                                         period_end__lt=ret.period_start)
+               if not r.returns.filter(status__in=LOCKED_STATUSES).exists()]
+    if missing:
+        raise error(f"Earlier VAT periods have no approved return: {', '.join(map(str, missing))} (box 15).",
+                    f"فترات سابقة بلا إقرار معتمد: {', '.join(map(str, missing))} (الخانة 15).",
+                    code="earlier_return_missing")
+    year = _last_return_of_year(ret)
+    if ret.version == 0 and year is not None:
+        status = _art51_port().year_status(ret.entity, year)
         if status.applies and not (status.final_ratio_approved and status.true_up_posted):
-            raise error(f"The Art. 51 final ratio of {ret.period_end.year} is not approved or its true-up is not posted "
-                        "(R55).", f"لم تُعتمد النسبة النهائية للمادة 51 لسنة {ret.period_end.year} أو لم تُرحَّل "
-                        "تسويتها.", code="art51_true_up_missing")
-    _refuse_changed_sources(ret)
+            raise error(f"The Art. 51 final ratio of {year} is not approved or its true-up is not posted (R55).",
+                        f"لم تُعتمد النسبة النهائية للمادة 51 لسنة {year} أو لم تُرحَّل تسويتها.",
+                        code="art51_true_up_missing")
+    _check_time_bars(ret, _today())
+    _refuse_open_exceptions(ret, _refuse_changed_sources(ret))
     with transaction.atomic():
         ret = VatReturn.objects.select_for_update(of=("self",)).select_related("entity").get(pk=ret.pk)
         if ret.status != ReturnStatus.REVIEWED:
             raise error("Only a reviewed return is approved.", "يُعتمد الإقرار بعد مراجعته فقط.", code="not_reviewed")
-        ret.source_hash = hashlib.sha256(_canonical_of_stored(ret).encode()).hexdigest()
+        ret.source_hash = _source_hash(ret)
         ret.settlement_offset_sar = _offset(ret)
         ret.status, ret.approved_by, ret.approved_at = ReturnStatus.APPROVED, user, _now()
         ret._service_write = True
@@ -1057,6 +1487,20 @@ def approve_return(vat_return, *, user):
         return ret
 
 
+def _approve_import(ret, user, grant):
+    _check_import_allowed(ret.entity, ret.period_start, ret.period_end, existing=ret)
+    with transaction.atomic():
+        ret = VatReturn.objects.select_for_update(of=("self",)).select_related("entity").get(pk=ret.pk)
+        if ret.status != ReturnStatus.REVIEWED:
+            raise error("Only a reviewed return is approved.", "يُعتمد الإقرار بعد مراجعته فقط.", code="not_reviewed")
+        ret.source_hash = hashlib.sha256(_canonical_of_stored(ret).encode()).hexdigest()
+        ret.status, ret.approved_by, ret.approved_at = ReturnStatus.FILED, user, _now()
+        ret._service_write = True
+        ret.save()
+        access.use_grant(grant, target=ret)
+        return ret
+
+
 def _vat_return_lines(document):
     """Registered ``build_lines`` for VatReturn: T1, Dr 2200 / Cr 1310 by the offset fixed at approval."""
     _require_posting(document)
@@ -1069,7 +1513,8 @@ def _vat_return_lines(document):
 def record_filing(vat_return, *, user, zatca_filing_reference, filed_on, acknowledgement, sadad_bill_number="",
                   voluntary_disclosure_ref=""):
     """approved -> filed (``tax.record_filing``): the ZATCA reference, date and portal receipt. An amendment needs the
-    voluntary disclosure reference; the return it amends becomes ``amended`` (R28)."""
+    voluntary disclosure reference; the return it amends becomes ``amended`` (R28). An overstatement in box 14 must
+    be filed within its 5-year bar (C7)."""
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     access.require(user, ret.entity, "tax.record_filing")
     _human(user, ret.entity, "tax.record_filing")
@@ -1079,6 +1524,7 @@ def record_filing(vat_return, *, user, zatca_filing_reference, filed_on, acknowl
     if ret.version > 0 and not (voluntary_disclosure_ref or "").strip():
         raise error("An amendment is filed with its voluntary disclosure reference (R28).",
                     "يُقدَّم التعديل مع مرجع الإفصاح الطوعي.", code="disclosure_ref_required")
+    _check_time_bars(ret, filed_on)
     with transaction.atomic():
         ret = VatReturn.objects.select_for_update(of=("self",)).select_related("entity").get(pk=ret.pk)
         if ret.status != ReturnStatus.APPROVED:
@@ -1103,14 +1549,40 @@ def record_filing(vat_return, *, user, zatca_filing_reference, filed_on, acknowl
         return VatReturn.objects.get(pk=ret.pk)
 
 
+def _check_import_allowed(entity, start, end, existing=None):
+    """R12 / review item 3 / G4: a legacy return is imported only for a period that ends before the entity's VAT
+    go-live date and has no posted ERP sources (sales, bills, import records)."""
+    golive = _settings(entity).vat_golive_date
+    if golive is None:
+        raise error(f"{entity.code} has no VAT go-live date; legacy returns are imported only for periods before it.",
+                    f"لا يوجد تاريخ بدء للإقرارات للكيان {entity.code}؛ تُستورد الإقرارات السابقة لما قبله فقط.",
+                    code="legacy_cutoff_missing")
+    if end >= golive:
+        raise error(f"The period {start}..{end} is not before the VAT go-live date {golive}; it is prepared in the ERP.",
+                    f"الفترة {start}..{end} ليست قبل تاريخ البدء {golive}؛ تُعدّ في النظام.", code="import_after_golive")
+    if JournalEntry.objects.filter(entity=entity, status__in=ledger.BOOKED, document_type__in=SOURCE_TYPES,
+                                   date__gte=start, date__lte=end).exists():
+        raise error("The period has posted sales, bills or import records in the ERP; it cannot be imported.",
+                    "للفترة مبيعات أو مشتريات أو سجلات استيراد مرحّلة في النظام؛ لا يمكن استيرادها.",
+                    code="import_period_has_sources")
+    others = VatReturn.objects.filter(entity=entity, period_start=start)
+    if existing is not None:
+        others = others.exclude(pk=existing.pk)
+    if others.exists():
+        raise error("A return for this period already exists.", "يوجد إقرار لهذه الفترة بالفعل.", code="no_such_period")
+
+
 def import_filed_return(entity, *, user, period_start, boxes, zatca_filing_reference, filed_on, refund_requested=False,
                         acknowledgement=None, rc_output_vat_sar="0"):
-    """R12: a return filed before go-live (e.g. in Falcon), loaded as ``filed`` with ``source=import``, its box values
-    and filing reference and no source lines. ``boxes`` = {box_no: {"amount", "adjustment", "vat"}} as filed."""
+    """R12: a return filed before go-live (e.g. in Falcon), entered with its box values and filing reference and no
+    source lines. It is created as a ``draft`` with ``source=import`` and becomes ``filed`` only after review and
+    approval by two other people (submit, review, approve: review item 3); only for periods before the entity's
+    VAT go-live date without posted ERP sources. ``boxes`` = {box_no: {"amount", "adjustment", "vat"}} as filed."""
     access.require(user, entity, "tax.prepare_return")
     access.require(user, entity, "tax.record_filing")
     _human(user, entity, "tax.record_filing")
     entity = Entity.objects.get(pk=entity.pk)
+    _check_vat_entity(entity)
     if not (zatca_filing_reference or "").strip() or filed_on is None:
         raise error("The ZATCA filing reference and date are required.", "مرجع التقديم وتاريخه مطلوبان.",
                     code="filing_incomplete")
@@ -1124,15 +1596,18 @@ def import_filed_return(entity, *, user, period_start, boxes, zatca_filing_refer
         raise error("Box 16 must equal 13 + 14 - 15 as filed.", "يجب أن تساوي الخانة 16 مجموع 13 و14 ناقص 15.",
                     code="import_boxes_inconsistent")
     with transaction.atomic():
-        rows = _ensure_schedule(entity, period_start, _today())
-        row = next((r for r in rows if r.period_start == period_start), None)
-        if row is None or row.returns.exists():
-            raise error("No free VAT return period starts on this date.", "لا تبدأ فترة إقرار متاحة في هذا التاريخ.",
+        Entity.objects.select_for_update().get(pk=entity.pk)
+        period = next(((s, e, f) for s, e, f in _walk(entity, _settings(entity), period_start) if s == period_start),
+                      None)
+        if period is None:
+            raise error("No VAT return period starts on this date.", "لا تبدأ فترة إقرار في هذا التاريخ.",
                         code="no_such_period")
+        start, end, frequency = period
+        _check_import_allowed(entity, start, end)
         now = _now()
-        ret = VatReturn(entity=entity, schedule=row, period_start=row.period_start, period_end=row.period_end,
-                        frequency=row.frequency, due_date=row.due_date, status=ReturnStatus.DRAFT,
-                        source=VatReturn.Source.IMPORT, created_by=user, created_at=now, filed_by=user, filed_at=now,
+        ret = VatReturn(entity=entity, schedule=None, period_start=start, period_end=end, frequency=frequency,
+                        due_date=_due_date(end), status=ReturnStatus.DRAFT, source=VatReturn.Source.IMPORT,
+                        created_by=user, created_at=now, filed_by=user, filed_at=now,
                         zatca_filing_reference=zatca_filing_reference.strip(), filed_on=filed_on,
                         refund_requested=bool(refund_requested), net_vat_sar=values[16]["vat"],
                         rc_output_vat_sar=_money(rc_output_vat_sar, "Reverse-charge output", "ضريبة الاحتساب العكسي"))
@@ -1149,9 +1624,6 @@ def import_filed_return(entity, *, user, period_start, boxes, zatca_filing_refer
                                vat_sar=values[n]["vat"])
             box._service_write = True
             box.save()
-        ret.status = ReturnStatus.FILED  # locked once its boxes are stored (R7)
-        ret._service_write = True
-        ret.save()
         return VatReturn.objects.get(pk=ret.pk)
 
 
@@ -1165,11 +1637,32 @@ def _treatment(difference, threshold):
     return VatCorrection.Treatment.OVERSTATEMENT_NEXT_RETURN
 
 
+def _period_corrections(entity, period_start):
+    """Corrections of one original period, all versions (C6), not cancelled and not already filed by an amendment."""
+    return (VatCorrection.objects.select_for_update(of=("self",)).select_related("target_return")
+            .filter(entity=entity, original_return__period_start=period_start)
+            .exclude(status=VatCorrection.Status.CANCELLED)
+            .exclude(treatment=VatCorrection.Treatment.AMENDMENT, status=VatCorrection.Status.FILED))
+
+
+def _check_correcting_entries(entity, entries, own=None):
+    used = _correction_exclusions(entity)
+    if own is not None:
+        used -= set(own.correcting_entries.values_list("pk", flat=True))
+    for entry in entries:
+        if entry.entity_id != entity.pk or entry.status not in ledger.BOOKED or entry.pk in used \
+                or entry.document_type in SETTLEMENT_TYPES:
+            raise error("Correcting entries are posted entries of the entity, not linked to another correction.",
+                        "قيود التصحيح قيود مرحّلة للكيان غير مرتبطة بتصحيح آخر.", code="correcting_entry_invalid")
+
+
 def record_correction(original_return, *, user, discovered_on, description_en, description_ar, tax_difference_sar,
                       correcting_entries=()):
-    """R27: record an error in a filed return. Below the threshold: next return (box 14); underdeclared at or above
-    it: amendment by voluntary disclosure within 20 days (``notify_by``, alert); overdeclared at or above it: claimed
-    in a next return, at the latest 5 years after the end of the calendar year of the original period."""
+    """R27: record an error in a filed return. The corrections of the same original period (all versions) are
+    netted first (C6, PSG §13.5): net below the threshold: next return (box 14); net underdeclared at or above it:
+    amendment by voluntary disclosure within 20 days (``notify_by``, alert); net overdeclared at or above it:
+    claimed in a next return within 5 years of the end of the calendar year of the original period. When the net
+    reaches the threshold every correction of the period that is not yet locked is re-classified with it."""
     original = VatReturn.objects.select_related("entity").get(pk=original_return.pk)
     entity = original.entity
     access.require(user, entity, "tax.prepare_return")
@@ -1183,30 +1676,54 @@ def record_correction(original_return, *, user, discovered_on, description_en, d
     difference = _money(tax_difference_sar, "The tax difference", "فرق الضريبة")
     if difference == ZERO:
         raise error("The tax difference is zero.", "فرق الضريبة صفر.", code="amount_zero")
-    treatment = _treatment(difference, _settings(entity).vat_correction_threshold_sar)
-    if treatment == VatCorrection.Treatment.OVERSTATEMENT_NEXT_RETURN and \
-            discovered_on > date_type(original.period_end.year + 5, 12, 31):
-        raise error("An overstatement is claimed at the latest 5 years after the end of the calendar year of the "
-                    "original period (Art. 63 [CC-verify]).",
-                    "تُسترد الزيادة خلال 5 سنوات من نهاية السنة التقويمية لفترة الإقرار الأصلي.",
-                    code="correction_time_barred")
     entries = list(correcting_entries)
-    used = _correction_exclusions(entity)
-    for entry in entries:
-        if entry.entity_id != entity.pk or entry.status not in ledger.BOOKED or entry.pk in used \
-                or entry.document_type in SETTLEMENT_TYPES:
-            raise error("Correcting entries are posted entries of the entity, not linked to another correction.",
-                        "قيود التصحيح قيود مرحّلة للكيان غير مرتبطة بتصحيح آخر.", code="correcting_entry_invalid")
+    _check_correcting_entries(entity, entries)
     with transaction.atomic():
+        others = list(_period_corrections(entity, original.period_start))
+        net = difference + sum((c.tax_difference_sar for c in others), ZERO)
+        treatment = _treatment(net, _settings(entity).vat_correction_threshold_sar)
+        if difference < ZERO and discovered_on > date_type(original.period_end.year + 5, 12, 31):
+            raise error("An overstatement is claimed at the latest 5 years after the end of the calendar year of the "
+                        "original period (VAT IR Art. 63).",
+                        "تُسترد الزيادة خلال 5 سنوات من نهاية السنة التقويمية لفترة الإقرار الأصلي.",
+                        code="correction_time_barred")
+        notify_by = discovered_on + timedelta(days=20) if treatment == VatCorrection.Treatment.AMENDMENT else None
         corr = VatCorrection(entity=entity, original_return=original, discovered_on=discovered_on,
                              description_en=description_en.strip(), description_ar=description_ar.strip(),
                              tax_difference_sar=difference, treatment=treatment, created_by=user, created_at=_now(),
-                             notify_by=discovered_on + timedelta(days=20)
-                             if treatment == VatCorrection.Treatment.AMENDMENT else None)
+                             notify_by=notify_by)
         corr._service_write = True
         corr.save()
         if entries:
             corr.correcting_entries.set(entries)
+        if treatment != VatCorrection.Treatment.NEXT_RETURN:
+            for other in others:
+                locked = other.status == VatCorrection.Status.FILED or (
+                    other.target_return_id and other.target_return.status in LOCKED_STATUSES)
+                if locked or other.treatment == treatment:
+                    continue
+                other.treatment, other.target_return, other.status = treatment, None, VatCorrection.Status.OPEN
+                other.notify_by = notify_by
+                other._service_write = True
+                other.save()
+        return corr
+
+
+def link_correcting_entries(correction, *, user, entries):
+    """Review item 4: link correcting entries to a correction that no approved return carries yet (once linked, an
+    entry is never unlinked, R26)."""
+    corr = VatCorrection.objects.select_related("entity", "target_return").get(pk=correction.pk)
+    access.require(user, corr.entity, "tax.prepare_return")
+    _human(user, corr.entity, "tax.prepare_return")
+    entries = list(entries)
+    with transaction.atomic():
+        corr = VatCorrection.objects.select_for_update(of=("self",)).select_related("target_return").get(pk=corr.pk)
+        if corr.status not in (VatCorrection.Status.OPEN, VatCorrection.Status.ASSIGNED) or (
+                corr.target_return_id and corr.target_return.status in LOCKED_STATUSES):
+            raise error("Correcting entries are linked only while no approved return carries the correction.",
+                        "تُربط قيود التصحيح فقط قبل اعتماد الإقرار الذي يتضمن التصحيح.", code="correction_locked")
+        _check_correcting_entries(corr.entity, entries, own=corr)
+        corr.correcting_entries.add(*entries)
         return corr
 
 
@@ -1362,8 +1879,12 @@ def create_vat_refund(vat_return, *, user, amount_sar, received_on, bank_account
 
 
 def create_import_vat_record(entity, *, user, customs_declaration_no, declaration_date, customs_value_sar,
-                             vat_paid_sar, attribution, bank_account, declaration_file, debit_account=None):
-    """Draft an import VAT record (R22, T3): VAT paid at customs, by bank in this slice."""
+                             vat_paid_sar, attribution, bank_account, declaration_file, debit_account=None,
+                             customs_duty_sar="0", other_charges_sar="0"):
+    """Draft an import VAT record (R22, T3): VAT paid at customs, by bank in this slice. The VAT base (box 8 Amount)
+    is customs value + customs duties + other charges (C13 [verify]). A cost account for non-recoverable VAT is
+    checked when the record is entered: never Sharia-prohibited where Sharia is enforced, never restricted (review
+    item 13)."""
     access.require(user, entity, "tax.prepare_return")
     _human(user, entity, "tax.prepare_return")
     if attribution not in ImportVatRecord.Attribution.values:
@@ -1376,10 +1897,14 @@ def create_import_vat_record(entity, *, user, customs_declaration_no, declaratio
         debit = debit_account if isinstance(debit_account, Account) else Account.objects.filter(
             entity=entity, code=debit_account).first()
         if debit is None or debit.entity_id != entity.pk or debit.type not in (Account.Type.EXPENSE, Account.Type.ASSET) \
-                or not debit.is_postable or debit.code in (VAT_INPUT, VAT_OUTPUT, BANK):
+                or not debit.is_postable or not debit.is_active or debit.code in (VAT_INPUT, VAT_OUTPUT, BANK) \
+                or debit.code in restricted.codes():
             raise error("Non-recoverable import VAT goes to a cost or asset account of the entity.",
                         "تُحمَّل ضريبة الاستيراد غير القابلة للاسترداد على حساب تكلفة أو أصل للكيان.",
                         code="debit_account_invalid")
+        if debit.sharia_prohibited and Entity.objects.get(pk=entity.pk).sharia_enforced:
+            raise error(f"Account {debit.code} is Sharia-prohibited in {entity.code}.",
+                        f"الحساب {debit.code} محظور شرعًا في الكيان {entity.code}.", code="debit_account_prohibited")
     if ImportVatRecord.objects.filter(entity=entity, customs_declaration_no=customs_declaration_no.strip()).exists():
         raise error("This customs declaration is already recorded.", "هذا البيان الجمركي مسجل مسبقًا.",
                     code="declaration_duplicate")
@@ -1387,6 +1912,10 @@ def create_import_vat_record(entity, *, user, customs_declaration_no, declaratio
         ImportVatRecord, user, entity=entity, customs_declaration_no=customs_declaration_no.strip(),
         declaration_date=declaration_date,
         customs_value_sar=_money(customs_value_sar, "The customs value", "القيمة الجمركية", positive=True),
+        customs_duty_sar=_money(customs_duty_sar, "The customs duties", "الرسوم الجمركية", positive=True,
+                                allow_zero=True),
+        other_charges_sar=_money(other_charges_sar, "The other charges", "الرسوم الأخرى", positive=True,
+                                 allow_zero=True),
         vat_paid_sar=_money(vat_paid_sar, "The VAT paid", "الضريبة المدفوعة", positive=True), attribution=attribution,
         debit_account=debit, bank_account=_bank_account(entity, bank_account), declaration_file=declaration_file)
 
@@ -1608,10 +2137,26 @@ def _export_rows(ret, language):
     return head, rows, tail
 
 
+FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe_text(value):
+    """Review item 8 (CSV / formula injection): text that a spreadsheet would read as a formula gets a leading
+    apostrophe. Amounts (numbers, possibly negative) are left as they are."""
+    if not isinstance(value, str) or not value.startswith(FORMULA_STARTS):
+        return value
+    try:
+        Decimal(value)
+        return value
+    except InvalidOperation:
+        return "'" + value
+
+
 def export_return(vat_return, *, user, fmt="xlsx", language="en"):
     """The return as a filled worksheet for manual entry into the ZATCA portal (§6): ``fmt`` ``csv`` or ``xlsx``,
     headers in ``language`` (``en`` / ``ar``; Arabic sheets right to left), labels in both languages (R53).
-    Returns (filename, bytes). Needs ``tax.view``."""
+    Text cells are written as strings, never formulas (review item 8). Returns (filename, bytes). Needs
+    ``tax.view``."""
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     access.require(user, ret.entity, "tax.view")
     if fmt not in ("csv", "xlsx") or language not in ("en", "ar"):
@@ -1623,7 +2168,7 @@ def export_return(vat_return, *, user, fmt="xlsx", language="en"):
         buf = io.StringIO()
         writer = csv.writer(buf)
         for row in head + rows + tail:
-            writer.writerow(row)
+            writer.writerow([_safe_text(v) for v in row])
         return name, buf.getvalue().encode("utf-8-sig")
     from openpyxl import Workbook
 
@@ -1631,32 +2176,85 @@ def export_return(vat_return, *, user, fmt="xlsx", language="en"):
     ws = wb.active
     ws.title = "VAT return" if language == "en" else "الإقرار الضريبي"
     ws.sheet_view.rightToLeft = language == "ar"
+
+    position = {"row": 0}
+
+    def put(values):
+        position["row"] += 1
+        for c, value in enumerate(values, start=1):
+            cell = ws.cell(row=position["row"], column=c)
+            if isinstance(value, str):
+                cell.value = _safe_text(value)
+                cell.data_type = "s"  # never a formula
+            else:
+                cell.value = value
+
     for row in head:
-        ws.append(row)
+        put(row)
     for row in rows:
-        ws.append([row[0], row[1], Decimal(row[2]), Decimal(row[3]), Decimal(row[4]), row[5], row[6]])
+        put([row[0], row[1], Decimal(row[2]), Decimal(row[3]), Decimal(row[4]), row[5], row[6]])
     for row in tail:
-        ws.append(row)
+        put(row)
     out = io.BytesIO()
     wb.save(out)
     return name, out.getvalue()
 
 
-def verify_box_definition(definition, *, user, entity):
-    """Mark a box definition as checked against the current ZATCA form (R6): ``tax.maintain_rates`` in the group
-    parent entity."""
+def _box_verifier(user, entity, definition):
     access.require(user, entity, "tax.maintain_rates")
     _human(user, entity, "tax.maintain_rates")
     if entity.consolidation != Entity.Consolidation.PARENT:
         raise error("Box definitions are verified at the group parent.", "يُتحقق من تعريفات الخانات في الشركة الأم.",
                     code="group_parent_only")
-    VatBoxDefinition.objects.filter(pk=definition.pk).update(verified_by=user, verified_at=_now())
-    access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity, permission="tax.maintain_rates",
-               details={"action": "verify_box_definition", "box": definition.box_no, "definition": definition.pk})
-    return VatBoxDefinition.objects.get(pk=definition.pk)
+    return VatBoxDefinition.objects.select_for_update().get(pk=definition.pk)
+
+
+def propose_box_verification(definition, *, user, entity):
+    """Step 1 (review item 12): a person holding ``tax.maintain_rates`` at the group parent records that a box
+    definition matches the current ZATCA form. Another person approves it (``verify_box_definition``)."""
+    with transaction.atomic():
+        found = _box_verifier(user, entity, definition)
+        if found.verified_at is not None:
+            raise error("This box definition is already verified.", "تم التحقق من تعريف الخانة هذا بالفعل.",
+                        code="already_verified")
+        found.proposed_by, found.proposed_at = user, _now()
+        found.save(update_fields=["proposed_by", "proposed_at"])
+        access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity,
+                            permission="tax.maintain_rates",
+                            details={"action": "propose_box_verification", "box": found.box_no, "definition": found.pk})
+        return found
+
+
+def verify_box_definition(definition, *, user, entity):
+    """Step 2 (R6, review item 12): mark a proposed box definition as checked against the current ZATCA form; by a
+    second person holding ``tax.maintain_rates`` in the group parent entity, never the proposer."""
+    with transaction.atomic():
+        found = _box_verifier(user, entity, definition)
+        if found.proposed_by_id is None:
+            raise error("A box definition is verified after another person proposed it.",
+                        "يُتحقق من تعريف الخانة بعد أن يقترحه شخص آخر.", code="verification_not_proposed")
+        if found.proposed_by_id == user.pk:
+            access.deny(user, entity, "tax.maintain_rates", "self_approval")
+        found.verified_by, found.verified_at = user, _now()
+        found.save(update_fields=["verified_by", "verified_at"])
+        access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity,
+                            permission="tax.maintain_rates",
+                            details={"action": "verify_box_definition", "box": found.box_no, "definition": found.pk})
+        return found
+
+
+def _rate(code, on):
+    return StatutoryTaxRate.objects.filter(code=code, valid_from__lte=on) \
+        .filter(Q(valid_to__isnull=True) | Q(valid_to__gte=on)).order_by("-valid_from").first()
 
 
 def _late_payment_rate(on):
-    row = StatutoryTaxRate.objects.filter(code=StatutoryTaxRate.Code.VAT_LATE_PAYMENT_MONTHLY, valid_from__lte=on) \
-        .filter(Q(valid_to__isnull=True) | Q(valid_to__gte=on)).order_by("-valid_from").first()
-    return row
+    return _rate(StatutoryTaxRate.Code.VAT_LATE_PAYMENT_MONTHLY, on)
+
+
+def _months_late(due, on):
+    """C16 (PSG §14: "for each month or part thereof"): calendar months started since the due date."""
+    months = 0
+    while _add_months(due, months) < on:
+        months += 1
+    return months

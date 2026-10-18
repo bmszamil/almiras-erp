@@ -140,7 +140,13 @@ class TaxSettings(ServiceWritten):
                                   default=default_alert_days)
     vat_correction_threshold_sar = models.DecimalField(
         bi("VAT correction threshold (SAR)", "حد تصحيح ضريبة القيمة المضافة (ريال)"), default=Decimal("15000.00"),
-        help_text=bi("[CC-verify] PSG §13.5 p.53", "[يحتاج تحققًا]"), **MONEY,
+        help_text=bi("PSG §13.5 p.53 (VAT IR Art. 63)", "الدليل §13.5 (المادة 63 من اللائحة)"), **MONEY,
+    )
+    vat_golive_date = models.DateField(
+        bi("VAT go-live date in the ERP", "تاريخ بدء الإقرارات الضريبية في النظام"), null=True, blank=True,
+        help_text=bi("Owner decision G4: returns start here; earlier periods were filed outside the ERP (legacy "
+                     "imports only, no alerts). Must be the start of a VAT return period.",
+                     "قرار المالك G4: تبدأ الإقرارات من هذا التاريخ؛ الفترات السابقة قُدّمت خارج النظام."),
     )
 
     class Meta:
@@ -157,6 +163,9 @@ class StatutoryTaxRate(models.Model):
     class Code(models.TextChoices):
         VAT_LATE_PAYMENT_MONTHLY = "vat_late_payment_monthly", bi("VAT late payment (per month)",
                                                                    "غرامة التأخر في سداد ضريبة القيمة المضافة (شهريًا)")
+        VAT_LATE_FILING_MIN = "vat_late_filing_min", bi("VAT late filing, minimum", "غرامة التأخر في تقديم الإقرار، الحد الأدنى")
+        VAT_LATE_FILING_MAX = "vat_late_filing_max", bi("VAT late filing, maximum", "غرامة التأخر في تقديم الإقرار، الحد الأعلى")
+        VAT_INCORRECT_RETURN = "vat_incorrect_return", bi("Incorrect or amended VAT return", "إقرار خاطئ أو معدَّل")
 
     code = models.CharField(bi("Code", "الرمز"), max_length=40, choices=Code.choices)
     rate = models.DecimalField(bi("Rate %", "النسبة %"), max_digits=7, decimal_places=4)
@@ -199,6 +208,10 @@ class VatBoxDefinition(models.Model):
     verify_note = models.CharField(bi("To verify", "للتحقق"), max_length=300, blank=True)
     valid_from = models.DateField(bi("Valid from", "ساري من"))
     valid_to = models.DateField(bi("Valid to", "ساري حتى"), null=True, blank=True)
+    # Review item 12: one person proposes the verification (draft), another approves it.
+    proposed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="+", verbose_name=bi("Verification proposed by", "اقترح التحقق"))
+    proposed_at = models.DateTimeField(bi("Verification proposed at", "تاريخ اقتراح التحقق"), null=True, blank=True)
     verified_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                     related_name="+", verbose_name=bi("Verified by", "تحقق منه"))
     verified_at = models.DateTimeField(bi("Verified at", "تاريخ التحقق"), null=True, blank=True)
@@ -218,6 +231,34 @@ class VatBoxDefinition(models.Model):
 class Frequency(models.TextChoices):
     MONTHLY = "monthly", bi("Monthly", "شهري")
     QUARTERLY = "quarterly", bi("Quarterly", "ربع سنوي")
+
+
+class VatFrequencyChange(ServiceWritten):
+    """A dated change of an entity's VAT return frequency (R4, review item 6); append-only.
+
+    Written when ``Entity.vat_return_period`` changes through ``core.services.change_entity_settings``. The
+    schedule applies ``frequency`` to every period that starts after ``changed_on`` and has no return, whenever
+    the schedule is generated."""
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="vat_frequency_changes",
+                               verbose_name=bi("Entity", "الكيان"))
+    previous_frequency = models.CharField(bi("Frequency before", "الدورية السابقة"), max_length=10,
+                                          choices=Frequency.choices)
+    frequency = models.CharField(bi("Frequency after", "الدورية الجديدة"), max_length=10, choices=Frequency.choices)
+    changed_on = models.DateField(bi("Changed on", "تاريخ التغيير"))
+    reason = models.CharField(bi("Reason", "السبب"), max_length=500, blank=True)
+    recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="+", verbose_name=bi("Recorded by", "سجّله"))
+    recorded_at = models.DateTimeField(bi("Recorded at", "تاريخ التسجيل"))
+
+    class Meta:
+        verbose_name = bi("VAT frequency change", "تغيير دورية الإقرار الضريبي")
+        verbose_name_plural = bi("VAT frequency changes", "تغييرات دورية الإقرار الضريبي")
+        ordering = ["entity", "changed_on", "pk"]
+
+    def check_change(self):
+        if self.pk is not None and type(self)._base_manager.filter(pk=self.pk).exists():
+            raise error(*APPEND_ONLY, code="append_only")
 
 
 class VatReturnSchedule(ServiceWritten):
@@ -287,8 +328,9 @@ class VatReturn(ServiceWritten):
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="vat_returns",
                                verbose_name=bi("Entity", "الكيان"))
-    schedule = models.ForeignKey(VatReturnSchedule, on_delete=models.PROTECT, related_name="returns",
-                                 verbose_name=bi("Return period", "فترة الإقرار"))
+    # Null only for a legacy return imported for a period before the entity's VAT go-live date (G4, R12).
+    schedule = models.ForeignKey(VatReturnSchedule, null=True, blank=True, on_delete=models.PROTECT,
+                                 related_name="returns", verbose_name=bi("Return period", "فترة الإقرار"))
     period_start = models.DateField(bi("Period start", "بداية الفترة"))
     period_end = models.DateField(bi("Period end", "نهاية الفترة"))
     frequency = models.CharField(bi("Frequency", "الدورية"), max_length=10, choices=Frequency.choices)
@@ -339,6 +381,10 @@ class VatReturn(ServiceWritten):
     net_vat_sar = models.DecimalField(bi("Net VAT due (box 16, SAR)", "صافي الضريبة المستحقة (الخانة 16، ريال)"),
                                       default=ZERO, **MONEY)
     refund_requested = models.BooleanField(bi("Refund requested", "طُلب الاسترداد"), default=False)
+    refund_requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Refund choice made by", "حدّد طلب الاسترداد"),
+        help_text=bi("Counts as a preparer (review item 10)", "يُعدّ من المُعدّين"))
     source_hash = models.CharField(bi("Source hash", "بصمة المصادر"), max_length=64, blank=True)
     settlement_offset_sar = models.DecimalField(bi("Offset posted at approval (T1)", "المقاصة المرحّلة عند الاعتماد"),
                                                 default=ZERO, **MONEY)
@@ -358,18 +404,42 @@ class VatReturn(ServiceWritten):
                 | (models.Q(version__gt=0) & models.Q(amends__isnull=False)),
                 name="vat_return_amendment_links_original",
             ),
+            models.CheckConstraint(condition=models.Q(schedule__isnull=False) | models.Q(source="import"),
+                                   name="vat_return_schedule_unless_import"),
         ]
 
     @property
     def is_locked(self):
         return self.status in LOCKED_STATUSES
 
+    def _check_filing_fields(self):
+        """Review item 9: a return becomes ``filed`` only with its ZATCA reference, date and filer (and the portal
+        receipt unless it is a legacy import, R12)."""
+        if not ((self.zatca_filing_reference or "").strip() and self.filed_on and self.filed_by_id
+                and (self.source == self.Source.IMPORT or self.acknowledgement)):
+            raise error("A filed VAT return needs its ZATCA filing reference, filing date, filer and portal receipt.",
+                        "يحتاج الإقرار المقدَّم إلى مرجع التقديم وتاريخه ومن سجّله وإيصال البوابة.",
+                        code="filing_incomplete")
+
     def check_change(self):
         stored = type(self)._base_manager.filter(pk=self.pk).values("status", "settlement_entry_id").first() \
             if self.pk else None
         if stored is None:
+            if self.status != ReturnStatus.DRAFT:  # review item 9: every return starts as a draft
+                raise error("A VAT return is created as a draft; it reaches later statuses only through its "
+                            "lifecycle.", "يُنشأ الإقرار الضريبي مسودةً ولا يصل إلى الحالات اللاحقة إلا عبر دورته.",
+                            code="insert_not_draft")
             return
         before, after = stored["status"], self.status
+        if after == ReturnStatus.FILED and before != ReturnStatus.FILED and before != ReturnStatus.SETTLED:
+            self._check_filing_fields()
+            if before != ReturnStatus.APPROVED and not (before == ReturnStatus.REVIEWED
+                                                        and self.source == self.Source.IMPORT
+                                                        and self.approved_by_id and self.reviewed_by_id):
+                raise _locked()
+        if before not in LOCKED_STATUSES and after in LOCKED_STATUSES and after != ReturnStatus.FILED:
+            if not (before == ReturnStatus.REVIEWED and after == ReturnStatus.APPROVED and self.approved_by_id):
+                raise _locked()
         if before not in LOCKED_STATUSES:
             return
         changed = changed_fields(self)
@@ -506,6 +576,28 @@ class ExceptionKind(models.TextChoices):
                                                       "قيد على حساب ضريبة بلا مستند ضريبي")
     REJECTED_DOCUMENT = "rejected_document", bi("Sales document rejected by ZATCA", "مستند مبيعات رفضته الهيئة")
     TIE_OUT_DIFFERENCE = "tie_out_difference", bi("Difference to the VAT accounts", "فرق مع حسابات الضريبة")
+    # Review fixes (tax-returns §10.4). Kinds marked "blocking" cannot be acknowledged; they are fixed at source.
+    TAX_POINT_FALLBACK = "tax_point_fallback", bi("Sales put in the period of their issue date (no tax point)",
+                                                  "مبيعات أُدرجت بتاريخ إصدارها (لا يوجد تاريخ استحقاق الضريبة)")
+    PERIOD_SHIFT = "period_shift", bi("Document reported in another period than its journal date",
+                                      "مستند أُدرج في فترة غير فترة قيده")
+    SAR_RATE_MISSING = "sar_rate_missing", bi("Foreign-currency sale without a SAR rate",
+                                              "بيع بعملة أجنبية دون سعر صرف بالريال")
+    PURCHASE_SAR_VAT_MISSING = "purchase_sar_vat_missing", bi("Foreign-currency bill without the SAR VAT of the "
+                                                              "supplier", "فاتورة مورد بعملة أجنبية دون الضريبة بالريال")
+    CORRECTING_ENTRY = "correcting_entry", bi("Entry left out as a correcting entry", "قيد استُبعد كقيد تصحيح")
+    CORRECTION_MISMATCH = "correction_mismatch", bi("Correcting entries differ from the correction",
+                                                    "قيود التصحيح لا تساوي فرق التصحيح")
+    CORRECTION_WITHOUT_ENTRY = "correction_without_entry", bi("Correction without a correcting entry (blocking)",
+                                                              "تصحيح دون قيد تصحيح (مانع)")
+    CARRY_FORWARD_GAP = "carry_forward_gap", bi("Earlier period without an approved return (blocking)",
+                                                "فترة سابقة بلا إقرار معتمد (مانع)")
+    UNPAID_BILL_12_MONTHS = "unpaid_bill_12_months", bi("Input VAT on a bill unpaid after 12 months",
+                                                        "ضريبة مدخلات على فاتورة لم تُسدد بعد 12 شهرًا")
+
+
+BLOCKING_EXCEPTIONS = frozenset({ExceptionKind.TIE_OUT_DIFFERENCE, ExceptionKind.CORRECTION_WITHOUT_ENTRY,
+                                 ExceptionKind.CARRY_FORWARD_GAP})
 
 
 class VatExceptionAck(ReturnChild):
@@ -515,11 +607,15 @@ class VatExceptionAck(ReturnChild):
         TAGGED = "tagged", bi("Linked to a correction", "رُبط بتصحيح")
         NOT_RETURN_RELEVANT = "not_return_relevant", bi("Not relevant to the return", "لا يخص الإقرار")
         INCLUDED_BY_ADJUSTMENT = "included_by_adjustment", bi("Included by a manual adjustment", "أُدرج بتعديل يدوي")
+        TAX_POINT_CONFIRMED = "tax_point_confirmed", bi("Period confirmed against the tax point",
+                                                        "تأكدت الفترة من تاريخ استحقاق الضريبة")
+        CONFIRMED_CORRECTION = "confirmed_correction", bi("Confirmed as a correcting entry", "تأكد أنه قيد تصحيح")
+        DIFFERENCE_EXPLAINED = "difference_explained", bi("Difference explained", "تم تفسير الفرق")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     vat_return = models.ForeignKey(VatReturn, on_delete=models.PROTECT, related_name="exception_acks",
                                    verbose_name=bi("VAT return", "الإقرار"))
-    kind = models.CharField(bi("Exception", "الاستثناء"), max_length=24, choices=ExceptionKind.choices)
+    kind = models.CharField(bi("Exception", "الاستثناء"), max_length=28, choices=ExceptionKind.choices)
     reference = models.CharField(bi("Reference", "المرجع"), max_length=60)
     decision = models.CharField(bi("Decision", "القرار"), max_length=24, choices=Decision.choices)
     reason_en = models.CharField(bi("Reason (English)", "السبب (بالإنجليزية)"), max_length=500, blank=True)
@@ -602,8 +698,11 @@ class ImportVatRecord(TaxDocument):
                                verbose_name=bi("Entity", "الكيان"))
     customs_declaration_no = models.CharField(bi("Customs declaration number", "رقم البيان الجمركي"), max_length=40)
     declaration_date = models.DateField(bi("Declaration date", "تاريخ البيان"))
-    customs_value_sar = models.DecimalField(bi("VAT base per the declaration (SAR)", "وعاء الضريبة حسب البيان (ريال)"),
-                                            **MONEY)
+    customs_value_sar = models.DecimalField(bi("Customs value (SAR)", "القيمة الجمركية (ريال)"), **MONEY)
+    # C13: the import VAT base is the customs value plus customs duties and other charges [verify] (box 8 Amount).
+    customs_duty_sar = models.DecimalField(bi("Customs duties (SAR)", "الرسوم الجمركية (ريال)"), default=ZERO, **MONEY)
+    other_charges_sar = models.DecimalField(bi("Other charges in the VAT base (SAR)",
+                                               "رسوم أخرى ضمن وعاء الضريبة (ريال)"), default=ZERO, **MONEY)
     vat_paid_sar = models.DecimalField(bi("VAT paid (SAR)", "الضريبة المدفوعة (ريال)"), **MONEY)
     attribution = models.CharField(bi("VAT attribution", "إسناد الضريبة"), max_length=8, choices=Attribution.choices)
     debit_account = models.ForeignKey("ledger.Account", null=True, blank=True, on_delete=models.PROTECT,
@@ -617,6 +716,10 @@ class ImportVatRecord(TaxDocument):
         verbose_name_plural = bi("import VAT records", "سجلات ضريبة الاستيراد")
         constraints = [models.UniqueConstraint(fields=["entity", "customs_declaration_no"],
                                                name="import_vat_declaration_once")]
+
+    @property
+    def vat_base_sar(self):
+        return self.customs_value_sar + self.customs_duty_sar + self.other_charges_sar
 
     def __str__(self):
         return f"{self.entity.code} customs {self.customs_declaration_no} ({self.status})"
@@ -717,10 +820,22 @@ class VatCorrection(ServiceWritten):
         verbose_name_plural = bi("VAT corrections", "التصحيحات الضريبية")
 
     def check_change(self):
-        stored = type(self)._base_manager.filter(pk=self.pk).values("status").first() if self.pk else None
-        if stored and stored["status"] in (self.Status.FILED, self.Status.CANCELLED) and changed_fields(self):
+        stored = type(self)._base_manager.filter(pk=self.pk).values("status", "target_return_id").first() \
+            if self.pk else None
+        if not stored:
+            return
+        changed = changed_fields(self)
+        if not changed:
+            return
+        if stored["status"] in (self.Status.FILED, self.Status.CANCELLED):
             raise error("A filed or cancelled correction never changes.", "لا يتغير التصحيح المقدَّم أو الملغى.",
                         code="correction_locked")
+        # Review item 9: once the return carrying it is approved, only its filing changes it.
+        if stored["target_return_id"] and VatReturn._base_manager.filter(
+                pk=stored["target_return_id"], status__in=LOCKED_STATUSES).exists():
+            if not (changed <= {"status", "voluntary_disclosure_ref"} and self.status == self.Status.FILED):
+                raise error("This correction is carried by an approved return; it is locked with it.",
+                            "يتضمن هذا التصحيحَ إقرارٌ معتمد؛ فهو مقفل معه.", code="correction_locked")
 
     def __str__(self):
         return f"{self.entity.code} correction {self.tax_difference_sar} ({self.treatment}, {self.status})"
@@ -750,6 +865,14 @@ class TaxAlert(ServiceWritten):
     message_ar = models.CharField(bi("Message (Arabic)", "الرسالة (بالعربية)"), max_length=500)
     exposure_sar = models.DecimalField(bi("Estimated late-payment exposure (SAR)", "تقدير غرامة التأخير (ريال)"),
                                        null=True, blank=True, **MONEY)
+    # C17 (PSG §14): late filing 5-25% of the tax that should have been reported; incorrect or amended return 25%
+    # of the difference. Estimates for display only, never posted.
+    late_filing_min_sar = models.DecimalField(bi("Late-filing penalty from (SAR)", "غرامة التأخر في التقديم من (ريال)"),
+                                              null=True, blank=True, **MONEY)
+    late_filing_max_sar = models.DecimalField(bi("Late-filing penalty up to (SAR)", "غرامة التأخر في التقديم حتى (ريال)"),
+                                              null=True, blank=True, **MONEY)
+    incorrect_return_sar = models.DecimalField(bi("Incorrect-return penalty (SAR)", "غرامة الإقرار الخاطئ (ريال)"),
+                                               null=True, blank=True, **MONEY)
     created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"))
 
     class Meta:

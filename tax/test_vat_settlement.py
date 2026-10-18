@@ -7,7 +7,7 @@ from core import access
 from core.access.testing import member
 from ledger.models import FiscalPeriod
 from tax import jobs, services
-from tax.conftest import D, approved, bill, box, close, close_q1, filed, pdf, reviewed, sale
+from tax.conftest import D, approved, bill, box, close, close_q1, filed, journal, pdf, reviewed, sale
 from tax.models import TaxAlert, TaxError, VatCorrection, VatReturn
 
 pytestmark = pytest.mark.django_db
@@ -34,20 +34,29 @@ def correction(t, original, amount, entries=(), on=date(2027, 5, 1)):
 def test_at26_treatment_by_threshold(t):
     q1 = filed_q1(t)
     small = correction(t, q1, "14999.99")
-    big = correction(t, q1, "15000.00")
-    over = correction(t, q1, "-20000.00")
     assert (small.treatment, small.notify_by) == ("next_return", None)
+    big = correction(t, q1, "15000.00")
+    small.refresh_from_db()
     assert (big.treatment, big.notify_by) == ("amendment", date(2027, 5, 21))
-    assert over.treatment == "overstatement_next_return"
+    assert (small.treatment, small.notify_by) == ("amendment", date(2027, 5, 21))  # C6: netted, re-classified
+    over = correction(t, q1, "-20000.00")  # net of the period now 9,999.99: below the threshold
+    assert over.treatment == "next_return"
+    small.refresh_from_db()
+    assert small.treatment == "amendment"  # the net only re-classifies upwards
     alerts = jobs.deadline_alerts(today=date(2027, 5, 1))
     assert [a.kind for a in alerts if a.correction_id == big.pk] == ["correction_notify"]
     assert "إفصاح" in TaxAlert.objects.get(correction=big).message_ar
     with pytest.raises(TaxError) as exc:
-        correction(t, q1, "-20000.00", on=date(2033, 1, 1))
+        correction(t, q1, "-50000.00", on=date(2033, 1, 1))
     assert exc.value.code == "correction_time_barred"
     with pytest.raises(TaxError) as exc:
         correction(t, services.compute_draft(t.alm, Q2, user=t.a1), "10.00")
     assert exc.value.code == "original_not_filed"
+
+
+def test_at26_large_overstatement_is_claimed_in_a_next_return(t):
+    q1 = filed_q1(t)
+    assert correction(t, q1, "-20000.00").treatment == "overstatement_next_return"
 
 
 def test_at25_correcting_entry_excluded_and_reported_in_box14(t):
@@ -63,7 +72,10 @@ def test_at25_correcting_entry_excluded_and_reported_in_box14(t):
     assert (corr.status, corr.target_return_id) == ("assigned", q2.pk)
     close(t, "2027-04", "2027-05", "2027-06")
     t.today.set(date(2027, 7, 10))
-    q2 = services.approve_return(reviewed(t, services.submit_for_review(q2, user=t.a1)), user=t.c1)
+    q2 = services.submit_for_review(q2, user=t.a1)
+    services.acknowledge_exception(q2, user=t.a2, kind="correcting_entry", reference=f"je:{missed.journal_entry_id}",
+                                   decision="confirmed_correction", reason_ar="فاتورة الربع الأول المتأخرة")
+    q2 = services.approve_return(reviewed(t, q2), user=t.c1)
     assert q2.settlement_offset_sar == 0
     filed(t, q2, on=date(2027, 7, 20), ref="Z-Q2")
     assert VatCorrection.objects.get().status == "filed"
@@ -78,9 +90,14 @@ def test_r26_a_correcting_entry_belongs_to_one_correction(t):
     assert exc.value.code == "correcting_entry_invalid"
 
 
+def vat_journal(t, amount, on=date(2027, 5, 2)):
+    """A correcting journal for output VAT not booked before: Dr 1100 / Cr 2200."""
+    return journal(t, on, [{"account": "1100", "debit": amount}, {"account": "2200", "credit": amount}])
+
+
 def test_at27_amendment_by_voluntary_disclosure(t):
     q1 = filed_q1(t)
-    corr = correction(t, q1, "20000.00")
+    corr = correction(t, q1, "20000.00", entries=[vat_journal(t, "20000.00")])
     with pytest.raises(TaxError):  # nothing to amend for an unrelated period
         services.create_amendment(services.compute_draft(t.alm, Q2, user=t.a1), user=t.a1)
     v1 = services.create_amendment(q1, user=t.a1)

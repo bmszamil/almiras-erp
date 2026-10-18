@@ -3,7 +3,8 @@ from django.contrib import admin
 
 from core.admin import EntityScopedAdmin
 
-from .models import ImportVatRecord, TaxAlert, TaxPayment, TaxRefund, VatCorrection, VatReturn, VatReturnSchedule
+from .models import (ImportVatRecord, TaxAlert, TaxPayment, TaxRefund, VatCorrection, VatFrequencyChange, VatReturn,
+                     VatReturnSchedule)
 
 
 class ReadOnlyTaxAdmin(EntityScopedAdmin):
@@ -51,3 +52,8 @@ class TaxRefundAdmin(ReadOnlyTaxAdmin):
 @admin.register(TaxAlert)
 class TaxAlertAdmin(ReadOnlyTaxAdmin):
     list_display = ["entity", "kind", "alert_date", "due_date", "message_en", "exposure_sar"]
+
+
+@admin.register(VatFrequencyChange)
+class VatFrequencyChangeAdmin(ReadOnlyTaxAdmin):
+    list_display = ["entity", "previous_frequency", "frequency", "changed_on", "recorded_by"]

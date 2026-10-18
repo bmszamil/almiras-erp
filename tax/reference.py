@@ -42,7 +42,16 @@ BOXES = {
 BOX_LABELS = {n: (row[0], row[1]) for n, row in BOXES.items()}
 BOXES_VALID_FROM = date(2018, 1, 1)
 
-# code: (rate %, valid_from, citation). Unverified [CC-verify]: display only (R13 exposure estimate).
+# code: (rate %, valid_from, citation). Display only (R13 estimates); seeded without a verifying person, so shown as
+# "unverified" (R6) until someone holding tax.maintain_rates verifies the row. The compliance check of 2026-10-18
+# found the 5% per month met against PSG §14 (C16).
 STATUTORY_RATES = {
-    "vat_late_payment_monthly": ("5.0000", date(2018, 1, 1), "PSG §14 p.54 [CC-verify]"),
+    "vat_late_payment_monthly": ("5.0000", date(2018, 1, 1), "PSG §14 p.54 (VAT Law Art. 43)"),
+}
+# Added by migration 0005 (C17): late filing 5% to 25% of the tax that should have been reported; an incorrect or
+# amended return 25% of the difference (ZATCA may raise it to 50% or reduce it to 0%).
+STATUTORY_RATES_0005 = {
+    "vat_late_filing_min": ("5.0000", date(2018, 1, 1), "PSG §14 p.54 (VAT Law Art. 41)"),
+    "vat_late_filing_max": ("25.0000", date(2018, 1, 1), "PSG §14 p.54 (VAT Law Art. 41)"),
+    "vat_incorrect_return": ("25.0000", date(2018, 1, 1), "PSG §14 p.54-55 (VAT Law Art. 42)"),
 }

@@ -18,6 +18,7 @@ class TaxConfig(AppConfig):
     verbose_name = "Tax returns / الإقرارات الضريبية"
 
     def ready(self):
+        from core.signals import entity_settings_changed
         from ledger import documents
 
         from . import services
@@ -33,3 +34,5 @@ class TaxConfig(AppConfig):
         documents.register(TaxRefund, post_permissions={"tax.approve_payment"},
                            reverse_permissions={"tax.reverse_document"}, build_lines=services._refund_lines,
                            reverse_guard=services._reverse_guard)
+        # R4 / review item 6: a VAT frequency change is dated and the schedule regenerated with it.
+        entity_settings_changed.connect(services._on_entity_settings_changed, dispatch_uid="tax_vat_frequency")
