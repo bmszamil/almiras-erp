@@ -174,3 +174,38 @@ Merge mechanics for C:
 11. **Retention:** keep everything forever (D18), or allow the PDPL anonymisation job (invoicing R52) after legal sign-off?
 12. **Custom user model:** confirm the custom `access.User` (main OQ1) over `auth.User` + profile (branch OQ-9).
 13. **Reconciliation plan:** confirm option C and the branch-based integration line, and who reviews and approves it before it replaces `main`.
+
+## 7. Owner answers 2026-10-18
+
+Source: `docs/approvals/owner-answers-2026-10-18.md` §A (and B1, B7). Recorded in the specs as dated decisions "project owner, 2026-10-18".
+
+**Wording note.** In questions 1 and 13, "branch" meant the **code branch** (`claude/funny-davinci-7yd88s`), not a company branch. The owner answered about **company governance** (who holds authority in each company). The answers are recorded as company governance; their effect on the code lines is the team's reading, listed under "Integration effect".
+
+| Q | Topic | Owner's answer (condensed) | Recorded as | Integration effect |
+|---|---|---|---|---|
+| 1 | Authority | Authority in each company lies with that company's CEO / GM; the Almiras MP is board member or shareholder representative only. *Team:* the owner's current answers prevail over earlier decisions on either line. | access A24 | Neither `main`'s "MP approves everything" (A-D2, B-D7) nor the branch's "CFO approves" (A1) stands as such; approvers come from data (Q2) |
+| 2 | Approver | MP does not approve everything; each company has its own **authority matrix** for every task and activity; contracted payroll needs no MP; overtime in Almiras needs the MP; other companies have their own structures. | access A25, R57; payroll P20; hr H21 | New per-entity `AuthorityRule` data (activity × amount band × role), replacing `main`'s policies; seed rows copy today's decided holders; each entity's content is open (access OQ-30, go-live) |
+| 3 | Self-approval | Only the highest authority of each entity (MP in Almiras, CEO elsewhere) may self-approve; nobody else ever; every such approval logged and in the monthly governance / internal-audit report. | access A26, R58, R59 | Keeps a narrowed `main` D10 (per-entity configurable top authority); the branch ledger registry must accept a logged top-authority grant (R35 note); invoicing `segregation_required` switch removed |
+| 4 | Group roles | Each company granted separately; no cascade. | access A27, R6 replaced, R64, R65 | `main` D12 wins; branch R6 coverage of `full` descendants is removed; tests built on cascade change |
+| 5 | CFO powers, extra roles | CEO approves and posts and can act as accountant; roles internal auditor, PA, business analyst, external auditor needed. | access A28, R60 | New roles as data (`ceo`, `internal_auditor`, `personal_assistant`, `business_analyst`, `external_auditor`); CFO (`approver`) rights set per entity by its matrix |
+| 6 | System users vs D17 | Yes: system users may issue and post after a person's prior approval. | access A29, R63 | Branch behaviour kept (billing auto-issue, ZATCA queue posting); `main` D17 reworded to apply to external integration and agent users only |
+| 7 | Auto-generated invoices | One approval per contract. | billing D14(a), invoicing D33(b) | Branch D8 kept; `main` B-R9/R10 per-invoice approval dropped |
+| 8 | Intercompany | Automatic mirror bill in the buying company; cost-plus, timesheets and cost pools at go-live. | billing D14(b), (c), R73 to R76; invoicing R113 | `main` B-D8, B-D3, B-D12 adopted into the branch's billing (mirror draft via `invoicing.create_mirror_bill`, `TimesheetEntry`, `CostPool`); branch D10 / invoicing D23 superseded |
+| 9 | Invoice dating | Last day of the service month, unless ZATCA requires otherwise (team to advise); earlier end date when the service ends earlier. | billing D14(d), R77, R78; zatca D-17(b), R-53 | Team advice: ZATCA `IssueDate` = generation date, never backdated, so the run happens **on** that day; a later run carries its own date with the supply period (KSA-5/KSA-24) for the month; tax invoice due by the 15th of the following month (VAT IR Art. 53 **[verify]**). Branch R15 no-backdating kept; `main` B-D12 date achieved by scheduling |
+| 10 | Generic engine scope | All approvable documents go through the same engine. | access A25, R61; billing R79; invoicing R114; migration M7 | `main`'s approvals engine becomes the single workflow layer for every module; module approve functions are reached only through engine adapters, with the branch's single-use grants |
+| 11 | Retention | Keep everything; data older than 10 years nominated for destruction; destruction decided by an internal audit committee approval minute (B7). | access A32, R55; invoicing R108; hr R67; payroll R31 | `main` D18 "keep forever" and the branch nomination model combine: no automatic deletion; `burn` needs the committee minute reference |
+| 12 | User model | Follow best practice for large groups / large ERPs. *Team:* custom user model. | access A30, R66 | `main`'s `access.User` adopted, `UserProfile` fields folded in, on a fresh database |
+| 13 | Reconciliation plan | Option C confirmed; the company CEO approves and reviews, and may delegate. *Team:* the project owner (or their delegate) reviews and approves the integration before it replaces `main`. | access A31, R62 | Option C, branch as base; human approval by the project owner or a named delegate (delegation recorded with dates) |
+
+**Resulting integration plan (option C, updated 2026-10-18)**
+
+1. New integration branch from the code branch (§6 step 1).
+2. Bring in `main`'s `access.User`, TOTP, lockout, service tokens, hardened settings and DRF API; set `AUTH_USER_MODEL = "access.User"` and fold `UserProfile` (Q12). Drop `main`'s `EntityAccess`/`Role`/`Permission`; map its roles to the branch catalogue plus the new roles (Q5).
+3. Bring in `main`'s `approvals` engine as the only workflow layer (Q10): replace its policies with `EntityGovernance` + `AuthorityRule` (Q2, Q3), its `Delegation` with `ApprovalDelegation` (Q13), eligibility through `core.access.has`, final decisions calling module services with single-use document-bound grants; ledger keeps `draft/posted/reversed`; the open request locks the draft.
+4. Remove group cascade from `core.access` (Q4); restrict `allow_self_approval` to the top-authority path and teach the ledger registry to accept it (Q3); remove invoicing's `segregation_required`.
+5. Billing: mirror draft bills, timesheets, cost pools, cost-plus, month-end dating run (Q7 to Q9).
+6. Seed each entity's matrix from today's decided holders; collect real matrices per entity before go-live (access OQ-30).
+7. Migrations regenerated on a fresh DB; both test suites run on SQLite and PostgreSQL (§6 steps 3, 4).
+8. Code-reviewer and compliance-checker review; the project owner (or a named delegate) approves before the integration replaces `main` (Q13).
+
+**Still open after these answers** (detail in the specs): each entity's matrix content (access OQ-30), who maintains it (OQ-31), self-approval conditions and delegation interplay (OQ-32), report recipients (OQ-33), escalation (OQ-34), amount bases (OQ-35), external auditor scope (OQ-36), PA / analyst permission sets (OQ-37), G permissions on the group parent vs no cascade (OQ-38), loan and bai' ajel approvers outside Almiras (OQ-39), receipts vs "no self-approval" (OQ-40), CFO alongside CEO (OQ-41); billing mirror scope and run time (billing OQ-39 to OQ-45); MFA scope (`main` D14 vs access OQ-4: not answered).
