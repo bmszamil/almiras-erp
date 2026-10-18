@@ -46,7 +46,12 @@ INSTALLED_APPS = [
     "zatca",
     "banking",
     "migration",
+    "tax",
 ]
+
+# tax-returns R55: the Art. 51 annual true-up hand-off (tax.art51_port). As built, invoicing posts mixed input VAT
+# fully to cost (invoicing R29 default; R104 not built), so the default port reports that no true-up is due.
+TAX_ART51_PORT = "tax.art51_port.InvoicingArt51Port"
 
 # ZATCA hand-off (invoicing.zatca_port), implemented by the zatca app (docs/specs/zatca.md). An entity without a
 # ZATCA profile keeps the old behaviour: its documents stay pending and nothing posts without a ZATCA result.
