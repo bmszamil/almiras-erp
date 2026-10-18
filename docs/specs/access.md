@@ -203,6 +203,8 @@ Flags: **A** = approval (creator ≠ approver, R14); **S!** = segregation that c
 | `invoicing.enter_wht_data` / `invoicing.verify_wht_data` | | payables_clerk, accountant / accountant |
 | `invoicing.manage_settings` | | approver |
 | `invoicing.post_purification_transfer` / `invoicing.approve_purification_payout` (R54) | P / A, P | accountant, approver / approver |
+| `invoicing.approve_purification_funding` (invoicing R54, owner decision C2, 2026-10-18; seed V10) | A, P | approver; managing_partner (fallback, OQ-1) |
+| `invoicing.mark_purification_instruction_sent` (invoicing R54, owner decision C4; seed V10) | | accountant |
 | `invoicing.view` | Ag (scoped) | all human entity roles |
 | `invoicing.view_personal_data` (R51) | | receivables_clerk, payables_clerk, accountant, approver (every view logged) |
 | `billing.edit_contract_draft` | Ag | accountant, approver, agent (if granted) |
