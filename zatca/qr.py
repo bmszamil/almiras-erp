@@ -1,15 +1,18 @@
 """QR code TLV for simplified documents (zatca R-15, R-37; DTG §6 p.58-62). Pure functions.
 
-Settled offline against ZATCA SDK R3.4.8 (``docs/compliance/zatca-sdk-3-findings-2026-10-17.md`` §3.1):
+Settled offline against ZATCA SDK R3.4.8 and confirmed with the R4.0.0 jar, whose QR generator and validator keep
+R3.4.8's logic (``docs/compliance/zatca-sdk-3-findings-2026-10-17.md`` §3.1, §7.2, §7.3):
 
 - Lengths are BER (the SDK's ``BerTlvBuilder``): one byte up to 127, ``0x81 LL`` for 128-255, ``0x82 LLLL`` above.
   A 1-byte length for a 128-255-byte value fails the SDK's QR check (``QRCODE_INVALID``). No per-value cap.
 - Tags 7-9 follow the DTG, which is the SDK's layout: 7 = ``ds:SignatureValue`` as base64 text, 8 = public key as
   DER SubjectPublicKeyInfo, 9 = the certificate's own signature (DER); tag 9 only on simplified documents. The
   SDK 2.0.3 layout (7 SPKI, 8 r, 9 s) fails R3.4.8 and is retired.
-- The QR is at most 1000 base64 characters (BR-CL-KSA-14 in R3.4.8; R-37).
-- The R3.4.8 validator does not fail a QR with missing tags, so presence is checked here (``missing_tags``) and
-  by AT-14, not left to the SDK.
+- Tag 3 is ``IssueDate "T" IssueTime`` without ``Z`` (``ubl.InvoiceData.qr_timestamp``); both builds warn
+  ``timeStamp`` otherwise. Tag 4 is BT-115.
+- The QR is at most 1000 base64 characters (BR-CL-KSA-14 in R3.4.8 and R4.0.0; R-37).
+- Neither validator (R3.4.8, R4.0.0) fails a QR with missing tags, so presence is checked here (``missing_tags``)
+  and by AT-14, not left to the SDK.
 """
 import base64
 
@@ -17,7 +20,7 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 
 LAYOUT_DTG = "dtg"
-MAX_CHARS = 1000  # R-37 / BR-CL-KSA-14 (SDK R3.4.8)
+MAX_CHARS = 1000  # R-37 / BR-CL-KSA-14 (SDK R3.4.8, R4.0.0)
 SIMPLIFIED_TAGS = tuple(range(1, 10))  # R-15: simplified documents and their notes carry tags 1 to 9
 STANDARD_TAGS = tuple(range(1, 9))  # ZATCA's QR in a cleared standard document: no tag 9
 # Values the retired ZATCA_QR_TAGS_7_9_LAYOUT setting may still hold without changing anything (both mean DTG).
@@ -38,8 +41,8 @@ def layout():
     """Always the DTG layout. The retired SDK 2.0.3 layout is refused loudly rather than silently ignored."""
     value = getattr(settings, "ZATCA_QR_TAGS_7_9_LAYOUT", None)
     if value not in _DTG_SETTING_VALUES:
-        raise ImproperlyConfigured(f"ZATCA_QR_TAGS_7_9_LAYOUT={value!r}: only the DTG layout exists (SDK R3.4.8 "
-                                   "findings §3.1); remove the setting")
+        raise ImproperlyConfigured(f"ZATCA_QR_TAGS_7_9_LAYOUT={value!r}: only the DTG layout exists (SDK R3.4.8 / "
+                                   "R4.0.0 findings §3.1, §7.3); remove the setting")
     return LAYOUT_DTG
 
 

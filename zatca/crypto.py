@@ -1,7 +1,9 @@
 """ZATCA cryptography with lxml + cryptography only (zatca R-13, R-14, §3.2). Pure functions, no database.
 
 The approach is the one proven against ZATCA SDK 2.0.3 in ``docs/compliance/zatca-sdk-kit/scripts``
-(``pyhash.py``, ``pysign.py``; findings §1 to §6):
+(``pyhash.py``, ``pysign.py``; findings §1 to §6) and re-verified unchanged against SDK R3.4.8 and the R4.0.0 jar
+(``docs/compliance/zatca-sdk-3-findings-2026-10-17.md`` §3.2, §3.3, §7.2: hash 31/31, signature and certificate
+encodings on 66 R4.0.0-era documents):
 
 - invoice hash: drop ``ext:UBLExtensions``, the ``cac:Signature`` child of the root and the QR
   ``cac:AdditionalDocumentReference``, canonicalise with lxml ``method="c14n"`` (C14N 1.0, byte-identical
@@ -120,15 +122,19 @@ TEMPLATE_NAMES = {"production": "ZATCA-Code-Signing", "simulation": "PREZATCA-Co
 
 
 def template_name(environment: str) -> str:
-    """§3.2: ``ZATCA-Code-Signing`` in production, ``PREZATCA-Code-Signing`` in simulation (SDK R3.4.8 ``-sim``;
-    findings §3.6, OQ-26), ``TSTZATCA-Code-Signing`` otherwise (sandbox; SDK ``-nonprod``)."""
+    """§3.2: ``ZATCA-Code-Signing`` in production, ``PREZATCA-Code-Signing`` in simulation (SDK R3.4.8 and R4.0.0
+    ``-sim``; findings §3.6, §7.3, OQ-26), ``TSTZATCA-Code-Signing`` otherwise (sandbox; SDK ``-nonprod``)."""
     return TEMPLATE_NAMES.get(environment, "TSTZATCA-Code-Signing")
 
 
 def build_csr(private_key, *, common_name, org_unit, org_name, serial_number, vat_number, invoice_type, location,
               industry, environment):
-    """CSR per the SDK 2.0.3 ``-csr`` layout (findings §6): subject C, OU, O, CN; one SAN DirectoryName with
-    SN, UID, title, registeredAddress, businessCategory; template-name extension; ecdsa-with-SHA256."""
+    """CSR per the SDK ``-csr`` layout (2.0.3 findings §6; unchanged in R3.4.8 and R4.0.0, findings-3 §7.3):
+    subject C, OU, O, CN; one SAN DirectoryName with SN, UID, title, registeredAddress, businessCategory;
+    template-name extension; ecdsa-with-SHA256.
+
+    The values are not checked here: ``zatca.services`` refuses beforehand what the SDK's CSR checks refuse
+    (``rules.SERIAL_RE`` without "=", ``rules.csr_value_problems``: ``! @ # $ % & * _ <``, VAT-group OU)."""
     subject = x509.Name([
         x509.NameAttribute(NameOID.COUNTRY_NAME, "SA"),
         x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, org_unit),
@@ -195,10 +201,11 @@ def cert_digest(cert_b64: str) -> str:
 
 
 def issuer_name(cert, style="rfc2253") -> str:
-    """X509IssuerName (R-14): RFC 2253 order with ", " separators (the SUN form; settled by SDK R3.4.8, whose
-    samples all carry it and whose validator accepts it with SUN as the first JCA provider; findings §3.3).
+    """X509IssuerName (R-14): RFC 2253 order with ", " separators (the SUN form; settled by SDK R3.4.8 and R4.0.0,
+    whose samples all carry it and whose validators accept it: R3.4.8 with SUN as the first JCA provider, R4.0.0
+    with the JDK default order on Java 21; findings §3.3, §7.3).
 
-    ``style="bc"`` gives the BouncyCastle form (``DC=local,DC=gov,...``), an artefact of running the SDK with
+    ``style="bc"`` gives the BouncyCastle form (``DC=local,DC=gov,...``), an artefact of running either SDK with
     BouncyCastle as provider 1; kept only for comparing against such a JVM, never for submission.
     """
     if style == "bc":
