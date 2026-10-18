@@ -394,11 +394,11 @@ def test_at51_at45_sar_invoice_xml(live):
     assert root.tag == "{urn:oasis:names:specification:ubl:schema:xsd:Invoice-2}Invoice"
     assert text(xml, "/*/cbc:TaxCurrencyCode") == "SAR" and text(xml, "/*/cbc:DocumentCurrencyCode") == "SAR"
     totals = root.xpath("/*/cac:TaxTotal", namespaces=crypto.NS)
-    assert len(totals) == 2
+    assert len(totals) == 2  # G2 / R-40: BT-111 without subtotals first, as in the SDK samples
     assert totals[0].xpath("cbc:TaxAmount/@currencyID", namespaces=crypto.NS) == ["SAR"]
-    assert totals[0].xpath("cac:TaxSubtotal", namespaces=crypto.NS)
+    assert not totals[0].xpath("cac:TaxSubtotal", namespaces=crypto.NS)
     assert totals[1].xpath("cbc:TaxAmount/@currencyID", namespaces=crypto.NS) == ["SAR"]
-    assert not totals[1].xpath("cac:TaxSubtotal", namespaces=crypto.NS)
+    assert totals[1].xpath("cac:TaxSubtotal", namespaces=crypto.NS)
     seller = "/*/cac:AccountingSupplierParty/cac:Party"
     assert text(xml, f"{seller}/cac:PartyLegalEntity/cbc:RegistrationName") == "شركة TST1 للاختبار"
     assert text(xml, f"{seller}/cac:PostalAddress/cbc:StreetName") == "شارع الاختبار"
@@ -516,7 +516,7 @@ def test_at72_kwd_amounts_emitted_with_two_decimals(live, monkeypatch):
     treasurer = make_user("treasury_kwd")
     member(treasurer, live.par, "group_treasury")
     ledger.create_rate(user=treasurer, from_currency="KWD", to_currency="SAR", on=TODAY, rate=D("12.2000"),
-                       group=live.par)
+                       group=live.par, source="sama", source_reference="SAMA test bulletin")
     doc = issue(live, live.tst1, lines=[("management_fee", "1", "1000.000")], currency="KWD")
     assert doc.total_net == D("1000.000") and doc.total_vat == D("150.000")
     run(live)
@@ -544,7 +544,7 @@ def test_at42_usd_invoice_carries_the_sar_tax_total(live, monkeypatch):
     treasurer = make_user("treasury_usd")
     member(treasurer, live.par, "group_treasury")
     ledger.create_rate(user=treasurer, from_currency="USD", to_currency="SAR", on=TODAY, rate=D("3.75"),
-                       group=live.par)
+                       group=live.par, source="sama", source_reference="SAMA test bulletin")
     doc = issue(live, live.tst1, lines=[("management_fee", "1", "1000.00")], currency="USD")
     assert doc.total_vat_sar == D("562.50")
     run(live)
@@ -553,6 +553,7 @@ def test_at42_usd_invoice_carries_the_sar_tax_total(live, monkeypatch):
     assert text(xml, "/*/cac:TaxTotal[cac:TaxSubtotal]/cbc:TaxAmount/@currencyID") == "USD"
     assert text(xml, "/*/cac:TaxTotal[not(cac:TaxSubtotal)]/cbc:TaxAmount") == "562.50"
     assert text(xml, "/*/cac:TaxTotal[not(cac:TaxSubtotal)]/cbc:TaxAmount/@currencyID") == "SAR"
+    assert text(xml, "/*/cac:TaxTotal[1]/cbc:TaxAmount") == "562.50"  # G2: the SAR total first (SDK FX sample)
     icv = last_icv(live)
     mutate(monkeypatch, total_vat_sar=D("0"))
     doc2 = issue(live, live.tst1, lines=[("management_fee", "1", "1000.00")], currency="USD")
@@ -696,3 +697,26 @@ def test_r1_attempts_follow_their_e_invoice_entity(live):
                                 message_en="x")
     with pytest.raises(ZatcaError):
         message.save()
+
+
+def test_g2_qr_tag_5_of_a_foreign_currency_simplified_invoice_is_the_sar_vat_total(live):
+    """Owner decision G2 (R-40, OQ-22; SDK findings §7.3): SAR TaxTotal first and QR tag 5 = BT-111 in SAR."""
+    from ledger import services as ledger
+
+    treasurer = make_user("treasury_qr")
+    member(treasurer, live.par, "group_treasury")
+    ledger.create_rate(user=treasurer, from_currency="USD", to_currency="SAR", on=TODAY, rate=D("3.75"),
+                       group=live.par, source="sama", source_reference="SAMA test bulletin")
+    doc = issue(live, live.tst1, simplified=True, lines=[("management_fee", "1", "100.00")], currency="USD")
+    assert (doc.total_vat, doc.total_vat_sar) == (D("15.00"), D("56.25"))
+    run(live)
+    einv = einvoice_of(doc)
+    assert einv.icv, list(einv.messages.values_list("code", "message_en"))
+    xml = xml_of(einv)
+    assert text(xml, "/*/cac:TaxTotal[1]/cbc:TaxAmount") == "56.25"
+    assert text(xml, "/*/cac:TaxTotal[1]/cbc:TaxAmount/@currencyID") == "SAR"
+    assert text(xml, "/*/cac:TaxTotal[2]/cbc:TaxAmount") == "15.00"
+    assert text(xml, "/*/cac:TaxTotal[2]/cbc:TaxAmount/@currencyID") == "USD"
+    tags = qr.decode(einv.qr_tlv)
+    assert tags[5] == b"56.25"  # the SAR VAT total, not USD 15.00
+    assert tags[4].decode() == text(xml, "/*/cac:LegalMonetaryTotal/cbc:PayableAmount") == "115.00"  # BT-115, USD

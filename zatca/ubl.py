@@ -130,6 +130,12 @@ class InvoiceData:
         return Decimal(self.total_gross) - Decimal(self.prepaid_amount)
 
     @property
+    def qr_vat_total(self):
+        """QR tag 5 (owner decision G2; R-40, OQ-22): the VAT total in SAR, BT-111, i.e. the first ``TaxTotal`` of the
+        document as both SDK generators read it. For a SAR document it equals BT-110."""
+        return Decimal(self.total_vat_sar)
+
+    @property
     def issue_local(self):
         """The issue moment in Riyadh time. Coordinator decision 2026-10-17, pending the owner's confirmation in an
         OQ-18 amendment: BT-2 / KSA-25 are emitted in AST without a suffix (XML v1.2 p.47 allows ``hh:mm:ss`` in
@@ -281,7 +287,11 @@ def build_unsigned(data: InvoiceData, icv: int, pih: str) -> bytes:
         if data.reason:  # KSA-10 (BR-KSA-17)
             _sub(pm, CBC, "InstructionNote", data.reason)
 
-    # R-40: the document-currency TaxTotal with subtotals (BT-110, first: QR tag 5), then BT-111 in SAR.
+    # R-40 as amended (owner decision G2): BT-111, the VAT total in SAR without subtotals, first, as in ZATCA's SDK
+    # samples (the FX sample included); then the document-currency TaxTotal with subtotals (BT-110). The SDK
+    # generators take QR tag 5 from the first TaxTotal, so tag 5 is the SAR total (qr_vat_total).
+    tt = _sub(root, CAC, "TaxTotal")
+    _sub(tt, CBC, "TaxAmount", amount(data.total_vat_sar), currencyID="SAR")
     tt = _sub(root, CAC, "TaxTotal")
     _sub(tt, CBC, "TaxAmount", amount(data.total_vat), currencyID=cur)
     for g in data.groups:
@@ -295,8 +305,6 @@ def build_unsigned(data: InvoiceData, icv: int, pih: str) -> bytes:
             _sub(tc, CBC, "TaxExemptionReasonCode", g.exemption_codes[0])
             _sub(tc, CBC, "TaxExemptionReason", g.exemption_text)
         _tax_scheme(tc)
-    tt = _sub(root, CAC, "TaxTotal")
-    _sub(tt, CBC, "TaxAmount", amount(data.total_vat_sar), currencyID="SAR")
 
     lmt = _sub(root, CAC, "LegalMonetaryTotal")
     line_sum = sum((line.net for line in data.lines), Decimal("0"))

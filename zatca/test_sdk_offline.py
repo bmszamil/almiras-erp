@@ -162,20 +162,39 @@ def test_sdk_validates_a_b2g_standard_invoice(zw, monkeypatch, tmp_path):
 
     from invoicing import services as invoicing_services
     from invoicing.conftest import ADDRESS, approve, invoice
-    from zatca import services
     from zatca.conftest import TODAY
 
     cred = _sdk_unit(zw)
     gov = invoicing_services.create_customer(
         zw.tst1, user=zw.clerk, code="G001", customer_kind="government", name_en="Test Ministry",
         name_ar="وزارة الاختبار", is_vat_registered=True, vat_number="310000000000003", **ADDRESS)
-    monkeypatch.setattr(services, "_payment_order_date", lambda doc: date(2026, 10, 5))
     w = SimpleNamespace(alm=zw.tst1, clerk=zw.clerk, customer=gov, cfo=zw.cfo)
     doc = approve(w, invoice(w, (("management_fee", "1", "100.00"),), customer=gov, user=zw.clerk,
-                             issue_date=TODAY, entity=zw.tst1), zw.cfo)
+                             issue_date=TODAY, entity=zw.tst1, payment_order_date=date(2026, 10, 5)), zw.cfo)
     einv, out = _validate(zw, monkeypatch, cred, doc, tmp_path, "module-std-388-b2g.xml")
     assert "<cbc:CompanyLegalForm>GOV</cbc:CompanyLegalForm>" in einv.signed_xml
     assert "<cbc:TaxPointDate>2026-10-05</cbc:TaxPointDate>" in einv.signed_xml
     _passed(out, STANDARD)
     for code in ("BR-KSA-91", "BR-KSA-92", "BR-KSA-06"):
         assert code not in out, out
+
+
+def test_g2_sdk_validates_a_foreign_currency_simplified_invoice_with_the_sar_tax_total_first(zw, monkeypatch,
+                                                                                           tmp_path):
+    """Owner decision G2 (R-40, OQ-22): a USD simplified invoice with BT-111 (SAR) as the first TaxTotal and QR
+    tag 5 = the SAR VAT total, as the SDK generator would write it; every stage passes, no QR warning."""
+    from core.access.testing import make_user, member
+    from ledger import services as ledger
+    from zatca.conftest import TODAY
+
+    cred = _sdk_unit(zw)
+    treasurer = make_user("treasury_sdk_usd")
+    member(treasurer, zw.par, "group_treasury")
+    ledger.create_rate(user=treasurer, from_currency="USD", to_currency="SAR", on=TODAY, rate="3.75", group=zw.par,
+                       source="sama", source_reference="SAMA test bulletin")
+    doc = issue(zw, zw.tst1, simplified=True, currency="USD")
+    einv, out = _validate(zw, monkeypatch, cred, doc, tmp_path, "module-simp-388-usd.xml")
+    assert "<cbc:TaxAmount currencyID=\"SAR\">56.25</cbc:TaxAmount>" in einv.signed_xml.split("<cac:TaxTotal>")[1]
+    assert qr.decode(einv.qr_tlv)[5] == b"56.25"
+    _passed(out, SIMPLIFIED)
+    _no_qr_warnings(einv, _folder(tmp_path), "module-simp-388-usd")

@@ -633,7 +633,7 @@ def _sign_xml(data, icv, pih, key_ref, master, credential, signing_time):
         qr_b64 = qr.encode(qr.simplified_values(
             seller_name=data.seller.name, vat_number=data.seller.vat_number,
             timestamp=data.qr_timestamp, total=ubl.amount(data.payable),
-            vat_total=ubl.amount(data.total_vat), invoice_hash=invoice_hash, signature_b64=signature_b64,
+            vat_total=ubl.amount(data.qr_vat_total), invoice_hash=invoice_hash, signature_b64=signature_b64,
             public_key_der=crypto.spki_der(cert.public_key()), certificate_signature=cert.signature))
         if qr.missing_tags(qr.decode(qr_b64), simplified=True):  # R-15 / AT-14: all 9 tags, none empty
             raise _LocalProblems([local("qr_tags")])
@@ -1070,10 +1070,11 @@ def _buyer_legal_form(doc, category):
 
 
 def _payment_order_date(doc):
-    """R-54 / OQ-37: BT-7 for a B2G document is the payment order date, supplied by ``invoicing``. Invoicing does
-    not capture it yet (no ``SalesDocument.payment_order_date``), so this is None and such a document is held
-    locally under BR-KSA-92 (no ICV consumed) until invoicing hands the date over. Never guessed from other dates."""
-    return getattr(doc, "payment_order_date", None)
+    """R-54 / OQ-37 (owner decision G1): BT-7 for a B2G document is the payment order date that ``invoicing``
+    stores on the document (``SalesDocument.payment_order_date``, invoicing R117). Invoicing refuses to issue a B2G
+    standard document without it; one that reaches the queue without it all the same (e.g. issued before R117) is
+    held locally under BR-KSA-92 (no ICV consumed) until it is set. Never guessed from other dates."""
+    return doc.payment_order_date
 
 
 class _LocalProblems(Exception):

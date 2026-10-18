@@ -112,16 +112,18 @@ def live(zw):
     return zw
 
 
-def _issue(zw, customer):
+def _issue(zw, customer, **fields):
     w = SimpleNamespace(alm=zw.tst1, clerk=zw.clerk, customer=customer, cfo=zw.cfo)
     doc = invoice(w, (("management_fee", "1", "100.00"),), customer=customer, user=zw.clerk, issue_date=TODAY,
-                  entity=zw.tst1)
+                  entity=zw.tst1, **fields)
     return approve(w, doc, zw.cfo)
 
 
-def test_at82_government_buyer_without_payment_order_date_is_held(live):
-    """Invoicing does not hand over a payment order date yet (OQ-37): the document is held, nothing guessed."""
-    doc = _issue(live, live.gov)
+def test_at82_government_buyer_without_payment_order_date_is_held(live, monkeypatch):
+    """Invoicing refuses to issue a B2G document without the date (invoicing R117); one that reaches the queue
+    without it all the same (issued before R117) is held, nothing guessed."""
+    doc = _issue(live, live.gov, payment_order_date=PAYMENT_ORDER)
+    monkeypatch.setattr(services, "_payment_order_date", lambda doc: None)  # as a document issued before R117
     run(live)
     einv = einvoice_of(doc)
     assert einv.status == "pending" and einv.icv is None and "tax_point_date" in held_codes(einv)
@@ -130,9 +132,8 @@ def test_at82_government_buyer_without_payment_order_date_is_held(live):
     assert "payment order date" in message.message_en and "أمر الدفع" in message.message_ar
 
 
-def test_at81_government_buyer_with_payment_order_date_is_cleared(live, monkeypatch):
-    monkeypatch.setattr(services, "_payment_order_date", lambda doc: PAYMENT_ORDER)
-    doc = _issue(live, live.gov)
+def test_at81_government_buyer_with_payment_order_date_is_cleared(live):
+    doc = _issue(live, live.gov, payment_order_date=PAYMENT_ORDER)  # invoicing R117 (G1)
     run(live)
     einv = einvoice_of(doc)
     assert einv.status == "cleared", list(einv.messages.values_list("code", "message_en"))
@@ -142,18 +143,18 @@ def test_at81_government_buyer_with_payment_order_date_is_cleared(live, monkeypa
     assert xml_text(xml, "/*/cbc:InvoiceTypeCode/@name") == "0100000"
 
 
-def test_at81_business_buyer_gets_neither(live, monkeypatch):
-    monkeypatch.setattr(services, "_payment_order_date", lambda doc: PAYMENT_ORDER)  # ignored: not B2G
-    doc = _issue(live, live.customers["TST1"])
+def test_at81_business_buyer_gets_neither(live):
+    doc = _issue(live, live.customers["TST1"], payment_order_date=PAYMENT_ORDER)  # ignored: not B2G
     run(live)
     einv = einvoice_of(doc)
     assert einv.status == "cleared"
     assert "CompanyLegalForm" not in einv.signed_xml and "TaxPointDate" not in einv.signed_xml
 
 
-def test_at81_payment_order_date_hook_is_none_until_invoicing_has_it(live):
+def test_at81_payment_order_date_comes_from_the_invoicing_document(live):
     doc = _issue(live, live.customers["TST1"])
     assert services._payment_order_date(doc) is None
+    assert services._payment_order_date(_issue(live, live.gov, payment_order_date=PAYMENT_ORDER)) == PAYMENT_ORDER
     assert services._buyer_legal_form(doc, "standard") == ""
     live.gov.refresh_from_db()
     doc.customer = live.gov
