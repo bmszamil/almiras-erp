@@ -1,4 +1,5 @@
-"""``manage.py migration_tieout --entity ALM --user u --tb tb.csv [--tb-columns cols.json] --as-of YYYY-MM-DD
+"""``manage.py migration_tieout --entity ALM --user u (--tb tb.csv [--tb-columns cols.json] | --workbook wb.xlsx)
+--as-of YYYY-MM-DD
 [--posted-only] [--pl-to-opening-equity] [--report out.csv]`` (migration R18). Read-only.
 
 The ERP trial balance per ERP account against the mapped legacy closing balances, to the halala. Exit status 1 when
@@ -10,7 +11,7 @@ from django.core.management.base import BaseCommand, CommandError
 
 from migration import services
 
-from ._common import add_common, iso_date, read_tb, resolve, run
+from ._common import add_common, add_workbook, iso_date, read_tb, resolve, run
 
 
 class Command(BaseCommand):
@@ -18,8 +19,9 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         add_common(parser, apply=False)
-        parser.add_argument("--tb", required=True)
+        parser.add_argument("--tb")
         parser.add_argument("--tb-columns")
+        add_workbook(parser)
         parser.add_argument("--as-of", type=iso_date, required=True)
         parser.add_argument("--posted-only", action="store_true", help="Leave import drafts out")
         parser.add_argument("--pl-to-opening-equity", action="store_true")
@@ -27,7 +29,9 @@ class Command(BaseCommand):
 
     def handle(self, *args, **o):
         entity, user = resolve(o)
-        tb = run(lambda: read_tb(o))
+        if not o["tb"] and not o["workbook"]:
+            raise CommandError("Give --tb or --workbook. / حدد ميزان المراجعة أو ملف الترحيل.")
+        tb = run(lambda: read_tb(o, entity))
         rows, problems = run(lambda: services.tie_out_ledger(
             entity, tb, user=user, as_of=o["as_of"], include_drafts=not o["posted_only"],
             pl_to_opening_equity=o["pl_to_opening_equity"], source_system=o["source_system"]))

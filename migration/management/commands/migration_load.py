@@ -1,5 +1,7 @@
-"""``manage.py migration_load --entity ALM --user u --cutover YYYY-MM-DD [--tb tb.csv --tb-columns cols.json]
-[--basis closing|opening] [--pl-to-opening-equity] [--journal f.xlsx] [--apply]`` (migration R14, R15).
+"""``manage.py migration_load --entity ALM --user u --cutover YYYY-MM-DD [--tb tb.csv --tb-columns cols.json |
+--workbook wb.xlsx] [--basis closing|opening] [--pl-to-opening-equity] [--journal f.xlsx] [--apply]``
+(migration R14, R15, W13). With ``--workbook`` the cut-over date defaults to the entity's date on its Entities sheet
+and the opening entry is drafted from its closing balances there.
 
 Drafts the opening entry from the trial balance and/or replays the journal's entries as drafts, through
 ledger.services only. Dry run unless ``--apply``; nothing is created when the report has an error. The drafts are
@@ -11,7 +13,7 @@ from django.db import transaction
 from migration import report as rendering
 from migration import services
 
-from ._common import add_common, iso_date, read_journal, read_tb, resolve, run
+from ._common import add_common, add_workbook, cutover, iso_date, read_journal, read_tb, resolve, run
 
 
 class Command(BaseCommand):
@@ -19,9 +21,10 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         add_common(parser)
-        parser.add_argument("--cutover", type=iso_date, required=True, help="Cut-over date (YYYY-MM-DD)")
+        parser.add_argument("--cutover", type=iso_date, help="Cut-over date (YYYY-MM-DD); required without --workbook")
         parser.add_argument("--tb", help="Trial balance export: load the opening entry from it")
         parser.add_argument("--tb-columns", help="Column map JSON for the trial balance")
+        add_workbook(parser)
         parser.add_argument("--basis", choices=["closing", "opening"], default=None,
                             help="Balances to load (default closing; opening when --journal is given)")
         parser.add_argument("--pl-to-opening-equity", action="store_true",
@@ -31,13 +34,23 @@ class Command(BaseCommand):
 
     def handle(self, *args, **o):
         entity, user = resolve(o)
-        if not o["tb"] and not o["journal"]:
-            raise CommandError("Give --tb and/or --journal. / حدد ميزان المراجعة أو دفتر اليومية.")
-        basis = o["basis"] or ("opening" if o["journal"] else "closing")
-        if o["journal"] and o["tb"] and basis != "opening":
-            raise CommandError("With --journal the trial balance loads its opening balances (--basis opening). / "
-                               "مع دفتر اليومية تُحمَّل الأرصدة الافتتاحية من الميزان.")
-        journal, tb = run(lambda: read_journal(o)), run(lambda: read_tb(o))
+        if not o["tb"] and not o["journal"] and not o["workbook"]:
+            raise CommandError("Give --tb, --workbook and/or --journal. / حدد ميزان المراجعة أو دفتر اليومية.")
+        o["cutover"] = cutover(o, entity)
+        if o["cutover"] is None:
+            raise CommandError("Give --cutover (YYYY-MM-DD). / حدد تاريخ التحويل.")
+        if o["workbook"]:
+            if o["basis"] == "opening":
+                raise CommandError("The workbook holds closing balances at the cut-over (--basis closing). / "
+                                   "يحتوي الملف على الأرصدة الختامية في تاريخ التحويل.")
+            basis = "closing"
+        else:
+            basis = o["basis"] or ("opening" if o["journal"] else "closing")
+            if o["journal"] and o["tb"] and basis != "opening":
+                raise CommandError("With --journal the trial balance loads its opening balances (--basis opening). / "
+                                   "مع دفتر اليومية تُحمَّل الأرصدة الافتتاحية من الميزان.")
+        journal, tb = run(lambda: read_journal(o)), run(lambda: read_tb(o, entity))
+        journal_tb = None if o["workbook"] else tb  # the workbook's TB is at the cut-over: no movement tie-out
         plans = []
         with transaction.atomic():
             if tb is not None:
@@ -47,7 +60,7 @@ class Command(BaseCommand):
                     source_system=o["source_system"])))
             if journal is not None and not (plans and plans[0].report.errors):
                 plans.append(run(lambda: services.load_journal_entries(
-                    entity, journal, user=user, cutover=o["cutover"], trial_balance=tb, apply=o["apply"],
+                    entity, journal, user=user, cutover=o["cutover"], trial_balance=journal_tb, apply=o["apply"],
                     source_system=o["source_system"])))
             failed = any(p.report.errors for p in plans)
             if failed:

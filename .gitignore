@@ -6,3 +6,6 @@ db.sqlite3
 # Raw legacy exports (Falcon or other systems) never enter git (migration.md R20).
 exports/
 migration/exports/
+# Filled migration workbooks never enter git (migration.md W2); only the generated template does.
+docs/migration/*.xlsx
+!docs/migration/almiras-migration-workbook.xlsx

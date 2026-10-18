@@ -8,7 +8,7 @@ from django.core.management.base import CommandError
 
 from core.access import AccessDenied
 from core.models import Entity
-from migration import readers
+from migration import readers, workbook
 
 
 def add_common(parser, *, apply=True):
@@ -36,7 +36,39 @@ def iso_date(value):
         raise CommandError(f"{value!r} is not a date (YYYY-MM-DD). / {value!r} ليس تاريخًا.") from None
 
 
-def read_tb(options):
+def add_workbook(parser):
+    parser.add_argument("--workbook", help="Filled migration workbook (xlsx, migration.md §11) / ملف الترحيل المعبأ")
+
+
+def read_book(options):
+    """The parsed workbook of ``--workbook`` (read once per command)."""
+    if "_book" not in options:
+        options["_book"] = run(lambda: workbook.read_workbook(options["workbook"]))
+    return options["_book"]
+
+
+def cutover(options, entity):
+    """``--cutover``, or the entity's cut-over date on the workbook's Entities sheet (which it must equal, W13)."""
+    given = options.get("cutover")
+    if not options.get("workbook"):
+        return given
+    sheet = run(lambda: workbook.cutover_of(read_book(options), entity.code))
+    if sheet is None:
+        raise CommandError(f"No cut-over date for {entity.code} on the Entities sheet. / "
+                           f"لا يوجد تاريخ تحويل للكيان {entity.code} في ورقة الكيانات.")
+    if given is not None and given != sheet:
+        raise CommandError(f"--cutover {given} differs from the workbook's cut-over date {sheet}. / "
+                           f"تاريخ التحويل {given} يختلف عن تاريخ الملف {sheet}.")
+    return sheet
+
+
+def read_tb(options, entity=None):
+    """The trial balance of ``--tb`` (with ``--tb-columns``) or of the entity's sheet in ``--workbook``."""
+    if options.get("workbook") and options.get("tb"):
+        raise CommandError("Give --tb or --workbook, not both. / حدد ميزان المراجعة أو ملف الترحيل، لا كليهما.")
+    if options.get("workbook"):
+        book = read_book(options)
+        return run(lambda: workbook.trial_balance_for(book, entity.code))
     if not options.get("tb"):
         return None
     return readers.read_trial_balance(options["tb"], options.get("tb_columns"))
