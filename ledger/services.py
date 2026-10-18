@@ -38,6 +38,7 @@ from .models import (
     JournalEntry,
     JournalLine,
     LedgerError,
+    NonPublicationDay,
     RevaluationRun,
 )
 
@@ -1412,6 +1413,64 @@ def get_rate(entity, from_currency, to_currency, on, rate_type=ExchangeRate.Rate
     return _require_rate(entity, _currency(from_currency).code, _currency(to_currency).code, on, rate_type)
 
 
+SAR = "SAR"
+
+
+def get_sama_rate(currency, on, *, user, entity):
+    """VAT in SAR (ledger-fx R12 amendment; invoicing R100; owner decision G7): the SAMA rate for ``currency``
+    -> SAR on ``on``, the document's tax point, for ``user`` (``ledger.view_rates`` in ``entity``, as ``get_rate``).
+
+    Only global spot rows with ``source=sama`` count; never the manual, file or entity rows that ``get_rate``
+    prefers. The row of ``on`` itself first; an earlier row only when every day after it up to ``on`` is a
+    ``NonPublicationDay`` (weekend or KSA public holiday). No 5-day tolerance. Raises ``sama_rate_missing``
+    (en/ar, naming currency and date) otherwise. SAR itself: rate 1, no row.
+    """
+    access.require(user, entity, "ledger.view_rates")
+    return _sama_rate(_currency(currency).code, on)
+
+
+def _sama_rate(code, on):
+    """:func:`get_sama_rate` without the rights check (internal)."""
+    if code == SAR:
+        return Rate(ONE, None)
+    rows = ExchangeRate.objects.filter(
+        entity__isnull=True, source=ExchangeRate.Source.SAMA, rate_type=ExchangeRate.RateType.SPOT,
+        from_currency_id=code, to_currency_id=SAR, date__lte=on, from_currency__is_active=True,
+    ).order_by("-date", "-pk")
+    row = rows.first()
+    if row is not None and row.date < on:
+        days = (on - row.date).days
+        closed = set(NonPublicationDay.objects.filter(date__gt=row.date, date__lte=on).values_list("date", flat=True))
+        if len(closed) != days:  # a publication day in between (or ``on`` itself) has no SAMA row
+            row = None
+    if row is None:
+        raise error(
+            f"No SAMA exchange rate {code}->SAR for {on} (an earlier SAMA rate is used only across weekends and "
+            "public holidays); enter the SAMA rate for that date.",
+            f"لا يوجد سعر صرف من البنك المركزي السعودي {code}->SAR بتاريخ {on} (يُستخدم سعر سابق للبنك المركزي "
+            "فقط في عطل نهاية الأسبوع والعطل الرسمية)؛ أدخل سعر البنك المركزي لذلك التاريخ.",
+            code="sama_rate_missing",
+        )
+    return Rate(row.rate, row)
+
+
+@transaction.atomic
+def create_non_publication_day(*, user, on, name_en, name_ar, group=None):
+    """Record a weekend day or KSA public holiday on which SAMA publishes no rate (R12 amendment, AT-41).
+
+    Global reference data, written like a global rate (R28: the group parent's treasury). Bilingual name required.
+    """
+    _authorise_rate_write(user, None, group)
+    name_en, name_ar = (name_en or "").strip(), (name_ar or "").strip()
+    if not name_en or not name_ar:
+        raise error("The day needs an English and an Arabic name.", "يحتاج اليوم إلى اسم بالإنجليزية والعربية.",
+                    code="name_required")
+    if NonPublicationDay.objects.filter(date=on).exists():
+        raise error(f"{on} is already recorded as a non-publication day.", f"اليوم {on} مسجل مسبقًا يومًا بلا نشر.",
+                    code="duplicate_day")
+    return NonPublicationDay.objects.create(date=on, name_en=name_en, name_ar=name_ar, created_by=user)
+
+
 def _group_parent(group):
     """The top-level group parent entity global rates are checked against (access.md R6, ledger-fx R28)."""
     if group is None:
@@ -1448,6 +1507,14 @@ def _new_rate(*, user, entity, from_currency, to_currency, on, rate, rate_type, 
         )
     if source not in ExchangeRate.Source.values:
         raise error(f"Unknown rate source {source!r}.", f"مصدر السعر {source!r} غير معروف.")
+    if source == ExchangeRate.Source.SAMA:  # R12 amendment: global rows, with where the rate was taken from
+        if entity is not None:
+            raise error("SAMA rates are group-wide; enter them without an entity.",
+                        "أسعار البنك المركزي السعودي للمجموعة كلها؛ أدخلها دون كيان.", code="sama_rate_global")
+        if not (source_reference or "").strip():
+            raise error("A SAMA rate needs its source reference (the SAMA publication it was taken from).",
+                        "يحتاج سعر البنك المركزي السعودي إلى مرجع مصدره (نشرة البنك المركزي المأخوذ منها).",
+                        code="sama_reference_required")
     rate = fx.to_decimal(rate, "rate")
     fx.check_rate(rate)
     row = ExchangeRate(
@@ -1499,14 +1566,18 @@ def import_rates(file, *, user, source=ExchangeRate.Source.FILE, entity=None, gr
     second import of the same file creates nothing; a row that exists with a
     different rate fails the import (stored rates are never overwritten, R11).
     Automatic sources (SAMA, ECB, CBE, CBUAE, PBOC) and derived cross rates (R13)
-    are not built: their sources and precedence are open (OQ-2).
+    are not built: their sources and precedence are open (OQ-2). ``source="sama"``: a CSV of
+    SAMA's published rates (R12 amendment), group-wide only, each row with its ``source_reference``.
     """
-    if source != ExchangeRate.Source.FILE:
+    if source not in (ExchangeRate.Source.FILE, ExchangeRate.Source.SAMA):
         raise error(
             f"Import from {source!r} is not enabled; only CSV files can be imported (OQ-2).",
             f"الاستيراد من {source!r} غير مفعّل؛ يمكن استيراد ملفات CSV فقط (OQ-2).",
             code="source_not_enabled",
         )
+    if source == ExchangeRate.Source.SAMA and entity is not None:  # R12 amendment: SAMA rows are global only
+        raise error("SAMA rates are group-wide; import them without an entity.",
+                    "أسعار البنك المركزي السعودي للمجموعة كلها؛ استوردها دون كيان.", code="sama_rate_global")
     _authorise_rate_write(user, entity, group)
     if isinstance(file, (str, Path)):
         with open(file, encoding="utf-8", newline="") as fh:
@@ -1515,11 +1586,11 @@ def import_rates(file, *, user, source=ExchangeRate.Source.FILE, entity=None, gr
     else:
         text = file.read()
         reference = getattr(file, "name", "") or "upload"
-    return _import_rows(text, user=user, entity=entity, reference=str(reference)[:200])
+    return _import_rows(text, user=user, entity=entity, reference=str(reference)[:200], source=source)
 
 
 @transaction.atomic
-def _import_rows(text, *, user, entity, reference):
+def _import_rows(text, *, user, entity, reference, source=ExchangeRate.Source.FILE):
     reader = csv.DictReader(io.StringIO(text))
     missing = [c for c in IMPORT_COLUMNS if c not in (reader.fieldnames or [])]
     if missing:
@@ -1539,8 +1610,7 @@ def _import_rows(text, *, user, entity, reference):
             raise error(f"Row {line_no}: duplicate rate in the file.", f"السطر {line_no}: سعر مكرر في الملف.")
         seen.add(key)
         existing = ExchangeRate.objects.filter(
-            entity=entity, date=on, from_currency_id=f, to_currency_id=t, rate_type=rate_type,
-            source=ExchangeRate.Source.FILE,
+            entity=entity, date=on, from_currency_id=f, to_currency_id=t, rate_type=rate_type, source=source,
         ).first()
         if existing is not None:
             if existing.rate != rate:
@@ -1555,7 +1625,9 @@ def _import_rows(text, *, user, entity, reference):
         try:
             _new_rate(
                 user=user, entity=entity, from_currency=f, to_currency=t, on=on, rate=rate, rate_type=rate_type,
-                source=ExchangeRate.Source.FILE, source_reference=(row.get("source_reference") or reference)[:200],
+                source=source, source_reference=(
+                    (row.get("source_reference") or "").strip() if source == ExchangeRate.Source.SAMA
+                    else (row.get("source_reference") or reference))[:200],
                 period_start=start, period_end=end, import_batch=batch,
             )
         except LedgerError as exc:

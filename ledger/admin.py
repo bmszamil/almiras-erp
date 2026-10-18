@@ -7,7 +7,7 @@ from core import access
 from core.admin import EntityScopedAdmin
 
 from . import services
-from .models import Account, ExchangeRate, FiscalPeriod, JournalEntry, JournalLine, RevaluationRun
+from .models import Account, ExchangeRate, FiscalPeriod, JournalEntry, JournalLine, NonPublicationDay, RevaluationRun
 
 
 @admin.register(Account)
@@ -207,6 +207,29 @@ class ExchangeRateAdmin(admin.ModelAdmin):
         if obj is None:
             return self.has_module_permission(request)
         return services.rates_visible_to(request.user).filter(pk=obj.pk).exists()
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(NonPublicationDay)
+class NonPublicationDayAdmin(admin.ModelAdmin):
+    """Read-only list: days are recorded with ledger.services.create_non_publication_day (R12 amendment, R28)."""
+
+    list_display = ["date", "name_en", "name_ar", "created_by", "created_at"]
+    date_hierarchy = "date"
+
+    def has_module_permission(self, request):
+        return access.entities_for(request.user, "ledger.view_rates").exists()
+
+    def has_view_permission(self, request, obj=None):
+        return self.has_module_permission(request)
 
     def has_add_permission(self, request):
         return False

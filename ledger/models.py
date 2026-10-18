@@ -617,6 +617,27 @@ class ExchangeRate(models.Model):
         return f"{self.date} {self.from_currency_id}->{self.to_currency_id} {self.rate} ({self.rate_type}, {self.source}, {scope})"
 
 
+class NonPublicationDay(models.Model):
+    """A day on which SAMA publishes no exchange rates: a weekend day or a KSA public holiday (ledger-fx R12
+    amendment, AT-41). Global reference data, maintained like global rates (R28). ``get_sama_rate`` uses an
+    earlier SAMA row only when every day after it up to the requested date is one of these."""
+
+    date = models.DateField(bi("Date", "التاريخ"), unique=True)
+    name_en = models.CharField(bi("Name (English)", "الاسم (بالإنجليزية)"), max_length=120)
+    name_ar = models.CharField(bi("Name (Arabic)", "الاسم (بالعربية)"), max_length=120)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                   verbose_name=bi("Created by", "أنشأه"))
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name=bi("Created at", "تاريخ الإنشاء"))
+
+    class Meta:
+        verbose_name = bi("SAMA non-publication day", "يوم لا ينشر فيه البنك المركزي الأسعار")
+        verbose_name_plural = bi("SAMA non-publication days", "أيام لا ينشر فيها البنك المركزي الأسعار")
+        ordering = ["-date"]
+
+    def __str__(self):
+        return f"{self.date} {self.name_en} / {self.name_ar}"
+
+
 class RevaluationRunQuerySet(models.QuerySet):
     """Runs are kept for audit (R44, R45): never deleted, status changes only through ledger.services."""
 
