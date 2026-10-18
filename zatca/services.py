@@ -1015,7 +1015,8 @@ def _invoice_data(einv):
         id_scheme=doc.buyer_other_id_scheme, id_value=doc.buyer_other_id,
         street=doc.buyer_street_ar or doc.buyer_street_en, building_no=doc.buyer_building_no,
         additional_no=doc.buyer_additional_no, district=doc.buyer_district_ar or doc.buyer_district_en,
-        city=doc.buyer_city_ar or doc.buyer_city_en, postal_code=doc.buyer_postal_code, country=doc.buyer_country)
+        city=doc.buyer_city_ar or doc.buyer_city_en, postal_code=doc.buyer_postal_code, country=doc.buyer_country,
+        legal_form=_buyer_legal_form(doc, einv.zatca_category))
     lines = [ubl.Line(line.line_no, line.description_ar or line.description_en, line.quantity, line.unit_code,
                       line.unit_price, line.line_discount, line.net_amount, line.vat_amount, line.vat_category,
                       line.vat_rate.rate if line.vat_rate_id else Decimal("0"))
@@ -1053,7 +1054,26 @@ def _invoice_data(einv):
         billing_reference_pre_go_live=bool(doc.original_document_id) and (
             original is None or (original.icv is None and original.hold_reason == EInvoice.Hold.NOT_LIVE)),
         reason=doc.reason_ar.strip(), flags=flags, retention_class=einv.retention_class,
-        acquisition_date=einv.acquisition_date)
+        acquisition_date=einv.acquisition_date,
+        tax_point_date=_payment_order_date(doc) if buyer.legal_form == "GOV" else None)
+
+
+def _buyer_legal_form(doc, category):
+    """R-54: KSA-40 = ``GOV`` when the buyer is a government customer (``invoicing.Customer.customer_kind``
+    ``government``, the existing buyer flag) on a standard document or its notes; empty otherwise."""
+    from invoicing.models import Customer
+
+    customer = doc.customer
+    if category == "standard" and customer is not None and customer.customer_kind == Customer.Kind.GOVERNMENT:
+        return "GOV"
+    return ""
+
+
+def _payment_order_date(doc):
+    """R-54 / OQ-37: BT-7 for a B2G document is the payment order date, supplied by ``invoicing``. Invoicing does
+    not capture it yet (no ``SalesDocument.payment_order_date``), so this is None and such a document is held
+    locally under BR-KSA-92 (no ICV consumed) until invoicing hands the date over. Never guessed from other dates."""
+    return getattr(doc, "payment_order_date", None)
 
 
 class _LocalProblems(Exception):

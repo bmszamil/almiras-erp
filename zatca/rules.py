@@ -126,6 +126,12 @@ def document_problems(data):
                 problems.append(local("buyer_postal_code"))
         if data.type_code == "388" and not data.supply_date:
             problems.append(local("supply_date"))
+        # R-54, B2G under VAT IR Art. 20(5) (R4.0.0 rules, warnings there; refused here so nothing is sent that
+        # ZATCA flags): KSA-40 is only ever GOV (BR-KSA-91), and GOV needs BT-7 = payment order date (BR-KSA-92).
+        if b.legal_form and b.legal_form != "GOV":
+            problems.append(local("buyer_legal_form"))
+        elif b.legal_form and not data.tax_point_date:
+            problems.append(local("tax_point_date"))
     # R-19: notes.
     if data.type_code in ("381", "383"):
         if data.billing_reference_pre_go_live:

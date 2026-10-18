@@ -152,3 +152,30 @@ def test_sdk_validates_module_signed_standard_invoice(zw, monkeypatch, tmp_path)
     cred = _sdk_unit(zw)
     _, out = _validate(zw, monkeypatch, cred, issue(zw, zw.tst1), tmp_path, "module-std-388.xml")
     _passed(out, STANDARD)
+
+
+def test_sdk_validates_a_b2g_standard_invoice(zw, monkeypatch, tmp_path):
+    """R-54: buyer KSA-40 GOV + BT-7 payment order date, KSA-2 at 7 positions. R4.0.0 would warn BR-KSA-91 / -92
+    on a wrong or incomplete pair and refuse a 9-position KSA-2 (BR-KSA-06); R3.4.8 ignores KSA-40."""
+    from datetime import date
+    from types import SimpleNamespace
+
+    from invoicing import services as invoicing_services
+    from invoicing.conftest import ADDRESS, approve, invoice
+    from zatca import services
+    from zatca.conftest import TODAY
+
+    cred = _sdk_unit(zw)
+    gov = invoicing_services.create_customer(
+        zw.tst1, user=zw.clerk, code="G001", customer_kind="government", name_en="Test Ministry",
+        name_ar="وزارة الاختبار", is_vat_registered=True, vat_number="310000000000003", **ADDRESS)
+    monkeypatch.setattr(services, "_payment_order_date", lambda doc: date(2026, 10, 5))
+    w = SimpleNamespace(alm=zw.tst1, clerk=zw.clerk, customer=gov, cfo=zw.cfo)
+    doc = approve(w, invoice(w, (("management_fee", "1", "100.00"),), customer=gov, user=zw.clerk,
+                             issue_date=TODAY, entity=zw.tst1), zw.cfo)
+    einv, out = _validate(zw, monkeypatch, cred, doc, tmp_path, "module-std-388-b2g.xml")
+    assert "<cbc:CompanyLegalForm>GOV</cbc:CompanyLegalForm>" in einv.signed_xml
+    assert "<cbc:TaxPointDate>2026-10-05</cbc:TaxPointDate>" in einv.signed_xml
+    _passed(out, STANDARD)
+    for code in ("BR-KSA-91", "BR-KSA-92", "BR-KSA-06"):
+        assert code not in out, out

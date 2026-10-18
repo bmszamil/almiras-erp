@@ -36,6 +36,9 @@ class Party:
     postal_code: str = ""
     region: str = ""  # CountrySubentity (BT-39/54): optional; required only by SDK 2.0.3's 2021 BR-KSA-10
     country: str = ""
+    # KSA-40 buyer CompanyLegalForm: "GOV" for a government buyer under VAT IR Art. 20(5) (B2G), else empty.
+    # Emitted on standard documents only (R4.0.0 rules BR-KSA-91 / -92; findings 2026-10-17 §7.3).
+    legal_form: str = ""
 
 
 @dataclass
@@ -118,6 +121,8 @@ class InvoiceData:
     attachments: list = field(default_factory=list)  # [(id, base64 text)] extra AdditionalDocumentReference
     prepaid_amount: Decimal = Decimal("0")  # BT-113; non-zero only with prepayment lines (R-39, not built yet)
     prepayments: list = field(default_factory=list)  # [PrepaymentLine] (R-39; validated, not emitted yet)
+    # BT-7 TaxPointDate: for a B2G supply (buyer legal form GOV) the payment order date (BR-KSA-92; Art. 20(5)).
+    tax_point_date: date | None = None
 
     @property
     def payable(self):
@@ -216,7 +221,9 @@ def build_unsigned(data: InvoiceData, icv: int, pih: str) -> bytes:
     _sub(root, CBC, "UUID", data.uuid)
     _sub(root, CBC, "IssueDate", data.issue_date_text)
     _sub(root, CBC, "IssueTime", data.issue_time_text)  # KSA-25 in AST, no suffix (OQ-18 amendment pending)
-    _sub(root, CBC, "InvoiceTypeCode", data.type_code, name=data.subtype_code)
+    _sub(root, CBC, "InvoiceTypeCode", data.type_code, name=data.subtype_code)  # KSA-2: always 7 positions
+    if data.category == "standard" and data.tax_point_date:  # BT-7, B2G only (R-54); UBL order: before BT-5
+        _sub(root, CBC, "TaxPointDate", data.tax_point_date.isoformat())
     _sub(root, CBC, "DocumentCurrencyCode", cur)
     _sub(root, CBC, "TaxCurrencyCode", "SAR")  # R-40: every document, SAR included
     if data.billing_reference:
@@ -253,7 +260,10 @@ def build_unsigned(data: InvoiceData, icv: int, pih: str) -> bytes:
             pts = _sub(buyer, CAC, "PartyTaxScheme")
             _sub(pts, CBC, "CompanyID", b.vat_number)
             _tax_scheme(pts)
-        _sub(_sub(buyer, CAC, "PartyLegalEntity"), CBC, "RegistrationName", b.name)
+        ple = _sub(buyer, CAC, "PartyLegalEntity")
+        _sub(ple, CBC, "RegistrationName", b.name)
+        if b.legal_form:  # KSA-40 (R-54); UBL order: after RegistrationName
+            _sub(ple, CBC, "CompanyLegalForm", b.legal_form)
     elif b.id_scheme == "NAT" and b.id_value:  # BR-KSA-49 / BR-KSA-25: citizen education / healthcare
         _sub(_sub(buyer, CAC, "PartyIdentification"), CBC, "ID", b.id_value, schemeID="NAT")
         _sub(_sub(buyer, CAC, "PartyLegalEntity"), CBC, "RegistrationName", b.name)
