@@ -161,6 +161,9 @@ def apply_entity_setup(entity, fields):
 
 # Changed only through change_entity_settings (base_currency: ledger.services.set_functional_currency).
 SENSITIVE_ENTITY_FIELDS = ("sharia_enforced", "consolidation", "parent", "is_active")
+# Also changed through change_entity_settings (same right), never by setup data once VAT returns exist: the VAT
+# return frequency; ``tax`` dates each change and regenerates the return schedule (tax-returns R4, review item 6).
+VAT_FREQUENCY_FIELD = "vat_return_period"
 ENTITY_SETTINGS_PERMISSION = "core.change_entity_settings"
 # R48 (A17): turning Sharia enforcement off is a two-step four-eyes action on the group parent:
 # managing_partner requests (first approval), chairman approves (second), managing_partner applies.
@@ -225,7 +228,8 @@ def _setting_value(entity, name):
 
 
 def change_entity_settings(entity, *, user, reason, dual_control_request=None, **changes):
-    """Change ``sharia_enforced``, ``consolidation``, ``parent`` or ``is_active`` of ``entity`` (R32).
+    """Change ``sharia_enforced``, ``consolidation``, ``parent``, ``is_active`` or ``vat_return_period`` of
+    ``entity`` (R32; tax-returns R4).
 
     ``user`` needs ``core.change_entity_settings`` on the group parent of the
     entity (OQ-18 default: managing_partner only); moving the entity to
@@ -239,7 +243,7 @@ def change_entity_settings(entity, *, user, reason, dual_control_request=None, *
     """
     from core.access import services as access
 
-    unknown = set(changes) - set(SENSITIVE_ENTITY_FIELDS)
+    unknown = set(changes) - set(SENSITIVE_ENTITY_FIELDS) - {VAT_FREQUENCY_FIELD}
     if "base_currency" in unknown:
         raise ValidationError(
             "The functional currency is changed with ledger.services.set_functional_currency. / "
@@ -249,6 +253,9 @@ def change_entity_settings(entity, *, user, reason, dual_control_request=None, *
         raise ValidationError(f"Not an entity setting: {', '.join(sorted(unknown))}. / ليس من إعدادات الكيان.")
     _require_boolean_values({name: value for name, value in changes.items() if name in _BOOLEAN_ENTITY_FIELDS})
     _reason_required(reason)
+    if VAT_FREQUENCY_FIELD in changes and changes[VAT_FREQUENCY_FIELD] not in Entity.VatReturnPeriod.values:
+        raise ValidationError("The VAT return period is monthly or quarterly. / فترة الإقرار الضريبي شهرية أو ربع سنوية.",
+                              code="vat_return_period_invalid")
     entity = Entity.objects.get(pk=entity.pk)
     group = access.group_parent_of(entity)
     _require_settings_right(access, user, group, changes)
@@ -389,6 +396,10 @@ def _change_entity_settings(entity, user, reason, changes, dual_control_request=
             **({"dual_control_request": dual_control_request.pk} if dual_control_request is not None else {}),
         },
     )
+    from core.signals import entity_settings_changed
+
+    entity_settings_changed.send(sender=Entity, entity=entity, user=user, reason=reason,
+                                 before={k: before[k] for k in changed}, after={k: after[k] for k in changed})
     return entity
 
 
