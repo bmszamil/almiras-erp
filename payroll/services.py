@@ -737,6 +737,7 @@ class Line:
     amount_txn: Decimal = None
     source_ref: str = ""
     origin_period: str = ""
+    basis: str = ""  # deduction basis of a one-off deduction input (C-A4 caps)
 
 
 @dataclass
@@ -802,6 +803,7 @@ class Slip:
     eosb: tuple = None  # (amount, required)
     notices: list = field(default_factory=list)  # [(origin, amount, en, ar)]
     alerts: list = field(default_factory=list)  # [(kind, key, en, ar, roles)]
+    input_ids: list = field(default_factory=list)  # inputs the payslip takes (review 9)
 
     def warn(self, en, ar):
         text = f"{self.employee.employee_code}: {en} / {self.employee.employee_code}: {ar}"
@@ -835,6 +837,8 @@ class Ctx:
         self._accounts = {}
         self.warnings = []
         self.skipped_local = 0
+        self.leavers = []  # (employee_code, last working day): paid by the final settlement (R10)
+        self.nothing_due = []  # off-cycle: employees with nothing left to pay
 
     def account(self, code):
         if code not in self._accounts:
@@ -1151,15 +1155,44 @@ def _expense(ctx, component):
     return component.expense_account if component is not None else ctx.account(SALARIES)
 
 
-def _by_account(ctx, info, days, flag, factor=Fraction(1)):
-    """{account: Fraction} of components with ``flag`` for the given days (version of each day), / divisor."""
+def _allocate(parts):
+    """Round a {key: Fraction} split so the rounded parts add up to the rounded total (largest remainder, by cent):
+    a reduction booked per component then totals exactly what one rounding of the whole would give."""
+    total = _round(sum(parts.values(), Fraction(0)))
+    floors = {}
+    for k, v in parts.items():
+        with localcontext() as c:
+            c.prec = 60
+            floors[k] = (Decimal(v.numerator) / Decimal(v.denominator)).quantize(CENT, rounding="ROUND_FLOOR")
+    rest = int((total - sum(floors.values(), ZERO)) / CENT)
+    order = sorted(parts, key=lambda k: (Fraction(floors[k]) - parts[k], getattr(k, "pk", 0)))
+    for k in order[:max(rest, 0)]:
+        floors[k] += CENT
+    return floors
+
+
+def _by_component(info, days, flag, factor=Fraction(1), weighted=True):
+    """{component: Fraction} of the earning components with ``flag`` for ``days`` (the version in force each day):
+    monthly x day weight / divisor. Review 4: reductions use the same day weights as the earnings (R10), so day 31
+    carries nothing on the 30-day basis and the last day of February carries the rest of the 30-day month."""
     out = {}
     for d in days:
-        v = info.version_on(d)
-        for c in _components(v):
+        w = Fraction(info.weights.get(d, 0)) if weighted else Fraction(1)
+        if not w:
+            continue
+        for c in _components(info.version_on(d)):
             if c.component.kind == "earning" and getattr(c.component, flag):
-                acc = c.component.expense_account
-                out[acc] = out.get(acc, Fraction(0)) + Fraction(c.monthly_amount) * factor / info.divisor
+                out[c.component] = out.get(c.component, Fraction(0)) + Fraction(c.monthly_amount) * factor * w / info.divisor
+    return out
+
+
+def _reduction_lines(ltype, parts, en, ar, quantity, source_ref=""):
+    """One reduction line per component (WPS needs BASIC and HOUSING net of reductions, C-C2)."""
+    out = []
+    for comp, amount in _allocate(parts).items():
+        if amount:
+            out.append(Line(ltype, amount, comp.expense_account, f"{en} ({comp.code})", f"{ar} ({comp.name_ar})",
+                            component=comp, quantity=quantity, source_ref=source_ref))
     return out
 
 
@@ -1205,13 +1238,12 @@ def _maternity(ctx, slip, emp, info, inputs):
                 slip.refuse("Full salary or support next to confirmed GOSI compensation needs written legal clearance "
                             "(R61(d)).", "الأجر الكامل أو الدعم مع تعويض التأمينات المؤكد يحتاج إلى إذن قانوني مكتوب.")
             weight = _weight(info, covered)
-            suspended = _by_account(ctx, info, covered, "counts_for_eosb")
+            suspended = _by_component(info, covered, "counts_for_eosb")
             full = _round(sum(suspended.values(), Fraction(0)))
-            # The days' share of contract pay is suspended per expense account.
-            for acc, amount in suspended.items():
-                slip.lines.append(Line(LT.MATERNITY_SUSPENDED, _round(amount), acc,
-                                       "Salary suspended: GOSI maternity compensation", "أجر موقوف: تعويض الأمومة من التأمينات",
-                                       quantity=Decimal(weight), source_ref=f"maternity:{case.pk}"))
+            slip.lines.extend(_reduction_lines(LT.MATERNITY_SUSPENDED, suspended,
+                                               "Salary suspended: GOSI maternity compensation",
+                                               "أجر موقوف: تعويض الأمومة من التأمينات", Decimal(weight),
+                                               f"maternity:{case.pk}"))
             benefit = _round(Fraction(case.monthly_amount) * weight / info.divisor)
             top_up = max(ZERO, full - benefit)
             slip.maternity_days, slip.gosi_benefit_amount, slip.maternity_top_up = Decimal(weight), benefit, top_up
@@ -1222,12 +1254,11 @@ def _maternity(ctx, slip, emp, info, inputs):
             handled |= set(covered)
         else:  # pending: not unpaid, carried, escalated (R61(b))
             weight = _weight(info, wage_days)
-            carried = _by_account(ctx, info, wage_days, "counts_for_eosb")
-            for acc, amount in carried.items():
-                slip.lines.append(Line(LT.MATERNITY_SUSPENDED, _round(amount), acc,
-                                       "Salary carried pending GOSI decision (not unpaid)",
-                                       "أجر مُرحّل بانتظار قرار التأمينات (ليست إجازة بدون أجر)", quantity=Decimal(weight),
-                                       source_ref=f"maternity_pending:{req.pk}"))
+            carried = _by_component(info, wage_days, "counts_for_eosb")
+            slip.lines.extend(_reduction_lines(LT.MATERNITY_SUSPENDED, carried,
+                                               "Salary carried pending GOSI decision (not unpaid)",
+                                               "أجر مُرحّل بانتظار قرار التأمينات (ليست إجازة بدون أجر)", Decimal(weight),
+                                               f"maternity_pending:{req.pk}"))
             slip.pending_gosi_amount = _round(sum(carried.values(), Fraction(0)))
             slip.maternity_days = Decimal(weight)
             slip.warn("Maternity case pending at GOSI: salary for the leave days carried, not unpaid (R61(b)).",
@@ -1241,9 +1272,44 @@ def _maternity(ctx, slip, emp, info, inputs):
     return handled
 
 
-def _employee_inputs(ctx, emp):
-    return list(PayrollInput.objects.filter(employee=emp, status=IS.APPROVED, payroll_period=ctx.period)
-                .select_related("component", "component__expense_account").order_by("id"))
+def _month_pay_lines(ctx, slip, emp, info, inputs=()):
+    """The contract pay of one month for ``info``: earnings per component (R10), maternity (R61), unpaid leave (R16)
+    and sick-leave reductions (R17), all on the same day weights (review 4). Used for the run's own period, for
+    earlier months re-examined (R14, review 10) and for the leaving month of a final settlement."""
+    for pk, (comp, amount) in _component_earnings(info).items():
+        if amount:
+            slip.lines.append(Line(LT.EARNING, amount, comp.expense_account, comp.name_en, comp.name_ar,
+                                   component=comp, quantity=Decimal(info.paid_days)))
+    handled = _maternity(ctx, slip, emp, info, inputs)
+    employed = {d for d, _ in info.days}
+    unpaid = sorted((hr._unpaid_days(emp, info.start, info.end) & employed) - handled)
+    if unpaid:
+        weight = Decimal(_weight(info, unpaid))
+        slip.lines.extend(_reduction_lines(LT.UNPAID_DEDUCTION, _by_component(info, unpaid, "deducted_for_unpaid_leave"),
+                                           f"Unpaid leave {weight} days", f"إجازة بدون أجر {weight} يوم", weight))
+    sick = {}
+    sick_weight = 0
+    for d in hr._live_sick_days(SickLeaveDay.objects.filter(employee=emp, date__range=(info.start, info.end))):
+        if d.date not in employed or d.date in handled or d.official_holiday or d.pay_pct >= 100:
+            continue
+        cut = (100 - Fraction(d.pay_pct)) / 100
+        for comp, amount in _by_component(info, [d.date], "counts_for_eosb", cut).items():
+            sick[comp] = sick.get(comp, Fraction(0)) + amount
+        sick_weight += info.weights.get(d.date, 0)
+    if sick:
+        slip.lines.extend(_reduction_lines(LT.SICK_DEDUCTION, sick, f"Sick-leave reduction {sick_weight} days (Art. 117)",
+                                           f"تخفيض الإجازة المرضية {sick_weight} يوم (المادة 117)", Decimal(sick_weight)))
+    return handled
+
+
+def _employee_inputs(ctx, emp, *, every_period=False):
+    """Review 9: approved inputs not yet taken by an approved run (or a final settlement) whose paid-in period is the
+    run's period or earlier: an input approved after its period's run was approved goes to the next run. A final
+    settlement takes every approved input not yet taken."""
+    qs = PayrollInput.objects.filter(employee=emp, status=IS.APPROVED, taken_run__isnull=True)
+    if not every_period:
+        qs = qs.filter(payroll_period__lte=ctx.period)
+    return list(qs.select_related("component", "component__expense_account").order_by("id"))
 
 
 def _prior_payslips(ctx, emp):
@@ -1253,52 +1319,170 @@ def _prior_payslips(ctx, emp):
 
 
 def _booked_lines(emp, period, types):
+    """Lines of approved (or paid) runs that belong to ``period``: the period's own runs and lines of later runs with
+    that period of origin."""
     return PayslipLine.objects.filter(payslip__employee=emp, payslip__run__status__in=(RS.APPROVED, RS.PAID),
-                                      line_type__in=types).filter(
+                                      payslip__refused=False, line_type__in=types).filter(
         Q(origin_period=period) | (Q(origin_period="") & Q(payslip__run__period=period)))
 
 
+PERIOD_TYPES = (LT.EARNING, LT.RETRO, LT.MATERNITY_TOP_UP, LT.UNPAID_DEDUCTION, LT.SICK_DEDUCTION,
+                LT.MATERNITY_SUSPENDED)
+
+
+def _net_key(line_type, component_id, source_ref):
+    """(key, sign) of a contract-pay line when a period is netted against what earlier runs booked for it; None for
+    lines that are never netted (inputs, loans, GOSI, EOSB)."""
+    if source_ref.startswith("input:"):
+        return None
+    if line_type == LT.RETRO and source_ref.startswith("release:"):
+        return ("red:" + source_ref.split(":")[1], component_id), -1
+    if line_type in (LT.EARNING, LT.RETRO):
+        return ("pay", component_id), 1
+    if line_type == LT.MATERNITY_TOP_UP:
+        return ("top_up", None), 1
+    if line_type in PayslipLine.REDUCTIONS:
+        return ("red:" + line_type, component_id), 1
+    return None
+
+
+def _net_against_booked(ctx, slip, emp, period, *, origin, mode, booked=None):
+    """Replace the contract-pay lines of ``period`` in ``slip`` by what is still due after the approved runs that
+    already booked that period (review 2: an off-cycle or later run never pays a month again; C-A10: a regular run
+    pays the rest after a leave advance). ``mode``: ``current`` (the run's own period), ``prior`` (an earlier month:
+    a pay decrease or a new reduction is a warning only, Art. 92) or ``final`` (a final settlement: an overpayment is a
+    debt recovered from the final dues, Art. 88). Lines of other kinds are kept as they are."""
+    booked = list(booked if booked is not None else _booked_lines(emp, period, PERIOD_TYPES).select_related(
+        "component", "account"))
+    if not booked and mode == "current":
+        return
+    never_paid = not any(_net_key(l.line_type, l.component_id, l.source_ref) for l in booked)
+    have, sample = {}, {}
+    for l in booked:
+        k = _net_key(l.line_type, l.component_id, l.source_ref)
+        if k is None:
+            continue
+        have[k[0]] = have.get(k[0], ZERO) + k[1] * l.amount
+        sample.setdefault(k[0], l)
+    want, template, keep = {}, {}, []
+    for l in slip.lines:
+        k = _net_key(l.line_type, l.component.pk if l.component else None, l.source_ref)
+        if k is None or (l.origin_period or "") != (origin if mode != "current" else ""):
+            keep.append(l)
+            continue
+        want[k[0]] = want.get(k[0], ZERO) + k[1] * l.amount
+        template.setdefault(k[0], l)
+    out = []
+    label = f" {period}" if mode != "current" else ""
+    for key in sorted(set(want) | set(have), key=lambda x: (x[0], x[1] or 0)):
+        delta = want.get(key, ZERO) - have.get(key, ZERO)
+        if not delta:
+            continue
+        t = template.get(key)
+        s = sample.get(key)
+        comp = t.component if t is not None else (s.component if s is not None else None)
+        account = t.account if t is not None else s.account
+        en = t.desc_en if t is not None else s.description_en
+        ar = t.desc_ar if t is not None else s.description_ar
+        kind = key[0]
+        if kind in ("pay", "top_up"):
+            if delta > 0:
+                ltype = (LT.RETRO if mode == "prior" else LT.EARNING) if kind == "pay" else LT.MATERNITY_TOP_UP
+                den, dar = f"{en}{label}", f"{ar}{label}"
+                if ltype == LT.RETRO and comp is not None:
+                    den, dar = f"Retro {comp.code} for {period}", f"فرق بأثر رجعي {comp.name_ar} عن {period}"
+                out.append(Line(ltype, delta, account, den, dar, component=comp,
+                                quantity=t.quantity if t is not None else None, origin_period=origin))
+            elif mode == "final":
+                out.append(Line(LT.DEDUCTION, -delta, account, f"Salary paid for {period} beyond the last working day",
+                                f"راتب مدفوع عن {period} بعد آخر يوم عمل", component=comp, origin_period=origin,
+                                source_ref=f"overpaid:{period}"))
+            else:
+                slip.warn(f"{en} for {period}: {-delta} more was paid than is due now; recover only by an approved "
+                          "deduction with written consent (Art. 92).",
+                          f"{ar} عن {period}: دُفع {-delta} أكثر من المستحق الآن؛ لا يُسترد إلا باستقطاع معتمد بموافقة "
+                          "كتابية (المادة 92).")
+        else:
+            ltype = kind.split(":", 1)[1]
+            if delta < 0:  # less reduction than booked: release (e.g. carried maternity days now confirmed or refused)
+                out.append(Line(LT.RETRO, -delta, account, f"Released: {en}{label}", f"صرف المحتجز: {ar}{label}",
+                                component=comp, origin_period=origin, source_ref=f"release:{ltype}"))
+            elif mode == "prior" and not never_paid:
+                slip.warn(f"{en} for {period} found after the month was paid ({delta}); recover only by an approved "
+                          "deduction with written consent (Art. 92).",
+                          f"{ar} عن {period} ظهر بعد صرف الشهر ({delta})؛ لا يُسترد إلا باستقطاع معتمد بموافقة كتابية "
+                          "(المادة 92).")
+            else:
+                out.append(Line(ltype, delta, account, f"{en}{label}", f"{ar}{label}", component=comp,
+                                quantity=t.quantity if t is not None else None, origin_period=origin))
+    slip.lines = keep + out
+
+
+def _covered_gosi_wage(emp, period, booked, branch, employer_side):
+    """The wage of ``period`` already subject to GOSI for a branch (R58): the GOSI wage of the period's approved
+    payslips (any run kind) plus the retro wage deltas later runs booked for it. A share missing on a covered wage is a
+    missed share (catch-up or borne); a wage not covered yet is paid now with its shares (retro)."""
+    base = Payslip.objects.filter(employee=emp, run__period=period, refused=False,
+                                  run__status__in=(RS.APPROVED, RS.PAID)).aggregate(t=Sum("gosi_wage"))["t"] or ZERO
+    if employer_side:
+        rows = [l for l in booked if l.gosi_branch == branch and l.line_type == LT.EMPLOYER_GOSI
+                and not l.source_ref.startswith("borne:")]
+    else:
+        rows = [l for l in booked if l.gosi_branch == branch and l.line_type == LT.EMPLOYEE_GOSI]
+    return base + sum((l.quantity for l in rows if l.quantity is not None and l.origin_period == period), ZERO)
+
+
+GOSI_TYPES = (LT.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI, LT.GOSI_CATCH_UP)
+
+
 def _prior_corrections(ctx, slip, emp, versions):
-    """R14 (retro pay) and R58 (GOSI shares of earlier months), for every earlier approved payslip of the group."""
-    for ps in _prior_payslips(ctx, emp):
-        q = ps.run.period
+    """R14 (retro pay) and R58 (GOSI shares of earlier months), review 10: every earlier month of the group with an
+    approved regular run, from the hire month, in which the employee was employed is re-examined, whether or not the
+    employee had a payslip in it (a contract approved late, a payslip refused and not yet paid off-cycle)."""
+    hire_p = _period_of(emp.hire_date)
+    periods = sorted(set(PayrollRun.objects.filter(
+        entity=ctx.entity, payroll_group=ctx.run.payroll_group, kind=PayrollRun.Kind.REGULAR,
+        status__in=(RS.APPROVED, RS.PAID), period__lt=ctx.period, period__gte=hire_p).values_list("period", flat=True)))
+    for q in periods:
         info = _employment(emp, q, ctx.s, versions)
         if info is None:
             continue
-        # Retro earnings (R14): the month's contract pay under the versions approved now, against what was paid.
-        if True:
-            required = _component_earnings(info)
-            for pk, (comp, amount) in required.items():
-                paid = _booked_lines(emp, q, (LT.EARNING, LT.RETRO)).filter(component_id=pk) \
-                    .aggregate(t=Sum("amount"))["t"] or ZERO
-                diff = amount - paid
-                if diff > 0:
-                    slip.lines.append(Line(LT.RETRO, diff, comp.expense_account, f"Retro {comp.code} for {q}",
-                                           f"فرق بأثر رجعي {comp.name_ar} عن {q}", component=comp, origin_period=q))
-                elif diff < 0:
-                    slip.warn(f"Contract decrease for {q}: {comp.code} overpaid by {-diff}; recover only by an approved "
-                              "deduction with written consent (Art. 92).",
-                              f"تخفيض بأثر رجعي عن {q}: زيادة مدفوعة {-diff}؛ لا تُسترد إلا باستقطاع معتمد بموافقة "
-                              "كتابية (المادة 92).")
-        # GOSI of the earlier month on the wage now known (R58).
+        ps = (Payslip.objects.filter(employee=emp, run__period=q, refused=False, run__status__in=(RS.APPROVED, RS.PAID))
+              .order_by("run__kind", "-pk").first())
+        # Retro earnings (R14): the month's contract pay under the versions approved now, against what was booked.
+        month = Slip(employee=emp, basis=slip.basis, nationality_class=slip.nationality_class, cohort=slip.cohort,
+                     currency=slip.currency)
         try:
-            sub = Slip(employee=emp, basis=slip.basis, nationality_class=slip.nationality_class, cohort=slip.cohort,
-                       currency=slip.currency)
-            g = _compute_gosi(ctx, sub, emp, info, cohort=ps.cohort, nclass=ps.nationality_class,
-                             basis=ps.employment_basis,
-                             remuneration_sar=(ps.gosi_wage_full if ps.employment_basis == Basis.REMUNERATION else None))
+            _month_pay_lines(ctx, month, emp, info)
+        except _Refused:
+            slip.warn(f"Month {q} not re-examined: {month.refusal}", f"لم يُراجع شهر {q}: {month.refusal}")
+            continue
+        for l in month.lines:
+            l.origin_period = q
+        _net_against_booked(ctx, month, emp, q, origin=q, mode="prior")
+        for w_ in month.warnings:
+            if w_ not in slip.warnings:
+                slip.warnings.append(w_)
+        slip.lines.extend(month.lines)
+        # GOSI of the earlier month on the wage now known (R58).
+        cohort = ps.cohort if ps else (emp.gosi_cohort or "")
+        nclass = ps.nationality_class if ps else _nationality_class(emp)
+        basis = ps.employment_basis if ps else emp.employment_basis
+        try:
+            sub = Slip(employee=emp, basis=basis, nationality_class=nclass, cohort=cohort, currency=slip.currency)
+            g = _compute_gosi(ctx, sub, emp, info, cohort=cohort, nclass=nclass, basis=basis,
+                             remuneration_sar=(ps.gosi_wage_full if ps and basis == Basis.REMUNERATION else None))
         except _Refused:
             continue
-        booked = list(_booked_lines(emp, q, (LT.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI, LT.GOSI_CATCH_UP)))
+        booked = list(_booked_lines(emp, q, GOSI_TYPES).select_related("account"))
         for branch, wage, ee, er in g.branches:
             en, ar = BRANCH_TEXT[branch]
             rows = [l for l in booked if l.gosi_branch == branch]
-            ee_rows = [l for l in rows if l.line_type in (LT.EMPLOYEE_GOSI, LT.GOSI_CATCH_UP)
+            ee_rows = [l for l in rows if l.line_type == LT.EMPLOYEE_GOSI
+                       or (l.line_type == LT.GOSI_CATCH_UP and l.account.code == GOSI_PAYABLE)
                        or l.source_ref.startswith("borne:")]
             er_rows = [l for l in rows if l.line_type == LT.EMPLOYER_GOSI and not l.source_ref.startswith("borne:")]
-            # Wage already covered for the month: the payslip's GOSI wage plus retro wage deltas booked since.
-            side_rows = er_rows if er else [l for l in ee_rows if l.line_type == LT.EMPLOYEE_GOSI]
-            covered = ps.gosi_wage + sum((l.quantity or ZERO for l in side_rows if l.origin_period == q), ZERO)
+            covered = _covered_gosi_wage(emp, q, rows, branch, bool(er))
             delta = wage - covered
             for side, pct, rows_, account, ltype in (("employee", ee, ee_rows, GOSI_PAYABLE, LT.EMPLOYEE_GOSI),
                                                      ("employer", er, er_rows, GOSI_EXPENSE, LT.EMPLOYER_GOSI)):
@@ -1314,27 +1498,35 @@ def _prior_corrections(ctx, slip, emp, versions):
                                            rate=pct, origin_period=q))
                 if missed <= 0:
                     continue
-                if side == "employer":
-                    slip.lines.append(Line(LT.EMPLOYER_GOSI, missed, ctx.account(GOSI_EXPENSE),
-                                           f"GOSI {en} employer share missed for {q}", f"حصة صاحب العمل الفائتة عن {q}",
-                                           branch=branch, rate=pct, origin_period=q))
-                elif ps.cohort == "legacy_m33" or ps.nationality_class != Payslip.NationalityClass.SAUDI:
-                    slip.lines.append(Line(LT.EMPLOYER_GOSI, missed, ctx.account(GOSI_EXPENSE),
-                                           f"GOSI {en} employee share for {q} borne by the employer (SIL M/33 Art. 19(4))",
-                                           f"حصة الموظف عن {q} يتحملها صاحب العمل (المادة 19(4))", branch=branch,
-                                           rate=pct, origin_period=q, source_ref=f"borne:{branch}"))
-                    slip.warn(f"Missed employee GOSI share for {q} ({missed}) is not deducted later: borne by the employer "
-                              "(SIL M/33 Art. 19(4), R58).", f"لا تُستقطع حصة الموظف الفائتة عن {q} لاحقًا ويتحملها "
-                              "صاحب العمل (المادة 19(4)).")
-                else:
-                    slip.lines.append(Line(LT.GOSI_CATCH_UP, missed, ctx.account(GOSI_PAYABLE),
-                                           f"GOSI {en} employee share missed for {q}, deducted later with notice",
-                                           f"استدراك حصة الموظف في {ar} عن {q} مع الإشعار", branch=branch, rate=pct,
-                                           origin_period=q))
-                    slip.notices.append((q, missed,
-                                         f"Your GOSI {en} share for {q} ({missed} SAR) was not deducted then; it is "
-                                         "deducted from this salary (Law Art. 9(1); P19(j)).",
-                                         f"لم تُستقطع حصتك في {ar} عن {q} ({missed} ريال) في حينها؛ وتُستقطع من هذا الراتب."))
+                _missed_share(ctx, slip, side, branch, pct, missed, q, cohort, nclass)
+
+
+def _missed_share(ctx, slip, side, branch, pct, missed, q, cohort, nclass):
+    """R58: a GOSI share of month ``q`` that was never booked. The employer share is booked now; a missed employee
+    share is deducted later with a notice (``new_m273``, P19(j)) or borne by the employer (``legacy_m33``, SIL M/33
+    Art. 19(4))."""
+    en, ar = BRANCH_TEXT[branch]
+    if side == "employer":
+        slip.lines.append(Line(LT.EMPLOYER_GOSI, missed, ctx.account(GOSI_EXPENSE),
+                               f"GOSI {en} employer share missed for {q}", f"حصة صاحب العمل الفائتة عن {q}",
+                               branch=branch, rate=pct, origin_period=q))
+    elif cohort == "legacy_m33" or nclass != Payslip.NationalityClass.SAUDI:
+        slip.lines.append(Line(LT.EMPLOYER_GOSI, missed, ctx.account(GOSI_EXPENSE),
+                               f"GOSI {en} employee share for {q} borne by the employer (SIL M/33 Art. 19(4))",
+                               f"حصة الموظف عن {q} يتحملها صاحب العمل (المادة 19(4))", branch=branch,
+                               rate=pct, origin_period=q, source_ref=f"borne:{branch}"))
+        slip.warn(f"Missed employee GOSI share for {q} ({missed}) is not deducted later: borne by the employer "
+                  "(SIL M/33 Art. 19(4), R58).", f"لا تُستقطع حصة الموظف الفائتة عن {q} لاحقًا ويتحملها "
+                  "صاحب العمل (المادة 19(4)).")
+    else:
+        slip.lines.append(Line(LT.GOSI_CATCH_UP, missed, ctx.account(GOSI_PAYABLE),
+                               f"GOSI {en} employee share missed for {q}, deducted later with notice",
+                               f"استدراك حصة الموظف في {ar} عن {q} مع الإشعار", branch=branch, rate=pct,
+                               origin_period=q))
+        slip.notices.append((q, missed,
+                             f"Your GOSI {en} share for {q} ({missed} SAR) was not deducted then; it is "
+                             "deducted from this salary (Law Art. 9(1); P19(j)).",
+                             f"لم تُستقطع حصتك في {ar} عن {q} ({missed} ريال) في حينها؛ وتُستقطع من هذا الراتب."))
 
 
 def _apply_caps(ctx, slip, emp, info):
@@ -1471,81 +1663,99 @@ def _ksa_warnings(ctx, slip, emp, info, prior):
                       "الرأي القانوني.")
 
 
-def _calc_ksa(ctx, emp, versions, info):
+def _input_lines(ctx, slip, info, inputs, v_last):
+    """Lines of the approved inputs a run takes (R15, R16, R18; review 9). Explicit: never netted."""
+    for inp in [i for i in inputs if i.kind == IK.UNPAID_DAYS]:
+        parts = _by_component(info, [info.last], "deducted_for_unpaid_leave", Fraction(inp.quantity), weighted=False)
+        slip.lines.extend(_reduction_lines(LT.UNPAID_DEDUCTION, parts, f"Unpaid absence {inp.quantity} days",
+                                           f"غياب بدون أجر {inp.quantity} يوم", inp.quantity, f"input:{inp.pk}"))
+    premium = Fraction(ctx.p("overtime.premium_pct_of_basic")["pct"]) / 100
+    for inp in [i for i in inputs if i.kind == IK.OVERTIME_HOURS]:
+        ctx.p("overtime.hour_divisor_rule")
+        v = info.version_on(inp.overtime_date) if inp.overtime_date else v_last
+        hours = Fraction(v.daily_hours)
+        hourly = (Fraction(_sum(v, "counts_for_eosb")) / info.divisor / hours
+                  + premium * Fraction(_sum(v, "counts_for_overtime_base")) / info.divisor / hours)
+        amount = _round(hourly * Fraction(inp.quantity))
+        slip.lines.append(Line(LT.OVERTIME, amount, ctx.account(SALARIES),
+                               f"Overtime {inp.quantity} h on {inp.overtime_date} (Art. 107)",
+                               f"عمل إضافي {inp.quantity} ساعة في {inp.overtime_date} (المادة 107)",
+                               quantity=inp.quantity, rate=_round_to(hourly, 4), source_ref=f"input:{inp.pk}"))
+    for inp in inputs:
+        if inp.kind in (IK.ONE_OFF_EARNING, IK.BONUS, IK.MATERNITY_SUPPORT):
+            ltype = {IK.ONE_OFF_EARNING: LT.ONE_OFF_EARNING, IK.BONUS: LT.BONUS,
+                     IK.MATERNITY_SUPPORT: LT.MATERNITY_SUPPORT}[inp.kind]
+            slip.lines.append(Line(ltype, _round(inp.amount), _expense(ctx, inp.component), inp.reason_en or inp.kind,
+                                   inp.reason_ar, component=inp.component, source_ref=f"input:{inp.pk}"))
+        elif inp.kind == IK.ONE_OFF_DEDUCTION:
+            slip.lines.append(Line(LT.DEDUCTION, _round(inp.amount), _expense(ctx, inp.component),
+                                   inp.reason_en or "Deduction", inp.reason_ar, component=inp.component,
+                                   source_ref=f"input:{inp.pk}", basis=inp.deduction_basis))
+
+
+def _gosi_for_period(ctx, slip, emp, info, nclass):
+    """R20 to R22 for the run's own period, less the wage that approved runs of the period already covered (an
+    off-cycle run never charges a month's GOSI twice, review 2)."""
+    g = _compute_gosi(ctx, slip, emp, info, cohort=slip.cohort, nclass=nclass, basis=emp.employment_basis)
+    slip.gosi_wage, slip.gosi_wage_full = g.wage, g.wage_full
+    booked = list(_booked_lines(emp, ctx.period, GOSI_TYPES))
+    if booked or Payslip.objects.filter(employee=emp, run__period=ctx.period, refused=False,
+                                        run__status__in=(RS.APPROVED, RS.PAID)).exists():
+        branches = []
+        for branch, wage, ee, er in g.branches:
+            delta = wage - _covered_gosi_wage(emp, ctx.period, booked, branch, bool(er))
+            if delta > 0:
+                branches.append((branch, delta, ee, er))
+        g.branches = branches
+        slip.gosi_wage = max((w_ for _, w_, _, _ in branches), default=ZERO)
+    slip.lines.extend(_gosi_lines(ctx, slip, g))
+
+
+MODES = ("regular", "off_cycle", "final")
+
+
+def _calc_ksa(ctx, emp, versions, info, mode=None):
+    """One KSA payslip. ``regular``: the month's pay, retro and GOSI corrections of earlier months, loans, caps, EOSB.
+    ``off_cycle`` (review 2): only what the period's approved runs have not paid yet (a payslip refused in the regular
+    run, carried maternity days now confirmed or refused) and the inputs not yet taken; no loans, no EOSB, no
+    re-examination of earlier months. ``final`` (C-A11, R34): the leaving month to the last working day net of what
+    was paid, earlier months re-examined, every input not yet taken; no caps, no loans and no EOSB here (the final
+    settlement adds them)."""
+    mode = mode or ("off_cycle" if ctx.run.kind == PayrollRun.Kind.OFF_CYCLE else "regular")
     nclass = _nationality_class(emp)
     v_last = info.version_on(info.last)
     slip = Slip(employee=emp, basis=emp.employment_basis, nationality_class=nclass, cohort=emp.gosi_cohort or "",
                 currency=ctx.entity.base_currency, contract=v_last, paid_days=Decimal(info.paid_days))
     try:
-        inputs = _employee_inputs(ctx, emp)
-        for pk, (comp, amount) in _component_earnings(info).items():
-            if amount:
-                slip.lines.append(Line(LT.EARNING, amount, comp.expense_account, comp.name_en, comp.name_ar,
-                                       component=comp, quantity=Decimal(info.paid_days)))
-        handled = _maternity(ctx, slip, emp, info, inputs)
-        employed = {d for d, _ in info.days}
-        unpaid = sorted((hr._unpaid_days(emp, info.start, info.end) & employed) - handled)
-        if unpaid:
-            for acc, amount in _by_account(ctx, info, unpaid, "deducted_for_unpaid_leave").items():
-                slip.lines.append(Line(LT.UNPAID_DEDUCTION, _round(amount), acc, f"Unpaid leave {len(unpaid)} days",
-                                       f"إجازة بدون أجر {len(unpaid)} يوم", quantity=Decimal(len(unpaid))))
-        for inp in [i for i in inputs if i.kind == IK.UNPAID_DAYS]:
-            day = info.last
-            for acc, amount in _by_account(ctx, info, [day], "deducted_for_unpaid_leave",
-                                           Fraction(inp.quantity)).items():
-                slip.lines.append(Line(LT.UNPAID_DEDUCTION, _round(amount), acc, f"Unpaid absence {inp.quantity} days",
-                                       f"غياب بدون أجر {inp.quantity} يوم", quantity=inp.quantity,
-                                       source_ref=f"input:{inp.pk}"))
-        sick = Fraction(0)
-        sick_days = 0
-        for d in hr._live_sick_days(SickLeaveDay.objects.filter(employee=emp, date__range=(info.start, info.end))):
-            if d.date not in employed or d.date in handled or d.official_holiday or d.pay_pct >= 100:
-                continue
-            wage = _sum(info.version_on(d.date), "counts_for_eosb")
-            sick += Fraction(wage) / info.divisor * (100 - Fraction(d.pay_pct)) / 100
-            sick_days += 1
-        if sick:
-            slip.lines.append(Line(LT.SICK_DEDUCTION, _round(sick), ctx.account(SALARIES),
-                                   f"Sick-leave reduction {sick_days} days (Art. 117)",
-                                   f"تخفيض الإجازة المرضية {sick_days} يوم (المادة 117)", quantity=Decimal(sick_days)))
-        premium = Fraction(ctx.p("overtime.premium_pct_of_basic")["pct"]) / 100
-        for inp in [i for i in inputs if i.kind == IK.OVERTIME_HOURS]:
-            ctx.p("overtime.hour_divisor_rule")
-            v = info.version_on(inp.overtime_date) if inp.overtime_date else v_last
-            hours = Fraction(v.daily_hours)
-            hourly = (Fraction(_sum(v, "counts_for_eosb")) / info.divisor / hours
-                      + premium * Fraction(_sum(v, "counts_for_overtime_base")) / info.divisor / hours)
-            amount = _round(hourly * Fraction(inp.quantity))
-            slip.lines.append(Line(LT.OVERTIME, amount, ctx.account(SALARIES),
-                                   f"Overtime {inp.quantity} h on {inp.overtime_date} (Art. 107)",
-                                   f"عمل إضافي {inp.quantity} ساعة في {inp.overtime_date} (المادة 107)",
-                                   quantity=inp.quantity, rate=_round_to(hourly, 4), source_ref=f"input:{inp.pk}"))
-        for inp in inputs:
-            if inp.kind in (IK.ONE_OFF_EARNING, IK.BONUS, IK.MATERNITY_SUPPORT):
-                ltype = {IK.ONE_OFF_EARNING: LT.ONE_OFF_EARNING, IK.BONUS: LT.BONUS,
-                         IK.MATERNITY_SUPPORT: LT.MATERNITY_SUPPORT}[inp.kind]
-                slip.lines.append(Line(ltype, _round(inp.amount), _expense(ctx, inp.component), inp.reason_en or inp.kind,
-                                       inp.reason_ar, component=inp.component, source_ref=f"input:{inp.pk}"))
-            elif inp.kind == IK.ONE_OFF_DEDUCTION:
-                slip.lines.append(Line(LT.DEDUCTION, _round(inp.amount), _expense(ctx, inp.component),
-                                       inp.reason_en or "Deduction", inp.reason_ar, component=inp.component,
-                                       source_ref=f"input:{inp.pk}"))
+        inputs = _employee_inputs(ctx, emp, every_period=mode == "final")
+        slip.input_ids = [i.pk for i in inputs]
+        _month_pay_lines(ctx, slip, emp, info, inputs)
+        _net_against_booked(ctx, slip, emp, ctx.period, origin="", mode="final" if mode == "final" else "current")
+        if mode == "off_cycle":
+            gross = slip.total(PayslipLine.EARNINGS) - slip.total(PayslipLine.REDUCTIONS)
+            if gross < 0:
+                slip.lines = [l for l in slip.lines if l.line_type not in PayslipLine.REDUCTIONS]
+                slip.warn(f"Reductions found after the month was paid ({-gross}) are not recovered by this run; recover "
+                          "only by an approved deduction with written consent (Art. 92).",
+                          f"تخفيضات ظهرت بعد صرف الشهر ({-gross}) لا يستردها هذا المسير؛ لا تُسترد إلا باستقطاع معتمد "
+                          "بموافقة كتابية (المادة 92).")
+        _input_lines(ctx, slip, info, inputs, v_last)
         prior = _prior_payslips(ctx, emp)
-        if ctx.run.kind == PayrollRun.Kind.REGULAR:
+        if mode in ("regular", "final"):
             _prior_corrections(ctx, slip, emp, versions)
-        g = _compute_gosi(ctx, slip, emp, info, cohort=slip.cohort, nclass=nclass, basis=emp.employment_basis)
-        slip.gosi_wage, slip.gosi_wage_full = g.wage, g.wage_full
-        slip.lines.extend(_gosi_lines(ctx, slip, g))
-        _loan_lines(ctx, slip, emp)
-        _apply_caps(ctx, slip, emp, info)
-        if ctx.run.kind == PayrollRun.Kind.REGULAR:
+        _gosi_for_period(ctx, slip, emp, info, nclass)
+        if mode == "regular":
+            _loan_lines(ctx, slip, emp)
+        if mode != "final":
+            _apply_caps(ctx, slip, emp, info)
+        if mode == "regular":
             _eosb(ctx, slip, emp, info)
         _ksa_warnings(ctx, slip, emp, info, prior)
         lt = hr.LeaveType.objects.filter(entity=emp.entity, code="ANNUAL").first()
         if lt is not None:
             slip.leave_balance = hr._balance(emp, lt)
         net = slip.total(PayslipLine.EARNINGS) - slip.total(PayslipLine.REDUCTIONS) - slip.total(PayslipLine.DEDUCTIONS)
-        if net < 0:
+        if net < 0 and mode != "final":
             slip.refuse(f"Net pay would be negative ({net}) (R18).", f"سيكون صافي الراتب سالبًا ({net}).")
     except _Refused:
         slip.lines = []
@@ -1632,6 +1842,9 @@ def create_run(entity, *, user, period, payroll_group=PayrollGroup.IN_COUNTRY, k
     if kind == PayrollRun.Kind.OFF_CYCLE and (not reason_ar.strip() or not employees):
         raise error("An off-cycle run needs a reason in Arabic and the named employees (R6).",
                     "يحتاج المسير خارج الدورة إلى سبب بالعربية وأسماء الموظفين.", code="off_cycle_reason")
+    if kind == PayrollRun.Kind.OFF_CYCLE and payroll_group == PayrollGroup.OUT_OF_COUNTRY:
+        raise error("Off-cycle remuneration runs are not built yet (review 2): correct in the next regular run.",
+                    "لم تُبنَ المسيرات خارج الدورة للمكافآت بعد: صحّح في المسير العادي التالي.", code="off_cycle_not_built")
     s = _settings_of(entity)
     start, end = _period_bounds(period)
     if pay_date is None:
@@ -1674,9 +1887,7 @@ def _calculate(ctx):
             continue
         term = _termination(emp)
         if term is not None and info.start <= term.last_working_day <= info.end and emp.employment_basis != Basis.REMUNERATION:
-            ctx.warnings.append(f"{emp.employee_code}: termination approved, last working day {term.last_working_day}: "
-                                f"paid through the final settlement, not the run (R10) / {emp.employee_code}: إنهاء خدمة "
-                                f"معتمد بآخر يوم عمل {term.last_working_day}: يُدفع عبر المخالصة النهائية لا المسير")
+            ctx.leavers.append((emp.employee_code, term.last_working_day))
             continue
         if emp.employment_basis == Basis.LOCAL_ENTITY_EMPLOYEE:
             # Never computed with Saudi parameters (R41); review 17: the skip is visible on the run.
@@ -1684,6 +1895,9 @@ def _calculate(ctx):
             continue
         calc = _calc_remuneration if emp.employment_basis == Basis.REMUNERATION else _calc_ksa
         slip = calc(ctx, emp, versions, info)
+        if ctx.run.kind == PayrollRun.Kind.OFF_CYCLE and not slip.refusal and not slip.lines:
+            ctx.nothing_due.append(emp.employee_code)
+            continue
         bad = sorted({l.account.code for l in slip.lines if l.account.sharia_prohibited})
         if bad and ctx.entity.sharia_enforced:  # R19, R37: checked here, and by the ledger again at posting
             slip.refusal = (f"{emp.employee_code}: account(s) {', '.join(bad)} are Sharia-prohibited in {ctx.entity.code} "
@@ -1695,6 +1909,15 @@ def _calculate(ctx):
         if diff:
             ctx.warnings.append(f"Account 2500 differs from the EOSB sub-ledger by {diff} (R25) / يختلف الحساب 2500 عن "
                                 f"سجل مخصص نهاية الخدمة بمقدار {diff}")
+    if ctx.leavers:
+        n = len(ctx.leavers)
+        ctx.warnings.append(f"{n} employee(s) with an approved termination in the period are paid through the final "
+                            f"settlement, not the run (R10) / {n} من الموظفين بإنهاء خدمة معتمد في الفترة يُدفع لهم عبر "
+                            "المخالصة النهائية لا المسير")
+    if ctx.nothing_due:
+        n = len(ctx.nothing_due)
+        ctx.warnings.append(f"{n} named employee(s) have nothing left to pay for the period (review 2) / لا يتبقى ما "
+                            f"يُدفع للفترة لعدد {n} من الموظفين المحددين")
     if ctx.skipped_local:
         ctx.warnings.append(f"{ctx.skipped_local} local entity employee(s) left out: their local payroll is not built "
                             f"(R41, OQ-28) / استُبعد {ctx.skipped_local} من موظفي الشركات المحلية: رواتبهم المحلية غير "
@@ -1716,7 +1939,8 @@ def _fingerprint(slips, warnings, params):
         return [l.line_type, str(l.amount), str(l.amount_txn), l.account.code, l.component.pk if l.component else None,
                 l.branch, str(l.quantity), str(l.rate), l.source_ref, l.origin_period]
     data = [[s.employee.pk, s.refusal, str(s.fx_rate), str(s.gosi_wage), str(s.eosb), s.maternity_status,
-             sorted(s.loan_effects), sorted(s.sale_effects), [line(l) for l in s.lines], sorted(s.notices)]
+             sorted(s.loan_effects), sorted(s.sale_effects), [line(l) for l in s.lines], sorted(s.notices),
+             sorted(s.input_ids)]
             for s in slips]
     return hashlib.sha256(json.dumps([data, sorted(warnings), params], default=str).encode()).hexdigest()
 
@@ -1737,7 +1961,8 @@ def _store(ctx, slips):
                      gosi_benefit_amount=s.gosi_benefit_amount, maternity_top_up=s.maternity_top_up,
                      pending_gosi_amount=s.pending_gosi_amount, legal_clearance_ref=s.legal_clearance_ref,
                      leave_balance_snapshot=s.leave_balance, document_flag=s.document_flag[:10],
-                     refused=bool(s.refusal), refusal=s.refusal, warnings=s.warnings, notes=s.notes)
+                     refused=bool(s.refusal), refusal=s.refusal, warnings=s.warnings, notes=s.notes,
+                     input_ids=sorted(s.input_ids))
         gross = s.total(PayslipLine.EARNINGS) - s.total(PayslipLine.REDUCTIONS)
         ded = s.total(PayslipLine.DEDUCTIONS)
         ps.gross, ps.total_deductions, ps.net = gross, ded, gross - ded
@@ -1759,6 +1984,38 @@ def _store(ctx, slips):
                               gosi_branch=l.branch, quantity=l.quantity, rate=l.rate, amount=l.amount, currency=cur,
                               amount_txn=txn, account=l.account, description_en=l.desc_en[:300],
                               description_ar=l.desc_ar[:300], source_ref=l.source_ref, origin_period=l.origin_period))
+
+
+def _summary_warnings(slips):
+    """Review 13: the run's own warnings are counts; each employee's warnings and refusal are on the payslip."""
+    out = []
+    warned = sum(1 for s in slips if s.warnings and not s.refusal)
+    refused = sum(1 for s in slips if s.refusal)
+    if warned:
+        out.append(f"{warned} payslip(s) have warnings: see the payslips / {warned} من القسائم عليها تنبيهات: راجع القسائم")
+    if refused:
+        out.append(f"{refused} payslip(s) refused: fix them, or submit without them and pay them by an off-cycle run "
+                   f"(R56, C-A2) / رُفضت {refused} من القسائم: صحّحها أو قدّم المسير دونها وادفعها بمسير خارج الدورة")
+    return out
+
+
+def _pay_date_warning(ctx):
+    """C-A2: monthly wages are paid once a month (Labour Law Art. 90); a pay date more than a month after the previous
+    run's pay date (30 days, or the same day of the next month when that is later) is a warning."""
+    run = ctx.run
+    prev = (PayrollRun.objects.filter(entity=run.entity, payroll_group=run.payroll_group, kind=PayrollRun.Kind.REGULAR,
+                                      status__in=(RS.APPROVED, RS.PAID), period__lt=run.period)
+            .order_by("-period").first())
+    if prev is None or run.kind != PayrollRun.Kind.REGULAR:
+        return
+    p = prev.pay_date
+    ny, nm = (p.year + 1, 1) if p.month == 12 else (p.year, p.month + 1)
+    same_day = date(ny, nm, min(p.day, calendar.monthrange(ny, nm)[1]))
+    limit = max(p + timedelta(days=30), same_day)
+    if run.pay_date > limit:
+        ctx.warnings.append(f"Pay date {run.pay_date} is more than a month after the previous pay date {p}: monthly wages "
+                            f"are paid once a month (Labour Law Art. 90) / تاريخ الصرف {run.pay_date} بعد أكثر من شهر من "
+                            f"تاريخ الصرف السابق {p}: يُصرف الأجر الشهري مرة كل شهر (المادة 90)")
 
 
 def _send_alerts(entity, alerts):
@@ -1785,7 +2042,12 @@ def calculate_run(run, *, user):
     run.status = RS.CALCULATED
     run.calc_version += 1
     run.parameter_ids = ctx.use.ids
-    run.warnings = ctx.warnings + [w for s in slips for w in s.warnings] + [s.refusal for s in slips if s.refusal]
+    _pay_date_warning(ctx)
+    run.warnings = ctx.warnings + _summary_warnings(slips)
+    # Review 13: per-employee details stay on the payslips (payroll.view_payslip); the run shows counts only.
+    run.employee_notes = ([f"{code}: last working day {lwd}: final settlement (R10) / {code}: آخر يوم عمل {lwd}: "
+                           "المخالصة النهائية" for code, lwd in ctx.leavers]
+                          + [f"{code}: nothing left to pay / {code}: لا يتبقى ما يُدفع" for code in ctx.nothing_due])
     run.inputs_hash = _fingerprint(slips, ctx.warnings, ctx.use.ids)
     run.calculated_by, run.calculated_at, run.modified_by, run.modified_at = user, _now(), user, _now()
     _save(run)
@@ -1794,18 +2056,26 @@ def calculate_run(run, *, user):
 
 
 @transaction.atomic
-def submit_run(run, *, user):
-    """R7, R56: submit a calculated run (``payroll.submit_run``); refused while any payslip is refused."""
+def submit_run(run, *, user, exclude_refused=False):
+    """R7, R56 as amended by C-A2: submit a calculated run (``payroll.submit_run``). While payslips are refused the
+    run is submitted only with ``exclude_refused``: the refused payslips post nothing, take no input or installment,
+    and their employees are paid by an off-cycle run once fixed (warning on the run)."""
     run = _lock(PayrollRun, run.pk)
     _require(user, run.entity, "payroll.submit_run")
     if run.status != RS.CALCULATED:
         raise error("Only a calculated run is submitted.", "يُقدم المسير المحتسب فقط.", code="run_status")
     refused = list(Payslip.objects.filter(run=run, refused=True).values_list("refusal", flat=True))
+    if refused and not exclude_refused:
+        raise _problems(["The run cannot be submitted while payslips are refused (R56): fix them, or submit without them "
+                         "(exclude_refused) and pay them by an off-cycle run. / لا يُقدم المسير ما دامت قسائم مرفوضة: "
+                         "صحّحها أو قدّمه دونها وادفعها بمسير خارج الدورة.", *refused], "payslips_refused")
+    if not Payslip.objects.filter(run=run, refused=False).exists():
+        raise error("The run has no payslips to pay.", "لا توجد قسائم للصرف في المسير.", code="run_empty")
     if refused:
-        raise _problems(["The run cannot be submitted while payslips are refused (R56). / لا يُقدم المسير ما دامت "
-                         "قسائم مرفوضة.", *refused], "payslips_refused")
-    if not Payslip.objects.filter(run=run).exists():
-        raise error("The run has no payslips.", "لا توجد قسائم في المسير.", code="run_empty")
+        n = len(refused)
+        run.warnings = list(run.warnings) + [
+            f"Submitted without {n} refused payslip(s): pay them by an off-cycle run (C-A2) / قُدّم دون {n} من القسائم "
+            "المرفوضة: ادفعها بمسير خارج الدورة"]
     run.status, run.submitted_by, run.submitted_at = RS.SUBMITTED, user, _now()
     _save(run)
     return run
@@ -1858,8 +2128,10 @@ def _next_number(entity, kind, year):
 def _approver_checks(run, user):
     """R39, R50 (defaults OQ-14, OQ-36): an approver whose own payslip in the run has inputs, or who created or
     approved an input taken by the run, is refused for it."""
-    employee_ids = list(Payslip.objects.filter(run=run).values_list("employee_id", flat=True))
-    inputs = PayrollInput.objects.filter(employee_id__in=employee_ids, status=IS.APPROVED, payroll_period=run.period)
+    employee_ids = list(Payslip.objects.filter(run=run, refused=False).values_list("employee_id", flat=True))
+    input_ids = [i for ids in Payslip.objects.filter(run=run, refused=False).values_list("input_ids", flat=True)
+                 for i in (ids or [])]
+    inputs = PayrollInput.objects.filter(pk__in=input_ids)
     own = Employee.objects.filter(pk__in=employee_ids, user=user).first()
     if own is not None and (inputs.filter(employee=own).exists()
                             or PayslipLine.objects.filter(payslip__run=run, payslip__employee=own,
@@ -1879,6 +2151,7 @@ def approve_run(run, *, user):
     grant = _require(user, run.entity, "payroll.approve_run", document=run)
     approvals.check(grant, run.entity, "payroll.run")
     _approver_checks(run, user)
+    _entity_lock(run.entity)  # review 1, 9: one approval at a time takes inputs and installments
     run = _lock(PayrollRun, run.pk)
     if run.status != RS.SUBMITTED:
         raise error("Only a submitted run is approved (R7).", "يُعتمد المسير المقدم فقط.", code="run_status")
@@ -1913,6 +2186,12 @@ def _apply_effects(run, slips):
     for s in slips:
         if s.refusal:
             continue
+        for inp in PayrollInput._base_manager.select_for_update().filter(pk__in=s.input_ids).order_by("pk"):
+            if inp.taken_run_id is not None:
+                raise error("An input of this run was taken by another run meanwhile: recalculate (R8, review 9).",
+                            "أخذ مسير آخر مدخلًا من هذا المسير في الأثناء: أعد الاحتساب.", code="recalculate")
+            inp.taken_run = run
+            _save(inp)
         for ref, amount in s.loan_effects:
             inst = _lock(LoanInstallment, int(ref.split(":")[1]))
             _deduct_installment(inst, amount, run, LoanInstallment)
@@ -2146,6 +2425,9 @@ def reverse_run(run, *, user, reason, date=None, acknowledge_wps=False, wps_reas
 
 def _release_inputs(run):
     """Inputs taken by a reversed run are free for a later run (review 9)."""
+    for inp in PayrollInput._base_manager.select_for_update().filter(taken_run=run).order_by("pk"):
+        inp.taken_run = None
+        _save(inp)
 
 
 # =====================================================================================================

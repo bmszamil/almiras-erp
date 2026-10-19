@@ -261,6 +261,10 @@ class PayrollInput(Tracked, ServiceWritten):
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     approved_by = _user("Approved by", "اعتمده")
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+    # Review 9: set when an approved run takes the input (cleared if that run is reversed); a run takes the approved
+    # inputs of its period or earlier that no approved run has taken yet.
+    taken_run = models.ForeignKey("PayrollRun", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+                                  verbose_name=bi("Taken by run", "أخذه المسير"))
 
     class Meta:
         verbose_name = bi("payroll input", "مدخل رواتب")
@@ -401,6 +405,9 @@ class PayrollRun(Tracked, ServiceWritten):
     reversed_by = _user("Reversed by", "عكسه")
     reversed_at = models.DateTimeField(bi("Reversed at", "تاريخ العكس"), null=True, blank=True)
     warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
+    # Review 13: per-employee notes of the run (employee codes), shown only with payroll.view_payslip; ``warnings``
+    # holds counts.
+    employee_notes = models.JSONField(bi("Employee notes", "ملاحظات الموظفين"), default=list, blank=True)
     parameter_ids = models.JSONField(bi("Parameters used", "المعايير المستخدمة"), default=list, blank=True)
     off_cycle_employees = models.ManyToManyField("hr.Employee", blank=True, related_name="+",
                                                  verbose_name=bi("Employees (off-cycle)", "الموظفون (خارج الدورة)"))
@@ -485,6 +492,7 @@ class Payslip(ServiceWritten):
     refusal = models.TextField(bi("Refusal reason (en/ar)", "سبب الرفض"), blank=True)
     warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
     notes = models.JSONField(bi("Notes", "ملاحظات"), default=list, blank=True)
+    input_ids = models.JSONField(bi("Inputs taken", "المدخلات المأخوذة"), default=list, blank=True)
 
     class Meta:
         verbose_name = bi("payslip", "قسيمة راتب")
