@@ -1945,6 +1945,16 @@ def _fingerprint(slips, warnings, params):
     return hashlib.sha256(json.dumps([data, sorted(warnings), params], default=str).encode()).hexdigest()
 
 
+def _stored_fingerprint(run):
+    """Review 6: every stored payslip and line of the run, all columns, by primary key. The ledger lines are built
+    from these rows, so approval compares this with the hash taken right after the calculation stored them."""
+    def rows(model, **filters):
+        names = [f.attname for f in model._meta.concrete_fields]
+        return [[str(r[n]) for n in names] for r in model._base_manager.filter(**filters).order_by("pk").values(*names)]
+    data = [rows(Payslip, run=run), rows(PayslipLine, payslip__run=run)]
+    return hashlib.sha256(json.dumps(data, default=str).encode()).hexdigest()
+
+
 def _store(ctx, slips):
     run = ctx.run
     for ps in Payslip.objects.filter(run=run):
@@ -2049,6 +2059,7 @@ def calculate_run(run, *, user):
                            "المخالصة النهائية" for code, lwd in ctx.leavers]
                           + [f"{code}: nothing left to pay / {code}: لا يتبقى ما يُدفع" for code in ctx.nothing_due])
     run.inputs_hash = _fingerprint(slips, ctx.warnings, ctx.use.ids)
+    run.stored_hash = _stored_fingerprint(run)
     run.calculated_by, run.calculated_at, run.modified_by, run.modified_at = user, _now(), user, _now()
     _save(run)
     _send_alerts(run.entity, [a for s in slips for a in s.alerts])
@@ -2162,6 +2173,12 @@ def approve_run(run, *, user):
     if _fingerprint(slips, ctx.warnings, ctx.use.ids) != run.inputs_hash:
         raise error("A source changed after the calculation: recalculate the run and submit it again (R8).",
                     "تغيّر مصدر بعد الاحتساب: أعد احتساب المسير وقدّمه مجددًا.", code="recalculate")
+    if _stored_fingerprint(run) != run.stored_hash:
+        # Review 6: the entry is built from the stored rows; a change to them outside the calculation is refused.
+        access_services.log_denial(actor=user, entity=run.entity, permission="payroll.approve_run",
+                                   details={"reason": "stored_payslips_changed", "run": run.pk})
+        raise error("The stored payslips of this run changed after the calculation: recalculate the run (R8, review 6).",
+                    "تغيّرت قسائم هذا المسير المخزنة بعد الاحتساب: أعد احتساب المسير.", code="payslips_changed")
     ctx.use.check_verified()
     run.number = _next_number(run.entity, "PAY", int(run.period[:4]))
     run.status, run.approved_by, run.approved_at = RS.APPROVED, user, _now()
@@ -2999,7 +3016,8 @@ def attach_bank_processed_file(wps_file, *, user, content):
     f.bank_processed_content = content
     f.bank_processed_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
     f.bank_processed_received_at = _now()
-    return _save(f)
+    # Only these columns: the stored salary file is never rewritten (review 15; PostgreSQL trigger).
+    return _save(f, update_fields=["bank_processed_content", "bank_processed_sha256", "bank_processed_received_at"])
 
 
 @transaction.atomic
@@ -3235,6 +3253,6 @@ def send_alerts(*, today=None, entity=None):
         cutoff = timezone.make_aware(datetime(today.year - 10, today.month, min(today.day, 28)))
         for f in WpsFile.objects.filter(entity=e, nominated_for_burn_at__isnull=True, generated_at__lt=cutoff):
             f.nominated_for_burn_at = _now()
-            _save(f)
+            _save(f, update_fields=["nominated_for_burn_at"])
             sent += 1
     return sent

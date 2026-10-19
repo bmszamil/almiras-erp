@@ -9,7 +9,7 @@ from django.core.exceptions import PermissionDenied
 
 from core.access.models import AccessLog
 from hr import services as hr
-from hr.models import Employee, HrError
+from hr.models import HrError
 from ledger.models import Account
 from payroll import services
 from payroll.conftest import D, amount, approved, calculated, expat, saudi, slip
@@ -119,10 +119,19 @@ def test_review17_employer_bank_settings_changes_are_logged_masked(w):
     assert "SA0380000000608010167519" not in str(log.details)
 
 
-def test_review17_a_local_entity_employee_left_out_is_a_run_warning(w):
+def test_review17_a_local_entity_employee_left_out_is_a_run_warning(w, monkeypatch):
     n1 = expat(w)
     expat(w)
-    Employee._base_manager.filter(pk=n1.pk).update(employment_basis="local_entity_employee")  # inconsistent data
+    members = services._members
+
+    def with_local(ctx):  # inconsistent data that hr itself refuses: a local entity employee in a Saudi entity
+        out = members(ctx)
+        for emp in out:
+            if emp.pk == n1.pk:
+                emp.employment_basis = "local_entity_employee"
+        return out
+
+    monkeypatch.setattr(services, "_members", with_local)
     run = calculated(w)
     assert not run.payslips.filter(employee=n1).exists()
     assert any("1 local entity employee" in x for x in run.warnings)

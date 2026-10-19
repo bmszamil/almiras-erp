@@ -45,10 +45,20 @@ APPEND_ONLY = ("These payroll records are append-only.", "سجلات الروا�
 
 
 class ServiceOnlyQuerySet(models.QuerySet):
+    """Review 6: bulk writes skip save() and delete(); they are refused, also through ``_base_manager`` (every
+    payroll model sets ``base_manager_name = "objects"``). Django's own save() and delete() do not go through these
+    methods."""
+
     def update(self, **kwargs):
         raise error(*SERVICE_ONLY, code="service_only")
 
     def delete(self):
+        raise error(*SERVICE_ONLY, code="service_only")
+
+    def bulk_create(self, objs, *args, **kwargs):
+        raise error(*SERVICE_ONLY, code="service_only")
+
+    def bulk_update(self, objs, fields, *args, **kwargs):
         raise error(*SERVICE_ONLY, code="service_only")
 
 
@@ -185,6 +195,7 @@ class PayrollSettings(ServiceWritten):
     updated_at = models.DateTimeField(bi("Updated at", "تاريخ التحديث"), auto_now=True)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("payroll settings", "إعدادات الرواتب")
         verbose_name_plural = bi("payroll settings", "إعدادات الرواتب")
 
@@ -267,6 +278,7 @@ class PayrollInput(Tracked, ServiceWritten):
                                   verbose_name=bi("Taken by run", "أخذه المسير"))
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("payroll input", "مدخل رواتب")
         verbose_name_plural = bi("payroll inputs", "مدخلات الرواتب")
         ordering = ["entity", "period", "id"]
@@ -308,6 +320,7 @@ class MaternityGosiCase(Tracked, ServiceWritten):
                                                  blank=True)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("GOSI maternity case", "حالة تعويض أمومة لدى التأمينات")
         verbose_name_plural = bi("GOSI maternity cases", "حالات تعويض الأمومة لدى التأمينات")
 
@@ -328,6 +341,7 @@ class GosiAbroadPeriod(Tracked, ServiceWritten):
     purpose = models.CharField(bi("Purpose", "الغرض"), max_length=10, choices=Purpose.choices)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("stay abroad (GOSI)", "إقامة خارج المملكة (التأمينات)")
         verbose_name_plural = bi("stays abroad (GOSI)", "الإقامات خارج المملكة (التأمينات)")
 
@@ -349,6 +363,7 @@ class GosiVariableWageBase(Tracked, ServiceWritten):
     source_note = models.CharField(bi("Source note", "مصدر الرقم"), max_length=300)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("GOSI variable wage base", "أساس الأجر المتغير للتأمينات")
         verbose_name_plural = bi("GOSI variable wage bases", "أسس الأجر المتغير للتأمينات")
         constraints = [models.UniqueConstraint(fields=["employee", "year"], name="payroll_variable_base_once")]
@@ -391,6 +406,8 @@ class PayrollRun(Tracked, ServiceWritten):
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     calc_version = models.PositiveIntegerField(bi("Calculation version", "نسخة الاحتساب"), default=0)
     inputs_hash = models.CharField(bi("Inputs hash", "بصمة المدخلات"), max_length=64, blank=True)
+    # Review 6: hash of the stored payslips and lines written by the calculation; approval refuses if they changed.
+    stored_hash = models.CharField(bi("Stored payslips hash", "بصمة القسائم المخزنة"), max_length=64, blank=True)
     calculated_by = _user("Calculated by", "احتسبه")
     calculated_at = models.DateTimeField(bi("Calculated at", "تاريخ الاحتساب"), null=True, blank=True)
     submitted_by = _user("Submitted by", "قدّمه")
@@ -413,6 +430,7 @@ class PayrollRun(Tracked, ServiceWritten):
                                                  verbose_name=bi("Employees (off-cycle)", "الموظفون (خارج الدورة)"))
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("payroll run", "مسير رواتب")
         verbose_name_plural = bi("payroll runs", "مسيرات الرواتب")
         ordering = ["entity", "-period", "payroll_group"]
@@ -495,6 +513,7 @@ class Payslip(ServiceWritten):
     input_ids = models.JSONField(bi("Inputs taken", "المدخلات المأخوذة"), default=list, blank=True)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("payslip", "قسيمة راتب")
         verbose_name_plural = bi("payslips", "قسائم الرواتب")
         ordering = ["run", "employee__employee_code"]
@@ -562,6 +581,7 @@ class PayslipLine(ServiceWritten):
     origin_period = models.CharField(bi("Period of origin", "فترة المنشأ"), max_length=7, blank=True)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("payslip line", "بند قسيمة")
         verbose_name_plural = bi("payslip lines", "بنود القسائم")
         ordering = ["payslip", "id"]
@@ -591,6 +611,7 @@ class EosbProvisionEntry(AppendOnly):
     created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("EOSB provision entry", "قيد مخصص نهاية الخدمة")
         verbose_name_plural = bi("EOSB provision entries", "قيود مخصص نهاية الخدمة")
         ordering = ["employee", "date", "id"]
@@ -613,6 +634,7 @@ class GosiCatchUpNotice(ServiceWritten):
     created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("GOSI catch-up notice", "إشعار استدراك التأمينات")
         verbose_name_plural = bi("GOSI catch-up notices", "إشعارات استدراك التأمينات")
 
@@ -656,6 +678,7 @@ class EmployeeLoan(Tracked, ServiceWritten):
                                          related_name="+", verbose_name=bi("Disbursement entry", "قيد الصرف"))
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("employee loan", "قرض موظف")
         verbose_name_plural = bi("employee loans", "قروض الموظفين")
         constraints = [models.CheckConstraint(condition=Q(interest_free=True), name="payroll_loan_interest_free"),
@@ -687,6 +710,7 @@ class LoanInstallment(ServiceWritten):
                                      verbose_name=bi("Remainder of", "باقي القسط"))
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("loan installment", "قسط قرض")
         verbose_name_plural = bi("loan installments", "أقساط القروض")
         ordering = ["loan", "period", "id"]
@@ -728,6 +752,7 @@ class DeferredSaleContract(Tracked, ServiceWritten):
     terms_approved_at = models.DateTimeField(bi("Terms approved at", "تاريخ اعتماد الشروط"), null=True, blank=True)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("bai' ajel contract", "عقد بيع آجل")
         verbose_name_plural = bi("bai' ajel contracts", "عقود البيع الآجل")
 
@@ -759,6 +784,7 @@ class DeferredSaleInstallment(ServiceWritten):
                                      verbose_name=bi("Remainder of", "باقي القسط"))
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("bai' ajel installment", "قسط بيع آجل")
         verbose_name_plural = bi("bai' ajel installments", "أقساط البيع الآجل")
         ordering = ["contract", "period", "id"]
@@ -803,6 +829,7 @@ class PayrollPayment(Tracked, ServiceWritten):
                                          related_name="+", verbose_name=bi("Journal entry", "القيد"))
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("payroll payment", "دفعة رواتب")
         verbose_name_plural = bi("payroll payments", "دفعات الرواتب")
         constraints = [models.CheckConstraint(condition=Q(amount__gt=0), name="payroll_payment_positive")]
@@ -836,6 +863,7 @@ class WpsFile(ServiceWritten):
                                                  blank=True)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("WPS file", "ملف حماية الأجور")
         verbose_name_plural = bi("WPS files", "ملفات حماية الأجور")
 
@@ -864,6 +892,7 @@ class MudadSubmission(ServiceWritten):
     created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("Mudad submission", "رفع على مدد")
         verbose_name_plural = bi("Mudad submissions", "عمليات الرفع على مدد")
 
@@ -882,6 +911,7 @@ class GosiReconciliation(ServiceWritten):
     created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
 
     class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("GOSI reconciliation", "مطابقة التأمينات")
         verbose_name_plural = bi("GOSI reconciliations", "مطابقات التأمينات")
 
