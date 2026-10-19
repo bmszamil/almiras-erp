@@ -1,6 +1,7 @@
 """Owner decision H1 (ledger-fx R12 amendment, AT-44): the proposed 2026-2027 SAMA non-publication days, loaded
-unverified by ``ledger_load_non_publication_days`` and verified by a second person before ``get_sama_rate`` bridges
-across them. Anonymised users and illustrative rates."""
+unverified by ``ledger_load_non_publication_days`` and verified by a second person. Since owner decision I2 the days
+are information only: ``get_sama_rate`` uses the latest earlier SAMA row across any gap. Anonymised users and
+illustrative rates."""
 import json
 from datetime import date, timedelta
 from decimal import Decimal
@@ -139,21 +140,15 @@ def _usd_thursday_and_loaded_weekend(g):
     return NonPublicationDay.objects.order_by("date")
 
 
-def test_unverified_days_never_bridge_to_an_earlier_sama_rate(g):
+def test_i2_unverified_days_no_longer_block_the_sama_lookup(g):
+    """AT-44 as amended by owner decision I2: the loaded days are information; the lookup uses the latest SAMA row."""
     _usd_thursday_and_loaded_weekend(g)
-    with pytest.raises(LedgerError) as exc:
-        services.get_sama_rate("USD", date(2026, 1, 3), user=g.clerk, entity=g.alm)
-    text = " ".join(exc.value.messages)
-    assert exc.value.code == "sama_rate_missing"
-    assert "not yet verified: 2026-01-02, 2026-01-03" in text and "لم يُتحقق منها" in text
+    assert services.get_sama_rate("USD", date(2026, 1, 3), user=g.clerk, entity=g.alm).rate == D("3.7500")
 
 
-def test_a_second_person_verifies_and_the_days_then_bridge(g):
+def test_a_second_person_verifies_the_loaded_days(g):
     fri, sat = _usd_thursday_and_loaded_weekend(g)
     services.verify_non_publication_day(fri, user=g.checker)
-    with pytest.raises(LedgerError):  # Saturday still unverified
-        services.get_sama_rate("USD", date(2026, 1, 3), user=g.clerk, entity=g.alm)
-    assert services.get_sama_rate("USD", date(2026, 1, 2), user=g.clerk, entity=g.alm).rate == D("3.7500")
     done = services.verify_non_publication_day(sat, user=g.checker, group=g.alm)
     assert (done.verified_by, done.is_verified) == (g.checker, True)
     assert services.get_sama_rate("USD", date(2026, 1, 3), user=g.clerk, entity=g.alm).rate == D("3.7500")

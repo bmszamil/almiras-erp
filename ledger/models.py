@@ -622,8 +622,8 @@ class ExchangeRate(models.Model):
 
 class NonPublicationDay(models.Model):
     """A day on which SAMA publishes no exchange rates: a weekend day or a KSA public holiday (ledger-fx R12
-    amendment, AT-41). Global reference data, maintained like global rates (R28). ``get_sama_rate`` uses an
-    earlier SAMA row only when every day after it up to the requested date is one of these."""
+    amendment, AT-41). Global reference data, maintained like global rates (R28). Information only since owner
+    decision I2: ``get_sama_rate`` uses the latest earlier SAMA row across any day without a published rate."""
 
     date = models.DateField(bi("Date", "التاريخ"), unique=True)
     name_en = models.CharField(bi("Name (English)", "الاسم (بالإنجليزية)"), max_length=120)
@@ -632,7 +632,7 @@ class NonPublicationDay(models.Model):
                                    verbose_name=bi("Created by", "أنشأه"))
     created_at = models.DateTimeField(auto_now_add=True, verbose_name=bi("Created at", "تاريخ الإنشاء"))
     # Owner decision H1: rows loaded from the seed file are proposals until a second person checks them against the
-    # SAMA / official announcement (``verify_non_publication_day``); ``get_sama_rate`` uses verified rows only.
+    # SAMA / official announcement (``verify_non_publication_day``). Since I2 no rate lookup depends on them.
     source = models.CharField(bi("Source", "المصدر"), max_length=300, blank=True)
     verified_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                     related_name="+", verbose_name=bi("Verified by", "تحقق منه"))

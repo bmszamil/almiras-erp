@@ -126,18 +126,25 @@ def test_at143_hand_tax_point_after_a_moved_issue_date_is_refused_at_submission(
 
 # --- G7: SAMA rate on the tax point --------------------------------------------------------------------------
 
-def test_at144_weekend_falls_back_to_the_last_published_sama_rate(w):
-    """AT-108 as amended: SAMA row only on Thursday 2027-03-04; 03-05 and 03-06 recorded as non-publication days."""
+def test_at144_i2_any_day_without_a_sama_rate_falls_back_to_the_last_published_one(w):
+    """AT-108 / AT-144 as amended by owner decision I2: SAMA row only on Thursday 2027-03-04; the weekend is recorded
+    as non-publication days, Sunday 03-07 (a publication day) has no row: both use the 03-04 rate."""
     usd_rate(w, "3.7500", on=date(2027, 3, 4))
     closed(w, date(2027, 3, 5), date(2027, 3, 6))
     sat = approve(w, invoice(w, currency="USD", issue_date=date(2027, 3, 6)))
     assert (sat.tax_point_date, sat.sar_rate, sat.total_vat_sar) == (date(2027, 3, 6), D("3.7500"), D("562.50"))
-    sunday = invoice(w, currency="USD", issue_date=date(2027, 3, 8), supply_date=date(2027, 3, 7))
+    sunday = approve(w, invoice(w, currency="USD", issue_date=date(2027, 3, 8), supply_date=date(2027, 3, 7)))
+    assert (sunday.tax_point_date, sunday.sar_rate, sunday.status) == (date(2027, 3, 7), D("3.7500"), "issued")
+
+
+def test_i2_no_sama_rate_on_or_before_the_tax_point_is_refused(w):
+    usd_rate(w, "3.7500", on=date(2027, 3, 8))  # only after the tax point
+    early = invoice(w, currency="USD", issue_date=date(2027, 3, 8), supply_date=date(2027, 3, 7))
     with pytest.raises(InvoicingError) as exc:
-        approve(w, sunday)
+        approve(w, early)
     assert exc.value.code == "sama_rate_missing"
     assert "2027-03-07" in messages(exc) and "البنك المركزي" in messages(exc)
-    stored = SalesDocument.objects.get(pk=sunday.pk)
+    stored = SalesDocument.objects.get(pk=early.pk)
     assert (stored.status, stored.number) == ("submitted", "")  # nothing issued, no number used
 
 

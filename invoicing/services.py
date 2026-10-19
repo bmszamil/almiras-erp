@@ -17,6 +17,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date as date_type
+from datetime import datetime
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from zoneinfo import ZoneInfo
@@ -313,9 +314,9 @@ def _fx_for(entity, currency_code, on, user):
 
 
 def _vat_sar_rate(entity, currency_code, tax_point, user):
-    """R100 as amended (G7; VAT IR Art. 61, TIR §4.2.2): (rate, SAMA row) from the document currency to SAR for
-    ``total_vat_sar`` and ``vat_breakdown.vat_sar``: the SAMA rate on the tax point, an earlier SAMA rate only
-    across weekends and public holidays (``ledger.get_sama_rate``). None of it: the document is not issued."""
+    """R100 as amended (G7, I2; VAT IR Art. 61, TIR §4.2.2): (rate, SAMA row) from the document currency to SAR for
+    ``total_vat_sar`` and ``vat_breakdown.vat_sar``: the SAMA rate on the tax point, else the latest SAMA rate
+    published before it (``ledger.get_sama_rate``). No SAMA rate on or before it: the document is not issued."""
     if currency_code == SAR:
         return Decimal("1"), None
     try:
@@ -349,10 +350,14 @@ def _booking_rate(entity, doc, sama_row, user):
 
 
 def _sama_tax_point(document):
-    """Registered ``sama_tax_point`` hook (ledger-fx R51, owner decision H2): the tax point of a stored sales
-    document booked at its SAMA tax-point row beyond the ledger's rate age limit, else None."""
+    """Registered ``sama_tax_point`` hook (ledger-fx R51, owner decisions H2, I2): ``(tax point, issued at)`` of a
+    stored sales document booked at its SAMA tax-point row beyond the ledger's rate age limit, else None. The issue
+    time (Riyadh, BR-KSA-04) is when its SAMA row was chosen: a SAMA row recorded later does not undo it."""
     if document.fx_rate_source == SAMA_TAX_POINT and document.fx_exchange_rate_id == document.vat_sar_exchange_rate_id:
-        return document.tax_point_date
+        if document.issue_time is None:
+            return document.tax_point_date
+        issued_at = datetime.combine(document.issue_date, document.issue_time, tzinfo=RIYADH)
+        return document.tax_point_date, issued_at
     return None
 
 

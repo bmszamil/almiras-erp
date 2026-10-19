@@ -1,7 +1,7 @@
 """ledger-fx R51 (owner decision H2): the narrow rule that lets a registered sales document book at its SAMA
 tax-point row beyond ``FX_MAX_RATE_AGE_DAYS``. The document flow is tested in
 ``invoicing/test_sama_tax_point_booking.py``; here the row checks, the registry guard and the caller refusals."""
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 from django.utils import timezone
@@ -29,17 +29,24 @@ def _sama(on=THU, **kw):
                 source_reference="SAMA bulletin", **kw)
 
 
-def test_a_sama_row_counts_on_its_date_and_across_verified_non_publication_days_only():
+def test_i2_a_sama_row_counts_for_a_tax_point_when_it_is_the_latest_one_on_or_before_it():
     row = _sama()
     assert services._sama_row_problem(row, "USD", "SAR", THU) is None
-    _closed(FRI)
-    _closed(SAT, verified=False)
-    assert services._sama_row_problem(row, "USD", "SAR", FRI) is None
-    for on in (SAT, SUN):  # unverified Saturday; Sunday a publication day
-        en, ar = services._sama_row_problem(row, "USD", "SAR", on)
-        assert "publishes on a day in between" in en and "البنك المركزي" in ar
-    assert services._sama_row_problem(row, "USD", "SAR", SUN, bridge=False) is None  # kind and date only
+    _closed(FRI, verified=False)  # non-publication days are information only (I2)
+    for on in (FRI, SAT, SUN):  # any gap: Sunday is a publication day without a SAMA row
+        assert services._sama_row_problem(row, "USD", "SAR", on) is None
     assert "after" in services._sama_row_problem(row, "USD", "SAR", date(2027, 3, 3))[0]
+    newer = _sama(on=SAT)
+    assert services._sama_row_problem(row, "USD", "SAR", FRI) is None  # the newer row is after the tax point
+    for on in (SAT, SUN):
+        en, ar = services._sama_row_problem(row, "USD", "SAR", on)
+        assert f"later SAMA row {newer.pk}" in en and "latest" in en and "البنك المركزي" in ar
+    assert services._sama_row_problem(row, "USD", "SAR", SUN, bridge=False) is None  # kind and date only
+    # as_of: a SAMA row recorded after the document chose its row does not undo it
+    before = newer.created_at - timedelta(seconds=1)
+    assert services._sama_row_problem(row, "USD", "SAR", SUN, as_of=before) is None
+    assert services._sama_row_problem(row, "USD", "SAR", SUN, as_of=newer.created_at) is not None
+    assert services._sama_row_problem(newer, "USD", "SAR", SUN) is None
 
 
 def test_only_a_global_sama_spot_row_into_sar_in_a_sar_entity_qualifies():

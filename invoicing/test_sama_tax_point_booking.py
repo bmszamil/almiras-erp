@@ -52,12 +52,11 @@ def test_a_tax_point_within_five_days_still_books_as_a_table_rate(w):
 
 
 def test_a_long_holiday_on_the_issue_date_books_at_the_last_sama_row_before_it(w):
-    """Tax point = issue date; SAMA published nothing for 8 days (verified non-publication days)."""
+    """Tax point = issue date; SAMA published nothing for 8 days (I2: proposed, unverified days or none at all)."""
     row = usd_rate(w, "3.7500", on=date(2027, 3, 3))
-    for offset in range(1, 9):
+    for offset in range(1, 5):
         NonPublicationDay.objects.create(date=date(2027, 3, 3) + timedelta(days=offset), name_en="Holiday",
-                                         name_ar="عطلة", created_by=w.cfo, verified_by=w.cfo,
-                                         verified_at=timezone.now())
+                                         name_ar="عطلة", created_by=w.cfo)
     doc = _issued(w, supply=date(2027, 3, 11), issue=date(2027, 3, 11))
     assert (doc.tax_point_date, doc.fx_rate_source, doc.fx_exchange_rate_id) == (date(2027, 3, 11), "sama_tp", row.pk)
     posted = w.zatca.clear(doc)
@@ -93,11 +92,14 @@ def _registration_with(hook):
 @pytest.mark.parametrize("hook, why", [
     (lambda doc: None, "no tax point"),
     (lambda doc: date(2027, 4, 1), "a tax point after the entry date"),
-    (lambda doc: date(2027, 3, 12), "a publication day without a SAMA row between the row and the tax point"),
+    (lambda doc: date(2027, 3, 12), "a later SAMA row between the row and the tax point (I2: not the latest)"),
+    (lambda doc: (date(2027, 3, 12), None), "the same, as (tax point, no time)"),
+    (lambda doc: date(2027, 3, 9), "a tax point before the row"),
 ])
 def test_the_ledger_checks_the_sama_row_against_the_documents_own_tax_point(w, hook, why):
     usd_rate(w, "3.7500", on=date(2027, 3, 10))
     doc = _issued(w, supply=date(2027, 3, 10), issue=date(2027, 3, 31))
+    usd_rate(w, "3.7520", on=date(2027, 3, 11))  # recorded after the issue: only a tampered hook gives no time
     with _registration_with(hook):
         with pytest.raises(Exception) as exc:
             w.zatca.clear(doc)
@@ -116,7 +118,8 @@ def test_lines_rated_otherwise_than_approved_are_refused(w):
                        fx_rate=stored.fx_rate, exchange_rate_id=stored.fx_exchange_rate_id, line_kind="normal")
     problems = services._check_document_rate(stored, [line])
     assert problems and "SAMA" in problems[0] and "البنك المركزي" in problems[0]
-    assert services._sama_tax_point(stored) == date(2027, 3, 10)
+    tax_point, issued_at = services._sama_tax_point(stored)
+    assert tax_point == date(2027, 3, 10) and issued_at.date() == date(2027, 3, 31) and issued_at.tzinfo is not None
     stored.fx_rate_source = "sama"
     assert services._sama_tax_point(stored) is None
 
@@ -135,3 +138,25 @@ def test_the_ledger_refuses_a_sama_tax_point_line_with_another_rate_or_kind(w):
     assert "normal" in ledger._sama_tax_point_problems(entry, line, "USD", "SAR", "L")[0]
     line.line_kind, line.exchange_rate_id = "normal", None
     assert "rate row" in ledger._sama_tax_point_problems(entry, line, "USD", "SAR", "L")[0]
+
+
+def test_i2_a_sama_row_entered_after_the_issue_for_a_day_in_the_gap_does_not_undo_the_document(w):
+    """The document chose the latest SAMA row on or before its tax point when it was issued (I2); a SAMA row for a
+    day in the gap recorded afterwards (before the ZATCA clearance posts it) does not make the posting fail."""
+    from datetime import datetime
+    from datetime import timezone as dt_tz
+    from unittest import mock
+
+    from django.utils import timezone as tz
+
+    row = usd_rate(w, "3.7500", on=date(2027, 3, 10))
+    doc = _issued(w, supply=date(2027, 3, 10), issue=date(2027, 3, 31))
+    assert (doc.fx_rate_source, doc.fx_exchange_rate_id) == ("sama_tp", row.pk)
+    later = datetime(2027, 4, 1, 6, 0, tzinfo=dt_tz.utc)  # 09:00 in Riyadh
+    with mock.patch.object(tz, "now", return_value=later):  # entered the day after the issue
+        backfilled = usd_rate(w, "3.7520", on=date(2027, 3, 11))
+    assert backfilled.created_at == later
+    posted = w.zatca.clear(doc)
+    assert posted.status == "final"
+    assert {l.exchange_rate_id for l in _lines(posted)} == {row.pk}
+    assert JournalLine.objects.get(entry=posted.journal_entry, account__code="2200").credit == posted.total_vat_sar

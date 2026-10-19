@@ -63,13 +63,14 @@ permission (sales documents, the VAT return offset T1) are therefore never rever
 
 Optional SAMA tax-point hook (owner decision H2, ledger-fx R51):
 
-- ``sama_tax_point(document)`` returns the stored document's tax point (a date) when its foreign-currency lines
-  book at the SAMA rate on that tax point (line spec ``rate_source="sama_tax_point"`` with the SAMA
-  ``exchange_rate`` row, from its own ``build_lines``), else None. The ledger then accepts that row even when it is
-  older than ``FX_MAX_RATE_AGE_DAYS`` before the entry date, but only if it is a global SAMA spot row from the
-  line currency to SAR (the functional currency), dated on the tax point or before it with only verified
-  non-publication days in between, and the tax point is not after the entry date. Accepted only for the types in
-  ``SAMA_TAX_POINT_TYPES``.
+- ``sama_tax_point(document)`` returns the stored document's tax point (a date), or ``(tax_point, as_of)`` with the
+  aware datetime at which the document chose its SAMA row, when its foreign-currency lines book at the SAMA rate
+  on that tax point (line spec ``rate_source="sama_tax_point"`` with the SAMA ``exchange_rate`` row, from its own
+  ``build_lines``), else None. The ledger then accepts that row even when it is older than
+  ``FX_MAX_RATE_AGE_DAYS`` before the entry date, but only if it is a global SAMA spot row from the line currency
+  to SAR (the functional currency), dated on the tax point or before it and the latest such row (owner decision
+  I2; with ``as_of``, among the rows recorded by then), and the tax point is not after the entry date. Accepted
+  only for the types in ``SAMA_TAX_POINT_TYPES``.
 
 Optional period hook:
 

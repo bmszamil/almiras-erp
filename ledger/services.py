@@ -10,6 +10,7 @@ from collections import defaultdict
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date as date_type
+from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -308,13 +309,14 @@ def _currency_problems(entry, lines):
     return problems
 
 
-def _sama_row_problem(row, code, functional, on, *, bridge=True):
-    """R51 (owner decision H2): None if ``row`` is a SAMA rate for ``code`` on ``on`` (a tax point), else the
-    (English, Arabic) reason. A SAMA rate for ``on`` is a global spot ``source=sama`` row from ``code`` to SAR, in an
-    entity whose functional currency is SAR, dated ``on`` or earlier with only **verified** non-publication days
-    after it up to ``on`` (as :func:`get_sama_rate`; a row entered later for one of those days does not undo it).
-    ``bridge=False``: only the kind of row and that it is not dated after ``on`` (the entry date, when the lines
-    are built and the tax point is not known yet).
+def _sama_row_problem(row, code, functional, on, *, bridge=True, as_of=None):
+    """R51 (owner decisions H2, I2): None if ``row`` is the SAMA rate for ``code`` on ``on`` (a tax point), else the
+    (English, Arabic) reason. The SAMA rate for ``on`` is a global spot ``source=sama`` row from ``code`` to SAR, in
+    an entity whose functional currency is SAR, dated ``on`` or earlier and the **latest** such row (as
+    :func:`get_sama_rate`, I2): no other SAMA row of the pair is dated after it up to ``on``. ``as_of`` (the time
+    the document chose its row): only rows recorded by then count, so a SAMA row entered later for a day in the gap
+    does not undo a document issued before it. ``bridge=False``: only the kind of row and that it is not dated after
+    ``on`` (the entry date, when the lines are built and the tax point is not known yet).
     """
     if functional != SAR or code == SAR:
         return (f"A SAMA tax-point rate books only foreign-currency lines in a SAR entity ({code}->{functional}).",
@@ -328,20 +330,23 @@ def _sama_row_problem(row, code, functional, on, *, bridge=True):
         return (f"SAMA rate row {row.pk} ({row.date}) is dated after {on}.",
                 f"سجل سعر البنك المركزي {row.pk} ({row.date}) مؤرخ بعد {on}.")
     if bridge and row.date < on:
-        days = (on - row.date).days
-        closed = NonPublicationDay.objects.filter(date__gt=row.date, date__lte=on, verified_at__isnull=False).count()
-        if closed != days:
-            return (f"SAMA rate row {row.pk} ({row.date}) is not the SAMA rate for {on}: SAMA publishes on a day in "
-                    "between (only verified weekends and public holidays are bridged).",
-                    f"سجل سعر البنك المركزي {row.pk} ({row.date}) ليس سعر البنك المركزي بتاريخ {on}: يوجد يوم نشر "
-                    "بينهما (لا تُتجاوز إلا عطل نهاية الأسبوع والعطل الرسمية المتحقق منها).")
+        later = _sama_rows(code).filter(date__gt=row.date, date__lte=on)
+        if as_of is not None:
+            later = later.filter(created_at__lte=as_of)
+        newer = later.order_by("-date", "-pk").first()
+        if newer is not None:
+            return (f"SAMA rate row {row.pk} ({row.date}) is not the SAMA rate for {on}: the later SAMA row "
+                    f"{newer.pk} ({newer.date}) is the latest published on or before it (I2).",
+                    f"سجل سعر البنك المركزي {row.pk} ({row.date}) ليس سعر البنك المركزي بتاريخ {on}: السجل الأحدث "
+                    f"{newer.pk} ({newer.date}) هو آخر سعر منشور في ذلك التاريخ أو قبله.")
     return None
 
 
 def _sama_tax_point_problems(entry, line, code, functional, where):
-    """R51 (owner decision H2): a ``sama_tax_point`` line books a registered document (``SAMA_TAX_POINT_TYPES``,
+    """R51 (owner decisions H2, I2): a ``sama_tax_point`` line books a registered document (``SAMA_TAX_POINT_TYPES``,
     hook ``sama_tax_point``) at the SAMA rate on the tax point the stored document gives, not after the entry date,
-    with that row's rate. The ledger checks this itself; the document only names its tax point and row."""
+    with that row's rate. The ledger checks this itself; the document only names its tax point (optionally with the
+    time it chose its row: ``(tax_point, as_of)``) and row."""
     if line.exchange_rate_id is None:
         return [_bi(f"{where}: a SAMA tax-point rate needs its rate row.",
                     f"{where}: سعر البنك المركزي في تاريخ استحقاق الضريبة يحتاج إلى سجل السعر.")]
@@ -355,10 +360,13 @@ def _sama_tax_point_problems(entry, line, code, functional, where):
                     f"{where}: سعر البنك المركزي في تاريخ استحقاق الضريبة لا يستخدمه إلا نوع مستند مسجل لذلك.")]
     document = doc_type.model._default_manager.filter(pk=entry.document_id).first()
     tax_point = doc_type.sama_tax_point(document) if document is not None else None
-    if not isinstance(tax_point, date_type) or tax_point > entry.date:
+    as_of = None
+    if isinstance(tax_point, tuple) and len(tax_point) == 2 and isinstance(tax_point[1], (datetime, type(None))):
+        tax_point, as_of = tax_point
+    if not isinstance(tax_point, date_type) or isinstance(tax_point, datetime) or tax_point > entry.date:
         return [_bi(f"{where}: the document gives no tax point on or before the entry date {entry.date}.",
                     f"{where}: لا يحدد المستند تاريخ استحقاق ضريبة في تاريخ القيد {entry.date} أو قبله.")]
-    problem = _sama_row_problem(line.exchange_rate, code, functional, tax_point)
+    problem = _sama_row_problem(line.exchange_rate, code, functional, tax_point, as_of=as_of)
     if problem is None and line.fx_rate != line.exchange_rate.rate:
         problem = (f"the line rate {line.fx_rate} is not the SAMA row's rate {line.exchange_rate.rate}.",
                    f"سعر البند {line.fx_rate} ليس سعر سجل البنك المركزي {line.exchange_rate.rate}.")
@@ -1494,46 +1502,37 @@ SAR = "SAR"
 
 
 def get_sama_rate(currency, on, *, user, entity):
-    """VAT in SAR (ledger-fx R12 amendment; invoicing R100; owner decision G7): the SAMA rate for ``currency``
+    """VAT in SAR (ledger-fx R12 amendment; invoicing R100; owner decisions G7, I2): the SAMA rate for ``currency``
     -> SAR on ``on``, the document's tax point, for ``user`` (``ledger.view_rates`` in ``entity``, as ``get_rate``).
 
     Only global spot rows with ``source=sama`` count; never the manual, file or entity rows that ``get_rate``
-    prefers. The row of ``on`` itself first; an earlier row only when every day after it up to ``on`` is a
-    ``NonPublicationDay`` (weekend or KSA public holiday). No 5-day tolerance. Raises ``sama_rate_missing``
-    (en/ar, naming currency and date) otherwise. SAR itself: rate 1, no row.
+    prefers. The row of ``on`` itself, else the **latest SAMA row published before** ``on`` (I2: after a long
+    holiday or any other day without a published rate; no 5-day tolerance and no ``NonPublicationDay`` check, those
+    days are information only). Raises ``sama_rate_missing`` (en/ar, naming currency and date) only when no SAMA
+    row exists on or before ``on``. SAR itself: rate 1, no row.
     """
     access.require(user, entity, "ledger.view_rates")
     return _sama_rate(_currency(currency).code, on)
 
 
+def _sama_rows(code):
+    """Global spot SAMA rows ``code`` -> SAR (the only rows that are SAMA rates, R12 amendment, R51)."""
+    return ExchangeRate.objects.filter(
+        entity__isnull=True, source=ExchangeRate.Source.SAMA, rate_type=ExchangeRate.RateType.SPOT,
+        from_currency_id=code, to_currency_id=SAR,
+    )
+
+
 def _sama_rate(code, on):
-    """:func:`get_sama_rate` without the rights check (internal). Only **verified** non-publication days bridge to
-    an earlier row (H1): a proposed day still awaiting its second-person check makes the lookup fail closed."""
+    """:func:`get_sama_rate` without the rights check (internal): the latest SAMA row on or before ``on`` (I2)."""
     if code == SAR:
         return Rate(ONE, None)
-    rows = ExchangeRate.objects.filter(
-        entity__isnull=True, source=ExchangeRate.Source.SAMA, rate_type=ExchangeRate.RateType.SPOT,
-        from_currency_id=code, to_currency_id=SAR, date__lte=on, from_currency__is_active=True,
-    ).order_by("-date", "-pk")
-    row = rows.first()
-    unverified = []
-    if row is not None and row.date < on:
-        days = (on - row.date).days
-        between = NonPublicationDay.objects.filter(date__gt=row.date, date__lte=on)
-        closed = set(between.filter(verified_at__isnull=False).values_list("date", flat=True))
-        if len(closed) != days:  # a publication day in between (or ``on`` itself) has no SAMA row
-            unverified = sorted(between.filter(verified_at__isnull=True).values_list("date", flat=True))
-            row = None
+    row = (_sama_rows(code).filter(date__lte=on, from_currency__is_active=True)
+           .order_by("-date", "-pk").first())
     if row is None:
-        en = (f"No SAMA exchange rate {code}->SAR for {on} (an earlier SAMA rate is used only across weekends and "
-              "public holidays); enter the SAMA rate for that date.")
-        ar = (f"لا يوجد سعر صرف من البنك المركزي السعودي {code}->SAR بتاريخ {on} (يُستخدم سعر سابق للبنك المركزي "
-              "فقط في عطل نهاية الأسبوع والعطل الرسمية)؛ أدخل سعر البنك المركزي لذلك التاريخ.")
-        if unverified:
-            listed = ", ".join(str(d) for d in unverified)
-            en += f" Non-publication days not yet verified: {listed}."
-            ar += f" أيام عدم نشر لم يُتحقق منها بعد: {listed}."
-        raise error(en, ar, code="sama_rate_missing")
+        raise error(f"No SAMA exchange rate {code}->SAR on or before {on}; enter the SAMA rate for that date.",
+                    f"لا يوجد سعر صرف من البنك المركزي السعودي {code}->SAR بتاريخ {on} أو قبله؛ أدخل سعر البنك "
+                    "المركزي لذلك التاريخ.", code="sama_rate_missing")
     return Rate(row.rate, row)
 
 
@@ -1628,7 +1627,8 @@ def verify_non_publication_day(day, *, user, group=None):
     """H1: a second person confirms a proposed non-publication day against the SAMA / official announcement.
 
     Needs ``ledger.maintain_global_rate`` at the group parent; never the person who loaded the row
-    (``self_approval``, logged). From then on ``get_sama_rate`` may bridge across it. Logged.
+    (``self_approval``, logged). Logged. Since I2 the days are information only: ``get_sama_rate`` uses the
+    latest earlier SAMA row across any gap.
     """
     group = _non_publication_writer(user, group)
     found = NonPublicationDay.objects.select_for_update().get(pk=day.pk)

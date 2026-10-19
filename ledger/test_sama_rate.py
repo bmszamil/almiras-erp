@@ -1,5 +1,5 @@
-"""SAMA rate for VAT in SAR (ledger-fx R12 amendment, AT-41; owner decision G7): ``get_sama_rate``, the
-``NonPublicationDay`` reference data and SAMA rows entered by hand or by CSV. Anonymised, illustrative rates."""
+"""SAMA rate for VAT in SAR (ledger-fx R12 amendment, AT-41; owner decisions G7, I2): ``get_sama_rate``, the
+``NonPublicationDay`` reference data (information only since I2) and SAMA rows entered by hand or by CSV. Anonymised, illustrative rates."""
 import io
 from datetime import date
 from decimal import Decimal
@@ -37,20 +37,27 @@ def closed(*days):
                                          verified_by=user, verified_at=timezone.now())
 
 
-def test_at41_sama_rate_only_across_non_publication_days(g):
+def test_at41_i2_the_latest_published_sama_rate_before_the_date_is_used(g):
+    """AT-41 as amended by owner decision I2: no verified non-publication day is needed any more."""
     row = sama(THU, "3.7500")
-    closed(FRI, SAT)
+    closed(FRI)  # recorded days are information only: Saturday is not recorded and still bridged
     rate("USD", "SAR", SUN, "3.7600")  # manual: never a SAMA rate
-    found = services.get_sama_rate("USD", SAT, user=g.clerk, entity=g.alm)
-    assert (found.rate, found.row) == (D("3.7500"), row)
-    for on in (SUN, MON):  # 03-07 is a publication day without a SAMA row
-        with pytest.raises(LedgerError) as exc:
-            services.get_sama_rate("USD", on, user=g.clerk, entity=g.alm)
-        assert exc.value.code == "sama_rate_missing"
-        text = " ".join(exc.value.messages)
-        assert "USD" in text and str(on) in text and "البنك المركزي" in text
+    for on in (FRI, SAT, SUN, MON):  # 03-07 and 03-08 are publication days without a SAMA row: still the 03-04 row
+        found = services.get_sama_rate("USD", on, user=g.clerk, entity=g.alm)
+        assert (found.rate, found.row) == (D("3.7500"), row)
+    with pytest.raises(LedgerError) as exc:  # no SAMA row on or before the date at all
+        services.get_sama_rate("USD", date(2027, 3, 3), user=g.clerk, entity=g.alm)
+    assert exc.value.code == "sama_rate_missing"
+    text = " ".join(exc.value.messages)
+    assert "USD" in text and "2027-03-03" in text and "on or before" in text and "البنك المركزي" in text
     # functional bookings keep the 5-day fallback of R12 and the manual-first order
     assert services.get_rate(g.alm, "USD", "SAR", MON, user=g.clerk).rate == D("3.7600")
+
+
+def test_i2_unverified_non_publication_days_do_not_block_the_lookup(g):
+    row = sama(THU, "3.7500")
+    NonPublicationDay.objects.create(date=FRI, name_en="Weekend", name_ar="عطلة", created_by=make_user("loader"))
+    assert services.get_sama_rate("USD", SAT, user=g.clerk, entity=g.alm).row == row
 
 
 def test_sama_rate_on_the_day_itself_wins(g):
@@ -71,12 +78,15 @@ def test_sama_rate_ignores_entity_rows_other_sources_and_average_rates(g):
     assert exc.value.code == "sama_rate_missing"
 
 
-def test_sama_rate_has_no_five_day_tolerance(g):
-    sama(date(2027, 3, 1), "3.75")
-    closed(date(2027, 3, 2))  # 03-03 is a publication day: the 03-01 row is not used on 03-03 or later
-    with pytest.raises(LedgerError):
-        services.get_sama_rate("USD", date(2027, 3, 3), user=g.clerk, entity=g.alm)
-    assert services.get_sama_rate("USD", date(2027, 3, 2), user=g.clerk, entity=g.alm).rate == D("3.75")
+def test_i2_any_gap_uses_the_latest_earlier_sama_row_without_a_day_limit(g):
+    """No 5-day tolerance and no other limit: a long holiday (or any gap) falls back to the latest SAMA row."""
+    first = sama(date(2027, 3, 1), "3.75")
+    assert services.get_sama_rate("USD", date(2027, 3, 20), user=g.clerk, entity=g.alm).row == first
+    later = sama(date(2027, 3, 10), "3.76")
+    assert services.get_sama_rate("USD", date(2027, 3, 20), user=g.clerk, entity=g.alm).row == later
+    assert services.get_sama_rate("USD", date(2027, 3, 9), user=g.clerk, entity=g.alm).row == first
+    with pytest.raises(LedgerError):  # functional bookings still stop at FX_MAX_RATE_AGE_DAYS (R12)
+        services.get_rate(g.alm, "USD", "SAR", date(2027, 3, 20), user=g.clerk)
 
 
 def test_sama_rate_for_sar_is_one(g):

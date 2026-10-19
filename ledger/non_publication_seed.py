@@ -3,8 +3,9 @@
 SAMA publishes no exchange rates on the weekend (Friday and Saturday) or on KSA public holidays. This module
 proposes those days for whole Gregorian years; ``ledger/seed/sama_non_publication_days_2026_2027.json`` holds the
 output for 2026 and 2027, which ``python manage.py ledger_load_non_publication_days`` loads **unverified**. A second
-person checks each row against the SAMA / official announcement (``ledger.services.verify_non_publication_day``);
-``get_sama_rate`` uses verified rows only.
+person checks each row against the SAMA / official announcement (``ledger.services.verify_non_publication_day``).
+Since owner decision I2 the days are information only: ``get_sama_rate`` uses the latest earlier SAMA row across
+any day without a published rate.
 
 Rules proposed (team, to confirm; none of them is taken from a SAMA announcement):
 
