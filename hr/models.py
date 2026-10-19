@@ -411,11 +411,17 @@ class Employee(Tracked):
         NEW_M273 = "new_m273", bi("New law (SIL M/273)", "النظام الجديد (م/273)")
 
     # GOSI identifiers (3.2: "PD-light", masked like the GOSI number; finding 7: encrypted too).
-    GOSI_FIELDS = ("gosi_number", "gosi_cohort", "gosi_first_coverage_date")
+    class GosiRelationship(models.TextChoices):
+        # R69 / payroll R41: a Saudi remuneration person abroad is a GOSI "worker" only with a real employment
+        # relationship (subordinate to and paid by the KSA employer; legal adviser E2, P19(b)).
+        SUBORDINATE = "subordinate", bi("Subordinate to and paid by the KSA employer", "تابع لصاحب العمل في المملكة ويتقاضى أجره منه")
+        NON_SUBORDINATE = "non_subordinate", bi("No subordination (board member, consultant)", "دون تبعية (عضو مجلس، مستشار)")
+
+    GOSI_FIELDS = ("gosi_number", "gosi_cohort", "gosi_first_coverage_date", "gosi_registered_dob")
     # Personal data (R10): encrypted, masked without hr.view_personal_data.
     PERSONAL_FIELDS = ("full_name_en", "full_name_ar", "id_number", "date_of_birth", "gender", "phone", "email",
                        "address", "bank_name", "iban", "country_of_residence") + GOSI_FIELDS
-    DATE_FIELDS = ("date_of_birth", "gosi_first_coverage_date")
+    DATE_FIELDS = ("date_of_birth", "gosi_first_coverage_date", "gosi_registered_dob")
     # What a payroll officer may see unmasked (§7: bank/IBAN and ID for WPS).
     PAYMENT_FIELDS = ("id_number", "bank_name", "iban")
 
@@ -441,6 +447,21 @@ class Employee(Tracked):
                                      blank=True, default="")
     gosi_first_coverage_date = EncryptedDateField(bi("First subject to GOSI on", "تاريخ أول خضوع للتأمينات"),
                                                   null=True, blank=True)
+    # GOSI Regs Art. 9 (report 2026-10-19): the GOSI-registered date of birth governs the GOSI age tests (payroll
+    # R55, R66) when it differs from the ID document.
+    gosi_registered_dob = EncryptedDateField(bi("Date of birth on the GOSI record", "تاريخ الميلاد في سجل التأمينات"),
+                                             null=True, blank=True)
+    # R69 (H20(b)): required before payroll for a Saudi remuneration person, with the agreement or board resolution.
+    gosi_employment_relationship = models.CharField(bi("GOSI employment relationship", "علاقة العمل لدى التأمينات"),
+                                                    max_length=16, choices=GosiRelationship.choices, blank=True,
+                                                    default="")
+    gosi_relationship_ref = models.CharField(bi("Agreement or board resolution", "الاتفاق أو قرار المجلس"),
+                                             max_length=200, blank=True, default="")
+    # GOSI Regs Art. 19 (payroll R68): the contributory wage registered with employers outside the group, from the
+    # GOSI record; the SAR 45,000 cap applies across all employers, pro rata.
+    gosi_other_employers_wage = models.DecimalField(bi("GOSI wage with other employers (SAR)",
+                                                       "أجر الاشتراك لدى أصحاب عمل آخرين (ريال)"), max_digits=18,
+                                                    decimal_places=2, null=True, blank=True)
     hire_date = models.DateField(bi("Hire date", "تاريخ التعيين"))
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     user = models.OneToOneField(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
@@ -635,6 +656,9 @@ class EmploymentContract(Tracked, ServiceGuarded):
     parameter_ids = models.JSONField(bi("Parameters used", "المعايير المستخدمة"), default=list, blank=True)
     # Set by an approved termination (R38), cleared by its withdrawal (R41): the only change to an approved row.
     ended_on = models.DateField(bi("Ended on", "تاريخ الانتهاء الفعلي"), null=True, blank=True)
+    # 3.4 (second GOSI check; GOSI Regs Art. 17(c)): housing provided in kind; payroll adds BASIC x
+    # gosi.housing_in_kind_basic_months / 12 to the GOSI wage. Refused together with a cash HOUSING component.
+    housing_in_kind = models.BooleanField(bi("Housing provided in kind", "السكن مقدم عينًا"), default=False)
 
     class Meta:
         verbose_name = bi("employment contract", "عقد عمل")

@@ -61,7 +61,7 @@ def test_at3_new_entity_works_as_data_egy_master_data_kept(w):
 
     member(hn, new, "hr_officer")
     member(cn, new, "approver")
-    assert SalaryComponent.objects.filter(entity=new).count() == 5
+    assert SalaryComponent.objects.filter(entity=new).count() == 7  # + COMMISSION, PROFIT_SHARE (GOSI Regs Art. 17)
     assert models.LeaveType.objects.filter(entity=new, code="ANNUAL").exists()
     dept = services.create_department(new, user=hn, code="ADM", name_en="Admin", name_ar="الإدارة")
     grade = services.create_grade(new, user=hn, code="G1", name_en="G1", name_ar="د1", overtime_eligible=False)

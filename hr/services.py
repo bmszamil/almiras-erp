@@ -496,6 +496,10 @@ COMPONENT_SEED = (
     ("HOUSING", "Housing allowance", "بدل السكن", True, True, False, True),
     ("TRANSPORT", "Transport allowance", "بدل النقل", False, True, False, True),
     ("OTHER", "Other allowance", "بدل آخر", False, True, False, True),
+    # GOSI Regs Art. 17(a) (report 2026-10-19): commission and a percentage of profits count as basic for GOSI
+    # (payroll R65: at last year's monthly average); part of the actual wage (Art. 2); not reduced for unpaid leave.
+    ("COMMISSION", "Commission (% of sales)", "عمولة (نسبة من المبيعات)", True, True, False, False),
+    ("PROFIT_SHARE", "Share of profits (%)", "نسبة من الأرباح", True, True, False, False),
 )
 REMUNERATION_COMPONENT = ("REMUNERATION", "Monthly remuneration", "المكافأة الشهرية", False, False, False, False)
 
@@ -587,10 +591,12 @@ def set_overtime_route(entity, route, *, user, reason):
 EMPLOYEE_FIELDS = frozenset({
     "full_name_en", "full_name_ar", "nationality", "id_type", "id_number", "date_of_birth", "gender", "phone", "email",
     "address", "bank_name", "iban", "gosi_number", "gosi_registered_on", "hire_date", "linked_user", "employment_basis",
-    "country_of_residence", "gosi_cohort", "gosi_first_coverage_date",
+    "country_of_residence", "gosi_cohort", "gosi_first_coverage_date", "gosi_registered_dob",
+    "gosi_employment_relationship", "gosi_relationship_ref", "gosi_other_employers_wage",
 })
 # AT-41: changes of these GOSI record fields are logged (en/ar) with the employee code.
-GOSI_LOGGED = ("gosi_cohort", "gosi_first_coverage_date")
+GOSI_LOGGED = ("gosi_cohort", "gosi_first_coverage_date", "gosi_registered_dob", "gosi_employment_relationship",
+               "gosi_other_employers_wage")
 
 
 def _employee_values(fields):
@@ -660,6 +666,16 @@ def _employee_problems(emp, hr_settings):
         warnings.append("GOSI cohort and first coverage date are not recorded: payroll refuses this employee's "
                         "payslip until they are entered from the GOSI record (payroll R56). / لم تُسجَّل فئة التأمينات "
                         "وتاريخ أول خضوع: ترفض الرواتب مسير هذا الموظف حتى يُدخَلا من سجل التأمينات.")
+    if (emp.gosi_employment_relationship or "") not in ("", *Employee.GosiRelationship.values):
+        problems.append(f"Unknown GOSI employment relationship {emp.gosi_employment_relationship!r}. / علاقة العمل "
+                        f"{emp.gosi_employment_relationship!r} غير معروفة.")
+    elif emp.gosi_employment_relationship and not (emp.gosi_relationship_ref or "").strip():
+        problems.append("The GOSI employment relationship needs the agreement or board resolution reference (R69). / "
+                        "تحتاج علاقة العمل لدى التأمينات إلى مرجع الاتفاق أو قرار المجلس.")
+    if emp.gosi_other_employers_wage is not None:
+        if isinstance(emp.gosi_other_employers_wage, float) or Decimal(emp.gosi_other_employers_wage) < 0:
+            problems.append("The GOSI wage with other employers is a Decimal of zero or more. / أجر الاشتراك لدى "
+                            "أصحاب عمل آخرين رقم عشري صفر أو أكثر.")
     if emp.iban and not _iban_ok(emp.iban):
         problems.append("The IBAN checksum is wrong. / رقم الآيبان غير صحيح (خانة التحقق).")
     if emp.email:
@@ -858,6 +874,7 @@ EXPORT_LABELS = {
     "country_of_residence": ("Country of residence", "بلد الإقامة"),
     "gosi_number": ("GOSI number", "رقم التأمينات"), "gosi_cohort": ("GOSI cohort", "فئة التأمينات"),
     "gosi_first_coverage_date": ("First subject to GOSI on", "تاريخ أول خضوع للتأمينات"),
+    "gosi_registered_dob": ("Date of birth on the GOSI record", "تاريخ الميلاد في سجل التأمينات"),
 }
 
 
@@ -1012,6 +1029,7 @@ CONTRACT_FIELDS = frozenset({
     "probation_agreement_ref", "renewal_count", "extended_hours_ref", "job_title_en",
     "job_title_ar", "occupation_code", "weekly_hours", "daily_hours", "annual_leave_days", "notice_days_employer",
     "notice_days_employee", "currency", "department", "grade", "qiwa_contract_ref", "suspension_agreement_ref", "paid_monthly",
+    "housing_in_kind",
 })
 
 
@@ -1286,6 +1304,9 @@ def _contract_problems(contract, *, statutory, use):
                             "يلزم العقد مكوّن راتب أساسي واحد أكبر من صفر.")
         if "REMUNERATION" in codes:
             problems.append("REMUNERATION is only for remuneration staff (R52). / المكافأة الشهرية لأصحابها فقط.")
+        if contract.housing_in_kind and "HOUSING" in codes:
+            problems.append("Housing is either in kind or a cash HOUSING allowance, not both (3.4; GOSI Regs Art. 17). / "
+                            "يكون السكن عينيًا أو بدل سكن نقديًا، لا الاثنين معًا.")
         if currency.code != entity.base_currency_id:
             problems.append(f"The contract is in {entity.base_currency_id}, the entity's functional currency, not "
                             f"{currency.code} (R18, R53, H10). / يكون العقد بعملة الكيان الوظيفية "
