@@ -1650,7 +1650,13 @@ def _calculate(ctx):
         if emp.employment_basis == Basis.LOCAL_ENTITY_EMPLOYEE:
             continue  # refused at the jurisdiction gate; never computed with Saudi parameters (R41)
         calc = _calc_remuneration if emp.employment_basis == Basis.REMUNERATION else _calc_ksa
-        slips.append(calc(ctx, emp, versions, info))
+        slip = calc(ctx, emp, versions, info)
+        bad = sorted({l.account.code for l in slip.lines if l.account.sharia_prohibited})
+        if bad and ctx.entity.sharia_enforced:  # R19, R37: checked here, and by the ledger again at posting
+            slip.refusal = (f"{emp.employee_code}: account(s) {', '.join(bad)} are Sharia-prohibited in {ctx.entity.code} "
+                            f"(R19, R37) / {emp.employee_code}: الحساب {', '.join(bad)} محظور شرعًا في {ctx.entity.code}")
+            slip.lines = []
+        slips.append(slip)
     if ctx.run.payroll_group == PayrollGroup.IN_COUNTRY and ctx.run.kind == PayrollRun.Kind.REGULAR:
         diff = _eosb_tie_out(ctx.entity, ctx.end)
         if diff:
@@ -1734,7 +1740,9 @@ def calculate_run(run, *, user):
     if run.status not in (RS.DRAFT, RS.CALCULATED, RS.RETURNED):
         raise error(f"A {run.status} run is not recalculated (R7, R13).", f"لا يُعاد احتساب مسير بحالة {run.status}.",
                     code="run_status")
-    ctx = Ctx(run, user, _jurisdiction_gate(run.entity, hr.ParamUse()))
+    use = hr.ParamUse()
+    ctx = Ctx(run, user, _jurisdiction_gate(run.entity, use))
+    ctx.use = use
     slips = _calculate(ctx)
     _store(ctx, slips)
     run.status = RS.CALCULATED
@@ -1836,8 +1844,9 @@ def approve_run(run, *, user):
     run = _lock(PayrollRun, run.pk)
     if run.status != RS.SUBMITTED:
         raise error("Only a submitted run is approved (R7).", "يُعتمد المسير المقدم فقط.", code="run_status")
-    s = _jurisdiction_gate(run.entity, hr.ParamUse())
-    ctx = Ctx(run, user, s)
+    use = hr.ParamUse()
+    ctx = Ctx(run, user, _jurisdiction_gate(run.entity, use))
+    ctx.use = use  # jurisdiction.active is verified with the rest (hr R68, R7)
     slips = _calculate(ctx)
     if _fingerprint(slips, ctx.warnings, ctx.use.ids) != run.inputs_hash:
         raise error("A source changed after the calculation: recalculate the run and submit it again (R8).",

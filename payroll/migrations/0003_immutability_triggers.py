@@ -189,14 +189,18 @@ DROP FUNCTION IF EXISTS payroll_changed_keys(jsonb, jsonb);
 """
 
 
-def forwards(apps, schema_editor):
+def _run(schema_editor, sql):
     if schema_editor.connection.vendor == "postgresql":
-        schema_editor.execute(FORWARD)
+        with schema_editor.connection.cursor() as cursor:
+            cursor.execute(sql)  # no parameters: the % in the RAISE messages are PL/pgSQL placeholders
+
+
+def forwards(apps, schema_editor):
+    _run(schema_editor, FORWARD)
 
 
 def backwards(apps, schema_editor):
-    if schema_editor.connection.vendor == "postgresql":
-        schema_editor.execute(REVERSE)
+    _run(schema_editor, REVERSE)
 
 
 class Migration(migrations.Migration):

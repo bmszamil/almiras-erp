@@ -1,0 +1,53 @@
+"""Seed data and permissions (hr R6, R7, R68; payroll R4, R38, §5, §7)."""
+from datetime import date
+
+from core.access import catalogue
+from core.access.models import Role
+from core.access.seed import ROLE_SEED, ROLE_SEED_V12, ROLE_SEED_V13
+from hr.models import StatutoryParameter
+from ledger.models import Account
+from payroll import statutory_seed
+
+
+def test_payroll_parameters_are_seeded_unverified_with_sources(db):
+    rows = StatutoryParameter.objects.filter(code__in=set(statutory_seed.SA_PAYROLL) | set(statutory_seed.SA_GOSI))
+    assert rows.count() == len(statutory_seed.SA_PAYROLL) + len(statutory_seed.SA_GOSI)
+    assert set(rows.values_list("status", flat=True)) == {"unverified"} and not rows.filter(verified_by__isnull=False)
+    steps = StatutoryParameter.objects.filter(code="gosi.rates.annuities").order_by("valid_from")
+    assert [r.value["new_m273"]["employee"] for r in steps] == ["9", "9.5", "10", "10.5", "11"]
+    assert all(r.value["legacy_m33"] == {"employer": "9", "employee": "9"} for r in steps)
+    assert StatutoryParameter.objects.get(code="gosi.partial_month_divisor").value == {"divisor": "calendar"}
+    fifth = StatutoryParameter.objects.get(code="gosi.legal_age").value["legacy_clause_fifth"]
+    assert len(fifth["schedule"]) == 21 and fifth["deemed_50_hijri_at"] == "48y6m"
+    assert "240 months" in fifth["track_rule"]
+
+
+def test_r68_only_sa_and_eg_are_active_and_egypt_rows_are_research(db):
+    active = StatutoryParameter.objects.filter(code="jurisdiction.active")
+    assert set(active.values_list("jurisdiction", flat=True)) == {"SA", "EG"}
+    eg = StatutoryParameter.objects.filter(jurisdiction="EG")
+    assert eg.filter(code="si.rates").get().value == {"employee": "0.11", "employer": "0.1875"}
+    assert all("not the Gazette" in r.source_reference or r.code == "jurisdiction.active" for r in eg)
+
+
+def test_v13_seed_payroll_rights(db):
+    assert ROLE_SEED is ROLE_SEED_V13
+    perms = {code: set(row[5]) for code, row in ROLE_SEED.items()}
+    assert {c for c, p in perms.items() if "payroll.approve_run" in p} == {"hr_officer", "managing_partner"}
+    assert {c for c, p in perms.items() if "payroll.approve_loan" in p} == {"managing_partner"}
+    assert perms["department_head"] == {"payroll.approve_overtime"}
+    assert not any(c.startswith("payroll.") for c in perms["system_billing"])
+    assert set(ROLE_SEED_V12) < set(ROLE_SEED_V13)
+    assert not [c for c, p in catalogue.CATALOGUE.items() if c.startswith("payroll.") and p.agent_ok]  # R38
+    assert "payroll.reverse_run" in catalogue.REVERSE_PERMISSIONS
+    assert Role.objects.get(code="department_head").scope == "entity"
+
+
+def test_approved_payroll_accounts_in_new_charts(db):
+    from core.models import Entity
+    from ledger.services_setup import install_chart_of_accounts
+    e = Entity.objects.create(code="NEWP", name_en="New", name_ar="جديد")
+    install_chart_of_accounts(e)
+    codes = set(Account.objects.filter(entity=e).values_list("code", flat=True))
+    assert {"1230", "1240", "2330", "2340", "5120"} <= codes
+    assert date  # noqa

@@ -263,3 +263,13 @@ def test_r10_terminated_in_period_is_left_to_the_final_settlement(w):
     run = calculated(w)
     assert not Payslip.objects.filter(run=run, employee=n1).exists()
     assert any("final settlement" in x for x in run.warnings)
+
+
+def test_at13_sharia_prohibited_component_account_refused_at_calculation(w):
+    from hr.models import SalaryComponent
+    from ledger.models import Account
+    s1 = saudi(w)
+    SalaryComponent.objects.filter(entity=w.alm, code="TRANSPORT").update(
+        expense_account=Account.objects.get(entity=w.alm, code="5610"))
+    run = calculated(w)
+    assert slip(run, s1).refused and "5610" in slip(run, s1).refusal and "شرع" in slip(run, s1).refusal
