@@ -5,6 +5,7 @@ from datetime import date
 from types import SimpleNamespace
 
 import pytest
+from django.utils import timezone
 from django.apps import apps as django_apps
 from django.db import connection
 
@@ -22,7 +23,8 @@ def messages(exc):
 
 def closed(w, *days):
     for day in days:
-        NonPublicationDay.objects.create(date=day, name_en="Weekend", name_ar="عطلة نهاية الأسبوع", created_by=w.cfo)
+        NonPublicationDay.objects.create(date=day, name_en="Weekend", name_ar="عطلة نهاية الأسبوع", created_by=w.cfo,
+                                         verified_by=w.cfo, verified_at=timezone.now())
 
 
 def draft(w, *, issue_date, lines=(("rent_commercial", "1", "1000.00"),), doc_type="invoice", **fields):

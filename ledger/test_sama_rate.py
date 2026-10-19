@@ -5,6 +5,7 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from django.utils import timezone
 
 from core.access.testing import make_user, member
 from ledger import services
@@ -32,7 +33,8 @@ def sama(on, value, currency="USD"):
 def closed(*days):
     user = make_user(f"npd{NonPublicationDay.objects.count()}")
     for day in days:
-        NonPublicationDay.objects.create(date=day, name_en="Weekend", name_ar="عطلة نهاية الأسبوع", created_by=user)
+        NonPublicationDay.objects.create(date=day, name_en="Weekend", name_ar="عطلة نهاية الأسبوع", created_by=user,
+                                         verified_by=user, verified_at=timezone.now())
 
 
 def test_at41_sama_rate_only_across_non_publication_days(g):

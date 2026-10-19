@@ -1430,7 +1430,8 @@ def get_sama_rate(currency, on, *, user, entity):
 
 
 def _sama_rate(code, on):
-    """:func:`get_sama_rate` without the rights check (internal)."""
+    """:func:`get_sama_rate` without the rights check (internal). Only **verified** non-publication days bridge to
+    an earlier row (H1): a proposed day still awaiting its second-person check makes the lookup fail closed."""
     if code == SAR:
         return Rate(ONE, None)
     rows = ExchangeRate.objects.filter(
@@ -1438,37 +1439,132 @@ def _sama_rate(code, on):
         from_currency_id=code, to_currency_id=SAR, date__lte=on, from_currency__is_active=True,
     ).order_by("-date", "-pk")
     row = rows.first()
+    unverified = []
     if row is not None and row.date < on:
         days = (on - row.date).days
-        closed = set(NonPublicationDay.objects.filter(date__gt=row.date, date__lte=on).values_list("date", flat=True))
+        between = NonPublicationDay.objects.filter(date__gt=row.date, date__lte=on)
+        closed = set(between.filter(verified_at__isnull=False).values_list("date", flat=True))
         if len(closed) != days:  # a publication day in between (or ``on`` itself) has no SAMA row
+            unverified = sorted(between.filter(verified_at__isnull=True).values_list("date", flat=True))
             row = None
     if row is None:
-        raise error(
-            f"No SAMA exchange rate {code}->SAR for {on} (an earlier SAMA rate is used only across weekends and "
-            "public holidays); enter the SAMA rate for that date.",
-            f"لا يوجد سعر صرف من البنك المركزي السعودي {code}->SAR بتاريخ {on} (يُستخدم سعر سابق للبنك المركزي "
-            "فقط في عطل نهاية الأسبوع والعطل الرسمية)؛ أدخل سعر البنك المركزي لذلك التاريخ.",
-            code="sama_rate_missing",
-        )
+        en = (f"No SAMA exchange rate {code}->SAR for {on} (an earlier SAMA rate is used only across weekends and "
+              "public holidays); enter the SAMA rate for that date.")
+        ar = (f"لا يوجد سعر صرف من البنك المركزي السعودي {code}->SAR بتاريخ {on} (يُستخدم سعر سابق للبنك المركزي "
+              "فقط في عطل نهاية الأسبوع والعطل الرسمية)؛ أدخل سعر البنك المركزي لذلك التاريخ.")
+        if unverified:
+            listed = ", ".join(str(d) for d in unverified)
+            en += f" Non-publication days not yet verified: {listed}."
+            ar += f" أيام عدم نشر لم يُتحقق منها بعد: {listed}."
+        raise error(en, ar, code="sama_rate_missing")
     return Rate(row.rate, row)
 
 
-@transaction.atomic
-def create_non_publication_day(*, user, on, name_en, name_ar, group=None):
-    """Record a weekend day or KSA public holiday on which SAMA publishes no rate (R12 amendment, AT-41).
-
-    Global reference data, written like a global rate (R28: the group parent's treasury). Bilingual name required.
-    """
-    _authorise_rate_write(user, None, group)
-    name_en, name_ar = (name_en or "").strip(), (name_ar or "").strip()
+def _name_problem(name_en, name_ar):
     if not name_en or not name_ar:
         raise error("The day needs an English and an Arabic name.", "يحتاج اليوم إلى اسم بالإنجليزية والعربية.",
                     code="name_required")
+
+
+@transaction.atomic
+def create_non_publication_day(*, user, on, name_en, name_ar, group=None, source=""):
+    """Record a weekend day or KSA public holiday on which SAMA publishes no rate (R12 amendment, AT-41).
+
+    Global reference data, written like a global rate (R28: the group parent's treasury). Bilingual name required.
+    A day entered by hand is taken from the announcement by the person entering it, like a SAMA rate row, and is
+    verified by that entry (``verified_by`` = ``user``); seeded proposals are loaded unverified (H1,
+    :func:`load_non_publication_days`).
+    """
+    _authorise_rate_write(user, None, group)
+    name_en, name_ar = (name_en or "").strip(), (name_ar or "").strip()
+    _name_problem(name_en, name_ar)
     if NonPublicationDay.objects.filter(date=on).exists():
         raise error(f"{on} is already recorded as a non-publication day.", f"اليوم {on} مسجل مسبقًا يومًا بلا نشر.",
                     code="duplicate_day")
-    return NonPublicationDay.objects.create(date=on, name_en=name_en, name_ar=name_ar, created_by=user)
+    return NonPublicationDay.objects.create(date=on, name_en=name_en, name_ar=name_ar, created_by=user,
+                                            source=(source or "").strip()[:300], verified_by=user,
+                                            verified_at=timezone.now())
+
+
+def _non_publication_writer(user, group):
+    """H1: loading and verifying proposed days is done by a person holding ``ledger.maintain_global_rate`` at the
+    top-level group parent (R28); system users and agents are refused (logged)."""
+    group = _group_parent(group)
+    access.require(user, group, "ledger.maintain_global_rate")  # refuses system users and agents (logged)
+    if kind_of(user) != Kind.HUMAN:
+        access.deny(user, group, "ledger.maintain_global_rate", "system_forbidden")
+    return group
+
+
+def _seed_row(raw, index):
+    """(date, name_en, name_ar, source) of one seed row; bilingual LedgerError naming the row when malformed."""
+    where = f"Row {index}"
+    if not isinstance(raw, dict):
+        raise error(f"{where} is not an object.", f"السطر {index} ليس كائنًا.", code="seed_row_invalid")
+    try:
+        on = date_type.fromisoformat(str(raw.get("date", "")))
+    except ValueError:
+        raise error(f"{where}: date {raw.get('date')!r} is not YYYY-MM-DD.",
+                    f"السطر {index}: التاريخ {raw.get('date')!r} ليس بصيغة YYYY-MM-DD.", code="seed_row_invalid") from None
+    name_en, name_ar = str(raw.get("name_en") or "").strip(), str(raw.get("name_ar") or "").strip()
+    source = str(raw.get("source") or "").strip()
+    if not name_en or not name_ar or not source:
+        raise error(f"{where} ({on}) needs name_en, name_ar and source.",
+                    f"السطر {index} ({on}) يحتاج إلى الاسم بالإنجليزية والعربية والمصدر.", code="seed_row_invalid")
+    return on, name_en[:120], name_ar[:120], source[:300]
+
+
+def load_non_publication_days(rows, *, user, group=None, apply=False):
+    """Load proposed SAMA non-publication days (owner decision H1) **unverified**.
+
+    ``rows``: dicts with ``date``, ``name_en``, ``name_ar``, ``source`` (the seed file). Dates already recorded are
+    skipped and never changed. Without ``apply`` nothing is written (dry run). Returns ``(new, skipped)`` lists of
+    dates. The loader holds ``ledger.maintain_global_rate`` at the group parent and is a person; the load is logged.
+    """
+    group = _non_publication_writer(user, group)
+    parsed, seen = [], set()
+    for index, raw in enumerate(rows, start=1):
+        on, name_en, name_ar, source = _seed_row(raw, index)
+        if on in seen:
+            raise error(f"Row {index}: {on} appears twice in the file.", f"السطر {index}: التاريخ {on} مكرر في الملف.",
+                        code="seed_row_invalid")
+        seen.add(on)
+        parsed.append((on, name_en, name_ar, source))
+    with transaction.atomic():
+        existing = set(NonPublicationDay.objects.select_for_update().filter(date__in=seen)
+                       .values_list("date", flat=True))
+        new = [row for row in parsed if row[0] not in existing]
+        if apply and new:
+            NonPublicationDay.objects.bulk_create([
+                NonPublicationDay(date=on, name_en=en, name_ar=ar, source=source, created_by=user)
+                for on, en, ar, source in new
+            ])
+            access_log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=group,
+                       permission="ledger.maintain_global_rate",
+                       details={"action": "load_non_publication_days", "created": len(new),
+                                "skipped": len(existing), "first": str(new[0][0]), "last": str(new[-1][0])})
+    return [row[0] for row in new], sorted(existing)
+
+
+@transaction.atomic
+def verify_non_publication_day(day, *, user, group=None):
+    """H1: a second person confirms a proposed non-publication day against the SAMA / official announcement.
+
+    Needs ``ledger.maintain_global_rate`` at the group parent; never the person who loaded the row
+    (``self_approval``, logged). From then on ``get_sama_rate`` may bridge across it. Logged.
+    """
+    group = _non_publication_writer(user, group)
+    found = NonPublicationDay.objects.select_for_update().get(pk=day.pk)
+    if found.verified_at is not None:
+        raise error(f"{found.date} is already verified.", f"تم التحقق من اليوم {found.date} مسبقًا.",
+                    code="already_verified")
+    if found.created_by_id == user.pk:
+        access.deny(user, group, "ledger.maintain_global_rate", "self_approval")
+    found.verified_by, found.verified_at = user, timezone.now()
+    found.save(update_fields=["verified_by", "verified_at"])
+    access_log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=group, permission="ledger.maintain_global_rate",
+               details={"action": "verify_non_publication_day", "day": str(found.date), "row": found.pk})
+    return found
 
 
 def _group_parent(group):

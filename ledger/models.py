@@ -628,14 +628,32 @@ class NonPublicationDay(models.Model):
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
                                    verbose_name=bi("Created by", "أنشأه"))
     created_at = models.DateTimeField(auto_now_add=True, verbose_name=bi("Created at", "تاريخ الإنشاء"))
+    # Owner decision H1: rows loaded from the seed file are proposals until a second person checks them against the
+    # SAMA / official announcement (``verify_non_publication_day``); ``get_sama_rate`` uses verified rows only.
+    source = models.CharField(bi("Source", "المصدر"), max_length=300, blank=True)
+    verified_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="+", verbose_name=bi("Verified by", "تحقق منه"))
+    verified_at = models.DateTimeField(bi("Verified at", "تاريخ التحقق"), null=True, blank=True)
 
     class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=(models.Q(verified_by__isnull=True) & models.Q(verified_at__isnull=True))
+                | (models.Q(verified_by__isnull=False) & models.Q(verified_at__isnull=False)),
+                name="non_publication_day_verified_complete",
+            ),
+        ]
         verbose_name = bi("SAMA non-publication day", "يوم لا ينشر فيه البنك المركزي الأسعار")
         verbose_name_plural = bi("SAMA non-publication days", "أيام لا ينشر فيها البنك المركزي الأسعار")
         ordering = ["-date"]
 
+    @property
+    def is_verified(self):
+        return self.verified_at is not None
+
     def __str__(self):
-        return f"{self.date} {self.name_en} / {self.name_ar}"
+        flag = "" if self.is_verified else " (unverified / غير متحقق منه)"
+        return f"{self.date} {self.name_en} / {self.name_ar}{flag}"
 
 
 class RevaluationRunQuerySet(models.QuerySet):

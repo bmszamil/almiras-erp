@@ -220,10 +220,27 @@ class ExchangeRateAdmin(admin.ModelAdmin):
 
 @admin.register(NonPublicationDay)
 class NonPublicationDayAdmin(admin.ModelAdmin):
-    """Read-only list: days are recorded with ledger.services.create_non_publication_day (R12 amendment, R28)."""
+    """Read-only list: days are recorded with ledger.services.create_non_publication_day (R12 amendment, R28) or
+    loaded unverified by ``ledger_load_non_publication_days`` (H1); the action verifies them through
+    ledger.services.verify_non_publication_day (a second person)."""
 
-    list_display = ["date", "name_en", "name_ar", "created_by", "created_at"]
+    list_display = ["date", "name_en", "name_ar", "verified", "source", "created_by", "verified_by", "verified_at"]
+    list_filter = [("verified_at", admin.EmptyFieldListFilter)]
     date_hierarchy = "date"
+    actions = ["verify_selected"]
+
+    @admin.display(boolean=True, description="Verified / متحقق منه")
+    def verified(self, obj):
+        return obj.is_verified
+
+    @admin.action(description="Verify the selected days against the SAMA announcement / التحقق من الأيام المحددة")
+    def verify_selected(self, request, queryset):
+        for day in queryset.order_by("date"):
+            try:
+                services.verify_non_publication_day(day, user=request.user)
+                self.message_user(request, f"Verified / تم التحقق: {day.date}")
+            except (ValidationError, PermissionDenied) as exc:
+                self.message_user(request, f"{day.date}: {exc}", messages.ERROR)
 
     def has_module_permission(self, request):
         return access.entities_for(request.user, "ledger.view_rates").exists()
