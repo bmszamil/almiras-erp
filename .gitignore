@@ -9,3 +9,8 @@ migration/exports/
 # Filled migration workbooks never enter git (migration.md W2); only the generated template does.
 docs/migration/*.xlsx
 !docs/migration/almiras-migration-workbook.xlsx
+# Commercial brand font files (HT Rakik, Hadi Type licence) never enter git (docs/design/brand.md).
+*Rakik*.woff2
+*Rakik*.woff
+*Rakik*.otf
+*Rakik*.ttf

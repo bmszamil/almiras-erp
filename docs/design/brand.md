@@ -64,10 +64,19 @@ So: orange is never used for small text. Primary buttons are **navy with white o
 
 - Arabic text right-aligned; line height 130 % for headings, 185 % for body text; natural letter spacing (no tracking).
 - The first line of a major title may be orange; the rest navy on light, sand on dark.
-- **Licensing:** Bricolage Grotesque is under the SIL Open Font License and may be self-hosted. **HT Rakik (Hadi Type) is licensed to Almiras under Hadi Type's *Desktop Font License*** (licence PDF shared by the owner on 2026-10-18). It allows installing the font on up to 5 owned devices and making print, branding and PDF material, but **does not allow** converting it to web formats (WOFF/WOFF2) without a separate web licence, distributing or sharing the font files, or using it in open-source environments. The ERP is an open-source web application that serves fonts to every browser, so it **must not** ship or serve HT Rakik under this licence. The font files are therefore not in the repository or on the ERP servers.
-  - **Until Almiras buys a Hadi Type web (or app) licence** that covers self-hosting in this application, the UI uses **IBM Plex Sans Arabic** (OFL) in Medium and Light for Arabic and body text, plus Bricolage Grotesque Bold for English headlines and figures.
-  - Generated PDFs (invoices, reports) follow the same rule: they may embed HT Rakik only if the server holds a licensed copy, which the desktop licence does not permit; they use IBM Plex Sans Arabic as well.
-  - To switch: obtain the web licence from Hadi Type, place the licensed WOFF2 files on the server outside git (deployment secret/asset store), and set `--alm-font-ar` to HT Rakik first.
+- **Licensing:** Bricolage Grotesque is under the SIL Open Font License and is self-hosted with the app's static files. **HT Rakik** is licensed from Hadi Type: a Desktop Font License (design work, up to 5 devices) and, from 2026-10-19, a **webfont licence** for Light and Medium (invoice HT2610260140, 20,000 pageviews per weight). The web licence lets the ERP serve the two WOFF2 files to browsers. The licence still forbids distributing, sharing, renaming or modifying the font files, so:
+  - the WOFF2 files live **only on the ERP host** in `deploy/brand-fonts/` (served by the proxy at `/brand-fonts/`), never in git, the Docker image or backups shared outside Almiras; `.gitignore` blocks them;
+  - file names and font data stay exactly as delivered;
+  - **pageview limit:** 20,000 pageviews per weight. Hadi Type's invoice does not say whether this is per month or in total. An internal ERP can pass it quickly (e.g. 50 users × 100 page loads a day ≈ 100,000 a month); fonts are cached by the browser for a year, but the licence counts pageviews, not downloads. Confirm the counting period with Hadi Type and upgrade the tier before go-live if needed;
+  - if the files are absent, the UI falls back to IBM Plex Sans Arabic (OFL).
+  - Generated PDFs (invoices, reports) use IBM Plex Sans Arabic: embedding HT Rakik in server-generated PDFs needs a server/app licence, which the web licence does not cover.
+
+```css
+@font-face { font-family: 'HT Rakik'; font-weight: 300; font-style: normal; font-display: swap;
+  src: url('/brand-fonts/HT%20Rakik%20-%20Light.woff2') format('woff2'); }
+@font-face { font-family: 'HT Rakik'; font-weight: 500; font-style: normal; font-display: swap;
+  src: url('/brand-fonts/HT%20Rakik%20-%20Medium.woff2') format('woff2'); }
+```
 
 ## Layout and shape
 

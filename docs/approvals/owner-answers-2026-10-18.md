@@ -93,3 +93,4 @@ Migration later. The journal export already sent is close to the final one. The 
 | H3 | VAT return box verification: the accountant proposes, the CFO (approver) verifies. |
 | H4 | A correction where the ledger is already right and only the filed return was wrong may be approved by the reviewer with a written reason (no correcting entry). |
 | H5 | HT Rakik web fonts (WOFF2) were supplied, but only with Hadi Type's Desktop Font License, which does not cover web use. The ERP keeps IBM Plex Sans Arabic until Almiras provides the Hadi Type web licence; the files are not committed. |
+| H6 | 2026-10-19: Almiras bought the Hadi Type **webfont** licence for HT Rakik Light and Medium (invoice HT2610260140, 20,000 pageviews each). The ERP uses HT Rakik on its screens, served from host-only files (`deploy/brand-fonts/`), never committed. The pageview counting period is to be confirmed with Hadi Type. Supersedes H5. |

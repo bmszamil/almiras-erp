@@ -4,3 +4,6 @@ secrets/*
 .env
 openbao/rendered/
 *.agekey
+# Licensed brand fonts (HT Rakik web licence) live on the host only, never in git.
+brand-fonts/*
+!brand-fonts/README.md

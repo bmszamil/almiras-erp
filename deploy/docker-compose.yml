@@ -73,6 +73,7 @@ services:
       - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./secrets/tls:/etc/caddy/tls:ro
       - static:/srv/static:ro
+      - ./brand-fonts:/srv/brand-fonts:ro
       - caddy_data:/data
     networks: [edge]
     depends_on:
