@@ -94,3 +94,13 @@ Migration later. The journal export already sent is close to the final one. The 
 | H4 | A correction where the ledger is already right and only the filed return was wrong may be approved by the reviewer with a written reason (no correcting entry). |
 | H5 | HT Rakik web fonts (WOFF2) were supplied, but only with Hadi Type's Desktop Font License, which does not cover web use. The ERP keeps IBM Plex Sans Arabic until Almiras provides the Hadi Type web licence; the files are not committed. |
 | H6 | 2026-10-19: Almiras bought the Hadi Type **webfont** licence for HT Rakik Light and Medium (invoice HT2610260140, 20,000 pageviews each). The ERP uses HT Rakik on its screens, served from host-only files (`deploy/brand-fonts/`), never committed. The pageview counting period is to be confirmed with Hadi Type. Supersedes H5. |
+
+## I. Owner instructions of 2026-10-19 (later)
+
+| # | Decision |
+| --- | --- |
+| I1 | Start the payroll build now. The owner has verified the open items from their side; the team proceeds on its recommendations without further questions. |
+| I2 | SAMA rate after a long holiday (or any day without a published rate): use the **latest published SAMA rate** before that date. |
+| I3 | B2G supplies under VAT Law Art. 20(5): the **payment order date** decides the VAT tax point, so it sets the VAT return period and the SAMA rate date. |
+| I4 | HT Rakik web fonts: permission confirmed to use them in the ERP (webfont licence, H6). |
+| I5 | Network access added for the ZATCA sandbox and uqn.gov.sa (GOSI regulations). |
