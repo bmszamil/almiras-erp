@@ -60,6 +60,7 @@ from .models import (
     HrError,
     HrSequence,
     HrSettings,
+    IbanChangeRequest,
     LeaveAdjustment,
     LeaveLedger,
     LeaveRequest,
@@ -615,11 +616,24 @@ def _iban_ok(iban):
     return int(digits) % 97 == 1
 
 
+# Payroll review item 7: a value that a spreadsheet would read as a formula never enters a salary (WPS) file.
+FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _formula_like(value):
+    text = value or ""
+    return text.startswith(FORMULA_START) or text.lstrip().startswith(FORMULA_START)
+
+
 def _employee_problems(emp, hr_settings):
     problems, warnings = [], []
     if not (emp.full_name_en or "").strip() or not (emp.full_name_ar or "").strip():
         problems.append("Both the English and the Arabic full name are required (R8, OQ-24). / "
                         "الاسم الكامل بالإنجليزية والعربية مطلوبان.")
+    for name in ("full_name_en", "full_name_ar", "bank_name"):
+        if _formula_like(getattr(emp, name)):
+            problems.append(f"{name} may not start with = + - @, a tab or a carriage return (salary files, payroll "
+                            f"review 7). / لا يبدأ {name} بالرموز = + - @ أو مسافة جدولة أو رجوع السطر.")
     jurisdiction = hr_settings.jurisdiction
     basis = emp.employment_basis
     if basis not in Basis.values:
@@ -767,12 +781,109 @@ def update_employee(employee, *, user, **fields):
                     "employee (R49, OQ-27).",
                     "لا يتغير أساس التوظيف بعد اعتماد عقد؛ أنهِ الخدمة وأنشئ سجل موظف جديدًا.", code="basis_fixed")
     before = {name: getattr(emp, name) for name in GOSI_LOGGED}
+    bank_before = {name: getattr(emp, name) or "" for name in ("iban", "bank_name")}
+    if emp.status != Employee.Status.DRAFT and any(
+            name in fields and (fields[name] or "") != bank_before[name] for name in ("iban", "bank_name")):
+        raise error("The IBAN or bank of an active employee changes only through request_iban_change, approved by a "
+                    "second person (payroll review 8).", "يتغير الآيبان أو البنك لموظف نشط فقط بطلب تغيير يعتمده شخص "
+                    "آخر.", code="iban_change_needs_approval")
     for name, value in _employee_values(fields).items():
         setattr(emp, name, value)
     emp.modified_by, emp.modified_at = user, timezone.now()
     _save_employee(emp, _settings(emp.entity))
     _log_gosi_changes(emp, before, user)
+    _log_bank_change(emp, bank_before, user, "iban_changed_draft")
     return emp
+
+
+def _last4(value):
+    return f"****{value[-4:]}" if value else ""
+
+
+def _log_bank_change(emp, before, user, action):
+    """Payroll review 8: IBAN and bank changes are logged with the employee code and the last four characters."""
+    changed = [n for n in ("iban", "bank_name") if (before.get(n) or "") != (getattr(emp, n) or "")]
+    if changed:
+        access_services.log(AccessLog.Event.PROFILE_CHANGED, actor=user, entity=emp.entity,
+                            permission="hr.manage_employee",
+                            details={"action": action, "employee_code": emp.employee_code, "fields": changed,
+                                     "iban_before": _last4(before.get("iban") or ""), "iban_after": _last4(emp.iban or ""),
+                                     "message_en": "Employee bank details changed",
+                                     "message_ar": "تغيّرت البيانات البنكية للموظف"})
+
+
+@transaction.atomic
+def request_iban_change(employee, *, user, iban, reason_ar, bank_name=""):
+    """Payroll review 8: request a new IBAN (and bank) for an active employee (``hr.manage_employee``). It takes effect
+    only when another person approves it (:func:`approve_iban_change`); one pending request per employee. Logged."""
+    emp = _lock(Employee, employee.pk)
+    access.require(user, emp.entity, "hr.manage_employee")
+    iban = "".join((iban or "").split()).upper()
+    problems = []
+    if not _iban_ok(iban):
+        problems.append("The IBAN checksum is wrong. / رقم الآيبان غير صحيح (خانة التحقق).")
+    if _formula_like(bank_name):
+        problems.append("The bank name may not start with = + - @, a tab or a carriage return. / لا يبدأ اسم البنك بهذه "
+                        "الرموز.")
+    if not (reason_ar or "").strip():
+        problems.append("The reason in Arabic is required. / السبب بالعربية مطلوب.")
+    if emp.status == Employee.Status.TERMINATED:
+        problems.append("A terminated employee is read-only (R14). / سجل الموظف المنتهية خدمته للقراءة فقط.")
+    if problems:
+        raise _problems(problems, "iban_change_invalid")
+    if IbanChangeRequest.objects.filter(employee=emp, status=IbanChangeRequest.Status.PENDING).exists():
+        raise error("An IBAN change is already pending for this employee.", "يوجد طلب تغيير آيبان قيد الاعتماد لهذا "
+                    "الموظف.", code="iban_change_pending")
+    req = _save(IbanChangeRequest(entity=emp.entity, employee=emp, new_iban=iban, new_bank_name=bank_name or "",
+                                  reason_ar=reason_ar, created_by=user, source=_source(user)))
+    access_services.log(AccessLog.Event.PROFILE_CHANGED, actor=user, entity=emp.entity, permission="hr.manage_employee",
+                        details={"action": "iban_change_requested", "employee_code": emp.employee_code,
+                                 "request": req.pk, "iban_before": _last4(emp.iban or ""), "iban_after": _last4(iban),
+                                 "message_en": "Employee IBAN change requested",
+                                 "message_ar": "طُلب تغيير آيبان الموظف"})
+    return req
+
+
+@transaction.atomic
+def approve_iban_change(request, *, user):
+    """Payroll review 8: a second person (``hr.manage_employee``; never the requester or the employee) approves the
+    IBAN change, which then replaces the employee's IBAN and bank. Payroll lists a payslip calculated on the old IBAN
+    as a WPS exception. Logged."""
+    req = _lock(IbanChangeRequest, request.pk)
+    access.require(user, req.entity, "hr.manage_employee")
+    emp = _lock(Employee, req.employee_id)
+    if user.pk == req.created_by_id:
+        access.deny(user, req.entity, "hr.manage_employee", "self_approval")
+    _deny_own(user, req.entity, "hr.manage_employee", emp)
+    if req.status != IbanChangeRequest.Status.PENDING:
+        raise error("Only a pending IBAN change is decided.", "يُقرر طلب تغيير الآيبان المعلق فقط.", code="iban_change_status")
+    before = {"iban": emp.iban or "", "bank_name": emp.bank_name or ""}
+    emp.iban = req.new_iban
+    if req.new_bank_name:
+        emp.bank_name = req.new_bank_name
+    emp.modified_by, emp.modified_at = user, timezone.now()
+    _save_employee(emp, _settings(emp.entity))
+    req.status, req.decided_by, req.decided_at = IbanChangeRequest.Status.APPROVED, user, timezone.now()
+    _save(req)
+    _log_bank_change(emp, before, user, "iban_change_approved")
+    return req
+
+
+@transaction.atomic
+def reject_iban_change(request, *, user, reason_ar):
+    req = _lock(IbanChangeRequest, request.pk)
+    access.require(user, req.entity, "hr.manage_employee")
+    if req.status != IbanChangeRequest.Status.PENDING or not (reason_ar or "").strip():
+        raise error("Only a pending IBAN change is rejected, with a reason in Arabic.",
+                    "يُرفض طلب تغيير الآيبان المعلق فقط مع سبب بالعربية.", code="iban_change_status")
+    req.status, req.decided_by, req.decided_at, req.decision_reason_ar = (IbanChangeRequest.Status.REJECTED, user,
+                                                                          timezone.now(), reason_ar)
+    _save(req)
+    access_services.log(AccessLog.Event.PROFILE_CHANGED, actor=user, entity=req.entity, permission="hr.manage_employee",
+                        details={"action": "iban_change_rejected", "employee_code": req.employee.employee_code,
+                                 "request": req.pk, "message_en": "Employee IBAN change rejected",
+                                 "message_ar": "رُفض تغيير آيبان الموظف"})
+    return req
 
 
 def _log_gosi_changes(emp, before, user):

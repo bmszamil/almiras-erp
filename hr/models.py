@@ -541,6 +541,40 @@ class Employee(Tracked):
         return self.employee_code
 
 
+class IbanChangeRequest(Tracked, ServiceGuarded):
+    """Payroll review item 8 (hr R10 note): a change of an active employee's IBAN or salary bank takes effect only
+    when a second person approves it (``hr.manage_employee``, never the requester or the employee). Requests and
+    decisions are logged with the last four characters only."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", bi("Pending approval", "بانتظار الاعتماد")
+        APPROVED = "approved", bi("Approved", "معتمد")
+        REJECTED = "rejected", bi("Rejected", "مرفوض")
+
+    EDITABLE_STATUSES = ("none",)  # every write goes through hr.services
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    employee = models.ForeignKey("Employee", on_delete=models.PROTECT, related_name="iban_changes",
+                                 verbose_name=bi("Employee", "الموظف"))
+    new_iban = EncryptedTextField(bi("New IBAN", "رقم الآيبان الجديد"), plain_max_length=34)
+    new_bank_name = EncryptedTextField(bi("New bank", "البنك الجديد"), plain_max_length=100, blank=True, default="")
+    reason_ar = models.TextField(bi("Reason (Arabic)", "السبب (بالعربية)"))
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.PENDING)
+    decided_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                   related_name="+", verbose_name=bi("Decided by", "قرره"))
+    decided_at = models.DateTimeField(bi("Decided at", "تاريخ القرار"), null=True, blank=True)
+    decision_reason_ar = models.TextField(bi("Decision reason (Arabic)", "سبب القرار (بالعربية)"), blank=True)
+
+    class Meta:
+        verbose_name = bi("IBAN change request", "طلب تغيير الآيبان")
+        verbose_name_plural = bi("IBAN change requests", "طلبات تغيير الآيبان")
+        constraints = [models.UniqueConstraint(fields=["employee"], condition=Q(status="pending"),
+                                               name="hr_one_pending_iban_change")]
+
+    def __str__(self):
+        return f"{self.employee.employee_code} IBAN change ({self.status})"
+
+
 # --- salary components and contracts (3.3, 3.4) --------------------------------------------------
 
 class SalaryComponent(models.Model):
