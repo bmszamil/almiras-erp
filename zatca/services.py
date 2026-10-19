@@ -11,6 +11,7 @@ the ``EInvoice`` (``pending``) -> the queue worker (:func:`process_queue`, ZATCA
 reported / rejected / failed) -> the result is handed to invoicing.
 """
 import base64
+import dataclasses
 import hashlib
 import json
 import logging
@@ -567,8 +568,19 @@ def _auth(credential, master):
     return zatca_client.Auth(token, secret)
 
 
-SAMPLE_BUYER = ubl.Party(name="مشتري عينة الامتثال", vat_number="399999999900003", street="شارع العينة",
+# R-8 sample buyer. Not ZATCA's documented test VAT 399999999900003: the developer portal's production CSID is
+# bound to it, and a seller with that VAT would then sell to itself (BR-CUSTOM-VALIDATION-01; sandbox run
+# 2026-10-19 §4). Made-up VAT numbers of valid form; the second is used when the seller has the first.
+SAMPLE_BUYER = ubl.Party(name="مشتري عينة الامتثال", vat_number="310000000000003", street="شارع العينة",
                          building_no="1111", district="حي العينة", city="الرياض", postal_code="11111", country="SA")
+SAMPLE_BUYER_ALTERNATE_VAT = "320000000000003"
+
+
+def _sample_buyer(seller_vat):
+    """R-8: the sample buyer's VAT never equals the seller's (BR-CUSTOM-VALIDATION-01)."""
+    if SAMPLE_BUYER.vat_number != seller_vat:
+        return SAMPLE_BUYER
+    return dataclasses.replace(SAMPLE_BUYER, vat_number=SAMPLE_BUYER_ALTERNATE_VAT)
 
 
 def _compliance_samples(egs):
@@ -582,6 +594,7 @@ def _compliance_samples(egs):
                        additional_no=entity.additional_no, district=entity.district_ar or entity.district_en,
                        city=entity.city_ar or entity.city_en, postal_code=entity.postal_code, country=entity.country)
     categories = [c for c, on in (("standard", egs.supports_standard), ("simplified", egs.supports_simplified)) if on]
+    sample_buyer = _sample_buyer(entity.vat_number)
     now = _now().replace(microsecond=0) - timedelta(minutes=1)
     samples = []
     for category in categories:
@@ -596,7 +609,7 @@ def _compliance_samples(egs):
             samples.append((f"{category}-{type_code}", ubl.InvoiceData(
                 number=number, uuid=str(_uuid5(f"{egs.pk}-{n}-{now.isoformat()}")), issue=now,
                 type_code=type_code, category=category, subtype_code=ubl.subtype_code(category, {}), currency="SAR",
-                currency_places=2, seller=seller, buyer=SAMPLE_BUYER if category == "standard" else ubl.Party(),
+                currency_places=2, seller=seller, buyer=sample_buyer if category == "standard" else ubl.Party(),
                 lines=[line], groups=[ubl.TaxGroup("S", Decimal("15.00"), Decimal("100.00"), Decimal("15.00"))],
                 total_net=Decimal("100.00"), total_vat=Decimal("15.00"), total_gross=Decimal("115.00"),
                 total_vat_sar=Decimal("15.00"), supply_date=now.date(), payment_means_code="10",
@@ -721,6 +734,39 @@ def run_compliance_checks(egs, *, user):
     return egs
 
 
+def _check_production_key(egs, profile, response):
+    """R-8: the production CSID must be a certificate for the unit's own key (as for renewal, R-10), checked
+    before anything is stored. ZATCA's developer-portal sandbox always answers with one fixed dummy certificate
+    for another key (sandbox run 2026-10-19 §3); storing it would leave an ``active`` unit that can never sign.
+    Refused in en/ar; the unit stays ``compliance_passed`` with its compliance CSID."""
+    token = _token_and_secret(response)[0]
+    try:
+        cert = crypto.load_cert_base64(crypto.cert_base64_from_token(token))
+        issued_public = crypto.spki_der(cert.public_key())
+    except ValueError:
+        issued_public = b""
+    try:
+        unit_public = keystore.get_store().public_key_der(egs.private_key_ref, _master_ref(egs.entity))
+    except SecretStoreUnavailable as exc:
+        raise ZatcaError(exc.en, exc.ar, code="secret_store_unavailable") from None
+    if issued_public == unit_public:
+        return
+    if profile.environment == "sandbox":
+        raise ZatcaError(
+            "ZATCA's developer-portal sandbox issued its fixed test certificate, which is not for this unit's key, "
+            "so it cannot sign. The sandbox supports onboarding and compliance checks only; the unit stays "
+            "'compliance passed' and nothing was stored. A production CSID for this key needs the simulation "
+            "environment (zatca R-8, OQ-36).",
+            "أصدرت بيئة التجربة في بوابة المطورين لدى الهيئة شهادتها التجريبية الثابتة، وهي لا تخص مفتاح هذه الوحدة "
+            "فلا يمكن التوقيع بها. تدعم بيئة التجربة التسجيل وفحوص الامتثال فقط؛ تبقى الوحدة في حالة «اجتازت الامتثال» "
+            "ولم يُحفظ شيء. شهادة الإنتاج لهذا المفتاح تحتاج إلى بيئة المحاكاة.", code="pcsid_key_mismatch")
+    raise ZatcaError(
+        "The production CSID issued by ZATCA is not for this unit's key; nothing was stored and the unit stays "
+        "'compliance passed' (R-8).",
+        "شهادة الإنتاج التي أصدرتها الهيئة لا تخص مفتاح هذه الوحدة؛ لم يُحفظ شيء وتبقى الوحدة في حالة «اجتازت "
+        "الامتثال».", code="pcsid_key_mismatch")
+
+
 def request_production_csid(egs, *, user):
     """R-8 / AT-5, AT-6: only from compliance_passed; compliance_passed -> active with the production CSID."""
     egs = EgsUnit.objects.select_related("entity").get(pk=egs.pk)
@@ -738,6 +784,7 @@ def request_production_csid(egs, *, user):
     if response.status != 200 or not _token_and_secret(response)[0]:
         raise ZatcaError(f"ZATCA did not issue the production CSID (HTTP {response.status}).",
                          f"لم تُصدر الهيئة شهادة الإنتاج (HTTP {response.status}).", code="pcsid_refused")
+    _check_production_key(egs, profile, response)
     with transaction.atomic():
         egs = EgsUnit.objects.select_for_update().select_related("entity").get(pk=egs.pk)
         _egs_transition(egs, EgsStatus.ACTIVE)

@@ -36,6 +36,22 @@ ZATCA_CODES_AR = {
     "BR-CO-14": "إجمالي الضريبة لا يساوي مجموع ضرائب الفئات.",
     "invalid-signature": "التوقيع الرقمي غير صالح.",
     "invalid-invoice-hash": "تجزئة الفاتورة غير صحيحة.",
+    # Codes met in the developer-portal sandbox, 2026-10-19 (docs/compliance/zatca-sandbox-2026-10-19.md §2 to §5).
+    "BR-CUSTOM-VALIDATION-01": "يجب ألا يطابق الرقم الضريبي للبائع (أو لمجموعته الضريبية) الرقمَ الضريبي للمشتري.",
+    "certificate-permissions": "لا يُسمح إلا باستخدام الرقم الضريبي الوارد في شهادة المصادقة.",
+    "certificate-issuer-name": "اسم جهة إصدار الشهادة في التوقيع لا يطابق الشهادة.",
+    "invalid-signing-certificate": "شهادة التوقيع غير صالحة أو ليست شهادة الوحدة المصادق بها.",
+    "signed-properties-hashing": "تجزئة الخصائص الموقعة في التوقيع غير صحيحة.",
+    "invoiceHash_QRCODE_INVALID": "تجزئة الفاتورة في رمز الاستجابة السريعة لا تطابق الفاتورة.",
+    "invoiceTimeStamp_QRCODE_INVALID": "تاريخ ووقت الفاتورة في رمز الاستجابة السريعة لا يطابقان تاريخ ووقت إصدارها.",
+    "timestamp_QRCODE_INVALID": "الطابع الزمني في رمز الاستجابة السريعة غير صالح.",
+    "invoiceTotal_QRCODE_INVALID": "إجمالي الفاتورة في رمز الاستجابة السريعة لا يطابق المبلغ المستحق.",
+    "sellerName_QRCODE_INVALID": "اسم البائع في رمز الاستجابة السريعة لا يطابق الفاتورة.",
+    "INVOICE_SIGNATURE_VALUE_QRCODE_INVALID": "قيمة التوقيع في رمز الاستجابة السريعة لا تطابق توقيع الفاتورة.",
+    "QRCODE_INVALID": "رمز الاستجابة السريعة غير صالح أو ينقصه أحد الوسوم.",
+    "XML-INVOICE-ERROR": "تعذرت قراءة ملف الفاتورة بصيغة XML.",
+    "Missing-OTP": "رمز التحقق مطلوب.",
+    "Incorrect-ComplianceRequestId": "رقم طلب الامتثال غير صحيح؛ يجب أن يتكون من 13 رقمًا.",
 }
 
 
@@ -188,6 +204,11 @@ LOCAL = {
     "tax_point_date": ("A standard document to a government buyer (legal form GOV) needs the tax point date, i.e. the "
                        "payment order date (BT-7, BR-KSA-92; VAT IR Art. 20(5)).",
                        "يحتاج المستند القياسي لجهة حكومية إلى تاريخ نقطة الضريبة، وهو تاريخ أمر الدفع."),
+    # Sandbox run 2026-10-19 §4, §5 I1: ZATCA rejects at clearance; in neither SDK's rules (R-56).
+    "BR-CUSTOM-VALIDATION-01": ("The buyer VAT number (BT-48) is the seller's own VAT number (BT-31); ZATCA rejects "
+                                "such a document (BR-CUSTOM-VALIDATION-01). Correct the buyer.",
+                                "الرقم الضريبي للمشتري هو الرقم الضريبي للبائع نفسه؛ ترفض الهيئة هذا المستند. صحّح "
+                                "بيانات المشتري."),
     "no_egs": ("No active EGS unit of this entity can sign this category of document.",
                "لا توجد وحدة فوترة نشطة لهذا الكيان توقّع هذه الفئة من المستندات."),
 }

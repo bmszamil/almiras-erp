@@ -91,7 +91,7 @@ def build_world(fakes):
     for e in (tst1, tst2):
         ns.customers[e.code] = invoicing_services.create_customer(
             e, user=ns.clerk, code="C001", name_en="Test Buyer LLC", name_ar="شركة المشتري التجريبية",
-            is_vat_registered=True, vat_number="399999999900003", **ADDRESS)
+            is_vat_registered=True, vat_number="344444444400003", **ADDRESS)  # not ZATCA's test VAT
         ns.customers[e.code + "-B2C"] = invoicing_services.create_customer(
             e, user=ns.clerk, code="C002", customer_kind="individual", name_en="Walk-in", name_ar="عميل نقدي")
     return ns

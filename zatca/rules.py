@@ -80,8 +80,8 @@ def _third_decimal(value):
 
 
 def document_problems(data):
-    """Local checks before any ICV is used (R-16, R-19, R-31, R-39, R-40, R-46, R-48, R-51, BT-27,
-    BR-KSA-63/-67, BR-CO-15).
+    """Local checks before any ICV is used (R-16, R-19, R-31, R-39, R-40, R-46, R-48, R-51, R-56, BT-27,
+    BR-KSA-63/-67, BR-CO-15, BR-CUSTOM-VALIDATION-01).
 
     ``data`` is a :class:`zatca.ubl.InvoiceData`.
     """
@@ -112,6 +112,10 @@ def document_problems(data):
             problems.append(local("export_buyer_vat"))
     if b.vat_number and not vat_number_ok(b.vat_number):
         problems.append(local("buyer_vat"))
+    # ZATCA refuses a buyer VAT (BT-48) equal to the seller VAT (BT-31) at clearance; not in either SDK's rules
+    # (sandbox run 2026-10-19 §4, §5 I1). Refused here before any ICV, whatever the category.
+    if (b.vat_number or "").strip() and (b.vat_number or "").strip() == (s.vat_number or "").strip():
+        problems.append(local("BR-CUSTOM-VALIDATION-01"))
     if data.category == "standard":
         if not (b.vat_number or (b.id_scheme and b.id_value)):
             problems.append(local("buyer_missing"))
