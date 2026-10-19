@@ -234,10 +234,10 @@ def test_item4_a_correction_without_a_correcting_entry_blocks_until_one_is_linke
     ret = prepared(t)
     kinds = {e["kind"] for e in services.exceptions(ret, user=t.a2)}
     assert "correction_without_entry" in kinds
-    with pytest.raises(services.TaxError) as exc:  # it is never acknowledged: 2200 would drift when Q1 is paid
+    with pytest.raises(services.TaxError) as exc:  # H4: only "ledger already correct" (tax/test_owner_decisions_h.py)
         services.acknowledge_exception(ret, user=t.a2, kind="correction_without_entry", reference=f"corr:{corr.pk}",
                                        decision="difference_explained", reason_ar="سبب")
-    assert exc.value.code == "no_such_exception"
+    assert exc.value.code == "decision_invalid"
     with pytest.raises(services.TaxError):
         services.complete_review(ret, user=t.a2)
     services.return_to_draft(ret, user=t.a2, reason_ar="ربط قيد التصحيح")

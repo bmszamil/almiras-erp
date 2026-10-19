@@ -1,6 +1,7 @@
 """Owner decisions of 2026-10-19 (`docs/approvals/owner-answers-2026-10-18.md` section H) in the VAT slice:
-H2 (sales booked at the SAMA tax-point rate: the output rate difference is for legacy rows only) and H3 (box
-verification: the accountant proposes, the approver verifies; OQ-46). Anonymised data."""
+H2 (sales booked at the SAMA tax-point rate: the output rate difference is for legacy rows only), H3 (box
+verification: the accountant proposes, the approver verifies; OQ-46) and H4 (a correction without a correcting
+entry accepted by the reviewer with a written bilingual reason; OQ-45). Anonymised data."""
 from datetime import date
 
 import pytest
@@ -130,3 +131,106 @@ def test_h3_proposals_only_at_the_group_parent_and_never_by_an_agent(t):
         services.propose_box_verification(definition, user=agent, entity=t.alm)
     assert VatBoxDefinition.objects.get(pk=definition.pk).proposed_by is None
 
+
+# --- H4: correction without a correcting entry, ledger already correct (OQ-45) ----------------------------------
+
+def _q4_2026_filed(t):
+    from tax.conftest import imported
+
+    return imported(t, date(2026, 10, 1), ref="OLD", filed_on=date(2027, 1, 20))
+
+
+def _correction(t, user=None):
+    return services.record_correction(_q4_2026_filed(t), user=user or t.a1, discovered_on=date(2027, 2, 1),
+                                      description_en="Filed return left out VAT already booked on 2200",
+                                      description_ar="الإقرار المقدم أغفل ضريبة مقيدة في 2200",
+                                      tax_difference_sar="100.00")
+
+
+def _accept(t, ret, corr, user, **reasons):
+    reasons.setdefault("reason_en", "2200 already holds the VAT; only the filed return was wrong")
+    reasons.setdefault("reason_ar", "الحساب 2200 يتضمن الضريبة؛ الخطأ في الإقرار المقدم فقط")
+    return services.acknowledge_exception(ret, user=user, kind="correction_without_entry",
+                                          reference=f"corr:{corr.pk}", decision="ledger_already_correct", **reasons)
+
+
+def test_h4_the_reviewer_accepts_a_correction_without_entry_with_a_bilingual_reason_and_it_is_logged(t):
+    from tax.conftest import close_q1, confirm_tax_points, prepared
+
+    corr = _correction(t)
+    ret = prepared(t)
+    found = {e["kind"]: e for e in services.exceptions(ret, user=t.a2)}
+    assert found["correction_without_entry"]["ack"] is None
+    with pytest.raises(TaxError) as exc:
+        services.complete_review(ret, user=t.a2)
+    assert exc.value.code == "exceptions_open"
+    with pytest.raises(TaxError) as exc:
+        _accept(t, ret, corr, t.a2, reason_en="")
+    assert exc.value.code == "reason_bilingual_required" and "بالإنجليزية والعربية" in " ".join(exc.value.messages)
+    with pytest.raises(TaxError) as exc:  # the Arabic reason is required for every acknowledgement
+        _accept(t, ret, corr, t.a2, reason_ar=" ")
+    assert exc.value.code == "reason_required"
+    ack = _accept(t, ret, corr, t.a2)
+    assert (ack.decision, ack.acknowledged_by, ack.reason_en[:4], ack.reason_ar[:6]) == (
+        "ledger_already_correct", t.a2, "2200", "الحساب")
+    log = AccessLog.objects.get(actor=t.a2, details__action="accept_correction_without_entry")
+    assert log.details["correction"] == corr.pk and log.details["reason_ar"] == ack.reason_ar
+    assert log.details["difference"] == "100.00"
+    confirm_tax_points(t, ret)
+    assert services.complete_review(ret, user=t.a2).status == "reviewed"
+    tie = services.tie_out(ret, user=t.a2)
+    assert (tie["difference_output"], tie["difference_input"]) == (0, 0)
+    close_q1(t)
+    done = services.approve_return(ret, user=t.c1)
+    assert done.status == "approved" and done.boxes.get(box_no=14).vat_sar == D("100.00")
+
+
+def test_h4_the_recorder_of_the_correction_never_accepts_or_reviews_it(t):
+    from tax.conftest import prepared
+
+    corr = _correction(t, user=t.a2)  # recorded by a2; the return is prepared by a1
+    ret = prepared(t)
+    with pytest.raises(access.AccessDenied) as exc:
+        _accept(t, ret, corr, t.a2)
+    assert exc.value.code == "self_approval"
+    _accept(t, ret, corr, t.c1)  # the approver role may review; then it may not approve
+    with pytest.raises(access.AccessDenied) as exc:
+        services.complete_review(ret, user=t.a2)
+    assert exc.value.code == "self_approval"
+
+
+def test_h4_three_people_the_approver_is_neither_the_recorder_nor_the_acceptor(t):
+    from tax.conftest import close_q1, confirm_tax_points, prepared
+
+    c2 = make_user("c2")
+    member(c2, t.alm, "accountant")
+    member(c2, t.alm, "approver")
+    corr = _correction(t, user=c2)  # c2 records the correction; a1 prepares; c1 accepts; a2 completes the review
+    ret = prepared(t)
+    _accept(t, ret, corr, t.c1)
+    confirm_tax_points(t, ret)
+    ret = services.complete_review(ret, user=t.a2)
+    close_q1(t)
+    for user in (c2, t.c1):  # the recorder, then the acceptor
+        with pytest.raises(access.AccessDenied) as exc:
+            services.approve_return(ret, user=user)
+        assert exc.value.code == "self_approval"
+    c3 = make_user("c3")
+    member(c3, t.alm, "approver")
+    assert services.approve_return(ret, user=c3).status == "approved"
+
+
+def test_h4_only_the_ledger_already_correct_decision_and_never_by_an_agent_or_preparer(t):
+    from tax.conftest import prepared
+
+    corr = _correction(t)
+    ret = prepared(t)
+    with pytest.raises(TaxError) as exc:
+        services.acknowledge_exception(ret, user=t.a2, kind="correction_without_entry", reference=f"corr:{corr.pk}",
+                                       decision="not_return_relevant", reason_ar="سبب", reason_en="reason")
+    assert exc.value.code == "decision_invalid"
+    with pytest.raises(access.AccessDenied):
+        _accept(t, ret, corr, t.a1)  # the preparer
+    with pytest.raises(access.AccessDenied):
+        _accept(t, ret, corr, make_agent("vat_reviewer"))
+    assert not ret.exception_acks.exists()

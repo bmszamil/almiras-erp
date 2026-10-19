@@ -588,16 +588,16 @@ class ExceptionKind(models.TextChoices):
     CORRECTING_ENTRY = "correcting_entry", bi("Entry left out as a correcting entry", "قيد استُبعد كقيد تصحيح")
     CORRECTION_MISMATCH = "correction_mismatch", bi("Correcting entries differ from the correction",
                                                     "قيود التصحيح لا تساوي فرق التصحيح")
-    CORRECTION_WITHOUT_ENTRY = "correction_without_entry", bi("Correction without a correcting entry (blocking)",
-                                                              "تصحيح دون قيد تصحيح (مانع)")
+    # Owner decision H4 (OQ-45): accepted only as "ledger already correct", with a bilingual reason, by the reviewer.
+    CORRECTION_WITHOUT_ENTRY = "correction_without_entry", bi("Correction without a correcting entry",
+                                                              "تصحيح دون قيد تصحيح")
     CARRY_FORWARD_GAP = "carry_forward_gap", bi("Earlier period without an approved return (blocking)",
                                                 "فترة سابقة بلا إقرار معتمد (مانع)")
     UNPAID_BILL_12_MONTHS = "unpaid_bill_12_months", bi("Input VAT on a bill unpaid after 12 months",
                                                         "ضريبة مدخلات على فاتورة لم تُسدد بعد 12 شهرًا")
 
 
-BLOCKING_EXCEPTIONS = frozenset({ExceptionKind.TIE_OUT_DIFFERENCE, ExceptionKind.CORRECTION_WITHOUT_ENTRY,
-                                 ExceptionKind.CARRY_FORWARD_GAP})
+BLOCKING_EXCEPTIONS = frozenset({ExceptionKind.TIE_OUT_DIFFERENCE, ExceptionKind.CARRY_FORWARD_GAP})
 
 
 class VatExceptionAck(ReturnChild):
@@ -611,6 +611,9 @@ class VatExceptionAck(ReturnChild):
                                                         "تأكدت الفترة من تاريخ استحقاق الضريبة")
         CONFIRMED_CORRECTION = "confirmed_correction", bi("Confirmed as a correcting entry", "تأكد أنه قيد تصحيح")
         DIFFERENCE_EXPLAINED = "difference_explained", bi("Difference explained", "تم تفسير الفرق")
+        # H4: the ledger (2200 / 1310) already holds the right VAT; only the filed return was wrong.
+        LEDGER_ALREADY_CORRECT = "ledger_already_correct", bi("Ledger already correct; only the filed return was wrong",
+                                                              "الدفاتر صحيحة؛ الخطأ في الإقرار المقدَّم فقط")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     vat_return = models.ForeignKey(VatReturn, on_delete=models.PROTECT, related_name="exception_acks",

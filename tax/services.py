@@ -1033,15 +1033,18 @@ def _correction_net(corr):
 
 def _correction_flags(ret, acks):
     """Review item 4: every correction in box 14 has correcting entries whose net 2200 - 1310 effect equals its
-    tax difference; else the reviewer decides (mismatch) or the return cannot proceed (no entry: 2200 would
-    drift when the return is paid)."""
+    tax difference; else the reviewer decides (mismatch). A correction without any correcting entry is open until
+    the reviewer records that the ledger already holds the right VAT and only the filed return was wrong, with a
+    written reason in English and Arabic (owner decision H4, OQ-45; ``ledger_already_correct``)."""
     found = []
     for corr in ret.assigned_corrections.exclude(status=VatCorrection.Status.CANCELLED).order_by("pk"):
         ref = f"corr:{corr.pk}"
         net = _correction_net(corr)
         if net is None:
             found.append({"kind": ExceptionKind.CORRECTION_WITHOUT_ENTRY, "reference": ref, "correction": corr.pk,
-                          "number": f"COR-{corr.pk}", "difference": corr.tax_difference_sar, "ack": None})
+                          "number": f"COR-{corr.pk}", "difference": corr.tax_difference_sar,
+                          "recorded_by": corr.created_by_id,
+                          "ack": acks.get((ExceptionKind.CORRECTION_WITHOUT_ENTRY, ref))})
         elif net != corr.tax_difference_sar:
             found.append({"kind": ExceptionKind.CORRECTION_MISMATCH, "reference": ref, "correction": corr.pk,
                           "number": f"COR-{corr.pk}", "difference": corr.tax_difference_sar - net, "entries_net": net,
@@ -1182,6 +1185,7 @@ ALLOWED_DECISIONS = {
                                              VatExceptionAck.Decision.INCLUDED_BY_ADJUSTMENT},
     ExceptionKind.CORRECTING_ENTRY: {VatExceptionAck.Decision.CONFIRMED_CORRECTION},
     ExceptionKind.CORRECTION_MISMATCH: {VatExceptionAck.Decision.DIFFERENCE_EXPLAINED},
+    ExceptionKind.CORRECTION_WITHOUT_ENTRY: {VatExceptionAck.Decision.LEDGER_ALREADY_CORRECT},  # H4
     ExceptionKind.UNPAID_BILL_12_MONTHS: {VatExceptionAck.Decision.NOT_RETURN_RELEVANT,
                                           VatExceptionAck.Decision.INCLUDED_BY_ADJUSTMENT},
 }
@@ -1190,8 +1194,10 @@ OUTPUT_KINDS = {ExceptionKind.REJECTED_DOCUMENT, ExceptionKind.TAX_POINT_FALLBAC
 
 def acknowledge_exception(vat_return, *, user, kind, reference, decision, reason_ar, reason_en=""):
     """The reviewer's decision on an exception (R15, R16), while the return is in review; not by a preparer.
-    Blocking kinds (tie-out difference, correction without entry, earlier period without a return) are fixed at
-    their source, never acknowledged."""
+    Blocking kinds (tie-out difference, earlier period without a return) are fixed at their source, never
+    acknowledged. A correction without a correcting entry (owner decision H4) is accepted only as
+    ``ledger_already_correct``, with the reason in English **and** Arabic, by a reviewer who did not record the
+    correction; logged."""
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     access.require(user, ret.entity, "tax.review_return")
     _human(user, ret.entity, "tax.review_return")
@@ -1207,13 +1213,15 @@ def acknowledge_exception(vat_return, *, user, kind, reference, decision, reason
         found = {(e["kind"], e["reference"]): e for e in _exceptions(ret)[0]}
         item = found.get((kind, reference))
         if item is None or kind in BLOCKING_EXCEPTIONS:
-            raise error("No open exception with this reference; a tie-out difference, a correction without a "
-                        "correcting entry or a missing earlier return is fixed at its source, never acknowledged.",
-                        "لا يوجد استثناء مفتوح بهذا المرجع؛ يُعالَج فرق المطابقة أو التصحيح بلا قيد أو الإقرار السابق "
-                        "المفقود من مصدره ولا يُقَرّ.", code="no_such_exception")
+            raise error("No open exception with this reference; a tie-out difference or a missing earlier return is "
+                        "fixed at its source, never acknowledged.",
+                        "لا يوجد استثناء مفتوح بهذا المرجع؛ يُعالَج فرق المطابقة أو الإقرار السابق المفقود من مصدره "
+                        "ولا يُقَرّ.", code="no_such_exception")
         if decision not in ALLOWED_DECISIONS.get(kind, set()):
             raise error("This decision does not apply to this exception.", "هذا القرار لا ينطبق على هذا الاستثناء.",
                         code="decision_invalid")
+        if kind == ExceptionKind.CORRECTION_WITHOUT_ENTRY:
+            _check_ledger_already_correct(ret, user, item, reason_en, reason_ar)
         if decision == VatExceptionAck.Decision.INCLUDED_BY_ADJUSTMENT:
             adjustments = ret.manual_adjustments.all()
             if kind == ExceptionKind.UNTAGGED_VAT_JOURNAL:
@@ -1234,7 +1242,36 @@ def acknowledge_exception(vat_return, *, user, kind, reference, decision, reason
                               acknowledged_at=_now())
         ack._service_write = True
         ack.save()
+        if kind == ExceptionKind.CORRECTION_WITHOUT_ENTRY:  # H4: logged with the written reason
+            access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=ret.entity,
+                                permission="tax.review_return",
+                                details={"action": "accept_correction_without_entry", "return": ret.pk,
+                                         "correction": item["correction"], "difference": str(item["difference"]),
+                                         "reason_en": ack.reason_en, "reason_ar": ack.reason_ar})
         return ack
+
+
+def _check_ledger_already_correct(ret, user, item, reason_en, reason_ar):
+    """H4 (OQ-45): the reviewer accepts a correction without a correcting entry only with a written reason in both
+    languages, and never for a correction they recorded themselves (three people: recorder / preparer, reviewer,
+    approver)."""
+    if not ((reason_en or "").strip() and (reason_ar or "").strip()):
+        raise error("Accepting a correction without a correcting entry needs the written reason in English and Arabic "
+                    "(why 2200 / 1310 already hold the right VAT).",
+                    "قبول تصحيح دون قيد تصحيح يحتاج إلى السبب مكتوبًا بالإنجليزية والعربية (لماذا يتضمن الحسابان "
+                    "2200 / 1310 الضريبة الصحيحة).", code="reason_bilingual_required")
+    if item["recorded_by"] == user.pk:
+        access.deny(user, ret.entity, "tax.review_return", "self_approval")
+
+
+def _ledger_correct_people(ret):
+    """H4: (recorders, acceptors) of the corrections of ``ret`` accepted as ``ledger_already_correct``."""
+    refs = list(ret.exception_acks.filter(kind=ExceptionKind.CORRECTION_WITHOUT_ENTRY,
+                                          decision=VatExceptionAck.Decision.LEDGER_ALREADY_CORRECT)
+                .values_list("reference", "acknowledged_by_id"))
+    ids = [int(ref.split(":", 1)[1]) for ref, _ in refs]
+    recorders = set(VatCorrection.objects.filter(pk__in=ids).values_list("created_by_id", flat=True))
+    return recorders, {who for _, who in refs}
 
 
 # --- lifecycle (R7 to R10) ------------------------------------------------------------------------------
@@ -1316,7 +1353,7 @@ def complete_review(vat_return, *, user):
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     access.require(user, ret.entity, "tax.review_return")
     _human(user, ret.entity, "tax.review_return")
-    if user.pk in _preparers(ret):
+    if user.pk in _preparers(ret) or user.pk in _ledger_correct_people(ret)[0]:  # H4: not a correction's recorder
         access.deny(user, ret.entity, "tax.review_return", "self_approval")
     if ret.status != ReturnStatus.IN_REVIEW:
         raise error("Only a return in review is reviewed.", "تُراجَع الإقرارات قيد المراجعة فقط.", code="not_in_review")
@@ -1433,7 +1470,8 @@ def approve_return(vat_return, *, user):
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     grant = access.require(user, ret.entity, "tax.approve_return", document=ret)
     _human(user, ret.entity, "tax.approve_return")
-    if ret.reviewed_by_id == user.pk or user.pk in _preparers(ret):
+    recorders, acceptors = _ledger_correct_people(ret)
+    if ret.reviewed_by_id == user.pk or user.pk in _preparers(ret) or user.pk in recorders | acceptors:  # R8, H4
         access.deny(user, ret.entity, "tax.approve_return", "self_approval")
     if ret.status != ReturnStatus.REVIEWED:
         raise error("Only a reviewed return is approved.", "يُعتمد الإقرار بعد مراجعته فقط.", code="not_reviewed")
