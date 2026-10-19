@@ -92,6 +92,9 @@ WHT_PAYABLE = "2220"
 FX_GAIN = "4700"
 FX_LOSS = "5750"
 
+# Review 16: hr refusals of calculate_eosb that leave the run going with a warning (no contract on the day, no EOSB
+# for the basis); any other refusal stops the calculation.
+EOSB_SKIPPABLE = frozenset({"no_terms", "remuneration_no_eosb"})
 MATERNITY_BIRTHS_FROM = date(2025, 7, 1)  # R61: GOSI maternity compensation for births from July 2025 (default gate)
 GCC = hr.GCC
 INTEREST_WORDS = ("interest", "fee", "profit", "penalty", "late_fee", "rate", "charge")
@@ -142,6 +145,13 @@ def _save(obj, **kwargs):
 
 def _lock(model, pk):
     return model._base_manager.select_for_update(of=("self",)).get(pk=pk)
+
+
+def _entity_lock(entity):
+    """Review 1: serialise the payroll postings of one entity (run approval and reversal, payments, final
+    settlements). Taken first, before the document rows, in every such service, so two of them never decide on the
+    same open amount at once. On SQLite the database serialises writers anyway."""
+    return PayrollSettings._base_manager.select_for_update().filter(entity=entity).first()
 
 
 def _human(user, entity, permission):
@@ -226,6 +236,9 @@ SETTINGS_FIELDS = frozenset({
 })
 
 
+BANK_SETTINGS = ("salary_bank", "salary_bank_account", "wps_format", "wps_bank_code", "employer_bank_iban")
+
+
 def _account(entity, code):
     acc = Account.objects.filter(entity=entity, code=code).first()
     if acc is None:
@@ -266,6 +279,7 @@ def configure_settings(entity, *, user, **fields):
     s = PayrollSettings._base_manager.select_for_update().filter(entity=entity).first() or setup_entity(entity)
     before = {k: getattr(s, k) for k in ("gosi_oh_rate_override", "gosi_oh_override_ref", "gosi_oh_override_from",
                                          "gosi_oh_override_to")}
+    bank_before = {k: getattr(s, k) for k in BANK_SETTINGS}
     for name, value in fields.items():
         if name == "salary_bank_account" and not isinstance(value, Account):
             value = _account(entity, value)
@@ -311,6 +325,20 @@ def configure_settings(entity, *, user, **fields):
                                      "after": {k: str(v) for k, v in after.items()},
                                      "message_en": "GOSI occupational hazards rate override changed",
                                      "message_ar": "تغيّر تعديل نسبة الأخطار المهنية"})
+    bank_after = {k: getattr(s, k) for k in BANK_SETTINGS}
+    changed = sorted(k for k in BANK_SETTINGS if bank_before[k] != bank_after[k])
+    if changed:  # review 17: the employer's bank details are logged, masked (never the full IBAN)
+        def shown(name, value):
+            if name in ("employer_bank_iban", "wps_bank_code"):
+                return _mask_iban(value or "")
+            return str(getattr(value, "code", value) or "")
+        access_services.log(AccessLog.Event.PROFILE_CHANGED, actor=user, entity=entity,
+                            permission="payroll.manage_settings",
+                            details={"action": "payroll_bank_settings", "fields": changed,
+                                     "before": {k: shown(k, bank_before[k]) for k in changed},
+                                     "after": {k: shown(k, bank_after[k]) for k in changed},
+                                     "message_en": "Payroll bank settings changed",
+                                     "message_ar": "تغيّرت إعدادات بنك الرواتب"})
     return s
 
 
@@ -806,6 +834,7 @@ class Ctx:
         self.use = hr.ParamUse()
         self._accounts = {}
         self.warnings = []
+        self.skipped_local = 0
 
     def account(self, code):
         if code not in self._accounts:
@@ -1389,10 +1418,12 @@ def _eosb(ctx, slip, emp, info):
     as_of = info.last
     try:
         result = hr.calculate_eosb(emp, as_of, Termination.Kind.EMPLOYER_TERMINATION, user=ctx.user)
-    except PayrollError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - hr refusals become warnings; the run is not blocked
-        slip.warn(f"EOSB provision not computed: {exc}", f"لم يُحتسب مخصص نهاية الخدمة: {exc}")
+    except hr.HrError as exc:
+        # Review 16: only the refusals that mean "no provision for this person" become a warning; a missing or
+        # unverified parameter, a permission refusal or a bug stops the calculation.
+        if getattr(exc, "code", None) not in EOSB_SKIPPABLE:
+            raise
+        slip.warn(f"EOSB provision not computed: {exc.text('en')}", f"لم يُحتسب مخصص نهاية الخدمة: {exc.text('ar')}")
         return
     balance = EosbProvisionEntry.objects.filter(employee=emp).aggregate(t=Sum("amount"))["t"] or ZERO
     amount = result.full_award - balance
@@ -1648,7 +1679,9 @@ def _calculate(ctx):
                                 f"معتمد بآخر يوم عمل {term.last_working_day}: يُدفع عبر المخالصة النهائية لا المسير")
             continue
         if emp.employment_basis == Basis.LOCAL_ENTITY_EMPLOYEE:
-            continue  # refused at the jurisdiction gate; never computed with Saudi parameters (R41)
+            # Never computed with Saudi parameters (R41); review 17: the skip is visible on the run.
+            ctx.skipped_local += 1
+            continue
         calc = _calc_remuneration if emp.employment_basis == Basis.REMUNERATION else _calc_ksa
         slip = calc(ctx, emp, versions, info)
         bad = sorted({l.account.code for l in slip.lines if l.account.sharia_prohibited})
@@ -1662,6 +1695,10 @@ def _calculate(ctx):
         if diff:
             ctx.warnings.append(f"Account 2500 differs from the EOSB sub-ledger by {diff} (R25) / يختلف الحساب 2500 عن "
                                 f"سجل مخصص نهاية الخدمة بمقدار {diff}")
+    if ctx.skipped_local:
+        ctx.warnings.append(f"{ctx.skipped_local} local entity employee(s) left out: their local payroll is not built "
+                            f"(R41, OQ-28) / استُبعد {ctx.skipped_local} من موظفي الشركات المحلية: رواتبهم المحلية غير "
+                            "مبنية")
     return slips
 
 
@@ -1778,7 +1815,8 @@ def submit_run(run, *, user):
 def return_run(run, *, user, reason_ar):
     """R7: the approver returns a submitted run for recalculation (``payroll.approve_run``)."""
     run = _lock(PayrollRun, run.pk)
-    _require(user, run.entity, "payroll.approve_run", document=run)
+    grant = _require(user, run.entity, "payroll.approve_run", document=run)
+    approvals.check(grant, run.entity, "payroll.run")  # review 17: the same matrix row as approval
     if run.status != RS.SUBMITTED or not (reason_ar or "").strip():
         raise error("Only a submitted run is returned, with a reason in Arabic.",
                     "يُعاد المسير المقدم فقط مع سبب بالعربية.", code="run_status")
@@ -2000,11 +2038,35 @@ def _reversal_date(entity, original, requested):
     return later.start_date
 
 
+def _installments_of(run):
+    out = []
+    for model in (LoanInstallment, DeferredSaleInstallment):
+        out.extend(model._base_manager.select_for_update().filter(run=run).order_by("pk"))
+    return out
+
+
+def _carry_chain(inst):
+    """Every remainder carried from ``inst`` (R18), followed down the chain."""
+    model = type(inst)
+    out, todo = [], [inst]
+    while todo:
+        cur = todo.pop()
+        for carry in model._base_manager.select_for_update().filter(carried_from=cur).order_by("pk"):
+            out.append(carry)
+            todo.append(carry)
+    return out
+
+
 @transaction.atomic
-def reverse_run(run, *, user, reason, date=None):
+def reverse_run(run, *, user, reason, date=None, acknowledge_wps=False, wps_reason=""):
     """R13 (E6): ``payroll.reverse_run`` by an approver who did not prepare the run, only while no payment of the run
-    is approved; the reversal is dated in an open period; installments go back to planned (carried remainders are
-    superseded), EOSB sub-ledger rows are mirrored. A reversed run is never re-approved."""
+    (and no GOSI payment covering it) is approved; the reversal is dated in an open period; installments go back to
+    planned (planned remainders are superseded), EOSB sub-ledger rows are mirrored, the inputs it took are free for a
+    later run. A reversed run is never re-approved.
+
+    Refused (review 5) while a later run has deducted a remainder carried from one of its installments: reverse that
+    run first. Refused (review 12) once a WPS file exists for the run, unless ``acknowledge_wps`` with a written
+    ``wps_reason`` (the bank may already have paid it); the acknowledgement is logged."""
     run = PayrollRun.objects.select_related("entity", "journal_entry").get(pk=run.pk)
     grant = _require(user, run.entity, "payroll.reverse_run", document=run)
     approvals.check(grant, run.entity, "payroll.reversal")
@@ -2012,6 +2074,7 @@ def reverse_run(run, *, user, reason, date=None):
         access.deny(user, run.entity, "payroll.reverse_run", "self_approval")
     if not (reason or "").strip():
         raise error("A reason is required.", "السبب مطلوب.", code="reason_required")
+    _entity_lock(run.entity)
     run = _lock(PayrollRun, run.pk)
     if run.status != RS.APPROVED or run.journal_entry_id is None:
         raise error("Only an approved, unpaid run is reversed (R13).", "يُعكس المسير المعتمد غير المدفوع فقط.",
@@ -2019,33 +2082,70 @@ def reverse_run(run, *, user, reason, date=None):
     if PayrollPayment.objects.filter(run=run, status=PayrollPayment.Status.APPROVED).exists():
         raise error("A payment of this run is approved: correct it in a later run instead (R13).",
                     "اعتُمدت دفعة لهذا المسير: صحّحه في مسير لاحق.", code="run_paid")
+    gosi_paid = PayrollPayment.objects.filter(entity=run.entity, kind=PayrollPayment.Kind.GOSI, gosi_period=run.period,
+                                              status=PayrollPayment.Status.APPROVED).aggregate(t=Sum("amount"))["t"] or ZERO
+    if gosi_paid and gosi_paid > _gosi_booked(run.entity, run.period, exclude_run=run):
+        raise error(f"GOSI payments of {run.period} ({gosi_paid}) cover this run's contributions: correct it in a later "
+                    "run instead (R13).", f"مدفوعات التأمينات لفترة {run.period} ({gosi_paid}) تغطي اشتراكات هذا "
+                    "المسير: صحّحه في مسير لاحق.", code="run_gosi_paid")
+    if WpsFile.objects.filter(run=run).exists():
+        if not (acknowledge_wps and (wps_reason or "").strip()):
+            raise error("A salary (WPS) file was generated for this run and may have been paid by the bank: confirm "
+                        "with acknowledge_wps and a written reason (review 12).",
+                        "أُنشئ ملف رواتب (حماية الأجور) لهذا المسير وقد يكون البنك صرفه: أكّد ذلك مع ذكر السبب كتابةً.",
+                        code="wps_file_exists")
+        access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=run.entity,
+                            permission="payroll.reverse_run",
+                            details={"action": "reverse_run_after_wps_file", "run": run.pk,
+                                     "wps_files": list(WpsFile.objects.filter(run=run).values_list("pk", flat=True)),
+                                     "reason": wps_reason.strip()[:500],
+                                     "message_en": "Run reversed after its salary file was generated",
+                                     "message_ar": "عُكس المسير بعد إنشاء ملف الرواتب"})
+    installments = _installments_of(run)
+    for inst in installments:
+        parent = inst.loan if isinstance(inst, LoanInstallment) else inst.contract
+        rescheduled = isinstance(inst, LoanInstallment) and inst.schedule_version != parent.schedule_version
+        for carry in [inst] + _carry_chain(inst):
+            if (carry is not inst and carry.status != "planned") or rescheduled:
+                raise error(f"A remainder of an installment of this run ({carry.period}) was deducted by a later run or "
+                            "the loan was rescheduled since: reverse the later run first, or correct in a later run "
+                            "(R13, R18; review 5).",
+                            f"استُقطع باقي قسط من هذا المسير ({carry.period}) في مسير لاحق أو أُعيدت جدولة القرض بعده: "
+                            "اعكس المسير اللاحق أولًا أو صحّح في مسير لاحق.", code="carry_deducted")
     on = _reversal_date(run.entity, run.entry_date, date)
     try:
         with _marker(_reversing, run):
             reversal = ledger.reverse_entry(run.journal_entry, grant, date=on, reason=reason.strip())
     except LedgerError as exc:
         raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "reversal_refused") from None
-    for model in (LoanInstallment, DeferredSaleInstallment):
-        for inst in model._base_manager.select_for_update().filter(run=run):
-            inst.status, inst.deducted_amount, inst.run = model.Status.PLANNED, ZERO, None
-            _save(inst)
-            for carry in model._base_manager.filter(carried_from=inst):
-                if model is LoanInstallment:
-                    carry.status = LoanInstallment.Status.SUPERSEDED
-                    _save(carry)
-                else:
-                    carry._service_delete = True
-                    carry.delete()
+    run.status, run.reversal_entry, run.reversed_by, run.reversed_at = RS.REVERSED, reversal, user, _now()
+    _save(run)
+    # The run is reversed before its installments are freed: the PostgreSQL trigger lets a deducted installment go
+    # back to planned only when its run is reversed (review 5).
+    for inst in installments:
+        model = type(inst)
+        for carry in _carry_chain(inst):
+            if model is LoanInstallment:
+                carry.status = LoanInstallment.Status.SUPERSEDED
+                _save(carry)
+            else:
+                carry._service_delete = True
+                carry.delete()
+        inst.status, inst.deducted_amount, inst.run = model.Status.PLANNED, ZERO, None
+        _save(inst)
     for row in EosbProvisionEntry.objects.filter(run=run, kind=EosbProvisionEntry.Kind.ACCRUAL):
         _save(EosbProvisionEntry(entity=run.entity, employee=row.employee, date=on, kind=EosbProvisionEntry.Kind.REVERSAL,
                                  amount=-row.amount, run=run))
+    _release_inputs(run)
     for loan in EmployeeLoan.objects.filter(entity=run.entity, status=EmployeeLoan.Status.SETTLED):
         if _loan_outstanding_of(loan) > 0:
             loan.status = EmployeeLoan.Status.ACTIVE
             _save(loan)
-    run.status, run.reversal_entry, run.reversed_by, run.reversed_at = RS.REVERSED, reversal, user, _now()
-    _save(run)
     return run
+
+
+def _release_inputs(run):
+    """Inputs taken by a reversed run are free for a later run (review 9)."""
 
 
 # =====================================================================================================
@@ -2133,6 +2233,9 @@ def approve_loan(loan, *, user):
     loan = EmployeeLoan.objects.select_related("entity", "employee").get(pk=loan.pk)
     grant = _require(user, loan.entity, "payroll.approve_loan", document=loan)
     approvals.check(grant, loan.entity, "payroll.loan")
+    # Review 17: the employee row is locked first, so two loans of the same person approved at once cannot both
+    # pass the 3 x BASIC cap on the same outstanding balance.
+    Employee._base_manager.select_for_update().filter(pk=loan.employee_id).first()
     loan = _lock(EmployeeLoan, loan.pk)
     if loan.status != EmployeeLoan.Status.SUBMITTED:
         raise error("Only a submitted loan is approved.", "يُعتمد القرض المقدم فقط.", code="loan_status")
@@ -2304,6 +2407,15 @@ def _run_payable(run, currency):
     return total, paid
 
 
+def _gosi_booked(entity, period, exclude_run=None):
+    qs = PayslipLine.objects.filter(entity=entity, payslip__run__period=period, payslip__refused=False,
+                                    payslip__run__status__in=(RS.APPROVED, RS.PAID),
+                                    line_type__in=(LT.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI, LT.GOSI_CATCH_UP))
+    if exclude_run is not None:
+        qs = qs.exclude(payslip__run=exclude_run)
+    return qs.aggregate(t=Sum("amount"))["t"] or ZERO
+
+
 def _gosi_open(entity, period):
     total = PayslipLine.objects.filter(entity=entity, payslip__run__period=period, payslip__refused=False,
                                        payslip__run__status__in=(RS.APPROVED, RS.PAID),
@@ -2314,23 +2426,37 @@ def _gosi_open(entity, period):
     return total - paid
 
 
+def _bank_account(entity, account):
+    """Review 17: a payment leaves from a postable asset account of the paying entity."""
+    if account.entity_id != entity.pk or account.type != "asset" or not account.is_postable:
+        raise error("The bank account is a postable asset account of the entity (R30).",
+                    "الحساب البنكي حساب أصول قابل للترحيل من حسابات الكيان.", code="bank_account_invalid")
+    return account
+
+
 @transaction.atomic
 def record_payment(entity, *, user, kind, payment_date, amount, run=None, gosi_period="", bank_account=None,
                    currency=None, wht_category=None, bank_reference=""):
     """R29: the payroll officer records a payment after the bank release (``payroll.record_payment``). Net salaries
     of a run (per currency) or the GOSI contributions of a period. Remuneration staff in a foreign currency: WHT is
-    considered on every payment (R43): a WHT category is required (rate from invoicing's global table)."""
+    considered on every payment (R43): a WHT category is required (rate from invoicing's global table). The entity's
+    payroll lock and the run row are taken before the open amount is read (review 1)."""
     _require(user, entity, "payroll.record_payment")
     amount = _dec(amount, "amount")
     s = _settings_of(entity)
+    _entity_lock(entity)
     if kind == PayrollPayment.Kind.NET_SALARIES:
         if run is None or run.entity_id != entity.pk:
             raise error("A salary payment names a run of the entity (R30).", "تحدد دفعة الرواتب مسيرًا للكيان.",
                         code="payment_run")
+        run = _lock(PayrollRun, run.pk)
         currency = currency or entity.base_currency_id
-    else:
+    elif kind == PayrollPayment.Kind.GOSI:
         _check_period(gosi_period)
         currency = entity.base_currency_id
+        run = None
+    else:
+        raise error("Unknown payment kind.", "نوع دفعة غير معروف.", code="payment_kind")
     cur = Currency.objects.get(code=getattr(currency, "code", currency))
     if amount <= 0 or not fx.has_places(amount, cur.minor_units):
         raise error(f"The amount is above zero with at most {cur.minor_units} decimals for {cur.code} (R5).",
@@ -2342,18 +2468,20 @@ def record_payment(entity, *, user, kind, payment_date, amount, run=None, gosi_p
                     "تحتاج دفعات المكافآت إلى فئة ضريبة الاستقطاع.", code="wht_category_required")
     acc = bank_account if isinstance(bank_account, Account) else _account(entity, bank_account) if bank_account \
         else s.salary_bank_account
+    _bank_account(entity, acc)
     payment = PayrollPayment(entity=entity, kind=kind, run=run, gosi_period=gosi_period, payment_date=payment_date,
                              bank_account=acc, currency=cur, amount=amount, wht_category=wht_category,
                              bank_reference=bank_reference, created_by=user)
-    _payment_room(payment)
+    _payment_room(payment, run)
     return _save(payment)
 
 
-def _payment_room(p):
+def _payment_room(p, run):
+    """R29: a payment never exceeds what is open. ``run`` is the locked run row (review 1)."""
     if p.kind == PayrollPayment.Kind.NET_SALARIES:
-        if p.run.status not in (RS.APPROVED, RS.PAID):
+        if run.status not in (RS.APPROVED, RS.PAID):
             raise error("Only an approved run is paid.", "يُدفع المسير المعتمد فقط.", code="run_status")
-        total, paid = _run_payable(p.run, p.currency_id)
+        total, paid = _run_payable(run, p.currency_id)
         if p.amount > total - paid:
             raise error(f"The payment exceeds the open net pay {total - paid} of the run (R29).",
                         f"الدفعة تتجاوز صافي الرواتب المتبقي {total - paid} للمسير.", code="overpayment")
@@ -2379,10 +2507,16 @@ def approve_payment(payment, *, user):
     p = PayrollPayment.objects.select_related("entity", "run").get(pk=payment.pk)
     grant = _require(user, p.entity, "payroll.approve_payment", document=p)
     approvals.check(grant, p.entity, "payroll.payment")
+    # Review 1: entity lock, then the run row, then the payment; the open amount is read under the locks, so two
+    # approvals (or an approval and a run reversal) never both see the same open amount.
+    _entity_lock(p.entity)
+    run = _lock(PayrollRun, p.run_id) if p.run_id else None
     p = _lock(PayrollPayment, p.pk)
     if p.status != PayrollPayment.Status.SUBMITTED:
         raise error("Only a submitted payment is approved.", "تُعتمد الدفعة المقدمة فقط.", code="payment_status")
-    _payment_room(p)
+    if run is not None:
+        p.run = run
+    _payment_room(p, run)
     if p.wht_category_id:
         rate = p.wht_category.rate
         p.wht_amount = _round_to(Fraction(p.amount) * Fraction(rate) / 100, p.currency.minor_units)
@@ -2401,8 +2535,7 @@ def approve_payment(payment, *, user):
         raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
     p.journal_entry = entry
     _save(p)
-    if p.run is not None:
-        run = _lock(PayrollRun, p.run_id)
+    if run is not None:
         currencies = set(Payslip.objects.filter(run=run, refused=False).values_list("currency_id", flat=True))
         if all(_run_payable(run, c)[0] <= _run_payable(run, c)[1] for c in currencies) and run.status == RS.APPROVED:
             run.status = RS.PAID
