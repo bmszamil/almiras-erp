@@ -329,17 +329,31 @@ def _vat_sar_rate(entity, currency_code, tax_point, user):
     return found.rate, found.row
 
 
+SAMA_TAX_POINT = "sama_tp"  # SalesDocument.fx_rate_source: booked at the SAMA tax-point row beyond the age limit
+
+
 def _booking_rate(entity, doc, sama_row, user):
-    """(rate, rate date, source, row) the document books at (R77, OQ-65 default as amended by G7): in a
-    SAR-functional entity the SAMA tax-point row when the ledger accepts it as a pinned rate on the issue date
-    (``ledger._pinned_rate``: not older than ``FX_MAX_RATE_AGE_DAYS``), so 2200 equals ``total_vat_sar``; else the
-    ledger rate on the issue date (R12), the VAT return then explains the difference (tax-returns §10.5)."""
+    """(rate, rate date, source, row) the document books at (R77; R100(d) as amended by owner decision H2, OQ-65):
+    in a SAR-functional entity a foreign-currency document books **all** its lines at its SAMA tax-point row, so 2200
+    equals ``total_vat_sar``. A row the ledger accepts as a pinned rate on the issue date (``ledger._pinned_rate``,
+    not older than ``FX_MAX_RATE_AGE_DAYS``) books as a table rate; an older one (tax point well before the issue
+    date, or a long holiday) books as ``sama_tp``, which the ledger checks against the document's tax point
+    (ledger-fx R51, ``_sama_tax_point``). Other functional currencies: the ledger rate on the issue date (R12)."""
     cur = doc.currency_id
     if sama_row is not None and entity.base_currency_id == SAR and cur != SAR:
         pinned = ledger._pinned_rate(entity, sama_row, cur, SAR, doc.issue_date)
         if pinned is not None and not pinned.inverted:
             return pinned.rate, sama_row.date, sama_row.source, sama_row
+        return sama_row.rate, sama_row.date, SAMA_TAX_POINT, sama_row
     return _fx_for(entity, cur, doc.issue_date, user)
+
+
+def _sama_tax_point(document):
+    """Registered ``sama_tax_point`` hook (ledger-fx R51, owner decision H2): the tax point of a stored sales
+    document booked at its SAMA tax-point row beyond the ledger's rate age limit, else None."""
+    if document.fx_rate_source == SAMA_TAX_POINT and document.fx_exchange_rate_id == document.vat_sar_exchange_rate_id:
+        return document.tax_point_date
+    return None
 
 
 # --- settings ----------------------------------------------------------------------------------------
@@ -1527,8 +1541,10 @@ def _pinned(document, specs):
     row = document.fx_exchange_rate
     if row is None:
         return list(specs)
-    return [{**spec, "exchange_rate": row} if spec.get("currency") and not spec.get("settles_line") else spec
-            for spec in specs]
+    pin = {"exchange_rate": row}
+    if getattr(document, "fx_rate_source", "") == SAMA_TAX_POINT:  # H2: the ledger checks it on the tax point (R51)
+        pin["rate_source"] = "sama_tax_point"
+    return [{**spec, **pin} if spec.get("currency") and not spec.get("settles_line") else spec for spec in specs]
 
 
 def _with_settlements(document, currency, plain, settlements):
@@ -1622,6 +1638,13 @@ def _check_document_rate(document, lines):
     for line in lines:
         if line.currency_id == functional or line.line_kind != "normal":
             continue
+        sama_tp = getattr(document, "fx_rate_source", "") == SAMA_TAX_POINT
+        if sama_tp != (line.rate_source == "sama_tax_point"):  # H2: the SAMA tax-point source only as approved
+            problems.append(
+                f"Line {line.account.code} has rate source {line.rate_source}; the document was approved at "
+                f"{'its SAMA tax-point rate' if sama_tp else 'a table rate'}. / مصدر سعر البند {line.account.code} "
+                f"هو {line.rate_source}؛ اعتُمد المستند {'بسعر البنك المركزي في تاريخ استحقاق الضريبة' if sama_tp else 'بسعر الجدول'}."
+            )
         if line.fx_rate != document.fx_rate or line.exchange_rate_id != document.fx_exchange_rate_id:
             problems.append(
                 f"Line {line.account.code} is rated {line.fx_rate} (rate row {line.exchange_rate_id}); the document "

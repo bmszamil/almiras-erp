@@ -341,6 +341,9 @@ class JournalLine(models.Model):
         TABLE = "table", bi("Rate table", "جدول الأسعار")
         MANUAL = "manual", bi("Manual rate", "سعر يدوي")
         CARRYING = "carrying", bi("Carrying rate (settlement)", "السعر الدفتري (تسوية)")
+        # Owner decision H2 (ledger-fx R12 amendment): a sales document booked at its SAMA tax-point rate, which may
+        # be older than FX_MAX_RATE_AGE_DAYS; verified against the document's registered tax point (R51).
+        SAMA_TAX_POINT = "sama_tax_point", bi("SAMA rate on the tax point", "سعر البنك المركزي في تاريخ استحقاق الضريبة")
 
     class LineKind(models.TextChoices):
         NORMAL = "normal", bi("Normal", "عادي")
@@ -372,7 +375,7 @@ class JournalLine(models.Model):
         help_text=bi("Functional units per 1 transaction unit", "وحدات العملة الوظيفية لكل وحدة من عملة المعاملة"),
     )
     rate_source = models.CharField(
-        bi("Rate source", "مصدر السعر"), max_length=10, choices=RateSource.choices, default=RateSource.FUNCTIONAL
+        bi("Rate source", "مصدر السعر"), max_length=16, choices=RateSource.choices, default=RateSource.FUNCTIONAL
     )
     exchange_rate = models.ForeignKey(
         "ExchangeRate", null=True, blank=True, on_delete=models.PROTECT, related_name="lines",

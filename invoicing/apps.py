@@ -23,6 +23,7 @@ class InvoicingConfig(AppConfig):
             build_lines=services._sales_document_lines, validate_lines=services._check_document_rate,
             pending_documents=services._pending_sales_documents,
             contract_approval=services._contract_approval,  # billing R53: auto-issued invoices
+            sama_tax_point=services._sama_tax_point,  # owner decision H2: booked at the SAMA tax-point rate
         )
         documents.register(
             PurchaseDocument, post_permissions={"invoicing.approve_bill"},

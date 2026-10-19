@@ -540,9 +540,10 @@ def _sales_sources(comp, entity, entry, doc, sign):
                      entry=entry, on=entry.date)
     vat = sum((Decimal(g["vat_sar"]) for g in doc.vat_breakdown if g["category"] == "S"), ZERO)
     comp.add(1, Column.VAT, s * vat, "sales_document", source_id=doc.pk, number=doc.number, entry=entry, on=entry.date)
-    if doc.currency_id != SAR and rate is not None:
-        # §10.5 (G7): box 1 VAT is at the SAMA tax-point rate; a document booked at another rate (invoicing R100(d))
-        # leaves the difference on 2200, explained in the tie-out like C12 for bills.
+    if doc.currency_id != SAR and rate is not None and doc.fx_exchange_rate_id != doc.vat_sar_exchange_rate_id:
+        # §10.5 (G7) as limited by H2 (§10.6): box 1 VAT is at the SAMA tax-point rate. Since H2 a foreign sale books
+        # every line at that SAMA row, so 2200 equals box 1 and nothing is explained here; only a legacy document,
+        # booked before H2 at another rate row, leaves a difference on 2200, explained in the tie-out like C12.
         booked = _ledger_entries(entity, ids={entry.pk}).get(entry.pk, {}).get("output", ZERO)
         if booked != s * vat:
             comp.output_rate_differences.append((entry.pk, booked - s * vat))

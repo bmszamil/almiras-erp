@@ -620,7 +620,9 @@ def test_g6_an_invoice_issued_after_the_quarter_counts_in_the_quarter_of_its_sup
 
 
 def test_g7_box_1_uses_the_sama_tax_point_rate_and_the_tie_out_explains_the_booking_rate(t):
-    """invoicing AT-138: SAMA 3.7500 on the supply date, 3.7510 on the issue date 21 days later."""
+    """invoicing AT-138: SAMA 3.7500 on the supply date, 3.7510 on the issue date 21 days later. Since owner
+    decision H2 the document books at 3.7500 too, so 2200 ties to box 1 without a rate difference (§10.6); the
+    legacy case is ``tax/test_owner_decisions_h.py::test_h2_..._legacy_...``."""
     from invoicing.conftest import usd_rate
     from tax.conftest import box
 
@@ -628,11 +630,11 @@ def test_g7_box_1_uses_the_sama_tax_point_rate_and_the_tie_out_explains_the_book
     usd_rate(t, "3.7510", on=date(2027, 3, 31))
     doc = sale(t, [("rent_commercial", "1", "1000.00")], on=date(2027, 3, 31), currency="USD",
                supply_date=date(2027, 3, 10))
-    assert (doc.sar_rate, doc.fx_rate) == (D("3.7500"), D("3.7510"))
+    assert (doc.sar_rate, doc.fx_rate) == (D("3.7500"), D("3.7500"))
     q1 = services.compute_draft(t.alm, Q1, user=t.a1)
     assert box(q1, 1) == (D("3750.00"), D("0"), D("562.50"))  # at the SAMA tax-point rate (C11, G7)
     tie = services.tie_out(q1, user=t.a1)
-    assert tie["rate_difference_output"] == D("0.15")  # 2200 booked 562.65
+    assert tie["rate_difference_output"] == D("0")  # 2200 booked 562.50 (H2)
     assert tie["difference_output"] == 0
 
 

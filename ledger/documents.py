@@ -61,6 +61,16 @@ An entry of a **registered** document type is never reversed with a ``ledger.rev
 reversal permission registered for that type (``document_reversal_only``). Types registered with no reversal
 permission (sales documents, the VAT return offset T1) are therefore never reversed.
 
+Optional SAMA tax-point hook (owner decision H2, ledger-fx R51):
+
+- ``sama_tax_point(document)`` returns the stored document's tax point (a date) when its foreign-currency lines
+  book at the SAMA rate on that tax point (line spec ``rate_source="sama_tax_point"`` with the SAMA
+  ``exchange_rate`` row, from its own ``build_lines``), else None. The ledger then accepts that row even when it is
+  older than ``FX_MAX_RATE_AGE_DAYS`` before the entry date, but only if it is a global SAMA spot row from the
+  line currency to SAR (the functional currency), dated on the tax point or before it with only verified
+  non-publication days in between, and the tax point is not after the entry date. Accepted only for the types in
+  ``SAMA_TAX_POINT_TYPES``.
+
 Optional period hook:
 
 - ``pending_documents(entity, start_date, end_date)`` returns descriptions of
@@ -120,6 +130,8 @@ class DocumentType:
     contract_approval: Callable | None = None
     # tax-returns review item 5: True only while the owning module reverses the document itself.
     reverse_guard: Callable | None = None
+    # H2 (ledger-fx R51): the tax point whose SAMA rate the document books at, or None.
+    sama_tax_point: Callable | None = None
 
     def entity_id_of(self, document):
         return getattr(document, f"{self.entity_field}_id")
@@ -146,6 +158,8 @@ CREATOR_MAY_POST_TYPES = frozenset({"invoicing.customerreceipt"})
 # billing R53: the only type whose clearance posting may rely on a contract approval, and the approvals that count.
 CONTRACT_APPROVAL_TYPES = frozenset({"invoicing.salesdocument"})
 CONTRACT_APPROVAL_PERMISSIONS = frozenset({"billing.approve_contract", "billing.approve_version"})
+# H2 (ledger-fx R51): the only type that may book at a SAMA tax-point rate older than the rate age limit.
+SAMA_TAX_POINT_TYPES = frozenset({"invoicing.salesdocument"})
 
 
 def _frozen():
@@ -168,7 +182,7 @@ def _check_caller(model, module_name):
 
 def register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
              creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None,
-             creator_may_post=None, contract_approval=None, reverse_guard=None):
+             creator_may_post=None, contract_approval=None, reverse_guard=None, sama_tax_point=None):
     """Register ``model`` as a document type that books journal entries. Idempotent for the same arguments.
 
     Call it from the ``AppConfig.ready()`` of the app that defines ``model``.
@@ -182,7 +196,7 @@ def register(model, *, post_permissions, reverse_permissions=(), entity_field="e
         model, post_permissions=post_permissions, reverse_permissions=reverse_permissions, entity_field=entity_field,
         changed_at_field=changed_at_field, creator_field=creator_field, build_lines=build_lines,
         validate_lines=validate_lines, pending_documents=pending_documents, creator_may_post=creator_may_post,
-        contract_approval=contract_approval, reverse_guard=reverse_guard,
+        contract_approval=contract_approval, reverse_guard=reverse_guard, sama_tax_point=sama_tax_point,
     )
 
 
@@ -195,7 +209,7 @@ def _field(model, name, label):
 
 def _register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
               creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None,
-              creator_may_post=None, contract_approval=None, reverse_guard=None):
+              creator_may_post=None, contract_approval=None, reverse_guard=None, sama_tax_point=None):
     """Validate and store one registration (no caller or freeze check; tests use it through the helpers below)."""
     if not (isinstance(model, type) and issubclass(model, models.Model)) or model._meta.abstract:
         raise DocumentRegistryError(f"{model!r} is not a concrete Django model.")
@@ -221,7 +235,8 @@ def _register(model, *, post_permissions, reverse_permissions=(), entity_field="
         _field(model, changed_at_field, label)
     for name, hook in (("build_lines", build_lines), ("validate_lines", validate_lines),
                        ("pending_documents", pending_documents), ("creator_may_post", creator_may_post),
-                       ("contract_approval", contract_approval), ("reverse_guard", reverse_guard)):
+                       ("contract_approval", contract_approval), ("reverse_guard", reverse_guard),
+                       ("sama_tax_point", sama_tax_point)):
         if hook is not None and not callable(hook):
             raise DocumentRegistryError(f"{label}: {name} must be callable.")
     if build_lines is None and validate_lines is None:
@@ -235,8 +250,15 @@ def _register(model, *, post_permissions, reverse_permissions=(), entity_field="
     if contract_approval is not None and label not in CONTRACT_APPROVAL_TYPES:
         # billing R53: only invoices auto-issued from an approved contract post on a contract approval.
         raise DocumentRegistryError(f"{label}: contract_approval is allowed only for {sorted(CONTRACT_APPROVAL_TYPES)}.")
+    if sama_tax_point is not None and label not in SAMA_TAX_POINT_TYPES:
+        # H2: only sales documents book at their SAMA tax-point rate beyond the rate age limit.
+        raise DocumentRegistryError(f"{label}: sama_tax_point is allowed only for {sorted(SAMA_TAX_POINT_TYPES)}.")
+    if sama_tax_point is not None and build_lines is None:
+        # The rate row and source come from the type's own build_lines, never from lines a caller passes.
+        raise DocumentRegistryError(f"{label}: sama_tax_point needs build_lines.")
     doc_type = DocumentType(label, model, post, reverse, entity_field, changed_at_field, creator_field, build_lines,
-                            validate_lines, pending_documents, creator_may_post, contract_approval, reverse_guard)
+                            validate_lines, pending_documents, creator_may_post, contract_approval, reverse_guard,
+                            sama_tax_point)
     existing = _REGISTRY.get(label)
     if existing is not None and existing != doc_type:
         raise DocumentRegistryError(f"{label} is already registered with other settings.")

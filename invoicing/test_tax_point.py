@@ -42,17 +42,17 @@ def draft(w, *, issue_date, lines=(("rent_commercial", "1", "1000.00"),), doc_ty
 def test_at138_tax_point_is_the_supply_date_and_drives_the_sama_rate(w):
     """ledger-fx AT-43: supply 2027-03-10, issued 2027-03-31; SAMA 3.7500 on 03-10, 3.7510 on 03-31."""
     on_supply = usd_rate(w, "3.7500", on=date(2027, 3, 10))
-    on_issue = usd_rate(w, "3.7510", on=date(2027, 3, 31))
+    usd_rate(w, "3.7510", on=date(2027, 3, 31))
     doc = approve(w, invoice(w, currency="USD", issue_date=date(2027, 3, 31), supply_date=date(2027, 3, 10)))
     assert (doc.tax_point_date, doc.tax_point_basis) == (date(2027, 3, 10), "supply")
     assert (doc.sar_rate, doc.vat_sar_exchange_rate_id) == (D("3.7500"), on_supply.pk)
     assert doc.total_vat_sar == D("562.50") and doc.vat_breakdown[0]["vat_sar"] == "562.50"
-    # booking: the 03-10 row is 21 days older than the issue date, beyond the ledger's pinned-rate window (R12),
-    # so the document books at the ledger rate on its issue date and the VAT return explains the difference
-    assert (doc.fx_rate, doc.fx_exchange_rate_id) == (D("3.7510"), on_issue.pk)
+    # booking (owner decision H2, R100(d)): the whole document at the SAMA tax-point row, although it is 21 days
+    # older than the issue date (ledger-fx R51), so 2200 equals total_vat_sar
+    assert (doc.fx_rate, doc.fx_exchange_rate_id, doc.fx_rate_source) == (D("3.7500"), on_supply.pk, "sama_tp")
     posted = w.zatca.clear(doc)
     vat = JournalLine.objects.get(entry=posted.journal_entry, account__code="2200")
-    assert vat.credit == D("562.65")
+    assert vat.credit == D("562.50") == doc.total_vat_sar
 
 
 def test_at139_continuous_supply_uses_the_end_of_the_supply_period(w):

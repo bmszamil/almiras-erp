@@ -295,6 +295,8 @@ def _currency_problems(entry, lines):
                             f"{where}: rate does not match entry date {entry.date}; re-rate the draft. / "
                             f"السعر لا يطابق تاريخ القيد {entry.date}؛ أعد تسعير المسودة."
                         )
+        if line.rate_source == Src.SAMA_TAX_POINT and not is_reversal:  # R51; a reversal copies the original
+            problems += _sama_tax_point_problems(entry, line, cur.code, functional, where)
         if line.line_kind == Kind_.SETTLEMENT or line.rate_source == Src.CARRYING or line.settles_line_id:
             problems += _settlement_problems(entry, line, where, is_reversal, consumed)
         elif cur.code != functional and amount != fx.convert(line.txn_amount, line.fx_rate):  # R7
@@ -304,6 +306,65 @@ def _currency_problems(entry, lines):
                 f"{fx.convert(line.txn_amount, line.fx_rate)}."
             )
     return problems
+
+
+def _sama_row_problem(row, code, functional, on, *, bridge=True):
+    """R51 (owner decision H2): None if ``row`` is a SAMA rate for ``code`` on ``on`` (a tax point), else the
+    (English, Arabic) reason. A SAMA rate for ``on`` is a global spot ``source=sama`` row from ``code`` to SAR, in an
+    entity whose functional currency is SAR, dated ``on`` or earlier with only **verified** non-publication days
+    after it up to ``on`` (as :func:`get_sama_rate`; a row entered later for one of those days does not undo it).
+    ``bridge=False``: only the kind of row and that it is not dated after ``on`` (the entry date, when the lines
+    are built and the tax point is not known yet).
+    """
+    if functional != SAR or code == SAR:
+        return (f"A SAMA tax-point rate books only foreign-currency lines in a SAR entity ({code}->{functional}).",
+                f"سعر البنك المركزي في تاريخ استحقاق الضريبة لبنود العملة الأجنبية في كيان عملته الريال فقط "
+                f"({code}->{functional}).")
+    if (row.entity_id is not None or row.source != ExchangeRate.Source.SAMA
+            or row.rate_type != ExchangeRate.RateType.SPOT or (row.from_currency_id, row.to_currency_id) != (code, SAR)):
+        return (f"Rate row {row.pk} is not a group-wide SAMA spot rate {code}->SAR.",
+                f"سجل السعر {row.pk} ليس سعرًا فوريًا للبنك المركزي السعودي {code}->SAR للمجموعة.")
+    if row.date > on:
+        return (f"SAMA rate row {row.pk} ({row.date}) is dated after {on}.",
+                f"سجل سعر البنك المركزي {row.pk} ({row.date}) مؤرخ بعد {on}.")
+    if bridge and row.date < on:
+        days = (on - row.date).days
+        closed = NonPublicationDay.objects.filter(date__gt=row.date, date__lte=on, verified_at__isnull=False).count()
+        if closed != days:
+            return (f"SAMA rate row {row.pk} ({row.date}) is not the SAMA rate for {on}: SAMA publishes on a day in "
+                    "between (only verified weekends and public holidays are bridged).",
+                    f"سجل سعر البنك المركزي {row.pk} ({row.date}) ليس سعر البنك المركزي بتاريخ {on}: يوجد يوم نشر "
+                    "بينهما (لا تُتجاوز إلا عطل نهاية الأسبوع والعطل الرسمية المتحقق منها).")
+    return None
+
+
+def _sama_tax_point_problems(entry, line, code, functional, where):
+    """R51 (owner decision H2): a ``sama_tax_point`` line books a registered document (``SAMA_TAX_POINT_TYPES``,
+    hook ``sama_tax_point``) at the SAMA rate on the tax point the stored document gives, not after the entry date,
+    with that row's rate. The ledger checks this itself; the document only names its tax point and row."""
+    if line.exchange_rate_id is None:
+        return [_bi(f"{where}: a SAMA tax-point rate needs its rate row.",
+                    f"{where}: سعر البنك المركزي في تاريخ استحقاق الضريبة يحتاج إلى سجل السعر.")]
+    if line.line_kind != Kind_.NORMAL:
+        return [_bi(f"{where}: only normal document lines book at a SAMA tax-point rate.",
+                    f"{where}: بنود المستند العادية فقط تُرحَّل بسعر البنك المركزي في تاريخ استحقاق الضريبة.")]
+    doc_type = documents.get(entry.document_type) if entry.document_type else None
+    if (doc_type is None or doc_type.sama_tax_point is None
+            or doc_type.label not in documents.SAMA_TAX_POINT_TYPES):
+        return [_bi(f"{where}: a SAMA tax-point rate is used only by a document type registered for it.",
+                    f"{where}: سعر البنك المركزي في تاريخ استحقاق الضريبة لا يستخدمه إلا نوع مستند مسجل لذلك.")]
+    document = doc_type.model._default_manager.filter(pk=entry.document_id).first()
+    tax_point = doc_type.sama_tax_point(document) if document is not None else None
+    if not isinstance(tax_point, date_type) or tax_point > entry.date:
+        return [_bi(f"{where}: the document gives no tax point on or before the entry date {entry.date}.",
+                    f"{where}: لا يحدد المستند تاريخ استحقاق ضريبة في تاريخ القيد {entry.date} أو قبله.")]
+    problem = _sama_row_problem(line.exchange_rate, code, functional, tax_point)
+    if problem is None and line.fx_rate != line.exchange_rate.rate:
+        problem = (f"the line rate {line.fx_rate} is not the SAMA row's rate {line.exchange_rate.rate}.",
+                   f"سعر البند {line.fx_rate} ليس سعر سجل البنك المركزي {line.exchange_rate.rate}.")
+    if problem is not None:
+        return [_bi(f"{where}: {problem[0]}", f"{where}: {problem[1]}")]
+    return []
 
 
 def _open_item(item, exclude_entry_id=None):
@@ -1065,6 +1126,22 @@ def _build_line(entity, on, spec, user):
         line.line_kind = Kind_.SETTLEMENT
         line.rate_source = Src.CARRYING
         line.fx_rate = item.fx_rate
+    elif spec.get("exchange_rate") is not None and spec.get("rate_source") == Src.SAMA_TAX_POINT:
+        # R51 (owner decision H2): the SAMA tax-point row of a sales document, possibly older than the rate age
+        # limit. Checked here for its kind and date; against the document's tax point by validate_entry.
+        row = spec["exchange_rate"]
+        row = row if isinstance(row, ExchangeRate) else ExchangeRate.objects.get(pk=row)
+        problem = _sama_row_problem(row, cur.code, functional, on, bridge=False)  # the tax point is checked later
+        if problem is not None:
+            raise error(problem[0], problem[1], code="sama_tax_point_invalid")
+        line.rate_source, line.fx_rate, line.exchange_rate = Src.SAMA_TAX_POINT, row.rate, row
+    elif spec.get("rate_source") not in (None, ""):
+        raise error(
+            f"Line {account.code}: rate source {spec.get('rate_source')!r} is not set by the caller (only a document's "
+            "own SAMA tax-point row, R51).",
+            f"البند {account.code}: مصدر السعر {spec.get('rate_source')!r} لا يحدده المستدعي (فقط سجل سعر البنك "
+            "المركزي في تاريخ استحقاق الضريبة للمستند نفسه).", code="rate_source_reserved",
+        )
     elif spec.get("exchange_rate") is not None:  # a rate row pinned by the document (create_entry, post=True)
         row = spec["exchange_rate"]
         row = row if isinstance(row, ExchangeRate) else ExchangeRate.objects.get(pk=row)
