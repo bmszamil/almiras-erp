@@ -267,8 +267,14 @@ ROLE_SEED_V11 = {
     "viewer": _plus(ROLE_SEED_V10, "viewer", "tax.view"),
     "managing_partner": _plus(ROLE_SEED_V10, "managing_partner", "tax.view", *_TAX_APPROVALS),
 }
+# V12 (migration core.0021, owner decision H3 of 2026-10-19, tax-returns OQ-46): VAT box verification is split; the
+# accountant proposes (tax.propose_box_verification), the approver (CFO) keeps verifying (tax.maintain_rates).
+ROLE_SEED_V12 = {
+    **ROLE_SEED_V11,
+    "accountant": _plus(ROLE_SEED_V11, "accountant", "tax.propose_box_verification"),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V11
+ROLE_SEED = ROLE_SEED_V12
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {

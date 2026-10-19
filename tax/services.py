@@ -2202,9 +2202,13 @@ def export_return(vat_return, *, user, fmt="xlsx", language="en"):
     return name, out.getvalue()
 
 
-def _box_verifier(user, entity, definition):
-    access.require(user, entity, "tax.maintain_rates")
-    _human(user, entity, "tax.maintain_rates")
+PROPOSE_BOX = "tax.propose_box_verification"  # owner decision H3: the accountant proposes
+VERIFY_BOX = "tax.maintain_rates"  # the approver (CFO) verifies
+
+
+def _box_verifier(user, entity, definition, permission):
+    access.require(user, entity, permission)
+    _human(user, entity, permission)
     if entity.consolidation != Entity.Consolidation.PARENT:
         raise error("Box definitions are verified at the group parent.", "يُتحقق من تعريفات الخانات في الشركة الأم.",
                     code="group_parent_only")
@@ -2212,26 +2216,27 @@ def _box_verifier(user, entity, definition):
 
 
 def propose_box_verification(definition, *, user, entity):
-    """Step 1 (review item 12): a person holding ``tax.maintain_rates`` at the group parent records that a box
-    definition matches the current ZATCA form. Another person approves it (``verify_box_definition``)."""
+    """Step 1 (review item 12; owner decision H3): a person holding ``tax.propose_box_verification`` at the group
+    parent (seeded: the accountant) records that a box definition matches the current ZATCA form. Another person,
+    holding ``tax.maintain_rates`` (seeded: the approver, CFO), verifies it (``verify_box_definition``)."""
     with transaction.atomic():
-        found = _box_verifier(user, entity, definition)
+        found = _box_verifier(user, entity, definition, PROPOSE_BOX)
         if found.verified_at is not None:
             raise error("This box definition is already verified.", "تم التحقق من تعريف الخانة هذا بالفعل.",
                         code="already_verified")
         found.proposed_by, found.proposed_at = user, _now()
         found.save(update_fields=["proposed_by", "proposed_at"])
-        access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity,
-                            permission="tax.maintain_rates",
+        access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity, permission=PROPOSE_BOX,
                             details={"action": "propose_box_verification", "box": found.box_no, "definition": found.pk})
         return found
 
 
 def verify_box_definition(definition, *, user, entity):
-    """Step 2 (R6, review item 12): mark a proposed box definition as checked against the current ZATCA form; by a
-    second person holding ``tax.maintain_rates`` in the group parent entity, never the proposer."""
+    """Step 2 (R6, review item 12; owner decision H3): mark a proposed box definition as checked against the current
+    ZATCA form; by a second person holding ``tax.maintain_rates`` in the group parent entity (seeded: the approver,
+    CFO), never the proposer."""
     with transaction.atomic():
-        found = _box_verifier(user, entity, definition)
+        found = _box_verifier(user, entity, definition, VERIFY_BOX)
         if found.proposed_by_id is None:
             raise error("A box definition is verified after another person proposed it.",
                         "يُتحقق من تعريف الخانة بعد أن يقترحه شخص آخر.", code="verification_not_proposed")

@@ -205,6 +205,7 @@ Flags: **A** = approval (creator ≠ approver, R14); **S!** = segregation that c
 | `invoicing.post_purification_transfer` / `invoicing.approve_purification_payout` (R54) | P / A, P | accountant, approver / approver |
 | `invoicing.approve_purification_funding` (invoicing R54, owner decision C2, 2026-10-18; seed V10) | A, P | approver; managing_partner (fallback, OQ-1) |
 | `invoicing.mark_purification_instruction_sent` (invoicing R54, owner decision C4; seed V10) | | accountant |
+| `tax.propose_box_verification` (tax-returns §10.6, owner decision H3, 2026-10-19; seed V12, `core/0021`) | | accountant (proposes a VAT box definition as checked; the approver verifies with `tax.maintain_rates`) |
 | `invoicing.view` | Ag (scoped) | all human entity roles |
 | `invoicing.view_personal_data` (R51) | | receivables_clerk, payables_clerk, accountant, approver (every view logged) |
 | `billing.edit_contract_draft` | Ag | accountant, approver, agent (if granted) |

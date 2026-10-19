@@ -250,6 +250,10 @@ _PERMS = [
     _p("tax.change_settings", "Change tax settings", "تغيير إعدادات الضرائب", APPROVAL),
     _p("tax.maintain_rates", "Verify statutory tax rates and VAT box definitions",
        "التحقق من النسب الضريبية النظامية وتعريفات خانات الإقرار"),
+    # Owner decision H3 (2026-10-19, tax-returns OQ-46): the accountant proposes a box definition as checked; the
+    # approver (CFO), holding tax.maintain_rates, verifies it.
+    _p("tax.propose_box_verification", "Propose VAT box definitions as checked against the ZATCA form",
+       "اقتراح اعتماد تعريفات خانات الإقرار بعد مطابقتها لنموذج الهيئة"),
 ]
 
 CATALOGUE = {p.codename: p for p in _PERMS}

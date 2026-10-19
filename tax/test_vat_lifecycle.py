@@ -114,19 +114,17 @@ def test_at6_unverified_definitions_are_marked_and_approval_allowed(t):
     _, body = services.export_return(ret, user=t.v1, fmt="csv")
     assert "unverified / غير متحقق منه" in body.decode("utf-8-sig")
     definition = VatBoxDefinition.objects.get(box_no=1)
-    with pytest.raises(access.AccessDenied):
-        services.propose_box_verification(definition, user=t.a1, entity=t.alm)
     with pytest.raises(TaxError) as exc:  # review item 12: two people, a proposal first
         services.verify_box_definition(definition, user=t.c1, entity=t.alm)
     assert exc.value.code == "verification_not_proposed"
-    services.propose_box_verification(definition, user=t.c1, entity=t.alm)
-    with pytest.raises(access.AccessDenied) as denied:
-        services.verify_box_definition(definition, user=t.c1, entity=t.alm)
-    assert denied.value.code == "self_approval"
-    c2 = make_user("c2")
-    member(c2, t.alm, "approver")
-    done = services.verify_box_definition(definition, user=c2, entity=t.alm)
-    assert (done.proposed_by, done.verified_by) == (t.c1, c2) and done.verified_at is not None
+    # owner decision H3 (OQ-46): the accountant proposes, the approver (CFO) verifies
+    with pytest.raises(access.AccessDenied):
+        services.propose_box_verification(definition, user=t.c1, entity=t.alm)
+    services.propose_box_verification(definition, user=t.a1, entity=t.alm)
+    with pytest.raises(access.AccessDenied):
+        services.verify_box_definition(definition, user=t.a2, entity=t.alm)
+    done = services.verify_box_definition(definition, user=t.c1, entity=t.alm)
+    assert (done.proposed_by, done.verified_by) == (t.a1, t.c1) and done.verified_at is not None
 
 
 # --- lifecycle and segregation (R7 to R10, R14) -------------------------------------------------------------
