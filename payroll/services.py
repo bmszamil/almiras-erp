@@ -1220,7 +1220,7 @@ def _employee_inputs(ctx, emp):
 def _prior_payslips(ctx, emp):
     return list(Payslip.objects.filter(employee=emp, refused=False, run__entity=ctx.entity,
                                        run__status__in=(RS.APPROVED, RS.PAID), run__payroll_group=ctx.run.payroll_group,
-                                       run__period__lt=ctx.period).select_related("run").order_by("run__period"))
+                                       run__kind=PayrollRun.Kind.REGULAR, run__period__lt=ctx.period).select_related("run").order_by("run__period"))
 
 
 def _booked_lines(emp, period, types):
@@ -1267,8 +1267,9 @@ def _prior_corrections(ctx, slip, emp, versions):
             ee_rows = [l for l in rows if l.line_type in (LT.EMPLOYEE_GOSI, LT.GOSI_CATCH_UP)
                        or l.source_ref.startswith("borne:")]
             er_rows = [l for l in rows if l.line_type == LT.EMPLOYER_GOSI and not l.source_ref.startswith("borne:")]
-            covered = sum((l.quantity or ZERO for l in ee_rows if l.line_type == LT.EMPLOYEE_GOSI), ZERO) if ee \
-                else sum((l.quantity or ZERO for l in er_rows), ZERO)
+            # Wage already covered for the month: the payslip's GOSI wage plus retro wage deltas booked since.
+            side_rows = er_rows if er else [l for l in ee_rows if l.line_type == LT.EMPLOYEE_GOSI]
+            covered = ps.gosi_wage + sum((l.quantity or ZERO for l in side_rows if l.origin_period == q), ZERO)
             delta = wage - covered
             for side, pct, rows_, account, ltype in (("employee", ee, ee_rows, GOSI_PAYABLE, LT.EMPLOYEE_GOSI),
                                                      ("employer", er, er_rows, GOSI_EXPENSE, LT.EMPLOYER_GOSI)):
