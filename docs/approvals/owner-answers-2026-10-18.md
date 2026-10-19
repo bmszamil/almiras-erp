@@ -83,3 +83,13 @@ Migration later. The journal export already sent is close to the final one. The 
 | G6 | VAT return period of a sale = its **tax point** (date of supply / earliest of supply, invoice, payment), per PSG §11.3. |
 | G7 | SAR exchange rate for VAT = **SAMA rate on the tax point date** (VAT IR Art. 61; TIR §4.2.2). This replaces B1 (invoice date) and needs no separate adviser opinion; when the tax point is the invoice date the two coincide. |
 | G8 | Group-level settings (global exchange rates, the Sharia switch under dual control) stay group-level; everything else is granted per company (A4). |
+
+## H. Further decisions on the team's recommendations (owner, 2026-10-19: "go with your recommendations")
+
+| # | Decision |
+| --- | --- |
+| H1 | The team prepares the 2026–2027 list of SAMA non-publication days (Fridays, Saturdays and KSA public holidays), loaded as unverified data for the accountant to review and confirm. |
+| H2 | When the tax point is earlier than the issue date, the whole sales document is booked at the SAMA rate on the tax point, so VAT account 2200 ties to the VAT in SAR without a rate difference. |
+| H3 | VAT return box verification: the accountant proposes, the CFO (approver) verifies. |
+| H4 | A correction where the ledger is already right and only the filed return was wrong may be approved by the reviewer with a written reason (no correcting entry). |
+| H5 | HT Rakik web fonts (WOFF2) were supplied, but only with Hadi Type's Desktop Font License, which does not cover web use. The ERP keeps IBM Plex Sans Arabic until Almiras provides the Hadi Type web licence; the files are not committed. |
