@@ -716,6 +716,8 @@ class SalesDocument(Tracked, Snapshot, Guarded):
         SUPPLY_END = "supply_end", bi("End of the supply period", "نهاية فترة التوريد")
         PAYMENT = "payment", bi("Payment or advance received", "استلام الدفعة أو الدفعة المقدمة")
         ISSUE = "issue", bi("Issue date", "تاريخ الإصدار")
+        # R117 as amended (owner decision I3): a B2G invoice (VAT IR Art. 20(5)) is taxed on its payment order date.
+        PAYMENT_ORDER = "payment_order", bi("Payment order date (B2G, Art. 20(5))", "تاريخ أمر الدفع (حكومي، المادة 20(5))")
         MANUAL = "manual", bi("Entered by hand, with a reason", "مُدخل يدويًا مع السبب")
         LEGACY = "legacy", bi("Issue date (set by migration, not computed)", "تاريخ الإصدار (من الترحيل، غير محسوب)")
 
@@ -779,21 +781,22 @@ class SalesDocument(Tracked, Snapshot, Guarded):
     )
     tax_point_date = models.DateField(
         bi("Tax point date", "تاريخ الاستحقاق الضريبي"), null=True, blank=True,
-        help_text=bi("Earliest of supply (end of the supply period), issue and payment; notes: their own date. "
-                     "Decides the VAT return period and the SAMA rate for VAT in SAR (R100, G6, G7)",
-                     "الأسبق من التوريد (نهاية فترة التوريد) والإصدار والدفع؛ الإشعارات: تاريخها. يحدد فترة الإقرار "
-                     "وسعر البنك المركزي لضريبة القيمة المضافة بالريال"),
+        help_text=bi("Earliest of supply (end of the supply period), issue and payment; B2G invoices: the payment "
+                     "order date; notes: their own date. Decides the VAT return period and the SAMA rate for VAT in "
+                     "SAR (R100, R117, G6, G7, I3)",
+                     "الأسبق من التوريد (نهاية فترة التوريد) والإصدار والدفع؛ الفواتير الحكومية: تاريخ أمر الدفع؛ "
+                     "الإشعارات: تاريخها. يحدد فترة الإقرار وسعر البنك المركزي لضريبة القيمة المضافة بالريال"),
     )
-    tax_point_basis = models.CharField(bi("Tax point taken from", "مصدر تاريخ الاستحقاق الضريبي"), max_length=10,
+    tax_point_basis = models.CharField(bi("Tax point taken from", "مصدر تاريخ الاستحقاق الضريبي"), max_length=16,
                                        choices=TaxPointBasis.choices, blank=True)
     tax_point_reason = models.TextField(
         bi("Reason for the tax point entered by hand", "سبب إدخال تاريخ الاستحقاق الضريبي يدويًا"), blank=True)
     payment_order_date = models.DateField(
         bi("Payment order date", "تاريخ أمر الدفع"), null=True, blank=True,
-        help_text=bi("Government customers (B2G, VAT IR Art. 20(5)): ZATCA TaxPointDate (BR-KSA-92); required before "
-                     "a standard document is issued (G1)",
-                     "العملاء الحكوميون (المادة 20(5) من اللائحة التنفيذية): تاريخ الاستحقاق الضريبي لدى الهيئة؛ "
-                     "مطلوب قبل إصدار المستند القياسي"),
+        help_text=bi("Government customers (B2G, VAT IR Art. 20(5)): ZATCA TaxPointDate (BR-KSA-92) and, on a "
+                     "standard invoice, its VAT tax point (I3); required before a standard document is issued (G1)",
+                     "العملاء الحكوميون (المادة 20(5) من اللائحة التنفيذية): تاريخ الاستحقاق الضريبي لدى الهيئة، وفي "
+                     "الفاتورة القياسية تاريخ استحقاق ضريبة القيمة المضافة؛ مطلوب قبل إصدار المستند القياسي"),
     )
     due_date = models.DateField(bi("Due date", "تاريخ الاستحقاق"), null=True, blank=True)
     currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",

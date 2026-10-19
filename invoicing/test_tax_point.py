@@ -1,5 +1,6 @@
 """Tax point and VAT SAR rate (invoicing R100 as amended by owner decisions G6 / G7, AT-138 to AT-146) and the B2G
-payment order date (R117, G1, AT-147 to AT-150). Anonymised entities and made-up rates (R70)."""
+payment order date (R117, G1, AT-147 to AT-150), which is the tax point of a B2G invoice (owner decision I3,
+AT-157 to AT-160). Anonymised entities and made-up rates (R70)."""
 import importlib
 from datetime import date
 from types import SimpleNamespace
@@ -213,7 +214,8 @@ def test_at147_standard_document_to_a_government_customer_needs_the_payment_orde
     services.update_sales_document(doc, user=w.clerk, payment_order_date=date(2027, 1, 5))
     issued = approve(w, services.submit_sales_document(doc, user=w.clerk))
     assert (issued.status, issued.payment_order_date) == ("issued", date(2027, 1, 5))
-    assert issued.tax_point_date == date(2027, 1, 10)  # the payment order date fills ZATCA BT-7 only (R117)
+    # R117 as amended by owner decision I3: the payment order date is also the VAT tax point (VAT IR Art. 20(5))
+    assert (issued.tax_point_date, issued.tax_point_basis) == (date(2027, 1, 5), "payment_order")
 
 
 def test_at148_other_buyers_and_simplified_documents_need_no_payment_order_date(w):
@@ -234,6 +236,102 @@ def test_at149_approval_refuses_a_b2g_document_without_the_date(w, monkeypatch):
         approve(w, doc)
     assert "BR-KSA-92" in messages(exc)
     assert SalesDocument.objects.get(pk=doc.pk).number == ""
+
+
+# --- I3: the payment order date is the tax point of a B2G invoice (R117 as amended) ---------------------------------
+
+def test_i3_a_b2g_invoice_is_taxed_on_its_payment_order_date_for_the_sama_rate_and_booking(w):
+    """AT-157: supply 03-10, payment order 03-20, issued 03-31: tax point 03-20 (not the earlier supply date)."""
+    usd_rate(w, "3.7500", on=date(2027, 3, 10))
+    on_order = usd_rate(w, "3.7520", on=date(2027, 3, 20))
+    usd_rate(w, "3.7510", on=date(2027, 3, 31))
+    gov = _government(w)
+    doc = draft(w, issue_date=date(2027, 3, 31), supply_date=date(2027, 3, 10), customer=gov, currency="USD")
+    assert (doc.tax_point_date, doc.tax_point_basis) == (date(2027, 3, 10), "supply")  # no payment order date yet
+    services.update_sales_document(doc, user=w.clerk, payment_order_date=date(2027, 3, 20))
+    assert SalesDocument.objects.get(pk=doc.pk).tax_point_basis == "payment_order"
+    issued = approve(w, services.submit_sales_document(doc, user=w.clerk))
+    assert (issued.tax_point_date, issued.tax_point_basis) == (date(2027, 3, 20), "payment_order")
+    assert (issued.sar_rate, issued.vat_sar_exchange_rate_id, issued.total_vat_sar) == (
+        D("3.7520"), on_order.pk, D("562.80"))
+    # H2 / R51: 11 days before the issue date, so the whole document books at the payment order date's SAMA row
+    assert (issued.fx_rate, issued.fx_exchange_rate_id, issued.fx_rate_source) == (D("3.7520"), on_order.pk, "sama_tp")
+    posted = w.zatca.clear(issued)
+    assert JournalLine.objects.get(entry=posted.journal_entry, account__code="2200").credit == D("562.80")
+
+
+def test_i3_a_payment_order_date_after_the_issue_date_is_still_the_tax_point(w):
+    """AT-158: issued 03-15, payment order 03-25 (Art. 20(5) defers the tax point). VAT in SAR at the SAMA rate for
+    03-25 (the latest on or before it); booking at the R12 rate on the issue date, never a later day's rate (R51);
+    the 2200 / VAT-in-SAR gap is explained in the VAT return tie-out (tax-returns §10.7)."""
+    on_issue = usd_rate(w, "3.7500", on=date(2027, 3, 15))
+    on_order = usd_rate(w, "3.7600", on=date(2027, 3, 25))
+    gov = _government(w)
+    doc = draft(w, issue_date=date(2027, 3, 15), customer=gov, currency="USD", payment_order_date=date(2027, 3, 25))
+    issued = approve(w, services.submit_sales_document(doc, user=w.clerk))
+    assert (issued.issue_date, issued.tax_point_date, issued.tax_point_basis) == (
+        date(2027, 3, 15), date(2027, 3, 25), "payment_order")
+    assert (issued.sar_rate, issued.vat_sar_exchange_rate_id, issued.total_vat_sar) == (
+        D("3.7600"), on_order.pk, D("564.00"))
+    assert (issued.fx_rate, issued.fx_exchange_rate_id, issued.fx_rate_source) == (D("3.7500"), on_issue.pk, "sama")
+    assert services._sama_tax_point(issued) is None  # never booked at a SAMA tax-point rate after the entry date
+    posted = w.zatca.clear(issued)
+    assert posted.journal_entry.date == date(2027, 3, 15)
+    lines = list(posted.journal_entry.lines.exclude(currency_id="SAR"))
+    assert lines and {(l.rate_source, l.fx_rate) for l in lines} == {("table", D("3.7500"))}
+    assert JournalLine.objects.get(entry=posted.journal_entry, account__code="2200").credit == D("562.50")
+
+
+def test_i3_a_later_payment_order_date_without_its_own_sama_row_uses_the_latest_published_rate(w):
+    """I2 with I3: at issue the SAMA rate of a later payment order date is not published yet; the latest SAMA
+    rate on or before it (the issue date's) is used, and the document books at that same row."""
+    on_issue = usd_rate(w, "3.7500", on=date(2027, 3, 15))
+    gov = _government(w)
+    doc = draft(w, issue_date=date(2027, 3, 15), customer=gov, currency="USD", payment_order_date=date(2027, 3, 25))
+    issued = approve(w, services.submit_sales_document(doc, user=w.clerk))
+    assert (issued.tax_point_date, issued.vat_sar_exchange_rate_id, issued.fx_exchange_rate_id) == (
+        date(2027, 3, 25), on_issue.pk, on_issue.pk)
+    posted = w.zatca.clear(issued)
+    assert JournalLine.objects.get(entry=posted.journal_entry, account__code="2200").credit == posted.total_vat_sar
+
+
+def test_i3_a_sar_b2g_invoice_is_taxed_on_the_payment_order_date_too(w):
+    gov = _government(w)
+    doc = draft(w, issue_date=date(2027, 1, 10), customer=gov, payment_order_date=date(2027, 1, 20))
+    issued = approve(w, services.submit_sales_document(doc, user=w.clerk))
+    assert (issued.tax_point_date, issued.tax_point_basis, issued.sar_rate) == (
+        date(2027, 1, 20), "payment_order", D("1"))
+    assert w.zatca.clear(issued).status == "final"
+
+
+def test_i3_no_tax_point_by_hand_on_a_b2g_invoice_and_the_payment_order_date_replaces_one(w):
+    gov = _government(w)
+    doc = draft(w, issue_date=date(2027, 1, 10), customer=gov)
+    with pytest.raises(InvoicingError) as exc:
+        services.set_tax_point(doc, user=w.clerk, tax_point_date=date(2027, 1, 8), reason="Contract")
+    assert exc.value.code == "tax_point_payment_order"
+    assert "payment order date" in messages(exc) and "أمر الدفع" in messages(exc)
+    stored = SalesDocument.objects.get(pk=doc.pk)
+    stored.tax_point_date, stored.tax_point_basis, stored.tax_point_reason = date(2027, 1, 8), "manual", "old"
+    stored.payment_order_date = date(2027, 1, 5)  # in memory: e.g. a hand tax point from before the customer kind
+    services._refresh_tax_point(stored)
+    assert (stored.tax_point_date, stored.tax_point_basis, stored.tax_point_reason) == (
+        date(2027, 1, 5), "payment_order", "")
+
+
+def test_i3_b2g_notes_simplified_documents_and_other_buyers_keep_the_r100_tax_point(w):
+    gov = _government(w)
+    original = final(w, invoice(w, customer=gov, payment_order_date=date(2027, 1, 5)))
+    assert (original.tax_point_date, original.tax_point_basis) == (date(2027, 1, 5), "payment_order")
+    note = services.create_sales_document(w.alm, user=w.clerk, customer=gov, issue_date=date(2027, 2, 10),
+                                          doc_type="credit_note", original_document=original,
+                                          payment_order_date=date(2027, 1, 5))
+    assert (note.tax_point_date, note.tax_point_basis) == (date(2027, 2, 10), "issue")  # D30(a): its own date
+    small = draft(w, issue_date=date(2027, 1, 10), customer=gov, zatca_profile="simplified",
+                  payment_order_date=date(2027, 1, 5), lines=(("rent_commercial", "1", "100.00"),))
+    assert (small.tax_point_date, small.tax_point_basis) == (date(2027, 1, 10), "issue")
+    business = draft(w, issue_date=date(2027, 1, 10), payment_order_date=date(2027, 1, 5))
+    assert (business.tax_point_date, business.tax_point_basis) == (date(2027, 1, 10), "issue")
 
 
 @pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL triggers")

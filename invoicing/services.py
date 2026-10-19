@@ -338,10 +338,14 @@ def _booking_rate(entity, doc, sama_row, user):
     in a SAR-functional entity a foreign-currency document books **all** its lines at its SAMA tax-point row, so 2200
     equals ``total_vat_sar``. A row the ledger accepts as a pinned rate on the issue date (``ledger._pinned_rate``,
     not older than ``FX_MAX_RATE_AGE_DAYS``) books as a table rate; an older one (tax point well before the issue
-    date, or a long holiday) books as ``sama_tp``, which the ledger checks against the document's tax point
-    (ledger-fx R51, ``_sama_tax_point``). Other functional currencies: the ledger rate on the issue date (R12)."""
+    date, or a long gap in SAMA rates, I2) books as ``sama_tp``, which the ledger checks against the document's tax
+    point (ledger-fx R51, ``_sama_tax_point``). A tax point **after** the issue date (a B2G invoice whose payment
+    order date is later, R117 / I3) books at the R12 rate on the issue date, like other functional currencies: an
+    entry dated on the issue date cannot use a rate of a later day (R51); the VAT return tie-out explains the
+    difference between 2200 and the VAT in SAR (tax-returns §10.7, ``rate_difference_output``)."""
     cur = doc.currency_id
-    if sama_row is not None and entity.base_currency_id == SAR and cur != SAR:
+    if (sama_row is not None and entity.base_currency_id == SAR and cur != SAR
+            and doc.tax_point_date <= doc.issue_date):
         pinned = ledger._pinned_rate(entity, sama_row, cur, SAR, doc.issue_date)
         if pinned is not None and not pinned.inverted:
             return pinned.rate, sama_row.date, sama_row.source, sama_row
@@ -591,9 +595,13 @@ def _computed_tax_point(doc):
     An invoice: the earliest of its supply date (for a supply over a period, i.e. with ``supply_end_date``, the end
     of the supply period: continuous supplies), its issue date and the date a payment or advance for it was
     received. On equal dates the issue date is named. A credit or debit note: its own date (D30(a), X9).
+    A B2G invoice (R117 as amended by owner decision I3, VAT IR Art. 20(5)) with its payment order date: that date,
+    also when it is after the issue date (Art. 20(5) defers the tax point to the payment order).
     """
     if doc.doc_type != SalesDocument.DocType.INVOICE:
         return doc.issue_date, TaxPoint.ISSUE
+    if _is_b2g_tax_point(doc):
+        return doc.payment_order_date, TaxPoint.PAYMENT_ORDER
     candidates = [(doc.issue_date, TaxPoint.ISSUE)]
     if doc.supply_end_date:
         candidates.append((doc.supply_end_date, TaxPoint.SUPPLY_END))
@@ -604,9 +612,16 @@ def _computed_tax_point(doc):
     return min(candidates, key=lambda c: c[0])  # min keeps the first of equal dates: the issue date
 
 
+def _is_b2g_tax_point(doc):
+    """R117 as amended (I3): a standard **invoice** to a government customer with its payment order date is taxed on
+    that date. Credit and debit notes of B2G supplies keep their own date (D30(a), X9)."""
+    return doc.doc_type == SalesDocument.DocType.INVOICE and bool(doc.payment_order_date) and _is_b2g(doc)
+
+
 def _refresh_tax_point(doc):
-    """Keep a draft's tax point computed (R100); a tax point entered by hand stays until it is cleared."""
-    if doc.tax_point_basis != TaxPoint.MANUAL:
+    """Keep a draft's tax point computed (R100); a tax point entered by hand stays until it is cleared. A B2G
+    invoice's payment order date (I3) replaces a tax point entered by hand."""
+    if doc.tax_point_basis != TaxPoint.MANUAL or _is_b2g_tax_point(doc):
         doc.tax_point_date, doc.tax_point_basis = _computed_tax_point(doc)
         doc.tax_point_reason = ""
 
@@ -624,6 +639,12 @@ def set_tax_point(document, *, user, tax_point_date, reason=""):
             raise error("A credit or debit note is taxed on its own date; its tax point is not entered by hand "
                         "(D30(a)).", "يُحتسب الإشعار الدائن أو المدين بتاريخه؛ ولا يُدخل تاريخ استحقاقه الضريبي يدويًا.",
                         code="tax_point_note")
+        if _is_b2g(doc):
+            raise error("A standard invoice to a government customer is taxed on its payment order date (VAT IR "
+                        "Art. 20(5), R117); enter the payment order date instead of a tax point.",
+                        "تُستحق ضريبة الفاتورة القياسية لعميل حكومي في تاريخ أمر الدفع (المادة 20(5) من اللائحة "
+                        "التنفيذية)؛ أدخل تاريخ أمر الدفع بدلًا من تاريخ الاستحقاق الضريبي.",
+                        code="tax_point_payment_order")
         reason = (reason or "").strip()
         if not reason:
             raise error("A tax point entered by hand needs a reason.",

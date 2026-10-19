@@ -492,7 +492,8 @@ def _sales_box(line):
 
 def _tax_point(doc):
     """C10 / G6 (PSG §11.3, TIR §4.2.3): the return period of a sale is its tax point, ``tax_point_date`` as
-    invoicing computed it (invoicing R100). Notes keep their own date (X9, TIR §7.1.1). Legacy invoices, whose
+    invoicing computed it (invoicing R100; a B2G invoice: its payment order date, R117 / I3, also when that is after
+    the issue date, §10.7). Notes keep their own date (X9, TIR §7.1.1). Legacy invoices, whose
     tax point migration 0026 set to the issue date without computing it (basis ``legacy``), or without one, fall
     back to the issue date and are listed for the reviewer (``tax_point_fallback``). Returns (date, known)."""
     if doc.doc_type != "invoice":
@@ -543,7 +544,9 @@ def _sales_sources(comp, entity, entry, doc, sign):
     if doc.currency_id != SAR and rate is not None and doc.fx_exchange_rate_id != doc.vat_sar_exchange_rate_id:
         # §10.5 (G7) as limited by H2 (§10.6): box 1 VAT is at the SAMA tax-point rate. Since H2 a foreign sale books
         # every line at that SAMA row, so 2200 equals box 1 and nothing is explained here; only a legacy document,
-        # booked before H2 at another rate row, leaves a difference on 2200, explained in the tie-out like C12.
+        # booked before H2 at another rate row, or a B2G invoice whose payment order date (its tax point, I3) is
+        # after its issue date and so booked at the issue-date rate (§10.7), leaves a difference on 2200, explained
+        # in the tie-out like C12.
         booked = _ledger_entries(entity, ids={entry.pk}).get(entry.pk, {}).get("output", ZERO)
         if booked != s * vat:
             comp.output_rate_differences.append((entry.pk, booked - s * vat))
