@@ -1213,7 +1213,7 @@ def _by_component(info, days, flag, factor=Fraction(1), weighted=True):
         if not w:
             continue
         for c in _components(info.version_on(d)):
-            if c.component.kind == "earning" and getattr(c.component, flag):
+            if c.component.kind == "earning" and (flag is None or getattr(c.component, flag)):
                 out[c.component] = out.get(c.component, Fraction(0)) + Fraction(c.monthly_amount) * factor * w / info.divisor
     return out
 
@@ -1464,8 +1464,15 @@ def _covered_gosi_wage(emp, period, booked, branch, employer_side):
     return base + sum((l.quantity for l in rows if l.quantity is not None and l.origin_period == period), ZERO)
 
 
-GOSI_TYPES = (LT.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI, LT.GOSI_CATCH_UP)
-GOSI_BOOKED_TYPES = GOSI_TYPES  # lines credited to 2340 (C-B7 adds the uncollected employee share)
+GOSI_TYPES = (LT.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI, LT.GOSI_CATCH_UP, LT.GOSI_UNCOLLECTED)
+GOSI_BOOKED_TYPES = GOSI_TYPES
+
+
+def _credits_2340(qs):
+    """C-B7: the payslip lines credited to 2340 (GOSI payable): both shares, the uncollected employee share and a
+    catch-up booked to 2340; a catch-up recovering an advanced share credits 1230 instead."""
+    return qs.filter(Q(line_type__in=(LT.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI, LT.GOSI_UNCOLLECTED))
+                     | Q(line_type=LT.GOSI_CATCH_UP, account__code=GOSI_PAYABLE))
 
 
 def _prior_corrections(ctx, slip, emp, versions):
@@ -1511,7 +1518,7 @@ def _prior_corrections(ctx, slip, emp, versions):
         for branch, wage, ee, er in g.branches:
             en, ar = BRANCH_TEXT[branch]
             rows = [l for l in booked if l.gosi_branch == branch]
-            ee_rows = [l for l in rows if l.line_type == LT.EMPLOYEE_GOSI
+            ee_rows = [l for l in rows if l.line_type in (LT.EMPLOYEE_GOSI, LT.GOSI_UNCOLLECTED)
                        or (l.line_type == LT.GOSI_CATCH_UP and l.account.code == GOSI_PAYABLE)
                        or l.source_ref.startswith("borne:")]
             er_rows = [l for l in rows if l.line_type == LT.EMPLOYER_GOSI and not l.source_ref.startswith("borne:")]
@@ -1529,9 +1536,14 @@ def _prior_corrections(ctx, slip, emp, versions):
                     slip.lines.append(Line(ltype, retro, ctx.account(account), f"GOSI {en} {side} on retro wage for {q}",
                                            f"التأمينات {ar} على فرق الأجر عن {q}", branch=branch, quantity=delta,
                                            rate=pct, origin_period=q))
-                if missed <= 0:
-                    continue
-                _missed_share(ctx, slip, side, branch, pct, missed, q, cohort, nclass)
+                if missed > 0:
+                    _missed_share(ctx, slip, side, branch, pct, missed, q, cohort, nclass)
+            # C-B7: an employee share advanced for month q (Dr 1230) is recovered with notice, within the caps.
+            advanced = sum((l.amount for l in rows if l.line_type == LT.GOSI_UNCOLLECTED), ZERO)
+            recovered = sum((l.amount for l in rows if l.line_type == LT.GOSI_CATCH_UP and l.account.code == LOANS),
+                            ZERO)
+            if advanced - recovered > 0:
+                _recover_share(ctx, slip, branch, ee, advanced - recovered, q)
 
 
 def _missed_share(ctx, slip, side, branch, pct, missed, q, cohort, nclass):
@@ -1552,14 +1564,36 @@ def _missed_share(ctx, slip, side, branch, pct, missed, q, cohort, nclass):
                   "(SIL M/33 Art. 19(4), R58).", f"لا تُستقطع حصة الموظف الفائتة عن {q} لاحقًا ويتحملها "
                   "صاحب العمل (المادة 19(4)).")
     else:
-        slip.lines.append(Line(LT.GOSI_CATCH_UP, missed, ctx.account(GOSI_PAYABLE),
-                               f"GOSI {en} employee share missed for {q}, deducted later with notice",
-                               f"استدراك حصة الموظف في {ar} عن {q} مع الإشعار", branch=branch, rate=pct,
-                               origin_period=q))
-        slip.notices.append((q, missed,
-                             f"Your GOSI {en} share for {q} ({missed} SAR) was not deducted then; it is "
-                             "deducted from this salary (Law Art. 9(1); P19(j)).",
-                             f"لم تُستقطع حصتك في {ar} عن {q} ({missed} ريال) في حينها؛ وتُستقطع من هذا الراتب."))
+        # C-B7: booked to 2340 in full now (Dr 1230, receivable from the employee) and recovered with notice.
+        slip.lines.append(Line(LT.GOSI_UNCOLLECTED, missed, ctx.account(LOANS),
+                               f"GOSI {en} employee share missed for {q}, paid by the employer and recovered later",
+                               f"حصة الموظف في {ar} الفائتة عن {q} يدفعها صاحب العمل وتُسترد لاحقًا", branch=branch,
+                               rate=pct, origin_period=q))
+        _recover_share(ctx, slip, branch, pct, missed, q)
+
+
+def _recover_share(ctx, slip, branch, pct, amount, q):
+    """R58 (P19(j)), C-B7: deduct an employee GOSI share the employer advanced for month ``q`` (Cr 1230), within the
+    caps (what the caps leave stays receivable for the next run), with the notice to the employee."""
+    en, ar = BRANCH_TEXT[branch]
+    slip.lines.append(Line(LT.GOSI_CATCH_UP, amount, ctx.account(LOANS),
+                           f"GOSI {en} employee share for {q} recovered (advanced by the employer), with notice",
+                           f"استرداد حصة الموظف في {ar} عن {q} (دفعها صاحب العمل) مع الإشعار", branch=branch, rate=pct,
+                           origin_period=q))
+
+
+def _catch_up_notices(slip):
+    """R58 (P19(j)): one notice per month of origin for what this payslip actually recovers (after the caps)."""
+    by_q = {}
+    for l in slip.lines:
+        if l.line_type == LT.GOSI_CATCH_UP and l.amount > 0:
+            by_q[l.origin_period] = by_q.get(l.origin_period, ZERO) + l.amount
+    for q, amount in sorted(by_q.items()):
+        slip.notices.append((q, amount,
+                             f"Your GOSI share for {q} ({amount} SAR) was not deducted then; the employer paid it to "
+                             "GOSI and it is deducted from this salary (Law Art. 9(1); P19(j)).",
+                             f"لم تُستقطع حصتك في التأمينات عن {q} ({amount} ريال) في حينها؛ ودفعها صاحب العمل للتأمينات "
+                             "وتُستقطع من هذا الراتب."))
 
 
 def _apply_caps(ctx, slip, emp, info):
@@ -1580,11 +1614,9 @@ def _apply_caps(ctx, slip, emp, info):
                     f"الاستقطاعات {fixed} تتجاوز نصف الأجر المستحق ({total_cap}) (المادة 93).")
     for l in gosi_ee:  # the statutory share first; what cannot be covered is caught up later (R61(f), R58)
         if l.amount > room:
-            short = l.amount - room
-            slip.warn(f"Employee GOSI share reduced by {short} to stay within half of the wage due; deducted later (R58).",
-                      f"خُفضت حصة الموظف في التأمينات بمقدار {short} للبقاء ضمن نصف الأجر؛ تُستقطع لاحقًا.")
-            l.amount = room
-            l.quantity = _round(Fraction(l.amount) * 100 / Fraction(l.rate)) if l.rate else l.quantity
+            short = l.amount - max(room, ZERO)
+            _uncollected_share(ctx, slip, l, short)
+            l.amount = max(room, ZERO)
         room -= l.amount
     slip.lines = [l for l in slip.lines if not (l.line_type == LT.EMPLOYEE_GOSI and l.amount <= 0)]
     loan_room = loan_cap
@@ -1611,6 +1643,28 @@ def _apply_caps(ctx, slip, emp, info):
                                                   ctx.p("deferred_sale.apply_loan_cap", info.end).get("apply")):
                 loan_room -= take
     slip.lines = [l for l in slip.lines if l.amount > 0 or l.line_type in PayslipLine.EARNINGS]
+
+
+def _uncollected_share(ctx, slip, line, short):
+    """C-B7: the full GOSI share is booked to 2340 every month. The part of the employee share the net pay cannot
+    cover is advanced by the employer: a receivable from the employee (Dr 1230, recovered later with notice; new law,
+    P19(j)) or, for ``legacy_m33``, employer cost (Dr 5110; SIL M/33 Art. 19(4): never deducted later)."""
+    en, ar = BRANCH_TEXT[line.branch]
+    if slip.cohort == "new_m273" and slip.nationality_class == Payslip.NationalityClass.SAUDI:
+        slip.lines.append(Line(LT.GOSI_UNCOLLECTED, short, ctx.account(LOANS),
+                               f"GOSI {en} employee share not covered by this pay: paid by the employer, recovered later",
+                               f"حصة الموظف في {ar} لم يغطها هذا الأجر: يدفعها صاحب العمل وتُسترد لاحقًا",
+                               branch=line.branch, rate=line.rate))
+        slip.warn(f"Employee GOSI share {short} not covered by the net pay: booked to GOSI in full, recovered from a later "
+                  "salary with notice (R58, C-B7).", f"حصة الموظف في التأمينات {short} لم يغطها صافي الأجر: قُيدت للتأمينات "
+                  "كاملة وتُسترد من راتب لاحق مع الإشعار.")
+    else:
+        slip.lines.append(Line(LT.EMPLOYER_GOSI, short, ctx.account(GOSI_EXPENSE),
+                               f"GOSI {en} employee share not covered by this pay, borne by the employer (SIL M/33 Art. "
+                               "19(4))", f"حصة الموظف في {ar} لم يغطها هذا الأجر ويتحملها صاحب العمل (المادة 19(4))",
+                               branch=line.branch, rate=line.rate, source_ref=f"borne:{line.branch}"))
+        slip.warn(f"Employee GOSI share {short} not covered by the net pay: borne by the employer (SIL M/33 Art. 19(4), "
+                  "C-B7).", f"حصة الموظف في التأمينات {short} لم يغطها صافي الأجر ويتحملها صاحب العمل (المادة 19(4)).")
 
 
 def _statutory_deduction_caps(ctx, slip, emp, info, due, actual, caps):
@@ -1773,6 +1827,28 @@ def _gosi_for_period(ctx, slip, emp, info, nclass):
 MODES = ("regular", "off_cycle", "final")
 
 
+def _calc_leave_advance(ctx, emp, info):
+    """C-A10 (Labour Law Art. 109: the leave wage is paid in advance): the contract pay of the annual leave days of
+    the period, net of what the period's approved runs already paid. No inputs, GOSI, loans or EOSB here: the
+    regular run of the period computes them and pays the rest of the month, net of this advance."""
+    req = ctx.run.leave_request
+    v_last = info.version_on(info.last)
+    slip = Slip(employee=emp, basis=emp.employment_basis, nationality_class=_nationality_class(emp),
+                cohort=emp.gosi_cohort or "", currency=ctx.entity.base_currency, contract=v_last,
+                iban_hash=_iban_hash(emp.iban), termination_ref=getattr(_termination(emp), "pk", None))
+    days = [d for d, _ in info.days if req.start_date <= d <= req.end_date]
+    weight = Decimal(_weight(info, days))
+    slip.paid_days = weight
+    for comp, amount in _allocate(_by_component(info, days, None)).items():
+        if amount:
+            slip.lines.append(Line(LT.EARNING, amount, comp.expense_account,
+                                   f"{comp.name_en}: annual leave pay in advance (Art. 109)",
+                                   f"{comp.name_ar}: أجر الإجازة السنوية مقدمًا (المادة 109)", component=comp,
+                                   quantity=weight))
+    _net_against_booked(ctx, slip, emp, ctx.period, origin="", mode="current")
+    return slip
+
+
 def _calc_ksa(ctx, emp, versions, info, mode=None):
     """One KSA payslip. ``regular``: the month's pay, retro and GOSI corrections of earlier months, loans, caps, EOSB.
     ``off_cycle`` (review 2): only what the period's approved runs have not paid yet (a payslip refused in the regular
@@ -1781,6 +1857,8 @@ def _calc_ksa(ctx, emp, versions, info, mode=None):
     was paid, earlier months re-examined, every input not yet taken; no caps, no loans and no EOSB here (the final
     settlement adds them)."""
     mode = mode or ("off_cycle" if ctx.run.kind == PayrollRun.Kind.OFF_CYCLE else "regular")
+    if mode == "off_cycle" and getattr(ctx.run, "purpose", "") == "leave_advance":
+        return _calc_leave_advance(ctx, emp, info)
     nclass = _nationality_class(emp)
     v_last = info.version_on(info.last)
     slip = Slip(employee=emp, basis=emp.employment_basis, nationality_class=nclass, cohort=emp.gosi_cohort or "",
@@ -1808,6 +1886,7 @@ def _calc_ksa(ctx, emp, versions, info, mode=None):
             _loan_lines(ctx, slip, emp)
         if mode != "final":
             _apply_caps(ctx, slip, emp, info)
+        _catch_up_notices(slip)
         if mode == "regular":
             _eosb(ctx, slip, emp, info)
         _ksa_warnings(ctx, slip, emp, info, prior)
@@ -1885,13 +1964,58 @@ def _calc_remuneration(ctx, emp, versions, info):
 # Runs (R6 to R13, R36, R39, R44, R50)
 # =====================================================================================================
 
+def _default_pay_date(settings, period, group=PayrollGroup.IN_COUNTRY):
+    start = _period_bounds(period)[0]
+    base = start if group == PayrollGroup.IN_COUNTRY else _period_bounds(_next_period(period))[0]
+    return min(base.replace(day=min(settings.default_pay_day, 28)), _period_bounds(_period_of(base))[1])
+
+
+def _leave_advance_periods(req, s):
+    """C-A10: the periods of an approved annual leave whose pay date is after the leave starts (paid in advance)."""
+    out, period = [], _period_of(req.start_date)
+    while period <= _period_of(req.end_date):
+        if req.start_date < _default_pay_date(s, period):
+            out.append(period)
+        period = _next_period(period)
+    return out
+
+
+@transaction.atomic
+def prepare_leave_advance(leave_request, *, user):
+    """C-A10 (Labour Law Art. 109): an approved annual leave of a KSA employee starting before the period's pay date
+    is paid in advance: one off-cycle run per period of the leave whose pay date is after its start, paying the leave
+    days' contract pay, with the pay date the day before the leave starts. The regular run of the period pays the
+    rest of the month net of the advance. Returns the calculated runs (submitted and approved as usual)."""
+    req = LeaveRequest.objects.select_related("entity", "employee", "leave_type").get(pk=leave_request.pk)
+    _require(user, req.entity, "payroll.prepare_run")
+    emp = req.employee
+    if (req.leave_type.code != "ANNUAL" or req.status != LeaveRequest.Status.APPROVED
+            or emp.employment_basis != Basis.KSA_EMPLOYEE):
+        raise error("Leave pay in advance is for an approved annual leave of a KSA employee (C-A10).",
+                    "أجر الإجازة مقدمًا لإجازة سنوية معتمدة لموظف خاضع لنظام العمل السعودي.", code="leave_advance")
+    s = _settings_of(req.entity)
+    runs = []
+    for period in _leave_advance_periods(req, s):
+        if PayrollRun.objects.filter(leave_request=req, period=period).exclude(status=RS.REVERSED).exists():
+            continue
+        run = create_run(req.entity, user=user, period=period, kind=PayrollRun.Kind.OFF_CYCLE,
+                         pay_date=req.start_date - timedelta(days=1), employees=[emp], purpose="leave_advance",
+                         leave_request=req, reason_ar="أجر الإجازة السنوية مقدمًا (المادة 109)",
+                         reason_en="Annual leave pay in advance (Labour Law Art. 109)")
+        runs.append(calculate_run(run, user=user))
+    if not runs:
+        raise error("Nothing to pay in advance for this leave (C-A10).", "لا يوجد ما يُدفع مقدمًا لهذه الإجازة.",
+                    code="leave_advance_nothing")
+    return runs
+
+
 def _entry_date(period):
     return _period_bounds(period)[1]
 
 
 @transaction.atomic
 def create_run(entity, *, user, period, payroll_group=PayrollGroup.IN_COUNTRY, kind=PayrollRun.Kind.REGULAR,
-               pay_date=None, reason_ar="", reason_en="", employees=()):
+               pay_date=None, reason_ar="", reason_en="", employees=(), purpose="", leave_request=None):
     """A draft run (``payroll.prepare_run``). One live regular run per (entity, period, group) (R6, R44); an
     off-cycle run needs an Arabic reason and named employees (R6). Both are dated the last day of the period (R12)."""
     _require(user, entity, "payroll.prepare_run")
@@ -1908,10 +2032,13 @@ def create_run(entity, *, user, period, payroll_group=PayrollGroup.IN_COUNTRY, k
     s = _settings_of(entity)
     start, end = _period_bounds(period)
     if pay_date is None:
-        base = start if payroll_group == PayrollGroup.IN_COUNTRY else _period_bounds(_next_period(period))[0]
-        pay_date = min(base.replace(day=min(s.default_pay_day, 28)), _period_bounds(_period_of(base))[1])
+        pay_date = _default_pay_date(s, period, payroll_group)
+    if purpose and (purpose != "leave_advance" or kind != PayrollRun.Kind.OFF_CYCLE or leave_request is None):
+        raise error("A leave advance is an off-cycle run for one approved annual leave (C-A10).",
+                    "دفعة الإجازة مقدمًا مسير خارج الدورة لإجازة سنوية معتمدة واحدة.", code="run_kind")
     run = PayrollRun(entity=entity, payroll_group=payroll_group, period=period, kind=kind, pay_date=pay_date,
-                     entry_date=end, reason_ar=reason_ar, reason_en=reason_en, created_by=user)
+                     entry_date=end, reason_ar=reason_ar, reason_en=reason_en, created_by=user, purpose=purpose,
+                     leave_request=leave_request)
     try:
         with transaction.atomic():
             _save(run)
@@ -2353,7 +2480,7 @@ def _run_lines(run):
                 add(l.account, -l.amount)
             elif t in PayslipLine.DEDUCTIONS:
                 add(l.account, -l.amount)
-            elif t == LT.EMPLOYER_GOSI:
+            elif t in (LT.EMPLOYER_GOSI, LT.GOSI_UNCOLLECTED):
                 add(l.account, l.amount)
                 add(_account(run.entity, GOSI_PAYABLE), -l.amount)
             elif t == LT.EOSB_ACCRUAL:
@@ -2819,22 +2946,20 @@ def _run_payable(run, currency):
 
 
 def _gosi_booked(entity, period, exclude_run=None):
-    qs = PayslipLine.objects.filter(entity=entity, payslip__run__period=period, payslip__refused=False,
-                                    payslip__run__status__in=(RS.APPROVED, RS.PAID),
-                                    line_type__in=(LT.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI, LT.GOSI_CATCH_UP))
+    qs = _credits_2340(PayslipLine.objects.filter(entity=entity, payslip__run__period=period, payslip__refused=False,
+                                                  payslip__run__status__in=(RS.APPROVED, RS.PAID)))
     if exclude_run is not None:
         qs = qs.exclude(payslip__run=exclude_run)
     return qs.aggregate(t=Sum("amount"))["t"] or ZERO
 
 
-def _gosi_open(entity, period):
-    total = PayslipLine.objects.filter(entity=entity, payslip__run__period=period, payslip__refused=False,
-                                       payslip__run__status__in=(RS.APPROVED, RS.PAID),
-                                       line_type__in=(LT.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI, LT.GOSI_CATCH_UP)) \
-        .aggregate(t=Sum("amount"))["t"] or ZERO
-    paid = PayrollPayment.objects.filter(entity=entity, kind=PayrollPayment.Kind.GOSI, gosi_period=period,
+def _gosi_paid(entity, period):
+    return PayrollPayment.objects.filter(entity=entity, kind=PayrollPayment.Kind.GOSI, gosi_period=period,
                                          status=PayrollPayment.Status.APPROVED).aggregate(t=Sum("amount"))["t"] or ZERO
-    return total - paid
+
+
+def _gosi_open(entity, period):
+    return _gosi_booked(entity, period) - _gosi_paid(entity, period)
 
 
 def _bank_account(entity, account):
@@ -2896,9 +3021,20 @@ def _payment_room(p, run):
         if p.amount > total - paid:
             raise error(f"The payment exceeds the open net pay {total - paid} of the run (R29).",
                         f"الدفعة تتجاوز صافي الرواتب المتبقي {total - paid} للمسير.", code="overpayment")
-    elif p.amount > _gosi_open(p.entity, p.gosi_period):
-        raise error(f"The payment exceeds the GOSI payable of {p.gosi_period} (R29).",
-                    f"الدفعة تتجاوز اشتراكات التأمينات المستحقة لفترة {p.gosi_period}.", code="overpayment")
+    else:
+        open_ = _gosi_open(p.entity, p.gosi_period)
+        recon = (GosiReconciliation.objects.filter(entity=p.entity, period=p.gosi_period).order_by("-pk").first())
+        # C-B7: up to the GOSI invoice recorded for the period (GOSI's figure governs what is paid); the part above
+        # the ERP contributions is flagged on the payment for the reconciliation.
+        allowed = max(open_, recon.gosi_invoice_amount - _gosi_paid(p.entity, p.gosi_period)) if recon else open_
+        if p.amount > allowed:
+            raise error(f"The payment exceeds the GOSI payable of {p.gosi_period} ({allowed}) (R29, C-B7).",
+                        f"الدفعة تتجاوز اشتراكات التأمينات المستحقة لفترة {p.gosi_period} ({allowed}).",
+                        code="overpayment")
+        if p.amount > open_:
+            p.warnings = [f"Pays {p.amount - max(open_, ZERO)} more than the ERP contributions of {p.gosi_period}, per the "
+                          f"GOSI invoice {recon.gosi_invoice_amount}: difference to reconcile (C-B7) / تزيد الدفعة "
+                          f"{p.amount - max(open_, ZERO)} على اشتراكات النظام وفق فاتورة التأمينات: فرق للمطابقة"]
 
 
 @transaction.atomic
@@ -3311,9 +3447,9 @@ def gosi_report(entity, period, *, user):
     _require(user, entity, "payroll.view_cost_reports")
     detail = access.has(user, entity, "payroll.view_payslip")
     rows, branches = {}, {}
-    for l in PayslipLine.objects.filter(entity=entity, payslip__run__period=period, payslip__refused=False,
-                                        payslip__run__status__in=(RS.APPROVED, RS.PAID),
-                                        line_type__in=GOSI_BOOKED_TYPES).select_related("payslip__employee"):
+    for l in _credits_2340(PayslipLine.objects.filter(entity=entity, payslip__run__period=period, payslip__refused=False,
+                                                      payslip__run__status__in=(RS.APPROVED, RS.PAID))) \
+            .select_related("payslip__employee"):
         side = "employer" if l.line_type == LT.EMPLOYER_GOSI and not l.source_ref.startswith("borne:") else "employee"
         b_ = branches.setdefault(l.gosi_branch or "", {"branch": l.gosi_branch or "", "employee": ZERO, "employer": ZERO})
         b_[side] += l.amount
@@ -3388,10 +3524,7 @@ def record_gosi_reconciliation(entity, period, *, user, gosi_invoice_amount, not
     """R23: the GOSI invoice against the ERP contributions of the period; the difference is reported, never posted."""
     _require(user, entity, "payroll.prepare_run")
     invoice = _dec(gosi_invoice_amount, "gosi_invoice_amount")
-    erp = PayslipLine.objects.filter(entity=entity, payslip__run__period=period, payslip__refused=False,
-                                     payslip__run__status__in=(RS.APPROVED, RS.PAID),
-                                     line_type__in=(LT.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI, LT.GOSI_CATCH_UP)) \
-        .aggregate(t=Sum("amount"))["t"] or ZERO
+    erp = _gosi_booked(entity, period)
     return _save(GosiReconciliation(entity=entity, period=period, gosi_invoice_amount=invoice, erp_amount=erp,
                                     difference=invoice - erp, note_ar=note_ar, note_en=note_en, recorded_by=user))
 
@@ -3447,6 +3580,21 @@ def send_alerts(*, today=None, entity=None):
                                       f"Register {emp.employee_code} at GOSI by {today.replace(day=last)} (Regs Art. 6).",
                                       f"سجّل {emp.employee_code} في التأمينات قبل {today.replace(day=last)}.", roles)])
                     sent += 1
+        # C-A10: an approved annual leave starting within 14 days before its period's pay date, not yet advanced.
+        for req in LeaveRequest.objects.filter(entity=e, leave_type__code="ANNUAL", status=LeaveRequest.Status.APPROVED,
+                                               employee__employment_basis=Basis.KSA_EMPLOYEE,
+                                               start_date__gt=today, start_date__lte=today + timedelta(days=14)) \
+                .select_related("employee"):
+            s_ = PayrollSettings.objects.filter(entity=e).first()
+            due = [p for p in _leave_advance_periods(req, s_)
+                   if not PayrollRun.objects.filter(leave_request=req, period=p).exclude(status=RS.REVERSED).exists()]
+            if due:
+                _send_alerts(e, [(PayrollAlert.Kind.LEAVE_ADVANCE, f"leave_advance:{req.pk}",
+                                  f"Annual leave of {req.employee.employee_code} starts {req.start_date}: pay the leave wage "
+                                  "in advance (Labour Law Art. 109; prepare_leave_advance).",
+                                  f"تبدأ الإجازة السنوية لـ {req.employee.employee_code} في {req.start_date}: اصرف أجر "
+                                  "الإجازة مقدمًا (المادة 109).", ("payroll_officer",))])
+                sent += 1
         if today.day == 10:
             open_ = _gosi_open(e, prev)
             if open_ > 0:

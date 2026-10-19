@@ -439,6 +439,12 @@ class PayrollRun(Tracked, ServiceWritten):
     parameter_ids = models.JSONField(bi("Parameters used", "المعايير المستخدمة"), default=list, blank=True)
     off_cycle_employees = models.ManyToManyField("hr.Employee", blank=True, related_name="+",
                                                  verbose_name=bi("Employees (off-cycle)", "الموظفون (خارج الدورة)"))
+    # C-A10 (Labour Law Art. 109): an off-cycle run paying the wage of an annual leave in advance, before it starts.
+    purpose = models.CharField(bi("Purpose", "الغرض"), max_length=16, blank=True,
+                               choices=[("leave_advance", bi("Annual leave pay in advance (Art. 109)",
+                                                             "أجر الإجازة السنوية مقدمًا (المادة 109)"))])
+    leave_request = models.ForeignKey("hr.LeaveRequest", null=True, blank=True, on_delete=models.PROTECT,
+                                      related_name="+", verbose_name=bi("Annual leave", "الإجازة السنوية"))
 
     class Meta:
         base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
@@ -554,6 +560,10 @@ class PayslipLine(ServiceWritten):
         DEDUCTION = "deduction", bi("Deduction", "استقطاع")
         EMPLOYEE_GOSI = "employee_gosi", bi("Employee GOSI", "حصة الموظف في التأمينات")
         GOSI_CATCH_UP = "gosi_catch_up", bi("GOSI catch-up", "استدراك حصة التأمينات")
+        # C-B7: the employee share the month's net pay could not cover is still booked to 2340 in full: Dr 1230
+        # (receivable from the employee, new law) and recovered later by a catch-up deduction (Cr 1230).
+        GOSI_UNCOLLECTED = "gosi_uncollected", bi("Employee GOSI share advanced by the employer",
+                                                  "حصة الموظف في التأمينات المدفوعة عنه مقدمًا")
         LOAN_INSTALLMENT = "loan_installment", bi("Loan installment (interest-free)", "قسط قرض حسن")
         DEFERRED_SALE_INSTALLMENT = "deferred_sale_installment", bi("Bai' ajel installment", "قسط البيع الآجل")
         EMPLOYER_GOSI = "employer_gosi", bi("Employer GOSI", "حصة صاحب العمل في التأمينات")
@@ -566,7 +576,7 @@ class PayslipLine(ServiceWritten):
     REDUCTIONS = frozenset({"unpaid_deduction", "sick_deduction", "maternity_suspended"})
     DEDUCTIONS = frozenset({"deduction", "employee_gosi", "gosi_catch_up", "loan_installment",
                             "deferred_sale_installment"})
-    EMPLOYER = frozenset({"employer_gosi", "eosb_accrual", "eosb_release"})
+    EMPLOYER = frozenset({"employer_gosi", "eosb_accrual", "eosb_release", "gosi_uncollected"})
 
     class Branch(models.TextChoices):
         ANNUITIES = "annuities", bi("Annuities", "المعاشات")
@@ -843,6 +853,8 @@ class PayrollPayment(Tracked, ServiceWritten):
     wht_amount = _txn("WHT (payment currency)", "ضريبة الاستقطاع (عملة الدفع)", default=ZERO)
     wht_amount_sar = _money("WHT (SAR)", "ضريبة الاستقطاع (ريال)", default=ZERO)
     bank_reference = models.CharField(bi("Bank reference", "المرجع البنكي"), max_length=60, blank=True)
+    # C-B7: e.g. a GOSI payment above the ERP contributions, up to the recorded GOSI invoice (difference flagged).
+    warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     submitted_by = _user("Submitted by", "قدّمه")
     submitted_at = models.DateTimeField(bi("Submitted at", "تاريخ التقديم"), null=True, blank=True)
@@ -952,6 +964,7 @@ class PayrollAlert(models.Model):
         GOSI_REGISTRATION = "gosi_registration", bi("GOSI registration due", "موعد التسجيل في التأمينات")
         GOSI_PAYMENT = "gosi_payment", bi("GOSI payment due", "موعد سداد التأمينات")
         RETENTION = "retention", bi("Retention review", "مراجعة الحفظ")
+        LEAVE_ADVANCE = "leave_advance", bi("Annual leave pay due in advance", "أجر إجازة سنوية مستحق مقدمًا")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="payroll_alerts",
