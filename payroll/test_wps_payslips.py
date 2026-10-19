@@ -1,6 +1,6 @@
 """WPS files, Mudad, payslips, reports and alerts (R2, R16, R24, R25, R31 to R33, R35, R40, R51, R53; AT-16,
 AT-19, AT-21, AT-22, AT-34, AT-39, AT-60)."""
-from datetime import date, datetime
+from datetime import date, timedelta, datetime
 
 import pytest
 from django.core.exceptions import PermissionDenied
@@ -129,7 +129,10 @@ def test_at39_r53_mudad_alerts_and_at60_retention_nomination(w, pclock):
     WpsFile.objects.filter(pk=f.pk)  # stored
     services.send_alerts(today=date(2027, 5, 1), entity=w.alm)
     assert WpsFile.objects.get(pk=f.pk).nominated_for_burn_at is None
-    services.send_alerts(today=date(2037, 3, 2) + (timezone.now().date() - date(2027, 3, 1)), entity=w.alm)
+    # generated_at is the real creation time (auto_now_add), so count the 10 years from it, plus two days
+    # so the Riyadh-midnight cutoff is past it at any time of day.
+    made = timezone.localtime(WpsFile.objects.get(pk=f.pk).generated_at).date()
+    services.send_alerts(today=date(made.year + 10, made.month, min(made.day, 28)) + timedelta(days=2), entity=w.alm)
     assert WpsFile.objects.get(pk=f.pk).nominated_for_burn_at is not None  # nominated, never deleted
 
 
