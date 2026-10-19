@@ -69,7 +69,7 @@ def test_h2_no_rate_difference_is_explained_for_a_document_booked_at_its_sama_ro
 # --- H3: VAT box verification (OQ-46) ---------------------------------------------------------------------------
 
 def test_h3_seed_v12_gives_the_accountant_the_proposal_and_keeps_verification_with_the_approver():
-    assert ROLE_SEED is ROLE_SEED_V12
+    assert set(ROLE_SEED_V12["accountant"][5]) <= set(ROLE_SEED["accountant"][5])  # V13 (payroll) keeps V12
     perms = {code: set(row[5]) for code, row in ROLE_SEED.items()}
     assert "tax.propose_box_verification" in perms["accountant"]
     assert "tax.maintain_rates" not in perms["accountant"]

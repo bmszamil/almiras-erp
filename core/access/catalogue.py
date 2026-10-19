@@ -209,6 +209,36 @@ _PERMS = [
     _p("hr.receive_alerts", "Receive HR alerts", "استلام تنبيهات الموارد البشرية"),
     _p("hr.manage_org", "Manage departments and grades", "إدارة الأقسام والدرجات الوظيفية"),
     _p("hr.set_overtime_route", "Change the overtime approval route", "تغيير مسار اعتماد العمل الإضافي"),
+    # payroll (payroll.md §7, P14, P20). No payroll permission is Ag (R38): agents and system users hold none.
+    # Approvers come from the entity's authority matrix once it is built (access 3.8); until then
+    # payroll.approvals holds the seed rows (runs: hr_officer only, never the MP; P20(a)).
+    _p("payroll.view", "View payroll (aggregates, personal data masked)", "عرض الرواتب (المجاميع، البيانات الشخصية مخفية)"),
+    _p("payroll.view_payslip", "View individual payslips (logged)", "عرض قسائم الرواتب الفردية (مسجّل)"),
+    _p("payroll.view_cost_reports", "View payroll cost reports without personal data",
+       "عرض تقارير تكاليف الرواتب دون بيانات شخصية"),
+    _p("payroll.manage_settings", "Manage payroll settings", "إدارة إعدادات الرواتب"),
+    _p("payroll.manage_inputs", "Enter payroll inputs", "إدخال مدخلات الرواتب"),
+    _p("payroll.approve_input", "Approve payroll inputs", "اعتماد مدخلات الرواتب", APPROVAL),
+    _p("payroll.approve_overtime", "Approve overtime", "اعتماد العمل الإضافي", APPROVAL),
+    _p("payroll.record_maternity_case", "Record GOSI maternity cases", "تسجيل حالات تعويض الأمومة لدى التأمينات"),
+    _p("payroll.approve_maternity_clearance", "Approve written legal clearances for maternity pay",
+       "اعتماد الإذن القانوني المكتوب لأجر الأمومة", APPROVAL),
+    _p("payroll.prepare_run", "Prepare and calculate payroll runs", "إعداد مسيرات الرواتب واحتسابها"),
+    _p("payroll.submit_run", "Submit payroll runs for approval", "تقديم مسيرات الرواتب للاعتماد"),
+    _p("payroll.approve_run", "Approve and post payroll runs", "اعتماد مسيرات الرواتب وترحيلها", APPROVAL, POSTS),
+    _p("payroll.reverse_run", "Reverse payroll runs", "عكس مسيرات الرواتب", POSTS),
+    _p("payroll.create_loan", "Draft interest-free employee loans", "إعداد مسودات قروض الموظفين الحسنة"),
+    _p("payroll.approve_loan", "Approve and disburse interest-free employee loans",
+       "اعتماد قروض الموظفين الحسنة وصرفها", APPROVAL, POSTS),
+    _p("payroll.create_deferred_sale", "Draft bai' ajel employee financing", "إعداد مسودات البيع الآجل للموظفين"),
+    _p("payroll.approve_deferred_sale_terms", "Approve bai' ajel terms", "اعتماد شروط البيع الآجل", APPROVAL),
+    # R47 (P19(k)): approving the sale creates the sale invoice through invoicing, which posts it (invoicing R112).
+    _p("payroll.approve_deferred_sale", "Approve bai' ajel sales", "اعتماد البيع الآجل", APPROVAL),
+    _p("payroll.record_payment", "Record payroll payments", "تسجيل مدفوعات الرواتب"),
+    _p("payroll.approve_payment", "Approve and post payroll payments", "اعتماد مدفوعات الرواتب وترحيلها", APPROVAL,
+       POSTS),
+    _p("payroll.generate_wps_file", "Generate salary (WPS) files", "إنشاء ملفات الرواتب (حماية الأجور)"),
+    _p("payroll.record_mudad_submission", "Record Mudad submissions", "تسجيل الرفع على منصة مدد"),
     # banking (banking.md §7). Agents may view (masked), suggest matches and draft bank transactions only (R43).
     _p("banking.view", "View banking (account numbers masked)", "عرض البيانات البنكية (أرقام الحسابات مخفية)", AGENT_OK),
     _p("banking.view_iban", "View full IBANs and account numbers", "عرض أرقام الآيبان والحسابات كاملة"),
@@ -297,7 +327,7 @@ SYSTEM_EXTRA = {
 #   banking.reverse_bank_transaction / tax.reverse_document for its document.
 #   Reversal grants only reverse: they never post a new entry.
 REVERSE_PERMISSIONS = frozenset({"ledger.reverse_entry", "invoicing.reverse_document",
-                                 "banking.reverse_bank_transaction", "tax.reverse_document"})
+                                 "banking.reverse_bank_transaction", "tax.reverse_document", "payroll.reverse_run"})
 DRAFT_POST_PERMISSIONS = frozenset({"ledger.post_entry"})
 DOCUMENT_POST_PERMISSIONS = frozenset(c for c, p in CATALOGUE.items() if p.posts) - DRAFT_POST_PERMISSIONS - REVERSE_PERMISSIONS
 POST_PERMISSIONS = DRAFT_POST_PERMISSIONS | DOCUMENT_POST_PERMISSIONS

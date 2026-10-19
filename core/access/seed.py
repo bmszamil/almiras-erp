@@ -273,8 +273,46 @@ ROLE_SEED_V12 = {
     **ROLE_SEED_V11,
     "accountant": _plus(ROLE_SEED_V11, "accountant", "tax.propose_box_verification"),
 }
+# V13 (migration core.0022, payroll.md §7 as amended by P11, P12, P14, P19, P20; slice 1): payroll rights.
+# - payroll_officer prepares, calculates and submits runs, enters and approves inputs (never its own entry or own
+#   pay), drafts loans and bai' ajel requests, records payments, generates WPS files and records Mudad submissions.
+# - hr_officer approves (= posts) runs (P14: the run's seed approver in every entity, never the MP, P20(a)), enters
+#   inputs and records GOSI maternity cases (R61); it sees payslips to review the run it approves.
+# - approver (CFO) approves (= posts) payments, reverses runs, manages settings, approves maternity legal clearances
+#   (R61(b), (d)) and sees payslips and cost reports.
+# - managing_partner approves loans, bai' ajel terms and (route ``managing_partner``) overtime (P11, P12) and holds
+#   every A permission as fallback (OQ-1); for runs payroll.approvals refuses it (P20(a): "contracted payroll needs
+#   no Managing Partner approval").
+# - department_head (new, proposed in access OQ-28; payroll R45 route ``department_head``): approves the overtime of
+#   the department it heads, nothing else.
+# - accountant and viewer: aggregates and cost reports.
+_PAYROLL_VIEW = ("payroll.view",)
+_PAYROLL_OFFICER = (
+    "payroll.view", "payroll.view_payslip", "payroll.manage_inputs", "payroll.approve_input", "payroll.prepare_run",
+    "payroll.submit_run", "payroll.create_loan", "payroll.create_deferred_sale", "payroll.record_payment",
+    "payroll.generate_wps_file", "payroll.record_mudad_submission",
+)
+_PAYROLL_APPROVALS = ("payroll.approve_input", "payroll.approve_overtime", "payroll.approve_maternity_clearance",
+                      "payroll.approve_run", "payroll.approve_loan", "payroll.approve_deferred_sale_terms",
+                      "payroll.approve_deferred_sale", "payroll.approve_payment")
+ROLE_SEED_V13 = {
+    **ROLE_SEED_V12,
+    "payroll_officer": _plus(ROLE_SEED_V12, "payroll_officer", *_PAYROLL_OFFICER),
+    "hr_officer": _plus(ROLE_SEED_V12, "hr_officer", "payroll.view", "payroll.view_payslip", "payroll.manage_inputs",
+                        "payroll.approve_run", "payroll.record_maternity_case"),
+    "approver": _plus(ROLE_SEED_V12, "approver", "payroll.view", "payroll.view_payslip", "payroll.view_cost_reports",
+                      "payroll.manage_settings", "payroll.approve_payment", "payroll.reverse_run",
+                      "payroll.approve_maternity_clearance"),
+    "accountant": _plus(ROLE_SEED_V12, "accountant", *_PAYROLL_VIEW, "payroll.view_cost_reports"),
+    "viewer": _plus(ROLE_SEED_V12, "viewer", *_PAYROLL_VIEW, "payroll.view_cost_reports"),
+    "managing_partner": _plus(ROLE_SEED_V12, "managing_partner", *_PAYROLL_VIEW, *_PAYROLL_APPROVALS),
+    "department_head": (
+        "Department head", "رئيس القسم", "entity", "human", None,
+        ("payroll.approve_overtime",),
+    ),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V12
+ROLE_SEED = ROLE_SEED_V13
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
