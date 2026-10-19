@@ -144,6 +144,30 @@ def rate(f, t, d, r):
                                        source="manual", rate_type="spot", created_by=make_user())
 
 
+def asset_bill(w, cost, on=date(2027, 2, 15)):
+    """A posted vendor bill of ALM debiting 1250 (bai' ajel asset bought in the company's name, E9): test data."""
+    from invoicing import services as inv
+    from ledger.models import Account
+
+    if not hasattr(w, "ap"):
+        Account.objects.get_or_create(entity=w.alm, code="1250", defaults=dict(
+            name_en="Assets acquired for employee deferred sale", name_ar="أصول مشتراة للبيع الآجل للموظفين",
+            type="asset", parent=Account.objects.get(entity=w.alm, code="1000"), is_postable=True))
+        w.ap = make_user("ap")
+        member(w.ap, w.alm, "payables_clerk")
+        w.vendor = inv.create_vendor(w.alm, user=w.ap, vendor_kind="business", code="V-BAJ", name_en="Test Car Dealer",
+                                     name_ar="معرض سيارات تجريبي", is_vat_registered=True, vat_number="320000000000003")
+        w.bills = 0
+    w.bills += 1
+    doc = inv.create_purchase_document(w.alm, user=w.ap, vendor=w.vendor, vendor_document_number=f"CAR-{w.bills}",
+                                       vendor_document_date=on, accounting_date=on)
+    inv.add_purchase_line(doc, user=w.ap, account="1250", quantity="1", unit_price=cost, description_ar="أصل للبيع الآجل")
+    doc.refresh_from_db()
+    _, net, charged, _, _, _, _ = inv._purchase_amounts(doc, list(doc.lines.select_related("vat_rate")))
+    inv.update_purchase_document(doc, user=w.ap, vendor_total_vat=charged, vendor_total_gross=net + charged)
+    return inv.approve_purchase_document(inv.submit_purchase_document(doc, user=w.ap), user=w.c)
+
+
 def approve_input(w, inp, user=None):
     return services.approve_input(inp, user=user or w.p2)
 

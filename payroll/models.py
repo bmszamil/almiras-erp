@@ -175,6 +175,9 @@ class PayrollSettings(ServiceWritten):
     salary_bank_account = models.ForeignKey("ledger.Account", on_delete=models.PROTECT, related_name="+",
                                             verbose_name=bi("Salary bank account", "حساب بنك الرواتب"))
     wps_format = models.CharField(bi("WPS file format", "صيغة ملف حماية الأجور"), max_length=30, blank=True)
+    # C-C1: name of the total-deductions column in the salary file ([CC-verify] per bank, OQ-10).
+    wps_deductions_field = models.CharField(bi("WPS deductions field name", "اسم حقل الاستقطاعات في ملف الرواتب"),
+                                            max_length=30, default="DEDUCTIONS")
     wps_bank_code = EncryptedTextField(bi("Establishment ID at the bank", "رقم المنشأة لدى البنك"),
                                        plain_max_length=40, blank=True, default="")
     employer_bank_iban = EncryptedTextField(bi("Employer IBAN", "آيبان صاحب العمل"), plain_max_length=34, blank=True,
@@ -242,6 +245,11 @@ class PayrollInput(Tracked, ServiceWritten):
         DAMAGE_ART91 = "damage_art91", bi("Damage recovery (Art. 91)", "تعويض إتلاف (المادة 91)")
         STATUTORY_OTHER = "statutory_other", bi("Other statutory deduction", "استقطاع نظامي آخر")
 
+    class Art106Case(models.TextChoices):
+        INVENTORY_CLOSING = "inventory_closing", bi("Inventory, balance sheets, closing (106(1))",
+                                                    "الجرد وإعداد الميزانية وإقفال الحسابات (106(1))")
+        OTHER = "other", bi("Another Art. 106 case", "حالة أخرى من المادة 106")
+
     EARNING_KINDS = (Kind.ONE_OFF_EARNING, Kind.BONUS, Kind.MATERNITY_SUPPORT)
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
@@ -261,6 +269,9 @@ class PayrollInput(Tracked, ServiceWritten):
     overtime_date = models.DateField(bi("Overtime date", "تاريخ العمل الإضافي"), null=True, blank=True)
     art106_exceptional = models.BooleanField(bi("Art. 106 exceptional case", "حالة استثنائية وفق المادة 106"),
                                              default=False)
+    # C-A7: which Art. 106 case; inventory and closing work (106(1)) is at most 30 days a year. Empty = another case.
+    art106_case = models.CharField(bi("Art. 106 case", "حالة المادة 106"), max_length=20, blank=True,
+                                   choices=Art106Case.choices)
     worker_consent_ref = models.CharField(bi("Worker consent above 720 hours", "موافقة العامل فوق 720 ساعة"),
                                           max_length=200, blank=True)
     deduction_basis = models.CharField(bi("Deduction basis", "أساس الاستقطاع"), max_length=20,
@@ -511,6 +522,10 @@ class Payslip(ServiceWritten):
     warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
     notes = models.JSONField(bi("Notes", "ملاحظات"), default=list, blank=True)
     input_ids = models.JSONField(bi("Inputs taken", "المدخلات المأخوذة"), default=list, blank=True)
+    # Review 8: keyed hash of the IBAN at calculation; a WPS file lists the employee as an exception if it changed.
+    iban_hash = models.CharField(bi("IBAN hash at calculation", "بصمة الآيبان عند الاحتساب"), max_length=64, blank=True)
+    termination_ref = models.PositiveIntegerField(bi("Approved termination at calculation", "إنهاء الخدمة المعتمد عند الاحتساب"),
+                                                  null=True, blank=True)
 
     class Meta:
         base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
@@ -727,6 +742,7 @@ class DeferredSaleContract(Tracked, ServiceWritten):
         DRAFT = "draft", bi("Draft", "مسودة")
         TERMS_SUBMITTED = "terms_submitted", bi("Terms submitted", "الشروط مقدمة")
         TERMS_APPROVED = "terms_approved", bi("Terms approved", "الشروط معتمدة")
+        ASSET_ACQUIRED = "asset_acquired", bi("Asset bought and possessed", "الأصل مشترى ومقبوض")
         SOLD = "sold", bi("Sold (invoice posted)", "مبيع (الفاتورة مرحّلة)")
         SETTLED = "settled", bi("Settled", "مسدد")
 
@@ -746,6 +762,13 @@ class DeferredSaleContract(Tracked, ServiceWritten):
     final_dues_undertaking = models.BooleanField(bi("Undertaking: deduct from final dues", "تعهد بالاستقطاع من المستحقات النهائية"),
                                                  default=False)
     sale_document_ref = models.CharField(bi("Sale invoice (invoicing)", "فاتورة البيع"), max_length=60, blank=True)
+    # Review 11 (R47 step 3, 3.11): the company buys the asset in its own name (a posted bill debiting 1250 at the
+    # cost) and takes possession before the sale; the sale is refused otherwise.
+    purchase_bill = models.ForeignKey("invoicing.PurchaseDocument", null=True, blank=True, on_delete=models.PROTECT,
+                                      related_name="+", verbose_name=bi("Purchase bill", "فاتورة الشراء"))
+    possession_date = models.DateField(bi("Possession date", "تاريخ القبض"), null=True, blank=True)
+    possession_evidence_ref = models.CharField(bi("Possession evidence", "مستند القبض"), max_length=200, blank=True)
+    sale_date = models.DateField(bi("Sale date", "تاريخ البيع"), null=True, blank=True)
     status = models.CharField(bi("Status", "الحالة"), max_length=16, choices=Status.choices, default=Status.DRAFT)
     submitted_by = _user("Submitted by", "قدّمه")
     terms_approved_by = _user("Terms approved by", "اعتمد الشروط")
@@ -848,7 +871,8 @@ class WpsFile(ServiceWritten):
     format_parameter = models.ForeignKey("hr.StatutoryParameter", null=True, blank=True, on_delete=models.PROTECT,
                                          related_name="+", verbose_name=bi("Format parameter", "معيار الصيغة"))
     generated_by = _user("Generated by", "أنشأه", null=False)
-    generated_at = models.DateTimeField(bi("Generated at", "تاريخ الإنشاء"), auto_now_add=True)
+    # Set by the service from its clock (the 10-year burn nomination counts from it; tests move the clock).
+    generated_at = models.DateTimeField(bi("Generated at", "تاريخ الإنشاء"))
     sha256 = models.CharField(bi("SHA-256", "البصمة"), max_length=64)
     employee_count = models.PositiveIntegerField(bi("Employees", "عدد الموظفين"))
     total_amount = _money("Total", "الإجمالي")
@@ -888,6 +912,9 @@ class MudadSubmission(ServiceWritten):
     message_en = models.TextField(bi("Message (English)", "الرسالة (بالإنجليزية)"), blank=True)
     message_ar = models.TextField(bi("Message (Arabic)", "الرسالة (بالعربية)"), blank=True)
     justifications = models.JSONField(bi("Justifications", "المبررات"), default=list, blank=True)
+    # Review 15: the hash of the bank-processed file uploaded to Mudad, as recorded.
+    bank_processed_sha256 = models.CharField(bi("Bank-processed file SHA-256", "بصمة ملف البنك المعالج"), max_length=64,
+                                             blank=True)
     recorded_by = _user("Recorded by", "سجّله", null=False)
     created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
 

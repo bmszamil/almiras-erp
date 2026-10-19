@@ -5,7 +5,7 @@ import pytest
 from django.core.exceptions import PermissionDenied
 
 from payroll import services
-from payroll.conftest import D, amount, approved, calculated, saudi, slip
+from payroll.conftest import D, amount, approved, asset_bill, calculated, saudi, slip
 from payroll.invoicing_port import NotBuiltInvoicingPort
 from payroll.models import DeferredSaleInstallment, EmployeeLoan, PayrollError
 
@@ -74,10 +74,14 @@ def test_r27_loan_settles_when_fully_deducted(w):
     assert EmployeeLoan.objects.get(pk=l.pk).status == "settled"
 
 
-def sale(w, emp, cost="30000.00", profit="3600.00", term=24, consent="SIGNED-BAJ-1", **kw):
+def sale(w, emp, cost="30000.00", profit="3600.00", term=24, consent="SIGNED-BAJ-1", acquire=True, **kw):
     c = services.create_deferred_sale(emp, user=w.p, asset_description_ar="سيارة", cost=cost, profit_amount=profit,
                                       term_months=term, first_period="2027-03", consent_ref=consent, **kw)
-    return services.approve_deferred_sale_terms(services.submit_deferred_sale_terms(c, user=w.p), user=w.mp)
+    c = services.approve_deferred_sale_terms(services.submit_deferred_sale_terms(c, user=w.p), user=w.mp)
+    if acquire:  # R47 step 3: bought in the company's name and possessed before the sale (review 11)
+        c = services.record_asset_acquisition(c, user=w.p, purchase_bill=asset_bill(w, cost),
+                                              possession_date=date(2027, 2, 16), possession_evidence_ref="DELIVERY-1")
+    return c
 
 
 def test_at30_at57_bai_ajel_sale_through_invoicing_and_installments(w):

@@ -1,10 +1,9 @@
 """WPS files, Mudad, payslips, reports and alerts (R2, R16, R24, R25, R31 to R33, R35, R40, R51, R53; AT-16,
 AT-19, AT-21, AT-22, AT-34, AT-39, AT-60)."""
-from datetime import date, timedelta, datetime
+from datetime import date
 
 import pytest
 from django.core.exceptions import PermissionDenied
-from django.utils import timezone
 
 from core.access.models import AccessLog
 from hr import services as hr
@@ -23,6 +22,10 @@ def test_at19_at39_wps_file_excludes_invalid_iban_and_logs(w):
     with pytest.raises(PayrollError) as exc:
         services.generate_wps_file(run, user=w.p)
     assert exc.value.code == "wps_format_missing"
+    with pytest.raises(PayrollError) as exc:  # C-C3: DEST-ID names the salary bank
+        services.generate_wps_file(run, user=w.p, format_code="mudad_placeholder")
+    assert exc.value.code == "salary_bank_missing"
+    services.configure_settings(w.alm, user=w.c, salary_bank="alrajhi")
     f = services.generate_wps_file(run, user=w.p, format_code="mudad_placeholder")
     assert f.employee_count == 2 and [e["employee_code"] for e in f.exceptions] == [n1.employee_code]
     rows = f.content.splitlines()
@@ -69,7 +72,7 @@ def test_at21_payslip_bilingual_masked_and_logged(w):
     with pytest.raises(PermissionDenied):
         services.render_payslip(ps, user=w.v)
     html = services.render_payslip(ps, user=w.p)
-    assert "Payslip / قسيمة راتب" in html and "شخص نموذجي" in html and "Net / الصافي" in html
+    assert "قسيمة راتب" in html and "Payslip" in html and "شخص نموذجي" in html and "الصافي" in html and "Net" in html
     assert s1.iban not in html and "****7519" in html and s1.id_number not in html
     assert AccessLog.objects.filter(details__action="payslip_viewed", actor=w.p).exists()
     StatutoryParameter.objects.filter(code="gosi.min_wage")  # stored values: nothing is recalculated on view
@@ -121,18 +124,18 @@ def test_at22_secondment_cost_report_without_names(w):
 def test_at39_r53_mudad_alerts_and_at60_retention_nomination(w, pclock):
     saudi(w)
     run = approved(w)
-    for day in (7, 10, 15):
+    for day in (3, 6, 11):  # C-C5: pay date 2027-03-27 + 7, 10 and 15 days
         services.send_alerts(today=date(2027, 4, day), entity=w.alm)
         services.send_alerts(today=date(2027, 4, day), entity=w.alm)  # once each
+    services.send_alerts(today=date(2027, 4, 7), entity=w.alm)  # day 7 of the month is not a Mudad day by itself
     assert PayrollAlert.objects.filter(kind="mudad_deadline", recipient=w.p).count() == 3
-    f = services.generate_wps_file(run, user=w.p, format_code="generic_csv")
+    f = services.generate_wps_file(run, user=w.p, format_code="generic_csv")  # generated 2027-03-20 (payroll clock)
     WpsFile.objects.filter(pk=f.pk)  # stored
     services.send_alerts(today=date(2027, 5, 1), entity=w.alm)
     assert WpsFile.objects.get(pk=f.pk).nominated_for_burn_at is None
-    # generated_at is the real creation time (auto_now_add), so count the 10 years from it, plus two days
-    # so the Riyadh-midnight cutoff is past it at any time of day.
-    made = timezone.localtime(WpsFile.objects.get(pk=f.pk).generated_at).date()
-    services.send_alerts(today=date(made.year + 10, made.month, min(made.day, 28)) + timedelta(days=2), entity=w.alm)
+    services.send_alerts(today=date(2037, 3, 19), entity=w.alm)
+    assert WpsFile.objects.get(pk=f.pk).nominated_for_burn_at is None
+    services.send_alerts(today=date(2037, 3, 22), entity=w.alm)
     assert WpsFile.objects.get(pk=f.pk).nominated_for_burn_at is not None  # nominated, never deleted
 
 

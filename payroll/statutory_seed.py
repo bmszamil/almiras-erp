@@ -38,6 +38,10 @@ SA_PAYROLL = {
                                       "Labour Law Art. 107; unified contract cl. 11.4" + CHECKED),
     "overtime.max_hours_year": ({"hours": "720"}, REGULATIONS, "Implementing Regulations Art. 22" + CHECKED),
     "overtime.exceptional_max": ({"daily": "10", "weekly": "60"}, LABOUR_LAW, "Labour Law Art. 106" + CHECKED),
+    "overtime.art106_inventory_max_days": ({"days": "30"}, LABOUR_LAW,
+                                           "Labour Law Art. 106(1): inventory, balance sheets, closing and seasonal "
+                                           "preparation, not more than 30 days a year (compliance C-A7, 2026-10-19); MP "
+                                           "verification pending (hr R7)"),
     "overtime.hour_divisor_rule": ({"rule": "day_basis_days_x_daily_hours"}, LABOUR_LAW,
                                    "[CC-verify: hour divisor not stated in HRSD sources]"),
     "deduction.caps": ({"loan_max_pct": "10", "total_max_pct": "50", "court_max_fraction": "1/4",
@@ -147,6 +151,21 @@ LEGAL_AGE = ({"new_m273": {"years": "65", "article": "SIL Art. 16(1)"},
              "booklet 2025 p.21" + REGS_READ)
 
 # hr R68 (H20(d), P19(f)): "activate only Egypt for now". One row per active jurisdiction; no row = not active.
+# C-C3 (compliance 2026-10-19): DEST-ID (salary bank) and BANK-57 (each employee's bank) as bank codes. Keyed by the
+# two-digit bank identifier of a Saudi IBAN (characters 5 and 6); SWIFT BICs from the banks' public SWIFT codes.
+# [CC-verify: confirm each bank's code for the WPS file with the bank (P18, OQ-10)].
+SAMA_BANKS = "https://www.sama.gov.sa/en-US/LicenseEntities/Pages/LicensedBanks.aspx"
+WPS_BANK_CODES = ({"by_iban_code": {
+    "80": {"bic": "RJHISARI", "salary_bank": "alrajhi"},
+    "10": {"bic": "NCBKSAJE", "salary_bank": "snb"},
+    "20": {"bic": "RIBLSARI", "salary_bank": "riyad"},
+    "60": {"bic": "BJAZSAJE", "salary_bank": "aljazira"},
+    "05": {"bic": "INMASARI", "salary_bank": "alinma"},
+    "45": {"bic": "SABBSARI"}, "55": {"bic": "BSFRSARI"}, "30": {"bic": "ARNBSARI"}, "15": {"bic": "ALBISARI"},
+    "65": {"bic": "SIBCSARI"},
+}}, SAMA_BANKS, "Bank identifier in the Saudi IBAN and SWIFT BIC per bank [CC-verify: WPS bank code per bank, P18]")
+WPS_FROM = "2000-01-01"
+
 ACTIVE_FROM = "2026-10-17"
 ACTIVE = {"SA": ({"active": True}, OWNER, "Project owner B3 (2026-10-17): Saudi payroll"),
           "EG": ({"active": True}, OWNER, "Project owner B3 (2026-10-17): \"activate only Egypt for now\"")}
@@ -209,6 +228,7 @@ def apply(StatutoryParameter):
         apply_rows(StatutoryParameter, {"gosi.rates.annuities": (
             {"new_m273": {"employer": pct, "employee": pct}, "legacy_m33": dict(_LEGACY)}, SIL_RD, ANNUITY_REF)},
             valid_from=valid_from)
+    apply_rows(StatutoryParameter, {"wps.bank_codes": WPS_BANK_CODES}, valid_from=WPS_FROM)
     for jurisdiction, row in ACTIVE.items():
         apply_rows(StatutoryParameter, {"jurisdiction.active": row}, jurisdiction=jurisdiction, valid_from=ACTIVE_FROM)
     for code, valid_from, value, url, ref in EG_ROWS:

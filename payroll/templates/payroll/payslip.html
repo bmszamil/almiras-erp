@@ -1,33 +1,36 @@
 <!DOCTYPE html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Payslip {{ period }} / قسيمة راتب {{ period }}</title></head>
+<html lang="ar" dir="rtl">
+<head><meta charset="utf-8"><title>قسيمة راتب {{ period }} / Payslip {{ period }}</title></head>
 <body>
 <header>
-  <h1>Payslip / قسيمة راتب</h1>
-  <p>{{ entity_en }} / <span lang="ar" dir="rtl">{{ entity_ar }}</span></p>
-  <p>Period / الفترة: {{ period }} &middot; Run / المسير: {{ number }}</p>
-  <p>Employee / الموظف: {{ employee_code }} &middot; {{ name_en }} / <span lang="ar" dir="rtl">{{ name_ar }}</span></p>
-  <p>IBAN / الآيبان: {{ iban }} &middot; Currency / العملة: {{ currency }}</p>
+  <h1>قسيمة راتب / <span lang="en" dir="ltr">Payslip</span></h1>
+  <p><strong>النص العربي هو المعتمد / <span lang="en" dir="ltr">The Arabic text prevails</span></strong></p>
+  <p>{{ entity_ar }} / <span lang="en" dir="ltr">{{ entity_en }}</span></p>
+  <p>الفترة / <span lang="en" dir="ltr">Period</span>: {{ period }} &middot; المسير / <span lang="en" dir="ltr">Run</span>: {{ number }}</p>
+  <p>تاريخ الصرف / <span lang="en" dir="ltr">Pay date</span>: {{ pay_date|date:"Y-m-d" }} &middot; الأيام المدفوعة / <span lang="en" dir="ltr">Paid days</span>: {{ paid_days }}</p>
+  <p>الموظف / <span lang="en" dir="ltr">Employee</span>: {{ employee_code }} &middot; {{ name_ar }} / <span lang="en" dir="ltr">{{ name_en }}</span></p>
+  <p>الآيبان / <span lang="en" dir="ltr">IBAN</span>: <span dir="ltr">{{ iban }}</span> &middot; العملة / <span lang="en" dir="ltr">Currency</span>: {{ currency }}</p>
+  <p>الأجر الخاضع للاشتراك في التأمينات / <span lang="en" dir="ltr">GOSI contributory wage</span>: {{ gosi_wage }}</p>
 </header>
 <table>
-  <thead><tr><th>Item / البند</th><th>Amount / المبلغ</th></tr></thead>
+  <thead><tr><th>البند / <span lang="en" dir="ltr">Item</span></th><th>المبلغ / <span lang="en" dir="ltr">Amount</span></th></tr></thead>
   <tbody>
-  {% for l in earnings %}<tr><td>{{ l.description_en }} / <span lang="ar" dir="rtl">{{ l.description_ar }}</span></td><td>{{ l.amount_txn }}</td></tr>{% endfor %}
-  {% for l in reductions %}<tr><td>{{ l.description_en }} / <span lang="ar" dir="rtl">{{ l.description_ar }}</span></td><td>-{{ l.amount_txn }}</td></tr>{% endfor %}
-  <tr><th>Gross / الإجمالي</th><th>{{ gross }}</th></tr>
-  {% for l in deductions %}<tr><td>{{ l.description_en }} / <span lang="ar" dir="rtl">{{ l.description_ar }}</span></td><td>-{{ l.amount_txn }}</td></tr>{% endfor %}
-  <tr><th>Net / الصافي</th><th>{{ net }}</th></tr>
-  {% if wht %}<tr><td>Withholding tax {{ wht.rate }}% / ضريبة الاستقطاع</td><td>-{{ wht.wht }}</td></tr>
-  <tr><th>Net of WHT / الصافي بعد ضريبة الاستقطاع</th><th>{{ wht.net_of_wht }}</th></tr>{% endif %}
+  {% for l in earnings %}<tr><td>{{ l.description_ar }} / <span lang="en" dir="ltr">{{ l.description_en }}</span></td><td>{{ l.amount_txn }}</td></tr>{% endfor %}
+  {% for l in reductions %}<tr><td>{{ l.description_ar }} / <span lang="en" dir="ltr">{{ l.description_en }}</span></td><td>-{{ l.amount_txn }}</td></tr>{% endfor %}
+  <tr><th>الإجمالي / <span lang="en" dir="ltr">Gross</span></th><th>{{ gross }}</th></tr>
+  {% for l in deductions %}<tr><td>{{ l.description_ar }} / <span lang="en" dir="ltr">{{ l.description_en }}</span></td><td>-{{ l.amount_txn }}</td></tr>{% endfor %}
+  <tr><th>الصافي / <span lang="en" dir="ltr">Net</span></th><th>{{ net }}</th></tr>
+  {% if wht %}<tr><td>ضريبة الاستقطاع / <span lang="en" dir="ltr">Withholding tax {{ wht.rate }}%</span></td><td>-{{ wht.wht }}</td></tr>
+  <tr><th>الصافي بعد ضريبة الاستقطاع / <span lang="en" dir="ltr">Net of WHT</span></th><th>{{ wht.net_of_wht }}</th></tr>{% endif %}
   </tbody>
 </table>
 <section>
-  <h2>Employer contributions / مساهمات صاحب العمل</h2>
-  <ul>{% for l in employer %}<li>{{ l.description_en }} / <span lang="ar" dir="rtl">{{ l.description_ar }}</span>: {{ l.amount }}</li>{% endfor %}</ul>
+  <h2>مساهمات صاحب العمل / <span lang="en" dir="ltr">Employer contributions</span></h2>
+  <ul>{% for l in employer %}<li>{{ l.description_ar }} / <span lang="en" dir="ltr">{{ l.description_en }}</span>: {{ l.amount }}</li>{% endfor %}</ul>
 </section>
-<p>Loan balance / رصيد القرض: {{ loan_balance }}{% if interest_free %} &middot; Interest-free loan (qard hasan) / <span lang="ar" dir="rtl">قرض حسن بدون فوائد</span>{% endif %}</p>
-<p>Annual leave balance (days) / رصيد الإجازة السنوية (أيام): {{ leave_balance }}</p>
-{% for n in notices %}<p>{{ n.text_en }} / <span lang="ar" dir="rtl">{{ n.text_ar }}</span></p>{% endfor %}
+<p>رصيد القرض / <span lang="en" dir="ltr">Loan balance</span>: {{ loan_balance }}{% if interest_free %} &middot; قرض حسن بدون فوائد / <span lang="en" dir="ltr">Interest-free loan (qard hasan)</span>{% endif %}</p>
+<p>رصيد الإجازة السنوية (أيام) / <span lang="en" dir="ltr">Annual leave balance (days)</span>: {{ leave_balance }}</p>
+{% for n in notices %}<p>{{ n.text_ar }} / <span lang="en" dir="ltr">{{ n.text_en }}</span></p>{% endfor %}
 {% for n in notes %}<p>{{ n }}</p>{% endfor %}
 </body>
 </html>

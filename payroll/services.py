@@ -232,7 +232,7 @@ SETTINGS_FIELDS = frozenset({
     "enabled", "default_pay_day", "input_cutoff_day", "out_of_country_cutoff_day", "salary_bank", "day_basis",
     "day_basis_ref", "salary_bank_account", "wps_format", "wps_bank_code", "employer_bank_iban",
     "gosi_oh_rate_override", "gosi_oh_override_ref", "gosi_oh_override_from", "gosi_oh_override_to",
-    "gosi_housing_in_kind_exempt_ref",
+    "gosi_housing_in_kind_exempt_ref", "wps_deductions_field",
 })
 
 
@@ -401,7 +401,8 @@ def _overtime_route(emp, on):
     return ("department_head",), head.user
 
 
-def _year_overtime_hours(emp, on, exclude=None):
+def _overtime_year(emp, on):
+    """The employee's year (contract calendar basis) holding ``on``."""
     terms = _terms(emp, on)
     if terms is not None and terms.calendar_basis == EmploymentContract.CalendarBasis.HIJRI:
         from hijridate import Gregorian
@@ -411,6 +412,11 @@ def _year_overtime_hours(emp, on, exclude=None):
         start, end = date(g1.year, g1.month, g1.day), date(g2.year, g2.month, g2.day) - timedelta(days=1)
     else:
         start, end = date(on.year, 1, 1), date(on.year, 12, 31)
+    return start, end
+
+
+def _year_overtime_hours(emp, on, exclude=None):
+    start, end = _overtime_year(emp, on)
     qs = PayrollInput.objects.filter(employee=emp, kind=IK.OVERTIME_HOURS, overtime_date__range=(start, end)) \
         .exclude(status=IS.REJECTED)
     if exclude is not None:
@@ -486,6 +492,22 @@ def _input_problems(inp, use):
                 if week + inp.quantity > Decimal(caps["weekly"]):
                     problems.append(f"In the exceptional cases of Art. 106 at most {caps['weekly']} hours a week (R52). / "
                                     f"في الحالات الاستثنائية للمادة 106 بحد أقصى {caps['weekly']} ساعة في الأسبوع.")
+                if inp.art106_case not in ("", *PayrollInput.Art106Case.values):
+                    problems.append("Unknown Art. 106 case. / حالة غير معروفة من حالات المادة 106.")
+                elif inp.art106_case == PayrollInput.Art106Case.INVENTORY_CLOSING:
+                    # C-A7: inventory, balance sheets, closing of accounts and seasonal preparation, at most 30 days a
+                    # year (Labour Law Art. 106(1)).
+                    max_days = int(use.get("SA", "overtime.art106_inventory_max_days", inp.overtime_date)["days"])
+                    ys, ye = _overtime_year(emp, inp.overtime_date)
+                    days = set(PayrollInput.objects.filter(
+                        employee=emp, kind=IK.OVERTIME_HOURS, art106_exceptional=True,
+                        art106_case=PayrollInput.Art106Case.INVENTORY_CLOSING, overtime_date__range=(ys, ye))
+                        .exclude(status=IS.REJECTED).exclude(pk=inp.pk).values_list("overtime_date", flat=True))
+                    days.add(inp.overtime_date)
+                    if len(days) > max_days:
+                        problems.append(f"Inventory and closing work under Art. 106(1) is at most {max_days} days a year; "
+                                        f"this would be day {len(days)} (C-A7). / العمل في الجرد وإقفال الحسابات وفق المادة "
+                                        f"106(1) لا يتجاوز {max_days} يومًا في السنة.")
     if inp.kind == IK.ONE_OFF_DEDUCTION:
         basis_ = inp.deduction_basis
         if basis_ not in PayrollInput.DeductionBasis.values:
@@ -500,16 +522,23 @@ def _input_problems(inp, use):
             terms = _terms(emp, end)
             wage = _sum(terms, "counts_for_eosb")
             caps = use.get("SA", "deduction.caps", end)
+            # C-A4: the caps are per month for all deductions of that basis together.
+            others = PayrollInput.objects.filter(employee=emp, kind=IK.ONE_OFF_DEDUCTION, deduction_basis=basis_,
+                                                 period=inp.period).exclude(status=IS.REJECTED).exclude(pk=inp.pk) \
+                .aggregate(t=Sum("amount"))["t"] or ZERO
+            total = others + inp.amount
             if basis_ == PayrollInput.DeductionBasis.COURT_ORDER:
                 limit = _round(Fraction(wage) * Fraction(caps["court_max_fraction"]))
-                if inp.amount > limit:
-                    problems.append(f"A court-ordered deduction is at most a quarter of the wage, {limit} (Art. 92(6)). / "
-                                    f"لا يتجاوز الاستقطاع بحكم قضائي ربع الأجر {limit}.")
+                if total > limit:
+                    problems.append(f"Court-ordered deductions are at most a quarter of the wage a month, {limit}; with the "
+                                    f"others of {inp.period} they would be {total} (Art. 92(6), C-A4). / لا تتجاوز "
+                                    f"الاستقطاعات بحكم قضائي ربع الأجر في الشهر {limit}؛ ومع غيرها تبلغ {total}.")
             else:
                 limit = _round(Fraction(wage) * int(caps["damage_max_days_month"]) / 30)
-                if inp.amount > limit:
-                    problems.append(f"Damage recovery is at most 5 days' wage a month, {limit} (Art. 91). / لا يتجاوز "
-                                    f"اقتطاع تعويض الإتلاف أجر خمسة أيام في الشهر {limit}.")
+                if total > limit:
+                    problems.append(f"Damage recovery is at most 5 days' wage a month, {limit}; with the others of "
+                                    f"{inp.period} it would be {total} (Art. 91, C-A4). / لا يتجاوز اقتطاع تعويض الإتلاف "
+                                    f"أجر خمسة أيام في الشهر {limit}؛ ومع غيره يبلغ {total}.")
     if inp.kind == IK.MATERNITY_SUPPORT and not inp.legal_clearance_ref.strip():
         problems.append("Temporary maternity support needs the written legal clearance reference (R61(b)). / يحتاج "
                         "الدعم المؤقت أثناء الأمومة إلى مرجع الإذن القانوني المكتوب.")
@@ -517,7 +546,7 @@ def _input_problems(inp, use):
 
 
 INPUT_FIELDS = frozenset({"kind", "period", "reference", "quantity", "amount", "component", "reason_en", "reason_ar",
-                          "overtime_date", "art106_exceptional", "worker_consent_ref", "deduction_basis",
+                          "overtime_date", "art106_exceptional", "art106_case", "worker_consent_ref", "deduction_basis",
                           "consent_ref", "legal_clearance_ref"})
 
 
@@ -804,6 +833,8 @@ class Slip:
     notices: list = field(default_factory=list)  # [(origin, amount, en, ar)]
     alerts: list = field(default_factory=list)  # [(kind, key, en, ar, roles)]
     input_ids: list = field(default_factory=list)  # inputs the payslip takes (review 9)
+    iban_hash: str = ""  # review 8: the IBAN the payslip was calculated with
+    termination_ref: int = None  # review 8: the approved termination known at calculation
 
     def warn(self, en, ar):
         text = f"{self.employee.employee_code}: {en} / {self.employee.employee_code}: {ar}"
@@ -1043,8 +1074,9 @@ def _compute_gosi(ctx, slip, emp, info, *, cohort, nclass, basis, remuneration_s
         other = _other_employers_wage(emp, info)
         if other and own + other > cap:
             own = cap * own / (own + other)
-            slip.notes.append(f"GOSI wage reduced pro rata: other employers {_round(other)} (GOSI Regs Art. 19, R68). / "
-                              f"خُفض أجر الاشتراك بالتناسب لوجود أصحاب عمل آخرين.")
+            # C-B4: the note never shows the other employers' amounts (their pay is not this employer's data).
+            slip.notes.append("GOSI wage reduced pro rata: the SAR 45,000 cap applies across all employers (GOSI Regs Art. "
+                              "19, R68). / خُفض أجر الاشتراك بالتناسب: يسري حد 45,000 ريال على جميع أصحاب العمل.")
     own = min(own, cap)
     g.wage_full = _round(own)
     wage = own
@@ -1433,6 +1465,7 @@ def _covered_gosi_wage(emp, period, booked, branch, employer_side):
 
 
 GOSI_TYPES = (LT.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI, LT.GOSI_CATCH_UP)
+GOSI_BOOKED_TYPES = GOSI_TYPES  # lines credited to 2340 (C-B7 adds the uncollected employee share)
 
 
 def _prior_corrections(ctx, slip, emp, versions):
@@ -1539,6 +1572,7 @@ def _apply_caps(ctx, slip, emp, info):
     total_cap = _round(Fraction(due) * Fraction(caps["total_max_pct"]) / 100) if due > 0 else ZERO
     loan_cap = _round(Fraction(actual) * Fraction(caps["loan_max_pct"]) / 100)
     fixed = slip.total({LT.DEDUCTION})
+    _statutory_deduction_caps(ctx, slip, emp, info, due, actual, caps)
     gosi_ee = [l for l in slip.lines if l.line_type == LT.EMPLOYEE_GOSI]
     room = total_cap - fixed
     if room < 0:
@@ -1577,6 +1611,31 @@ def _apply_caps(ctx, slip, emp, info):
                                                   ctx.p("deferred_sale.apply_loan_cap", info.end).get("apply")):
                 loan_room -= take
     slip.lines = [l for l in slip.lines if l.amount > 0 or l.line_type in PayslipLine.EARNINGS]
+
+
+def _statutory_deduction_caps(ctx, slip, emp, info, due, actual, caps):
+    """C-A4: court-ordered deductions at most a quarter of the wage due for the month and damage recovery at most 5
+    days' wage a month (Labour Law Art. 92(6), 91), counting every deduction of that basis the period's approved runs
+    already took."""
+    for basis, en, ar in ((PayrollInput.DeductionBasis.COURT_ORDER, "Court-ordered deductions", "الاستقطاعات بحكم قضائي"),
+                          (PayrollInput.DeductionBasis.DAMAGE_ART91, "Damage recovery", "اقتطاع تعويض الإتلاف")):
+        this = sum((l.amount for l in slip.lines if l.line_type == LT.DEDUCTION and l.basis == basis), ZERO)
+        if not this:
+            continue
+        booked = PayrollInput.objects.filter(employee=emp, kind=IK.ONE_OFF_DEDUCTION, deduction_basis=basis,
+                                             taken_run__period=ctx.period,
+                                             taken_run__status__in=(RS.APPROVED, RS.PAID)).aggregate(t=Sum("amount"))["t"]
+        booked = _round(booked or ZERO)
+        if basis == PayrollInput.DeductionBasis.COURT_ORDER:
+            month_due = due + (Payslip.objects.filter(employee=emp, run__period=ctx.period, refused=False,
+                                                      run__status__in=(RS.APPROVED, RS.PAID))
+                               .aggregate(t=Sum("gross"))["t"] or ZERO)
+            limit = _round(Fraction(max(month_due, ZERO)) * Fraction(caps["court_max_fraction"]))
+        else:
+            limit = _round(Fraction(actual) * int(caps["damage_max_days_month"]) / 30)
+        if this + booked > limit:
+            slip.refuse(f"{en} of {ctx.period} ({this + booked}) exceed the monthly limit {limit} (Art. 92(6), 91; C-A4).",
+                        f"{ar} لفترة {ctx.period} ({this + booked}) تتجاوز الحد الشهري {limit}.")
 
 
 def _loan_lines(ctx, slip, emp):
@@ -1725,7 +1784,8 @@ def _calc_ksa(ctx, emp, versions, info, mode=None):
     nclass = _nationality_class(emp)
     v_last = info.version_on(info.last)
     slip = Slip(employee=emp, basis=emp.employment_basis, nationality_class=nclass, cohort=emp.gosi_cohort or "",
-                currency=ctx.entity.base_currency, contract=v_last, paid_days=Decimal(info.paid_days))
+                currency=ctx.entity.base_currency, contract=v_last, paid_days=Decimal(info.paid_days),
+                iban_hash=_iban_hash(emp.iban), termination_ref=getattr(_termination(emp), "pk", None))
     try:
         inputs = _employee_inputs(ctx, emp, every_period=mode == "final")
         slip.input_ids = [i.pk for i in inputs]
@@ -1940,7 +2000,7 @@ def _fingerprint(slips, warnings, params):
                 l.branch, str(l.quantity), str(l.rate), l.source_ref, l.origin_period]
     data = [[s.employee.pk, s.refusal, str(s.fx_rate), str(s.gosi_wage), str(s.eosb), s.maternity_status,
              sorted(s.loan_effects), sorted(s.sale_effects), [line(l) for l in s.lines], sorted(s.notices),
-             sorted(s.input_ids)]
+             sorted(s.input_ids), s.iban_hash, s.termination_ref]
             for s in slips]
     return hashlib.sha256(json.dumps([data, sorted(warnings), params], default=str).encode()).hexdigest()
 
@@ -1972,7 +2032,7 @@ def _store(ctx, slips):
                      pending_gosi_amount=s.pending_gosi_amount, legal_clearance_ref=s.legal_clearance_ref,
                      leave_balance_snapshot=s.leave_balance, document_flag=s.document_flag[:10],
                      refused=bool(s.refusal), refusal=s.refusal, warnings=s.warnings, notes=s.notes,
-                     input_ids=sorted(s.input_ids))
+                     input_ids=sorted(s.input_ids), iban_hash=s.iban_hash, termination_ref=s.termination_ref)
         gross = s.total(PayslipLine.EARNINGS) - s.total(PayslipLine.REDUCTIONS)
         ded = s.total(PayslipLine.DEDUCTIONS)
         ps.gross, ps.total_deductions, ps.net = gross, ded, gross - ded
@@ -2662,25 +2722,77 @@ def approve_deferred_sale_terms(contract, *, user):
     return _save(c)
 
 
+ASSET_ACCOUNT = "1250"
+
+
+def _bill_cost(bill, entity):
+    """The posted cost of the asset on a purchase bill: its debits on 1250 (E9), functional currency."""
+    if bill.entity_id != entity.pk or bill.doc_type != "bill" or bill.status != "posted" or bill.journal_entry_id is None:
+        return None
+    return JournalLine.objects.filter(entry_id=bill.journal_entry_id, account__code=ASSET_ACCOUNT).aggregate(
+        t=Sum("debit"))["t"] or ZERO
+
+
 @transaction.atomic
-def approve_deferred_sale(contract, *, user):
-    """R47 steps 3 to 5 (P19(k), P20(h)): the matrix approver approves the sale; invoicing creates and posts the sale
-    invoice at 15% VAT on the sale price, charged to the employee (invoicing R112, through ``invoicing_port``). The
-    schedule then spreads sale price + VAT over the term exactly; installments are deducted with the signed consent
-    within the 50% cap (no 10% loan cap, R49)."""
+def record_asset_acquisition(contract, *, user, purchase_bill, possession_date, possession_evidence_ref):
+    """R47 step 3 (review 11): the company bought the asset in its own name (a posted bill of the same entity debiting
+    1250 at exactly the contract cost, E9) and took possession (date and evidence). Only then may the sale be
+    approved."""
+    c = _lock(DeferredSaleContract, contract.pk)
+    _require(user, c.entity, "payroll.create_deferred_sale")
+    if c.status != DeferredSaleContract.Status.TERMS_APPROVED:
+        raise error("The terms must be approved before the purchase is recorded (R47).",
+                    "يجب اعتماد الشروط قبل تسجيل الشراء.", code="sale_status")
+    problems = []
+    cost = _bill_cost(purchase_bill, c.entity)
+    if cost is None:
+        problems.append("The purchase bill must be a posted bill of the same entity (R47, E9). / يجب أن تكون فاتورة "
+                        "الشراء فاتورة مرحّلة للكيان نفسه.")
+    elif cost != c.cost:
+        problems.append(f"The bill debits {cost} to 1250; the contract cost is {c.cost} (R47). / تقيد الفاتورة {cost} على "
+                        f"الحساب 1250 وتكلفة العقد {c.cost}.")
+    if possession_date is None or not (possession_evidence_ref or "").strip():
+        problems.append("Possession needs its date and the evidence reference (R47). / يحتاج القبض إلى تاريخه ومرجع "
+                        "المستند.")
+    elif purchase_bill is not None and possession_date < purchase_bill.accounting_date:
+        problems.append("Possession cannot come before the purchase (R47). / لا يسبق القبض الشراء.")
+    if problems:
+        raise _problems(problems, "acquisition_invalid")
+    c.purchase_bill, c.possession_date, c.possession_evidence_ref = purchase_bill, possession_date, possession_evidence_ref
+    c.status, c.modified_by, c.modified_at = DeferredSaleContract.Status.ASSET_ACQUIRED, user, _now()
+    return _save(c)
+
+
+@transaction.atomic
+def approve_deferred_sale(contract, *, user, sale_date=None):
+    """R47 steps 4 and 5 (P19(k), P20(h)): the matrix approver approves the sale, only after the company bought the
+    asset (posted bill, still posted) and took possession, on a sale date on or after possession (review 11); invoicing
+    creates and posts the sale invoice at 15% VAT on the sale price, charged to the employee (invoicing R112, through
+    ``invoicing_port``). The schedule then spreads sale price + VAT over the term exactly; installments are deducted
+    with the signed consent within the 50% cap (no 10% loan cap, R49)."""
     c = DeferredSaleContract.objects.get(pk=contract.pk)
     grant = _require(user, c.entity, "payroll.approve_deferred_sale", document=c)
     approvals.check(grant, c.entity, "payroll.deferred_sale")
     c = _lock(DeferredSaleContract, c.pk)
-    if c.status != DeferredSaleContract.Status.TERMS_APPROVED:
+    if c.status == DeferredSaleContract.Status.TERMS_APPROVED:
+        raise error("The company must buy the asset and take possession before selling it (R47, review 11).",
+                    "يجب أن تشتري الشركة الأصل وتقبضه قبل بيعه.", code="asset_not_acquired")
+    if c.status != DeferredSaleContract.Status.ASSET_ACQUIRED:
         raise error("The terms must be approved first (R47).", "يجب اعتماد الشروط أولًا.", code="sale_status")
+    sale_date = sale_date or _today()
+    if _bill_cost(c.purchase_bill, c.entity) != c.cost:
+        raise error("The purchase bill is no longer posted at the contract cost (R47).",
+                    "لم تعد فاتورة الشراء مرحّلة بتكلفة العقد.", code="asset_not_acquired")
+    if c.possession_date is None or sale_date < c.possession_date:
+        raise error("The sale date is on or after the possession date (R47, 3.11).",
+                    "تاريخ البيع في تاريخ القبض أو بعده.", code="sale_before_possession")
     if not c.consent_ref.strip():
         raise error("The sale needs the employee's signed consent to salary deductions (R49).",
                     "يحتاج البيع إلى موافقة الموظف الموقعة على الاستقطاع من الراتب.", code="consent_required")
     result = invoicing_port.get_port().create_bai_ajel_sale(c, user=user)
     c.sale_document_ref, c.vat_amount = result.document_ref, _dec(result.vat_amount, "vat_amount")
     c.number = _next_number(c.entity, "BAJ", int(c.first_period[:4]))
-    c.status = DeferredSaleContract.Status.SOLD
+    c.status, c.sale_date = DeferredSaleContract.Status.SOLD, sale_date
     _save(c)
     total = c.receivable
     n = int(c.term_months)
@@ -2905,51 +3017,112 @@ def _mask_iban(iban):
     return f"****{iban[-4:]}" if iban else ""
 
 
-def _wps_rows(run):
-    """Employees in the salary file: KSA employees only (R51; remuneration staff are outside WPS); without a valid
-    IBAN they are listed as exceptions (R31)."""
+def _iban_hash(iban):
+    """Review 8: keyed hash of the normalised IBAN (never stored in clear on the payslip)."""
+    text = "".join((iban or "").split()).upper()
+    return hr.crypto.keyed_hash(text) if text else ""
+
+
+FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _cell(value):
+    """Review 7: a CSV cell a spreadsheet would read as a formula is prefixed with an apostrophe."""
+    text = "" if value is None else str(value)
+    return "'" + text if text.startswith(FORMULA_START) else text
+
+
+def _wps_amounts(ps):
+    """C-C1, C-C2: MOL-BAS = this period's BASIC net of its reductions, MOL-HALI = cash HOUSING net of its reductions,
+    MOL-OEA = every other earning net of reductions (retro, overtime, one-offs, released pay); none negative; their sum
+    is the gross. Deductions = the payslip's total deductions."""
+    basic = housing = ZERO
+    for l in ps.lines.filter(line_type__in=(LT.EARNING, *PayslipLine.REDUCTIONS), origin_period="",
+                             component__code__in=("BASIC", "HOUSING")).select_related("component"):
+        sign = 1 if l.line_type == LT.EARNING else -1
+        if l.component.code == "BASIC":
+            basic += sign * l.amount
+        else:
+            housing += sign * l.amount
+    basic, housing = max(basic, ZERO), max(housing, ZERO)
+    other = ps.gross - basic - housing
+    if other < 0:  # reductions of other components above their earnings: taken from housing, then basic
+        cut = min(housing, -other)
+        housing, other = housing - cut, other + cut
+        cut = min(basic, -other)
+        basic, other = basic - cut, other + cut
+    return basic, housing, max(other, ZERO)
+
+
+def _wps_rows(run, bank_codes=None):
+    """Employees in the salary file: KSA employees only (R51; remuneration staff are outside WPS). Exceptions (listed,
+    not in the file, R31): no valid IBAN; IBAN changed since the payslip was calculated, or a termination approved
+    after the run was approved (review 8: check before paying); the bank of the IBAN unknown in ``wps.bank_codes``
+    (C-C3)."""
     rows, exceptions = [], []
     for ps in Payslip.objects.filter(run=run, refused=False).select_related("employee").order_by("employee__employee_code"):
         emp = Employee.objects.get(pk=ps.employee_id)  # unmasked, inside the service only; logged below
         if not emp.wps_included:
             continue
+        reason = None
         if not emp.iban or not hr._iban_ok(emp.iban):
-            exceptions.append({"employee_code": emp.employee_code,
-                               "reason": "No valid IBAN / لا يوجد آيبان صالح"})
+            reason = "No valid IBAN / لا يوجد آيبان صالح"
+        elif ps.iban_hash and _iban_hash(emp.iban) != ps.iban_hash:
+            reason = ("IBAN changed since the payslip was calculated: confirm it before paying (review 8) / تغيّر "
+                      "الآيبان بعد احتساب القسيمة: تحقق منه قبل الصرف")
+        elif (getattr(_termination(emp), "pk", None) or 0) != (ps.termination_ref or 0):
+            reason = ("Termination approved after the payslip was calculated: check before paying (review 8) / اعتُمد "
+                      "إنهاء الخدمة بعد احتساب القسيمة: تحقق قبل الصرف")
+        bic = ""
+        if reason is None and bank_codes is not None:
+            entry = bank_codes.get("".join(emp.iban.split()).upper()[4:6])
+            if entry is None:
+                reason = ("The bank of this IBAN has no code in wps.bank_codes (C-C3) / لا يوجد رمز لبنك هذا الآيبان في "
+                          "wps.bank_codes")
+            else:
+                bic = entry["bic"]
+        if reason is not None:
+            exceptions.append({"employee_code": emp.employee_code, "reason": reason})
             continue
-        comp = {l.component.code: l.amount for l in ps.lines.filter(line_type=LT.EARNING).select_related("component")}
-        basic = comp.get("BASIC", ZERO)
-        housing = comp.get("HOUSING", ZERO)
+        basic, housing, other = _wps_amounts(ps)
         rows.append({"employee_code": emp.employee_code, "name": emp.full_name_en, "id": emp.id_number,
-                     "iban": emp.iban, "bank": emp.bank_name, "net": ps.net, "basic": basic, "housing": housing,
-                     "other": ps.gross - basic - housing, "deductions": ps.total_deductions})
+                     "iban": emp.iban, "bank": emp.bank_name, "bic": bic, "net": ps.net, "basic": basic,
+                     "housing": housing, "other": other, "deductions": ps.total_deductions})
     return rows, exceptions
 
 
-def _wps_csv(run, fmt, rows, s, use):
+def _wps_csv(run, fmt, rows, s, use, bank_codes=None):
     out = io.StringIO()
     w = csv.writer(out, lineterminator="\r\n")
+
+    def write(cells):
+        w.writerow([_cell(c) for c in cells])
+
     total = sum((r["net"] for r in rows), ZERO)
     if fmt == "generic_csv":
-        w.writerow(["employee_code", "name", "id_number", "iban", "bank", "basic", "housing", "other_earnings",
-                    "deductions", "net"])
+        write(["employee_code", "name", "id_number", "iban", "bank", "basic", "housing", "other_earnings",
+               "deductions", "net"])
         for r in rows:
-            w.writerow([r["employee_code"], r["name"], r["id"], r["iban"], r["bank"], r["basic"], r["housing"],
-                        r["other"], r["deductions"], r["net"]])
+            write([r["employee_code"], r["name"], r["id"], r["iban"], r["bank"], r["basic"], r["housing"], r["other"],
+                   r["deductions"], r["net"]])
         return out.getvalue(), None
     fields = use.get("SA", "wps.fields.mol", run.entry_date)
     hs = HrSettings.objects.filter(entity=run.entity).first()
-    header = {"DEST-ID": s.salary_bank, "ESTB-ID": s.wps_bank_code, "BANK-ACC": s.employer_bank_iban,
+    dest = next((v["bic"] for v in (bank_codes or {}).values() if v.get("salary_bank") == s.salary_bank), "")
+    header = {"DEST-ID": dest, "ESTB-ID": s.wps_bank_code, "BANK-ACC": s.employer_bank_iban,
               "32A-CCY": run.entity.base_currency_id, "32A-VAL": run.pay_date.isoformat(), "32A-AMT": str(total),
               "D-CATE": "", "FILE-REF": run.number, "FILE-REJCDE": "", "MOL-ESTBID": hs.mudad_establishment_no if hs else ""}
-    w.writerow(fields["header"])
-    w.writerow([header.get(f, "") for f in fields["header"]])
-    w.writerow(fields["content"])
+    # C-C1: the total deductions, under the field name the bank uses (settings; [CC-verify] per bank, OQ-10).
+    content_fields = list(fields["content"]) + [s.wps_deductions_field or "DEDUCTIONS"]
+    write(fields["header"])
+    write([header.get(f, "") for f in fields["header"]])
+    write(content_fields)
     for r in rows:
-        content = {"32B-AMT": str(r["net"]), "ACC-59": r["iban"], "NAM-57": r["name"], "BANK-57": r["bank"],
+        content = {"32B-AMT": str(r["net"]), "ACC-59": r["iban"], "NAM-57": r["name"], "BANK-57": r["bic"],
                    "DET-70": "", "MOL-BAS": str(r["basic"]), "MOL-HALI": str(r["housing"]),
-                   "MOL-OEA": str(r["other"]), "MOL-ALL": str(r["basic"] + r["housing"] + r["other"]), "MOL-ID": r["id"]}
-        w.writerow([content.get(f, "") for f in fields["content"]])
+                   "MOL-OEA": str(r["other"]), "MOL-ALL": str(r["basic"] + r["housing"] + r["other"]), "MOL-ID": r["id"],
+                   s.wps_deductions_field or "DEDUCTIONS": str(r["deductions"])}
+        write([content.get(f, "") for f in content_fields])
     return out.getvalue(), None
 
 
@@ -2983,9 +3156,16 @@ def generate_wps_file(run, *, user, format_code=None):
         use.check_verified()
         raise error(f"The {fmt} byte layout is not built until the bank supplies it (P18).",
                     f"لم يُبنَ تنسيق بنك {fmt} حتى يزوده البنك.", code="wps_format_missing")
-    rows, exceptions = _wps_rows(run)
-    content, _ = _wps_csv(run, fmt, rows, s, use)
+    bank_codes = None
+    if fmt == "mudad_placeholder":
+        if not s.salary_bank:
+            raise error("Set the salary bank first: the file names it in DEST-ID (R51, C-C3).",
+                        "حدّد بنك الرواتب أولًا: يُذكر في الحقل DEST-ID.", code="salary_bank_missing")
+        bank_codes = use.get("SA", "wps.bank_codes", run.entry_date)["by_iban_code"]
+    rows, exceptions = _wps_rows(run, bank_codes)
+    content, _ = _wps_csv(run, fmt, rows, s, use, bank_codes)
     f = _save(WpsFile(entity=run.entity, run=run, format_code=fmt, format_parameter=param_row, generated_by=user,
+                      generated_at=_now(),
                       sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(), employee_count=len(rows),
                       total_amount=sum((r["net"] for r in rows), ZERO), exceptions=exceptions, content=content))
     access_services.log(AccessLog.Event.PERSONAL_DATA_VIEWED, actor=user, entity=run.entity,
@@ -3013,6 +3193,13 @@ def attach_bank_processed_file(wps_file, *, user, content):
     _require(user, f.entity, "payroll.record_mudad_submission")
     if not content:
         raise error("The bank-processed file is empty.", "ملف البنك المعالج فارغ.", code="file_empty")
+    if f.bank_processed_sha256:
+        raise error("The bank-processed file of this WPS file is already attached; it is kept as received (review 15).",
+                    "أُرفق ملف البنك المعالج لهذا الملف مسبقًا؛ ويُحفظ كما ورد.", code="bank_file_attached")
+    limit = int(getattr(django_settings, "PAYROLL_BANK_FILE_MAX_BYTES", 5_000_000))
+    if len(content.encode("utf-8")) > limit:
+        raise error(f"The bank-processed file is larger than {limit} bytes (review 15).",
+                    f"ملف البنك المعالج أكبر من {limit} بايت.", code="file_too_large")
     f.bank_processed_content = content
     f.bank_processed_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
     f.bank_processed_received_at = _now()
@@ -3031,7 +3218,8 @@ def record_mudad_submission(wps_file, *, user, submitted_on, reference, status, 
     if status not in MudadSubmission.Status.values or not (reference or "").strip():
         raise error("Mudad reference and status are required.", "مرجع مدد والحالة مطلوبان.", code="mudad_invalid")
     return _save(MudadSubmission(entity=f.entity, run=f.run, wps_file=f, submitted_on=submitted_on, reference=reference,
-                                 status=status, message_ar=message_ar, message_en=message_en, recorded_by=user))
+                                 status=status, message_ar=message_ar, message_en=message_en, recorded_by=user,
+                                 bank_processed_sha256=f.bank_processed_sha256))
 
 
 # =====================================================================================================
@@ -3069,6 +3257,8 @@ def payslip_data(payslip, *, user):
     return {
         "entity_en": ps.entity.legal_name_en or ps.entity.name_en, "entity_ar": ps.entity.legal_name_ar or ps.entity.name_ar,
         "period": ps.run.period, "number": ps.run.number, "employee_code": emp.employee_code,
+        # C-A13: paid days, the pay date and the GOSI wage are on the payslip.
+        "paid_days": ps.paid_days, "pay_date": ps.run.pay_date, "gosi_wage": ps.gosi_wage,
         "name_en": emp.full_name_en, "name_ar": emp.full_name_ar, "iban": _mask_iban(emp.iban),
         "currency": ps.currency_id, "earnings": [l for l in lines if l.line_type in PayslipLine.EARNINGS],
         "reductions": [l for l in lines if l.line_type in PayslipLine.REDUCTIONS],
@@ -3113,23 +3303,35 @@ def payroll_register(run, *, user):
 
 
 def gosi_report(entity, period, *, user):
-    """GOSI report of a period (approved runs; codes only): wage and shares per branch, the due date (15th of the
-    following month, Regs Art. 24(1)) and the late-fine rule (2% per month or part; waivers, Regs Art. 25)."""
+    """GOSI report of a period (approved runs): totals per branch and side, the due date (15th of the following
+    month, Regs Art. 24(1)) and the late-fine rule (2% per month or part; waivers, Regs Art. 25). Review 13 (D1): the
+    per-employee rows (employee code, GOSI wage and shares) are individual pay: they are included only for a holder of
+    ``payroll.view_payslip`` in the entity, and that view is logged; ``payroll.view_cost_reports`` alone gets the
+    aggregates."""
     _require(user, entity, "payroll.view_cost_reports")
-    rows = {}
+    detail = access.has(user, entity, "payroll.view_payslip")
+    rows, branches = {}, {}
     for l in PayslipLine.objects.filter(entity=entity, payslip__run__period=period, payslip__refused=False,
                                         payslip__run__status__in=(RS.APPROVED, RS.PAID),
-                                        line_type__in=(LT.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI, LT.GOSI_CATCH_UP)) \
-            .select_related("payslip__employee"):
-        r = rows.setdefault(l.payslip.employee.employee_code, {"employee_code": l.payslip.employee.employee_code,
-                                                               "gosi_wage": l.payslip.gosi_wage, "employee": ZERO,
-                                                               "employer": ZERO})
-        r["employer" if l.line_type == LT.EMPLOYER_GOSI else "employee"] += l.amount
+                                        line_type__in=GOSI_BOOKED_TYPES).select_related("payslip__employee"):
+        side = "employer" if l.line_type == LT.EMPLOYER_GOSI and not l.source_ref.startswith("borne:") else "employee"
+        b_ = branches.setdefault(l.gosi_branch or "", {"branch": l.gosi_branch or "", "employee": ZERO, "employer": ZERO})
+        b_[side] += l.amount
+        if detail:
+            r = rows.setdefault(l.payslip.employee.employee_code, {"employee_code": l.payslip.employee.employee_code,
+                                                                   "gosi_wage": l.payslip.gosi_wage, "employee": ZERO,
+                                                                   "employer": ZERO})
+            r[side] += l.amount
+    if detail:
+        access_services.log(AccessLog.Event.PERSONAL_DATA_VIEWED, actor=user, entity=entity,
+                            permission="payroll.view_payslip",
+                            details={"action": "gosi_report", "period": period, "employee_codes": sorted(rows)})
     due_day = int(hr.param("SA", "gosi.payment_due_day", _period_bounds(period)[1]).value["new_m273"])
     ns = _period_bounds(_next_period(period))[0]
     fine = hr.param("SA", "gosi.late_fine_pct", _period_bounds(period)[1]).value
-    total = sum((r["employee"] + r["employer"] for r in rows.values()), ZERO)
-    return {"period": period, "rows": sorted(rows.values(), key=lambda r: r["employee_code"]), "total": total,
+    total = sum((b_["employee"] + b_["employer"] for b_ in branches.values()), ZERO)
+    return {"period": period, "rows": sorted(rows.values(), key=lambda r: r["employee_code"]),
+            "branches": sorted(branches.values(), key=lambda b_: b_["branch"]), "total": total,
             "due_date": ns.replace(day=due_day), "open": _gosi_open(entity, period),
             "late_fine_en": f"Late payment: {fine['pct']}% of the due contribution per month or part (Law Art. 9(3)); a "
                             f"delay of up to {fine['full_waiver_max_delay_days']} days may be fully waived (Regs Art. 25); "
@@ -3209,6 +3411,9 @@ def record_catch_up_notification(notice, *, user, notified_on, channel):
 # Alerts job (R10, R22, R53; P19(m))
 # =====================================================================================================
 
+MUDAD_ALERT_DAYS = (7, 10, 15)
+
+
 def send_alerts(*, today=None, entity=None):
     """``payroll_alerts`` (daily): Mudad upload due (days 7, 10, 15 of the following month while no submission is
     recorded, R53); GOSI registration (25th and last day of the joining month, Regs Art. 6); GOSI payment due (the
@@ -3221,15 +3426,17 @@ def send_alerts(*, today=None, entity=None):
     for e in entities:
         roles = ("payroll_officer", "hr_officer")
         prev = _period_of(today.replace(day=1) - timedelta(days=1))
-        if today.day in (7, 10, 15):
-            for run in PayrollRun.objects.filter(entity=e, period=prev, payroll_group=PayrollGroup.IN_COUNTRY,
+        # C-C5: Mudad counts from the pay date: alerts 7, 10 and 15 days after it while no submission is recorded.
+        for offset in MUDAD_ALERT_DAYS:
+            for run in PayrollRun.objects.filter(entity=e, pay_date=today - timedelta(days=offset),
+                                                 payroll_group=PayrollGroup.IN_COUNTRY,
                                                  status__in=(RS.APPROVED, RS.PAID)):
                 if not MudadSubmission.objects.filter(run=run).exists():
-                    _send_alerts(e, [(PayrollAlert.Kind.MUDAD_DEADLINE, f"mudad:{run.pk}:{today.day}",
-                                      f"Upload the bank-processed salary file of {run.period} to Mudad (day {today.day}; "
-                                      "Mudad refers to inspection on day 20).",
-                                      f"ارفع ملف الرواتب المعالج من البنك لفترة {run.period} على مدد (اليوم {today.day}؛ "
-                                      "يُحال إلى التفتيش في اليوم 20).", roles)])
+                    _send_alerts(e, [(PayrollAlert.Kind.MUDAD_DEADLINE, f"mudad:{run.pk}:{offset}",
+                                      f"Upload the bank-processed salary file of {run.period} to Mudad: {offset} days since "
+                                      f"the pay date {run.pay_date} (R53, C-C5).",
+                                      f"ارفع ملف الرواتب المعالج من البنك لفترة {run.period} على مدد: مضى {offset} أيام على "
+                                      f"تاريخ الصرف {run.pay_date}.", roles)])
                     sent += 1
         last = calendar.monthrange(today.year, today.month)[1]
         if today.day in (25, last):
