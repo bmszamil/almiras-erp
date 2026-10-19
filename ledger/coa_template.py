@@ -23,6 +23,9 @@ TEMPLATE = [
     ("1200", "Trade receivables", "الذمم المدينة التجارية", A, {"monetary": True}),
     ("1210", "Due from group entities", "مستحق من شركات المجموعة", A, {"intercompany": True, "monetary": True}),
     ("1220", "Loans to group entities", "قروض لشركات المجموعة", A, {"intercompany": True, "monetary": True}),
+    # Approved by the CFO 2026-10-17 (payroll.md §5, P19(g)): payroll control accounts (payroll documents only).
+    ("1230", "Employee loans and advances", "قروض وسلف الموظفين", A, {"monetary": True}),
+    ("1240", "Employee deferred-sale (bai' ajel) receivable", "ذمم البيع الآجل للموظفين", A, {"monetary": True}),
     ("1300", "Sharia-compliant deposits (e.g. murabaha, wakala)", "ودائع متوافقة مع الشريعة", A, {"monetary": True}),
     ("1310", "VAT input", "ضريبة القيمة المضافة - مدخلات", A, {"monetary": True}),
     ("1320", "Prepayments", "مصروفات مدفوعة مقدماً", A, {}),
@@ -42,6 +45,8 @@ TEMPLATE = [
     # PROPOSED (invoicing.md §5, D14, D18, D29): accountant / CFO to review; WHT on payments to non-residents (E20 to E22).
     ("2220", "Withholding tax payable", "ضريبة الاستقطاع المستحقة", L, {"monetary": True}),
     ("2300", "Accrued expenses", "مصروفات مستحقة", L, {"monetary": True}),
+    ("2330", "Salaries payable", "رواتب مستحقة", L, {"monetary": True}),  # payroll.md §5, P19(g)
+    ("2340", "GOSI payable", "اشتراكات التأمينات الاجتماعية المستحقة", L, {"monetary": True}),  # P19(g)
     ("2400", "Islamic financing (murabaha, tawarruq)", "تمويل إسلامي", L, {"monetary": True}),
     ("2410", "Conventional interest-bearing loans", "قروض تقليدية بفائدة", L, {"prohibited": True}),
     ("2500", "End-of-service provision", "مخصص مكافأة نهاية الخدمة", L, {"monetary": True}),
@@ -75,6 +80,7 @@ TEMPLATE = [
     ("5000", "Expenses", "المصروفات", X, {"header": True}),
     ("5100", "Salaries and benefits", "الرواتب والمزايا", X, {}),
     ("5110", "GOSI", "التأمينات الاجتماعية", X, {}),
+    ("5120", "End-of-service benefit expense", "مصروف مكافأة نهاية الخدمة", X, {}),  # payroll.md §5, P19(g)
     ("5200", "Rent", "الإيجار", X, {}),
     ("5300", "Professional fees", "الأتعاب المهنية", X, {}),
     ("5400", "Depreciation", "الاستهلاك", X, {}),
