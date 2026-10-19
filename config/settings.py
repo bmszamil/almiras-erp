@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     "banking",
     "migration",
     "tax",
+    "payroll",
 ]
 
 # tax-returns R55: the Art. 51 annual true-up hand-off (tax.art51_port). As built, invoicing posts mixed input VAT
@@ -110,8 +111,11 @@ HR_BILLING_PORT = "billing.hr_port.BillingHrPort"
 # billing.md R13, R43: the invoicing services billing calls (create_from_billing and create_adjustment_from_billing
 # are still stubs in invoicing; billing is tested against billing.testing.FakeInvoicing).
 BILLING_INVOICING_PORT = "billing.invoicing_port.InvoicingServicesPort"
-# R38/R41: where HR hands a terminated employee's final-settlement inputs to payroll (payroll.md 3.8, not built).
-HR_PAYROLL_PORT = "hr.payroll_port.NoPayrollPort"
+# R38/R41: where HR hands a terminated employee's final-settlement inputs to payroll (payroll.md 3.8; slice 1 answers
+# loan and bai' ajel balances; the payroll final settlement is slice 2).
+HR_PAYROLL_PORT = "payroll.hr_port.PayrollHrPort"
+# payroll R47 (P19(k)): the bai' ajel sale invoice is created by invoicing (R112, not built yet: refused, en/ar).
+PAYROLL_INVOICING_PORT = "payroll.invoicing_port.NotBuiltInvoicingPort"
 HR_ASSIGNMENT_EVENT_MAX_ATTEMPTS = 5  # R25 default
 
 # Banking (docs/specs/banking.md R4): IBANs, account numbers, statement files and counterparty data are encrypted at

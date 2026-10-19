@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Payslip {{ period }} / قسيمة راتب {{ period }}</title></head>
+<body>
+<header>
+  <h1>Payslip / قسيمة راتب</h1>
+  <p>{{ entity_en }} / <span lang="ar" dir="rtl">{{ entity_ar }}</span></p>
+  <p>Period / الفترة: {{ period }} &middot; Run / المسير: {{ number }}</p>
+  <p>Employee / الموظف: {{ employee_code }} &middot; {{ name_en }} / <span lang="ar" dir="rtl">{{ name_ar }}</span></p>
+  <p>IBAN / الآيبان: {{ iban }} &middot; Currency / العملة: {{ currency }}</p>
+</header>
+<table>
+  <thead><tr><th>Item / البند</th><th>Amount / المبلغ</th></tr></thead>
+  <tbody>
+  {% for l in earnings %}<tr><td>{{ l.description_en }} / <span lang="ar" dir="rtl">{{ l.description_ar }}</span></td><td>{{ l.amount_txn }}</td></tr>{% endfor %}
+  {% for l in reductions %}<tr><td>{{ l.description_en }} / <span lang="ar" dir="rtl">{{ l.description_ar }}</span></td><td>-{{ l.amount_txn }}</td></tr>{% endfor %}
+  <tr><th>Gross / الإجمالي</th><th>{{ gross }}</th></tr>
+  {% for l in deductions %}<tr><td>{{ l.description_en }} / <span lang="ar" dir="rtl">{{ l.description_ar }}</span></td><td>-{{ l.amount_txn }}</td></tr>{% endfor %}
+  <tr><th>Net / الصافي</th><th>{{ net }}</th></tr>
+  {% if wht %}<tr><td>Withholding tax {{ wht.rate }}% / ضريبة الاستقطاع</td><td>-{{ wht.wht }}</td></tr>
+  <tr><th>Net of WHT / الصافي بعد ضريبة الاستقطاع</th><th>{{ wht.net_of_wht }}</th></tr>{% endif %}
+  </tbody>
+</table>
+<section>
+  <h2>Employer contributions / مساهمات صاحب العمل</h2>
+  <ul>{% for l in employer %}<li>{{ l.description_en }} / <span lang="ar" dir="rtl">{{ l.description_ar }}</span>: {{ l.amount }}</li>{% endfor %}</ul>
+</section>
+<p>Loan balance / رصيد القرض: {{ loan_balance }}{% if interest_free %} &middot; Interest-free loan (qard hasan) / <span lang="ar" dir="rtl">قرض حسن بدون فوائد</span>{% endif %}</p>
+<p>Annual leave balance (days) / رصيد الإجازة السنوية (أيام): {{ leave_balance }}</p>
+{% for n in notices %}<p>{{ n.text_en }} / <span lang="ar" dir="rtl">{{ n.text_ar }}</span></p>{% endfor %}
+{% for n in notes %}<p>{{ n }}</p>{% endfor %}
+</body>
+</html>

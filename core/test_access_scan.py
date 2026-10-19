@@ -42,6 +42,12 @@ ALLOW = {
     "invoicing/services.py:anonymisation_candidates": "invoicing_anonymise job only: reads retention dates (R52)",
     "invoicing/services.py:anonymise_expired_personal_data": "invoicing_anonymise operator job only (R52; off by "
                                                               "default, dry run unless applied)",
+    "payroll/services.py:runs": "the scope mechanism for payroll runs (access.scope with payroll.view, payroll R2)",
+    "payroll/services.py:get_run": "the scope mechanism for one run (get_scoped_or_404 with payroll.view, R2)",
+    "payroll/services.py:get_payslip": "the scope mechanism for one payslip (get_scoped_or_404, payroll.view_payslip)",
+    "payroll/services.py:setup_entity": "payroll_setup_entity command only (operator setup of a new entity, R3)",
+    "payroll/services.py:send_alerts": "payroll_alerts job only (R10, R22, R53; retention nomination)",
+    "payroll/services.py:skip_installment": "always refuses (R27: a skip needs a new approved schedule)",
     "hr/services.py:employees": "the scope mechanism for employees (access.scope with hr.view, R2)",
     "invoicing/services.py:send_charity_recipient_alerts": "invoicing_charity_recipient_alerts job only (owner "
                                                             "decision C3: expiry alerts 30 and 7 days before)",

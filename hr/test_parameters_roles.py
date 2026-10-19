@@ -28,11 +28,16 @@ def _submitted_termination(w, emp, kind="employer_termination", **fields):
 # --- R6: parameters are data ------------------------------------------------------------------------
 
 def test_r6_seeded_parameters_are_unverified_sa_rows(db):
+    from payroll import statutory_seed as payroll_seed
+
     rows = StatutoryParameter.objects.filter(jurisdiction="SA")
-    assert set(rows.values_list("code", flat=True)) == set(statutory_seed.ALL_CODES)
-    assert set(rows.values_list("status", flat=True)) == {"unverified"}
-    assert all(r.source_url and r.source_reference for r in rows)
-    assert not StatutoryParameter.objects.exclude(jurisdiction="SA").exists()  # OQ-26: none for EG, CN, AE
+    payroll_codes = (set(payroll_seed.SA_PAYROLL) | set(payroll_seed.SA_GOSI)
+                     | {"gosi.rates.annuities", "jurisdiction.active"})
+    assert set(rows.values_list("code", flat=True)) == set(statutory_seed.ALL_CODES) | payroll_codes
+    assert set(StatutoryParameter.objects.values_list("status", flat=True)) == {"unverified"}
+    assert all(r.source_url and r.source_reference for r in StatutoryParameter.objects.all())
+    # hr R68 / payroll R4: Egypt is activated as data with unverified research rows; none for CN, AE.
+    assert set(StatutoryParameter.objects.exclude(jurisdiction="SA").values_list("jurisdiction", flat=True)) == {"EG"}
 
 
 def test_r6_param_reads_the_row_valid_on_the_day(db):
@@ -43,7 +48,7 @@ def test_r6_param_reads_the_row_valid_on_the_day(db):
     assert services.param("SA", "probation.max_days", date(2027, 12, 31)).pk == old.pk
     assert services.param("SA", "probation.max_days", date(2028, 1, 1)).value == {"days": "170"}
     with pytest.raises(HrError) as exc:
-        services.param("EG", "probation.max_days", date(2027, 1, 1))
+        services.param("CN", "probation.max_days", date(2027, 1, 1))
     assert exc.value.code == "jurisdiction_not_configured" and "/" in exc.value.messages[0]
 
 
