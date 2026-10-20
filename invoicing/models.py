@@ -360,12 +360,23 @@ class Customer(Tracked, Address):
         help_text=bi("R52: personal data replaced by a fixed token after the retention period",
                      "استُبدلت البيانات الشخصية برمز ثابت بعد انتهاء مدة الحفظ"),
     )
+    # R112: the employee's own individual customer record, created by the bai' ajel sale (never by hand).
+    employee = models.ForeignKey(
+        "hr.Employee", null=True, blank=True, editable=False, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Employee", "الموظف"),
+        help_text=bi("The employee this individual customer is (bai' ajel sale, R112)",
+                     "الموظف الذي يمثله هذا العميل الفرد (البيع الآجل)"),
+    )
 
     class Meta:
         verbose_name = bi("customer", "عميل")
         verbose_name_plural = bi("customers", "العملاء")
         ordering = ["entity", "code"]
-        constraints = [models.UniqueConstraint(fields=["entity", "code"], name="customer_code_per_entity")]
+        constraints = [
+            models.UniqueConstraint(fields=["entity", "code"], name="customer_code_per_entity"),
+            models.UniqueConstraint(fields=["entity", "employee"], condition=models.Q(employee__isnull=False),
+                                    name="one_customer_per_employee"),
+        ]
 
     def clean(self):
         from . import services
@@ -2082,3 +2093,157 @@ class PayableAllocation(Allocation):
                 name="payable_allocation_one_source",
             ),
         ]
+
+
+# --- bai' ajel sale to an employee (R112, E28; payroll R47; owner decision E8) ----------------------------
+
+DEFERRED_SALE_SERVICE_ONLY = (
+    "Bai' ajel sales and their profit recognition change only through invoicing.services (R112). / "
+    "لا يتغير البيع الآجل وأرباحه المحققة إلا من خلال خدمات الفوترة."
+)
+
+
+class _DeferredSaleQuerySet(models.QuerySet):
+    """Bulk writes skip save(): these rows are written one by one by invoicing.services (R112)."""
+
+    def _refuse(self, *args, **kwargs):
+        raise error(*DEFERRED_SALE_SERVICE_ONLY.split(" / "), code="service_only")
+
+    update = delete = bulk_update = bulk_create = _refuse
+
+
+class _DeferredSaleWritten(models.Model):
+    """Saved only by a service that sets ``_service_write`` right before the one save it makes; never deleted."""
+
+    objects = _DeferredSaleQuerySet.as_manager()
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        allowed, self._service_write = getattr(self, "_service_write", False), False
+        if not allowed:
+            raise error(*DEFERRED_SALE_SERVICE_ONLY.split(" / "), code="service_only")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error(*DEFERRED_SALE_SERVICE_ONLY.split(" / "), code="service_only")
+
+
+class DeferredSale(_DeferredSaleWritten):
+    """The bai' ajel sale of one asset to one employee (R112, E28; payroll R47, owner decision E8).
+
+    Created only by ``invoicing.services.create_deferred_sale``, which payroll's sale approval calls through the
+    payroll invoicing port (``invoicing.payroll_port``), never by hand. The company bought the asset in its own name
+    (a posted purchase bill debiting 1250, E9) and took possession before the sale; the sale price is the cost on
+    1250 plus the profit fixed at the terms approval and never increases (no rate, penalty or late-fee field exists,
+    payroll R48). The sales document is a simplified invoice to the employee's own individual customer record, VAT
+    15% on the sale price charged to the employee (D33(i)); it posts on ZATCA reporting: Dr 1240 / Cr 1250 /
+    Cr 1241 / Cr 2200. ``active`` turns False only when ZATCA rejected that document and a new one replaces it.
+    """
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    sales_document = models.OneToOneField(SalesDocument, on_delete=models.PROTECT, related_name="deferred_sale",
+                                          verbose_name=bi("Sale invoice", "فاتورة البيع"))
+    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Employee (customer)", "الموظف (العميل)"))
+    purchase_bill = models.ForeignKey(PurchaseDocument, on_delete=models.PROTECT, related_name="+",
+                                      verbose_name=bi("Purchase bill (1250)", "فاتورة الشراء (1250)"))
+    source_type = models.CharField(bi("Approved in", "اعتُمد في"), max_length=60,
+                                   help_text=bi("app_label.model of the approved contract (payroll)",
+                                                "نوع العقد المعتمد (الرواتب)"))
+    source_id = models.PositiveBigIntegerField(bi("Contract", "العقد"))
+    cost = models.DecimalField(bi("Cost (from 1250)", "التكلفة (من 1250)"), max_digits=18, decimal_places=2)
+    profit_amount = models.DecimalField(bi("Fixed profit", "الربح الثابت"), max_digits=18, decimal_places=2)
+    vat_amount = models.DecimalField(bi("VAT charged to the employee", "الضريبة على الموظف"), max_digits=18,
+                                     decimal_places=2)
+    possession_date = models.DateField(bi("Possession date", "تاريخ القبض"))
+    possession_evidence_ref = models.CharField(bi("Possession evidence", "مستند القبض"), max_length=200)
+    approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                    verbose_name=bi("Sale approved by", "اعتمد البيع"))
+    approved_at = models.DateTimeField(bi("Sale approved at", "تاريخ اعتماد البيع"))
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                   verbose_name=bi("Created by", "أنشأه"))
+    created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
+    active = models.BooleanField(bi("Active", "نشط"), default=True,
+                                 help_text=bi("False once ZATCA rejected the sale invoice and a new one replaced it",
+                                              "يصبح غير نشط إذا رفضت الهيئة فاتورة البيع واستُبدلت بأخرى"))
+
+    class Meta:
+        verbose_name = bi("bai' ajel sale", "بيع آجل")
+        verbose_name_plural = bi("bai' ajel sales", "عمليات البيع الآجل")
+        ordering = ["entity", "-created_at"]
+        constraints = [
+            # One asset is sold once (R112, payroll R47): one live sale per purchase bill and per approved contract.
+            models.UniqueConstraint(fields=["purchase_bill"], condition=models.Q(active=True),
+                                    name="deferred_sale_one_per_bill"),
+            models.UniqueConstraint(fields=["entity", "source_type", "source_id"], condition=models.Q(active=True),
+                                    name="deferred_sale_one_per_contract"),
+            models.CheckConstraint(condition=models.Q(cost__gt=0), name="deferred_sale_cost_positive"),
+            models.CheckConstraint(condition=models.Q(profit_amount__gte=0), name="deferred_sale_profit_not_negative"),
+            models.CheckConstraint(condition=models.Q(vat_amount__gte=0), name="deferred_sale_vat_not_negative"),
+        ]
+
+    @property
+    def sale_price(self):
+        return self.cost + self.profit_amount
+
+    @property
+    def receivable(self):
+        """D33(i): the employee owes the sale price plus the VAT on it (the 1240 debit)."""
+        return self.sale_price + self.vat_amount
+
+    def __str__(self):
+        return f"{self.sales_document.number or 'DRAFT'} ({self.cost} + {self.profit_amount})"
+
+
+class DeferredProfitRelease(_DeferredSaleWritten):
+    """Profit of a bai' ajel sale recognised as its instalments are collected (R112, payroll E12, E13).
+
+    One row per collection payroll reports (an instalment deducted by an approved run, or recovered by the final
+    settlement), identified by ``source_ref``. The profit recognised to date is the fixed profit times the share of
+    the receivable (sale price + VAT) collected to date, rounded half-up to 2 decimals; the last collection releases
+    the rest, so the sum is exactly the fixed profit. Nothing depends on dates or time elapsed: no profit accrues on
+    a late or skipped instalment (payroll R48). Posts Dr 1241 / Cr 4610 through the ledger; corrected only by its
+    reversal (a reversed payroll run).
+    """
+
+    class Status(models.TextChoices):
+        POSTED = "posted", bi("Posted", "مرحّل")
+        REVERSED = "reversed", bi("Reversed", "معكوس")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    deferred_sale = models.ForeignKey(DeferredSale, on_delete=models.PROTECT, related_name="releases",
+                                      verbose_name=bi("Bai' ajel sale", "البيع الآجل"))
+    source_ref = models.CharField(bi("Collection (payroll)", "التحصيل (الرواتب)"), max_length=100)
+    date = models.DateField(bi("Date", "التاريخ"))
+    collected_amount = models.DecimalField(bi("Amount collected", "المبلغ المحصل"), max_digits=18, decimal_places=2)
+    collected_to_date = models.DecimalField(bi("Collected to date", "المحصل حتى تاريخه"), max_digits=18,
+                                            decimal_places=2)
+    profit_amount = models.DecimalField(bi("Profit recognised", "الربح المحقق"), max_digits=18, decimal_places=2)
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.POSTED)
+    journal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                      related_name="+", verbose_name=bi("Journal entry", "القيد اليومي"))
+    reversal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                       related_name="+", verbose_name=bi("Reversal entry", "قيد العكس"))
+    reversed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="+", verbose_name=bi("Reversed by", "عكسه"))
+    reversed_at = models.DateTimeField(bi("Reversed at", "تاريخ العكس"), null=True, blank=True)
+    reversal_reason = models.CharField(bi("Reversal reason", "سبب العكس"), max_length=300, blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                   verbose_name=bi("Collected by (payroll approver)", "حصّله (معتمد الرواتب)"))
+    created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
+
+    class Meta:
+        verbose_name = bi("bai' ajel profit recognition", "تحقق أرباح البيع الآجل")
+        verbose_name_plural = bi("bai' ajel profit recognitions", "تحقق أرباح البيع الآجل")
+        ordering = ["deferred_sale", "date", "id"]
+        constraints = [
+            models.UniqueConstraint(fields=["deferred_sale", "source_ref"], condition=models.Q(status="posted"),
+                                    name="deferred_profit_one_per_collection"),
+            models.CheckConstraint(condition=models.Q(collected_amount__gt=0), name="deferred_profit_collected_positive"),
+            models.CheckConstraint(condition=models.Q(profit_amount__gte=0), name="deferred_profit_not_negative"),
+        ]
+
+    def __str__(self):
+        return f"{self.deferred_sale_id} {self.source_ref}: {self.profit_amount} ({self.status})"

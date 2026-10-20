@@ -15,14 +15,21 @@ class InvoicingConfig(AppConfig):
         from ledger import documents, restricted
 
         from . import services
-        from .models import CustomerReceipt, PurchaseDocument, PurificationTransfer, SalesDocument, VendorPayment
+        from .models import (
+            CustomerReceipt,
+            DeferredProfitRelease,
+            PurchaseDocument,
+            PurificationTransfer,
+            SalesDocument,
+            VendorPayment,
+        )
 
         # Sales documents post only on ZATCA clearance or reporting (R41); they are never reversed (R17, OQ-28).
         documents.register(
             SalesDocument, post_permissions={"invoicing.post_on_clearance"},
             build_lines=services._sales_document_lines, validate_lines=services._check_document_rate,
             pending_documents=services._pending_sales_documents,
-            contract_approval=services._contract_approval,  # billing R53: auto-issued invoices
+            contract_approval=services._contract_approval,  # billing R53 auto-issued invoices; R112 bai' ajel sales
             sama_tax_point=services._sama_tax_point,  # owner decision H2: booked at the SAMA tax-point rate
         )
         documents.register(
@@ -51,6 +58,14 @@ class InvoicingConfig(AppConfig):
                               "invoicing.approve_purification_payout"},
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._purification_lines,
+        )
+        # R112 (payroll E12, E13): bai' ajel profit recognised as payroll collects the instalments (Dr 1241 /
+        # Cr 4610), posted by the deferred-sale system user after the payroll approval that collected them; reversed
+        # only through invoicing.services.reverse_deferred_profit with the payroll.reverse_run grant of a person.
+        documents.register(
+            DeferredProfitRelease, post_permissions={"invoicing.post_deferred_profit"},
+            reverse_permissions={"payroll.reverse_run"}, changed_at_field=None,
+            build_lines=services._deferred_profit_lines, reverse_guard=services._deferred_profit_reverse_guard,
         )
         # D31b review fix 1 and 2: GL 1140 (the purification account) is posted only by purification fundings and
         # payouts, the banking kinds banking allows on it and migration openings (and their reversals); every such

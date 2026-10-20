@@ -25,6 +25,8 @@ from .models import (
     CharityRecipient,
     CustomerReceipt,
     Customer,
+    DeferredProfitRelease,
+    DeferredSale,
     IncomeType,
     InvoicingSettings,
     NoteReason,
@@ -284,6 +286,19 @@ class VendorPaymentAdmin(ReadOnlyScopedAdmin):
         return ("vendor",) if obj is not None and _masked_party(request, obj.vendor) else ()
 
 
+class DeferredSaleAdmin(ReadOnlyScopedAdmin):
+    """R112: bai' ajel sales, read-only. The employee is shown by customer code only (an individual, R51)."""
+
+    list_display = ["sales_document", "entity", "customer", "purchase_bill", "cost", "profit_amount", "vat_amount",
+                    "possession_date", "approved_by", "active"]
+    status_field = None
+
+
+class DeferredProfitReleaseAdmin(ReadOnlyScopedAdmin):
+    list_display = ["deferred_sale", "entity", "source_ref", "date", "collected_amount", "collected_to_date",
+                    "profit_amount", "journal_entry", "status"]
+
+
 class AllocationAdmin(ReadOnlyScopedAdmin):
     list_display = ["entity", "target", "amount", "date", "via_settlement", "created_by"]
     status_field = None
@@ -366,6 +381,8 @@ admin.site.register(SalesDocument, SalesDocumentAdmin)
 admin.site.register(PurchaseDocument, PurchaseDocumentAdmin)
 admin.site.register(CustomerReceipt, ReceiptAdmin)
 admin.site.register(VendorPayment, VendorPaymentAdmin)
+admin.site.register(DeferredSale, DeferredSaleAdmin)
+admin.site.register(DeferredProfitRelease, DeferredProfitReleaseAdmin)
 admin.site.register(ReceivableAllocation, AllocationAdmin)
 admin.site.register(PayableAllocation, AllocationAdmin)
 admin.site.register(InvoicingSettings, SettingsAdmin)

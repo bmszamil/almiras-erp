@@ -1,5 +1,5 @@
-"""Statutory and spec reference data for invoicing (3.2), applied by migrations ``invoicing.0002`` (V1) and
-``invoicing.0005`` (V2).
+"""Statutory and spec reference data for invoicing (3.2), applied by migrations ``invoicing.0002`` (V1),
+``invoicing.0005`` (V2) and ``invoicing.0029`` (V3).
 
 Global data, no entity. Rates are data with effective dates, never constants. To change any of it,
 add a new data migration; never edit V1 after it has been applied anywhere.
@@ -142,10 +142,30 @@ def apply_v2(apps):
         IncomeType.objects.filter(code=code).update(default_exemption_reason=Reason.objects.get(code=reason))
 
 
+# --- V3 (R112, D32(r), D33(i); payroll R47), applied by migration invoicing.0029 ------------------------------------
+# The bai' ajel sale to an employee: a taxable supply at 15% on the sale price (legal adviser E8, D32(r)). No default
+# account: its lines credit 1250 (cost) and 1241 (deferred profit), set by the bai' ajel sale itself; a person can
+# never put this income type on a line (R112: created by payroll's sale approval, never by hand).
+# code, name_en, name_ar, vat category, art51 class, account, intercompany account, real-estate rent
+INCOME_TYPES_V3 = (
+    ("deferred_sale", "Bai' ajel (deferred-payment) sale to an employee", "البيع الآجل للموظف", "S", "taxable", "", "",
+     False),
+)
+
+
+def apply_v3(apps):
+    IncomeType = apps.get_model("invoicing", "IncomeType")
+    for code, en, ar, cat, art51, account, ic, rent in INCOME_TYPES_V3:
+        IncomeType.objects.update_or_create(code=code, defaults=dict(
+            name_en=en, name_ar=ar, default_vat_category=cat, art51_class=art51, default_account_code=account,
+            default_intercompany_account_code=ic, is_real_estate_rent=rent))
+
+
 def apply_all(apps):
     """Every version in order (tests that flush the database reload the reference data with this)."""
     apply(apps)
     apply_v2(apps)
+    apply_v3(apps)
 
 
 # Withholding tax categories for payments to non-residents (D14, OQ-8; WHT guideline §3 p.28, p.31, verification

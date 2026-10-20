@@ -44,7 +44,7 @@ Optional contract-approval hook (billing.md R53; invoicing R60):
 
 - ``contract_approval(document)`` returns a :class:`RecordedApproval` (or None) for a stored document that was
   issued without a per-document approval because a person approved the contract terms it was generated from
-  (an invoice auto-issued from billing). Posting on clearance then accepts that person as ``posted_by`` only
+  (an invoice auto-issued from billing, or a bai' ajel sale invoice approved in payroll, invoicing R112). Posting on clearance then accepts that person as ``posted_by`` only
   if the access log holds their granted approval (``permission``) of that very record (``target``), given no
   later than the recorded approval time. Accepted only for the types in ``CONTRACT_APPROVAL_TYPES`` and the
   permissions in ``CONTRACT_APPROVAL_PERMISSIONS``. Nobody approves the document in that person's name: the
@@ -158,7 +158,10 @@ REVERSING_PERMISSIONS = catalogue.REVERSE_PERMISSIONS - {"ledger.reverse_entry"}
 CREATOR_MAY_POST_TYPES = frozenset({"invoicing.customerreceipt"})
 # billing R53: the only type whose clearance posting may rely on a contract approval, and the approvals that count.
 CONTRACT_APPROVAL_TYPES = frozenset({"invoicing.salesdocument"})
-CONTRACT_APPROVAL_PERMISSIONS = frozenset({"billing.approve_contract", "billing.approve_version"})
+# invoicing R112 (payroll R47): a bai' ajel sale invoice is issued on the matrix approver's approval of the sale in
+# payroll (payroll.approve_deferred_sale for the contract), not on a per-invoice approval.
+CONTRACT_APPROVAL_PERMISSIONS = frozenset({"billing.approve_contract", "billing.approve_version",
+                                           "payroll.approve_deferred_sale"})
 # H2 (ledger-fx R51): the only type that may book at a SAMA tax-point rate older than the rate age limit.
 SAMA_TAX_POINT_TYPES = frozenset({"invoicing.salesdocument"})
 

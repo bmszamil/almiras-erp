@@ -47,7 +47,8 @@ def test_five_statutory_note_reasons_bilingual():
 def test_income_types_from_the_spec():
     codes = set(IncomeType.objects.values_list("code", flat=True))
     assert codes == {"rent_commercial", "rent_residential", "management_fee", "service_charge", "service_fee",
-                     "secondment", "car_rental", "ip_licence", "other"}  # no dividends (D16)
+                     "secondment", "car_rental", "ip_licence", "other",
+                     "deferred_sale"}  # no dividends (D16); deferred_sale: bai' ajel sale to an employee (R112)
     residential = IncomeType.objects.get(code="rent_residential")
     assert (residential.default_vat_category, residential.art51_class) == ("E", "exempt")  # OQ-39 default
 

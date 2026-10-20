@@ -114,8 +114,9 @@ BILLING_INVOICING_PORT = "billing.invoicing_port.InvoicingServicesPort"
 # R38/R41: where HR hands a terminated employee's final-settlement inputs to payroll (payroll.md 3.8; slice 1 answers
 # loan and bai' ajel balances; the payroll final settlement is slice 2).
 HR_PAYROLL_PORT = "payroll.hr_port.PayrollHrPort"
-# payroll R47 (P19(k)): the bai' ajel sale invoice is created by invoicing (R112, not built yet: refused, en/ar).
-PAYROLL_INVOICING_PORT = "payroll.invoicing_port.NotBuiltInvoicingPort"
+# payroll R47 (P19(k)): the bai' ajel sale invoice is created by invoicing (R112, E28) through its payroll port, which
+# also recognises the profit as instalments are collected (invoicing.payroll_port).
+PAYROLL_INVOICING_PORT = "invoicing.payroll_port.PayrollInvoicingPort"
 HR_ASSIGNMENT_EVENT_MAX_ATTEMPTS = 5  # R25 default
 
 # Banking (docs/specs/banking.md R4): IBANs, account numbers, statement files and counterparty data are encrypted at

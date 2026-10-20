@@ -22,7 +22,7 @@ from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from zoneinfo import ZoneInfo
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
 
@@ -50,6 +50,8 @@ from .models import (
     CustomerReceipt,
     Customer,
     CustomerIdentifier,
+    DeferredProfitRelease,
+    DeferredSale,
     DocumentSequence,
     IncomeType,
     InvoicingError,
@@ -107,6 +109,18 @@ PURIFICATION_CASH_NOTE_AR = (
     "من النقد وما في حكمه في قائمة التدفقات النقدية (معيار المحاسبة الدولي 7 / القسم 7 من المعيار الدولي للمنشآت "
     "الصغيرة والمتوسطة) مع هذا الإفصاح. والالتزام المقابل هو المستحق للجهات الخيرية (2600).")
 CONTROL_ACCOUNTS = frozenset({AR, AR_GROUP, AP, AP_GROUP, VAT_OUTPUT, VAT_INPUT, WHT_PAYABLE, PURIFICATION_BANK})
+# R112 / E28 (payroll R47, owner decision E8): the bai' ajel sale to an employee. Its receivable is 1240, its lines
+# credit 1250 (cost) and 1241 (deferred profit); profit moves from 1241 to 4610 as the instalments are collected.
+EMPLOYEE_RECEIVABLE, DEFERRED_PROFIT, SALE_ASSET, SALE_PROFIT_INCOME = "1240", "1241", "1250", "4610"
+DEFERRED_SALE_LINE_ACCOUNTS = frozenset({SALE_ASSET, DEFERRED_PROFIT})
+# Never on a line a person enters (sales or purchase): only the bai' ajel sale and its profit recognition post them
+# in invoicing (payroll credits 1240 when it collects). 1250 stays open to purchase bills (E9).
+DEFERRED_SALE_ONLY_ACCOUNTS = frozenset({EMPLOYEE_RECEIVABLE, DEFERRED_PROFIT, SALE_PROFIT_INCOME})
+DEFERRED_SALE_INCOME = "deferred_sale"  # income type (reference data V3)
+DEFERRED_SALE_SOURCE = "system:deferred_sale"
+DEFERRED_SALE_SYSTEM = "deferred_sale"  # system user code (access seed V15)
+# True only inside create_deferred_sale: the one writer of bai' ajel lines.
+_deferred_sale_writes = ContextVar("invoicing_deferred_sale_writes", default=False)
 
 Status = SalesDocument.Status
 PStatus = PurchaseDocument.Status
@@ -284,6 +298,10 @@ def _account_problems(entity, account, types, what):
     if account.code in CONTROL_ACCOUNTS:
         problems.append(f"Account {account.code} is a control or VAT account; it is set by the document. / "
                         f"الحساب {account.code} حساب رقابة أو ضريبة يحدده المستند.")
+    if account.code in DEFERRED_SALE_ONLY_ACCOUNTS:
+        problems.append(f"Account {account.code} is posted only by a bai' ajel sale approved in payroll and its profit "
+                        f"recognition (R112). / الحساب {account.code} لا يُرحَّل إلا من خلال بيع آجل معتمد في الرواتب "
+                        "وتحقق أرباحه.")
     if account.sharia_prohibited and entity.sharia_enforced:
         problems.append(f"Account {account.code} ({account.name_en}) is Sharia-prohibited. / "
                         f"الحساب {account.code} ({account.name_ar}) محظور شرعًا.")
@@ -718,6 +736,8 @@ def create_sales_document(entity, *, user, customer, issue_date, doc_type=SalesD
             raise error("A credit or debit note references exactly one original invoice (OQ-43).",
                         "يشير الإشعار إلى فاتورة أصلية واحدة فقط.", code="one_original")
         _same_entity(entity, original_document, "original invoice", "الفاتورة الأصلية")
+        if _is_deferred_sale(original_document):
+            raise _deferred_sale_note_refused()
     elif doc_type != SalesDocument.DocType.INVOICE:
         raise error("A credit or debit note references its original invoice.", "الإشعار يشير إلى فاتورته الأصلية.",
                     code="original_required")
@@ -799,6 +819,9 @@ def _sales_line_values(doc, line, *, income_type, quantity, unit_price, descript
     entity = doc.entity
     if not isinstance(income_type, IncomeType):
         income_type = _reference(IncomeType, income_type, "income type", "نوع الإيراد")
+    deferred = income_type.code == DEFERRED_SALE_INCOME
+    if deferred and not _deferred_sale_writes.get():
+        raise _deferred_sale_by_hand()
     line.income_type = income_type
     line.quantity = _decimal(quantity, "quantity")
     if not fx.has_places(line.quantity, 3) or line.quantity <= ZERO:
@@ -834,7 +857,7 @@ def _sales_line_values(doc, line, *, income_type, quantity, unit_price, descript
                         f"نوع الإيراد {income_type.code} ليس له حساب افتراضي؛ اختر حساب الإيراد.", code="account_required")
         income_account = code
     line.income_account = income_account if isinstance(income_account, Account) else _account(entity, income_account)
-    problems = _account_problems(entity, line.income_account, {Account.Type.INCOME}, "income")
+    problems = _sales_line_account_problems(entity, line)
     problems += _line_vat_problems(line, doc.supply_date or doc.issue_date)
     if problems:
         raise _problems_error(problems, "line_invalid")
@@ -1105,6 +1128,8 @@ def _note_problems(doc, gross):
         return ["A credit or debit note references its original invoice. / الإشعار يشير إلى فاتورته الأصلية."]
     if original.doc_type != SalesDocument.DocType.INVOICE:
         problems.append("The original document must be an invoice. / يجب أن يكون المستند الأصلي فاتورة.")
+    if _is_deferred_sale(original):
+        problems.append(" / ".join(DEFERRED_SALE_NOTE))
     if original.status != Status.FINAL:
         problems.append("The original invoice is not final (not yet cleared or reported). / "
                         "الفاتورة الأصلية ليست نهائية (لم تُعتمد أو يُبلَّغ عنها بعد).")
@@ -1153,8 +1178,9 @@ def _issue_problems(doc, *, check_period=True, user=None):
     except InvoicingError as exc:
         problems += exc.messages
     for line in lines:
-        problems += [_on_line(line.line_no, p) for p in _account_problems(
-            entity, line.income_account, {Account.Type.INCOME}, "income")]
+        problems += [_on_line(line.line_no, p) for p in _sales_line_account_problems(entity, line)]
+        if line.income_type.code == DEFERRED_SALE_INCOME and not _deferred_sale_writes.get():
+            problems.append(_on_line(line.line_no, " / ".join(DEFERRED_SALE_BY_HAND)))
         problems += [_on_line(line.line_no, p) for p in _line_vat_problems(line, on)]
         if not line.description_ar.strip():
             problems.append(_on_line(line.line_no, "the Arabic description is required. / وصف البند بالعربية مطلوب."))
@@ -1554,8 +1580,10 @@ def _control_line(document):
     """The control-account line that booked ``document`` (the item later documents settle, ledger-fx R18)."""
     if document.journal_entry_id is None:
         return None
-    party = getattr(document, "customer", None) or document.vendor
-    account, _ = _control(party, isinstance(document, SalesDocument))
+    if isinstance(document, SalesDocument):
+        account, _ = _sales_control(document)
+    else:
+        account, _ = _control(document.vendor, False)
     debit = isinstance(document, SalesDocument) and document.doc_type != SalesDocument.DocType.CREDIT_NOTE
     lines = JournalLine.objects.filter(entry_id=document.journal_entry_id, account__code=account, line_kind="normal")
     lines = lines.filter(debit__gt=0) if debit else lines.filter(credit__gt=0)
@@ -1628,7 +1656,7 @@ def _sales_document_lines(document):
         raise error("A sales document is booked only once ZATCA cleared or reported it.",
                     "لا يُرحَّل مستند المبيعات إلا بعد اعتماده من الهيئة أو الإبلاغ عنه.", code="not_cleared")
     cur, functional = document.currency_id, document.entity.base_currency_id
-    control, counterparty = _control(document.customer, receivable=True)
+    control, counterparty = _sales_control(document)
     credit_note = document.doc_type == SalesDocument.DocType.CREDIT_NOTE
     income_side, control_side = ("debit", "credit") if credit_note else ("credit", "debit")
     label = f"{document.number}"
@@ -1781,6 +1809,8 @@ def _allocation_problems(source, target, amount):
     if sales:
         if target.doc_type == SalesDocument.DocType.CREDIT_NOTE:
             problems.append("A credit note is not an allocation target. / الإشعار الدائن ليس هدفًا للتخصيص.")
+        if _is_deferred_sale(target):
+            problems.append(" / ".join(DEFERRED_SALE_COLLECTED_BY_PAYROLL))
         if isinstance(source, SalesDocument) and source.doc_type != SalesDocument.DocType.CREDIT_NOTE:
             problems.append("Only receipts and credit notes are allocated. / تُخصَّص المقبوضات والإشعارات الدائنة فقط.")
         if isinstance(source, CustomerReceipt) and source.kind != CustomerReceipt.Kind.RECEIPT:
@@ -2297,6 +2327,8 @@ def _application_problems(source, target, amount, receivable, planned=ZERO):
     if receivable:
         if target.doc_type == SalesDocument.DocType.CREDIT_NOTE or target.status != Status.FINAL:
             problems.append("Only final invoices and debit notes are settled (R44). / تُسوّى الفواتير والإشعارات المدينة النهائية فقط.")
+        if _is_deferred_sale(target):
+            problems.append(" / ".join(DEFERRED_SALE_COLLECTED_BY_PAYROLL))
         open_ = _open_receivable(target)
     else:
         if target.doc_type != PurchaseDocument.DocType.BILL or target.status != PStatus.POSTED:
@@ -4237,7 +4269,9 @@ def reconcile_subledger(entity, as_of, *, user):
             qs = qs.filter(Q(reversal_entry__isnull=True) | Q(reversal_entry__date__gt=as_of))
         return qs
 
-    for d in booked(SalesDocument.objects.all(), reversible=False).select_related("customer__group_entity"):
+    # R112: bai' ajel invoices are receivables on 1240, collected by payroll, not on 1200 / 1210.
+    for d in booked(SalesDocument.objects.filter(deferred_sale__isnull=True), reversible=False).select_related(
+            "customer__group_entity"):
         sign = -1 if d.doc_type == SalesDocument.DocType.CREDIT_NOTE else 1
         add(*ctrl(d.customer, True), d.currency_id, sign * d.total_gross)
     for r in booked(CustomerReceipt.objects.all()).select_related("customer__group_entity"):
@@ -4417,6 +4451,9 @@ def _contract_approval(document):
     """
     from ledger.documents import RecordedApproval
 
+    deferred = _deferred_sale_approval(document)
+    if deferred is not None or _is_deferred_sale(document):
+        return deferred
     if (document.source != BILLING_SOURCE or document.billing_item_id is None
             or document.doc_type != SalesDocument.DocType.INVOICE or document.approved_by_id is None):
         return None
@@ -4499,3 +4536,455 @@ def discard_adjustment_draft(document, user):
         with billing_line_writes():  # billing R46c: the one delete of billing lines (the guards refuse all others)
             SalesDocumentLine.objects.filter(document=doc).delete()
         doc.delete()
+
+
+# --- bai' ajel sale to an employee (R112, E28; payroll R47, R48; owner decisions B8, E8) -----------------------------
+
+DEFERRED_SALE_BY_HAND = (
+    "A bai' ajel sale line is created only by the sale approved in payroll, never by hand (R112).",
+    "بند البيع الآجل لا يُنشأ إلا من خلال البيع المعتمد في الرواتب، ولا يُدخل يدويًا.",
+)
+DEFERRED_SALE_NOTE = (
+    "A bai' ajel sale invoice takes no credit or debit note: its price is fixed at the sale and never increases "
+    "(Sharia, payroll R48); an early-settlement rebate (ibra') awaits its Sharia decision (payroll OQ-33).",
+    "لا يصدر إشعار دائن أو مدين على فاتورة البيع الآجل: ثمنها ثابت عند البيع ولا يزيد أبدًا (الضوابط الشرعية)؛ "
+    "والإبراء عند السداد المبكر بانتظار القرار الشرعي.",
+)
+DEFERRED_SALE_COLLECTED_BY_PAYROLL = (
+    "A bai' ajel sale invoice is collected by the payroll instalments on 1240, never by receipts or allocations here "
+    "(R112).",
+    "تُحصَّل فاتورة البيع الآجل من خلال أقساط الرواتب على الحساب 1240، لا بسندات القبض أو التخصيص هنا.",
+)
+# The payroll approvals that collect instalments (a run deducts them, a final settlement recovers the balance); one of
+# them must be held by the person whose approval the profit recognition follows (owner decision A6).
+COLLECTING_APPROVALS = ("payroll.approve_run", "payroll.approve_final_settlement")
+DEFERRED_PROFIT_REVERSAL = "payroll.reverse_run"
+# (release pk) while reverse_deferred_profit reverses that release (registered reverse_guard).
+_reversing_profit = ContextVar("invoicing_reversing_profit", default=None)
+
+
+def _deferred_sale_by_hand():
+    return error(*DEFERRED_SALE_BY_HAND, code="deferred_sale_by_hand")
+
+
+def _deferred_sale_note_refused():
+    return error(*DEFERRED_SALE_NOTE, code="deferred_sale_note")
+
+
+def _is_deferred_sale(document):
+    """True for the sales document of a bai' ajel sale (R112), whatever the caller's copy says."""
+    if not isinstance(document, SalesDocument) or document.pk is None:
+        return False
+    return DeferredSale.objects.filter(sales_document_id=document.pk).exists()
+
+
+def _sales_control(document):
+    """The receivable a sales document books (E1 to E4): 1200 or 1210, or 1240 for a bai' ajel sale (E28)."""
+    if _is_deferred_sale(document):
+        return EMPLOYEE_RECEIVABLE, None
+    return _control(document.customer, receivable=True)
+
+
+def _sales_line_account_problems(entity, line):
+    """R1, R2, R5 for a sales line: an income account, or for a bai' ajel line 1250 (cost) or 1241 (deferred
+    profit) of the entity (R112, E28)."""
+    account = line.income_account
+    if line.income_type.code != DEFERRED_SALE_INCOME:
+        return _account_problems(entity, account, {Account.Type.INCOME}, "income")
+    if account.entity_id != entity.pk:
+        return [f"Account {account.code} belongs to another entity. / الحساب {account.code} يخص كيانًا آخر."]
+    problems = []
+    if account.code not in DEFERRED_SALE_LINE_ACCOUNTS or account.type != Account.Type.ASSET:
+        problems.append(f"A bai' ajel sale line credits 1250 (cost) or 1241 (deferred profit), not {account.code} "
+                        f"(R112, E28). / يُقيَّد بند البيع الآجل دائنًا على 1250 (التكلفة) أو 1241 (الربح المؤجل) لا "
+                        f"على {account.code}.")
+    if not account.is_postable or not account.is_active:
+        problems.append(f"Account {account.code} is not open for posting. / الحساب {account.code} غير مفتوح للترحيل.")
+    if account.sharia_prohibited and entity.sharia_enforced:
+        problems.append(f"Account {account.code} is Sharia-prohibited. / الحساب {account.code} محظور شرعًا.")
+    return problems
+
+
+def _deferred_sale_approval(document):
+    """Registered ``contract_approval`` for a bai' ajel sale invoice (R112): the matrix approver's approval of the
+    sale in payroll (``payroll.approve_deferred_sale`` for the contract), recorded on the sale. None otherwise."""
+    from django.apps import apps
+
+    from ledger.documents import RecordedApproval
+
+    sale = DeferredSale.objects.filter(sales_document_id=document.pk).first()
+    if (sale is None or document.source != DEFERRED_SALE_SOURCE or document.approved_by_id != sale.approved_by_id
+            or document.doc_type != SalesDocument.DocType.INVOICE):
+        return None
+    try:
+        model = apps.get_model(sale.source_type)
+    except (LookupError, ValueError):
+        return None
+    target = model._default_manager.filter(pk=sale.source_id).first()
+    if target is None:
+        return None
+    return RecordedApproval("payroll.approve_deferred_sale", target, sale.approved_by_id, sale.approved_at)
+
+
+def _employee_customer(entity, employee, user):
+    """The employee's own ``individual`` customer record in ``entity`` (R112), created on the first sale. Not VAT
+    registered: the invoice is simplified and reported to ZATCA (R48). The name is personal data, masked like every
+    individual's (R51)."""
+    customer = Customer.objects.select_for_update(of=("self",)).filter(entity=entity, employee=employee).first()
+    if customer is not None:
+        if not customer.is_active or customer.anonymised_at is not None:
+            raise error(f"The employee's customer record {customer.code} is inactive or anonymised.",
+                        f"سجل العميل للموظف {customer.code} غير نشط أو مخفي الهوية.", code="customer_inactive")
+        return customer
+    code = f"EMP-{employee.employee_code}"[:20]
+    if Customer.objects.filter(entity=entity, code=code).exists():
+        raise error(f"Customer code {code} is taken by another customer; the employee's record cannot be created.",
+                    f"رمز العميل {code} مستخدم لعميل آخر؛ لا يمكن إنشاء سجل الموظف.", code="customer_code_taken")
+    customer = Customer(
+        entity=entity, code=code, name_ar=(employee.full_name_ar or "").strip()[:200] or code,
+        name_en=(employee.full_name_en or "").strip()[:200], customer_kind=Customer.Kind.INDIVIDUAL,
+        is_vat_registered=False, currency_id=SAR, country="SA", created_by=user, source=DEFERRED_SALE_SOURCE,
+        employee=employee,
+    )
+    problems = party_problems(customer)
+    if problems:
+        raise _problems_error(problems, "customer_invalid")
+    customer.save()
+    return customer
+
+
+def _bill_asset_cost(bill):
+    """The asset cost the posted purchase bill put on 1250 (E9), in SAR."""
+    total = JournalLine.objects.filter(entry_id=bill.journal_entry_id, account__code=SALE_ASSET).aggregate(
+        t=Sum("debit"))["t"] or ZERO
+    return Decimal(total).quantize(CENT)
+
+
+def _check_deferred_sale(entity, *, employee, bill, cost, possession_date, possession_evidence_ref, today, sale_date,
+                         source_type, source_id):
+    """R112 / payroll R47 (owner decision E8): the company bought the asset in its own name and took possession
+    before selling it, and sells it once. Raises with a code per refusal."""
+    if entity.base_currency_id != SAR:
+        raise error(f"A bai' ajel sale is invoiced in SAR by a Saudi entity; {entity.code} keeps its books in "
+                    f"{entity.base_currency_id}.", f"يُفوتر البيع الآجل بالريال من كيان سعودي؛ دفاتر {entity.code} "
+                    f"بعملة {entity.base_currency_id}.", code="currency")
+    if getattr(employee, "entity_id", None) != entity.pk:
+        raise error("The employee belongs to another entity.", "الموظف يتبع كيانًا آخر.", code="entity_mismatch")
+    if (not isinstance(bill, PurchaseDocument) or bill.entity_id != entity.pk
+            or bill.doc_type != PurchaseDocument.DocType.BILL or bill.status != PStatus.POSTED
+            or bill.journal_entry_id is None or bill.reversal_entry_id is not None):
+        raise error("The asset must be bought first: its purchase bill is a posted bill of this entity (R112, E9).",
+                    "يجب شراء الأصل أولًا: فاتورة شرائه فاتورة مرحّلة لهذا الكيان.", code="purchase_bill_not_posted")
+    sold = (DeferredSale.objects.filter(purchase_bill=bill, active=True)
+            .exclude(source_type=source_type, source_id=source_id).exclude(sales_document__status=Status.REJECTED))
+    if sold.exists():
+        raise error("This asset is already sold: its purchase bill backs another bai' ajel sale (R112).",
+                    "هذا الأصل مبيع مسبقًا: فاتورة شرائه مستخدمة لبيع آجل آخر.", code="asset_already_sold")
+    on_asset = _bill_asset_cost(bill)
+    if on_asset != cost:
+        raise error(f"The purchase bill put {on_asset} on 1250; the sale's cost is {cost}. The cost is the posted cost "
+                    "of the asset (R112).", f"قيدت فاتورة الشراء {on_asset} على الحساب 1250 وتكلفة البيع {cost}؛ التكلفة "
+                    "هي التكلفة المرحّلة للأصل.", code="cost_mismatch")
+    if possession_date is None or not (possession_evidence_ref or "").strip():
+        raise error("The company's possession of the asset (date and evidence) must be recorded before the sale "
+                    "(R112, owner decision E8).", "يجب تسجيل قبض الشركة للأصل (التاريخ والمستند) قبل البيع.",
+                    code="possession_not_recorded")
+    if possession_date < bill.accounting_date:
+        raise error("Possession cannot come before the purchase.", "لا يسبق القبض الشراء.",
+                    code="possession_not_recorded")
+    if today < possession_date or (sale_date is not None and sale_date < possession_date):
+        raise error(f"The sale is on or after the possession date {possession_date} (R112).",
+                    f"يكون البيع في تاريخ القبض {possession_date} أو بعده.", code="sale_before_possession")
+
+
+def _deferred_line(doc, account, amount, description_ar, description_en):
+    last = doc.lines.order_by("-line_no").values_list("line_no", flat=True).first() or 0
+    line = SalesDocumentLine(entity=doc.entity, document=doc, line_no=last + 1)
+    _sales_line_values(
+        doc, line, income_type=DEFERRED_SALE_INCOME, quantity="1", unit_price=amount, description_ar=description_ar[:300],
+        description_en=description_en[:300], vat_category=VatCategory.STANDARD, vat_exemption_reason=None,
+        income_account=account, line_discount="0", unit_code="C62",
+    )
+    line.save()
+    return line
+
+
+def _deactivate(sale):
+    sale.active = False
+    sale._service_write = True
+    sale.save(update_fields=["active"])
+
+
+def create_deferred_sale(source, *, approver, employee, purchase_bill, cost, profit_amount, possession_date,
+                         possession_evidence_ref, asset_description_ar, asset_description_en="", sale_date=None,
+                         term_months=None):
+    """R112 / E28 (payroll R47 step 4, P19(k), P20(h); owner decisions B8, E8): the bai' ajel sale invoice.
+
+    Called by payroll's sale approval through ``invoicing.payroll_port`` (never by hand), inside its transaction.
+    ``source`` is the approved contract (a stored record of the entity) and ``approver`` the person approving the
+    sale there; their ``payroll.approve_deferred_sale`` right for that contract is checked again here and recorded
+    as used for this invoice: it is the approval the invoice is issued and posted on (ledger ``contract_approval``).
+
+    Refused (en/ar, by code) unless the company bought the asset in its own name (a posted purchase bill of the
+    entity, ``purchase_bill_not_posted``) at exactly ``cost`` on 1250 (``cost_mismatch``), recorded its possession
+    with evidence (``possession_not_recorded``) on or before the sale (``sale_before_possession``), and the asset was
+    not sold already (``asset_already_sold``).
+
+    The deferred-sale system user creates, submits and issues a **simplified** invoice to the employee's own
+    individual customer record: one line at the cost (Cr 1250) and one at the fixed profit (Cr 1241), category S,
+    VAT 15% on the sale price charged to the employee; the document is handed to ZATCA after commit and posts on
+    reporting like any sales document (R41): Dr 1240 sale price + VAT / Cr 1250 / Cr 1241 / Cr 2200. The price is
+    cost + the fixed profit: no rate, penalty or late-payment increase exists (payroll R48).
+
+    Idempotent per contract: a second call returns the contract's live invoice; after a ZATCA rejection a new
+    invoice (new number) replaces the rejected one.
+    """
+    entity = Entity.objects.get(pk=source.entity_id)
+    system = access.system_user(DEFERRED_SALE_SYSTEM)
+    access.require(system, entity, "invoicing.create_deferred_sale")
+    if access_services.kind_of(approver) != Kind.HUMAN:  # payroll R38: people approve sales, never agents or systems
+        access.deny(approver, entity, "payroll.approve_deferred_sale", "agent_forbidden")
+    grant = access.require(approver, entity, "payroll.approve_deferred_sale", document=source)
+    source_type, source_id = source._meta.label_lower, source.pk
+    cost = _money(cost, "cost", positive=True, currency=SAR)
+    profit = _money(profit_amount, "profit", currency=SAR)
+    description_ar = (asset_description_ar or "").strip()
+    if not description_ar:
+        raise error("The asset description in Arabic is required.", "وصف الأصل بالعربية مطلوب.",
+                    code="description_ar")
+    with transaction.atomic():
+        live = (DeferredSale.objects.select_for_update(of=("self",)).select_related("sales_document")
+                .filter(entity=entity, source_type=source_type, source_id=source_id, active=True).first())
+        if live is not None:
+            if live.sales_document.status != Status.REJECTED:
+                doc = live.sales_document
+                doc.warnings = []
+                return doc
+            _deactivate(live)  # ZATCA rejected it: the number stays used, a new invoice replaces it (R20)
+        bill = PurchaseDocument.objects.select_for_update(of=("self",)).filter(pk=getattr(purchase_bill, "pk", None)).first()
+        today = _riyadh_now().date()
+        _check_deferred_sale(entity, employee=employee, bill=bill, cost=cost, possession_date=possession_date,
+                             possession_evidence_ref=possession_evidence_ref, today=today, sale_date=sale_date,
+                             source_type=source_type, source_id=source_id)
+        if not (entity.vat_number or "").strip():  # R94 / OQ-59: an entity without a VAT number cannot issue it yet
+            raise _not_vat_registered(entity)
+        customer = _employee_customer(entity, employee, system)
+        terms_en = f" in {term_months} monthly instalments" if term_months else ""
+        terms_ar = f" على {term_months} قسطًا شهريًا" if term_months else ""
+        doc = SalesDocument(
+            entity=entity, doc_type=SalesDocument.DocType.INVOICE, customer=customer, issue_date=today,
+            currency=_currency(SAR, entity), zatca_profile=SalesDocument.Profile.SIMPLIFIED,
+            supply_date=sale_date or today, created_by=system, source=DEFERRED_SALE_SOURCE,
+            notes_en=(f"Bai' ajel (deferred-payment) sale at a fixed price, paid from salary{terms_en}. The price never "
+                      "increases, also when an instalment is late."),
+            notes_ar=(f"بيع آجل بثمن ثابت يُسدَّد من الراتب{terms_ar}. لا يزيد الثمن أبدًا ولو تأخر سداد قسط."),
+        )
+        _refresh_tax_point(doc)
+        doc.save()
+        token = _deferred_sale_writes.set(True)
+        try:
+            _deferred_line(doc, SALE_ASSET, cost, f"{description_ar} (فاتورة الشراء {bill.number})",
+                           f"{(asset_description_en or '').strip() or description_ar} (purchase bill {bill.number})")
+            if profit > ZERO:
+                _deferred_line(doc, DEFERRED_PROFIT, profit, "ربح البيع الآجل (ثابت)", "Bai' ajel profit (fixed)")
+            doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity", "customer").get(pk=doc.pk)
+            lines = list(doc.lines.select_related("vat_rate", "vat_exemption_reason", "income_account", "income_type"))
+            _, _, vat, _ = _sales_breakdown(doc, lines)
+            problems = _issue_problems(doc, check_period=False)
+            if problems:
+                raise _problems_error(problems, "document_invalid")
+            approved_at = timezone.now()
+            sale = DeferredSale(
+                entity=entity, sales_document=doc, customer=customer, purchase_bill=bill, source_type=source_type,
+                source_id=source_id, cost=cost, profit_amount=profit, vat_amount=vat, possession_date=possession_date,
+                possession_evidence_ref=possession_evidence_ref.strip()[:200], approved_by=approver,
+                approved_at=approved_at, created_by=system,
+            )
+            sale._service_write = True
+            try:
+                with transaction.atomic():
+                    sale.save()
+            except IntegrityError:  # the same asset sold at the same moment (one live sale per bill)
+                raise error("This asset is already sold: its purchase bill backs another bai' ajel sale (R112).",
+                            "هذا الأصل مبيع مسبقًا: فاتورة شرائه مستخدمة لبيع آجل آخر.",
+                            code="asset_already_sold") from None
+            doc.status = Status.SUBMITTED
+            doc.submitted_by, doc.submitted_at = system, timezone.now()
+            _bump(doc)
+            doc._service_write = True
+            doc.save()
+            _issue_submitted(doc, rate_user=system, approved_by=approver, approved_at=approved_at)
+        finally:
+            _deferred_sale_writes.reset(token)
+        if Decimal(doc.total_vat) != sale.vat_amount:  # the same lines, rate and rounding: never differs
+            raise error("The VAT of the issued invoice differs from the sale's.", "تختلف ضريبة الفاتورة عن ضريبة البيع.",
+                        code="vat_mismatch")
+        access.use_grant(grant, target=doc)  # the approval the posting on reporting relies on (contract_approval)
+        access_services.log(
+            AccessLog.Event.PERMISSION_GRANTED, actor=system, entity=entity, permission="invoicing.create_deferred_sale",
+            details={"document": [doc._meta.label_lower, doc.pk], "action": "issue_deferred_sale",
+                     "approved_in": [source_type, source_id], "approved_by": approver.pk},
+        )
+        # The ZATCA queue system user hands it over (zatca R-32); a hand-off failure leaves it not_submitted for the
+        # automatic resubmission (R79) and never undoes the payroll approval.
+        port, queue = zatca_port.get_port(), access.system_user("zatca_queue")
+        transaction.on_commit(lambda: port.submit_document(SalesDocument.objects.get(pk=doc.pk), queue), robust=True)
+    doc.warnings = []
+    return doc
+
+
+def _live_deferred_sale(entity, source, *, lock=False):
+    qs = DeferredSale.objects.select_related("sales_document").filter(
+        entity=entity, source_type=source._meta.label_lower, source_id=source.pk, active=True)
+    if lock:
+        qs = qs.select_for_update(of=("self",))
+    return qs.first()
+
+
+def deferred_sale_of(source):
+    """The live bai' ajel sale approved in ``source`` (a payroll contract), or None. No right needed: payroll reads
+    its own contract's sale through its port (``invoicing.payroll_port``)."""
+    return _live_deferred_sale(Entity.objects.get(pk=source.entity_id), source)
+
+
+def _profit_figures(sale, collected_after, profit_before):
+    """Profit to recognise when ``collected_after`` of the receivable is collected: the fixed profit times the
+    collected share, rounded half-up once; all of it once everything is collected. Never time-based (R48)."""
+    if collected_after >= sale.receivable:
+        to_date = sale.profit_amount
+    else:
+        with localcontext() as ctx:
+            ctx.prec = 60
+            to_date = _round(sale.profit_amount * collected_after / sale.receivable, 2)
+    return (Decimal(to_date) - Decimal(profit_before)).quantize(CENT)
+
+
+def _require_collecting_approver(user, entity, permission):
+    """The person whose payroll approval collected the instalment (owner decision A6): a human holding a payroll
+    approval that collects instalments in ``entity``."""
+    if access_services.kind_of(user) != Kind.HUMAN:
+        access.deny(user, entity, permission, "agent_forbidden")
+    if not any(access.has(user, entity, code) for code in COLLECTING_APPROVALS):
+        access.deny(user, entity, COLLECTING_APPROVALS[0], "no_membership")
+
+
+def recognise_deferred_profit(source, *, user, collected_amount, collected_on, source_ref):
+    """R112 / payroll E12, E13: recognise the profit of the bai' ajel sale approved in ``source`` as payroll collects
+    its instalments: Dr 1241 / Cr 4610, dated ``collected_on`` (the date of the payroll entry that collected it).
+
+    ``user`` is the person whose payroll approval collected ``collected_amount`` (a run deducting an instalment, a
+    final settlement recovering the balance; holder of ``payroll.approve_run`` or ``payroll.approve_final_settlement``
+    in the entity); the deferred-sale system user posts after that approval (owner decision A6). ``source_ref``
+    names the collection (e.g. ``payroll.deferredsaleinstallment:42``) and makes the call idempotent: the same
+    reference returns the recognition already posted (refused if the amount differs).
+
+    The profit recognised to date is ``profit x collected to date / receivable`` (receivable = sale price + VAT),
+    rounded half-up once; the collection that completes the receivable releases the rest, so the total is exactly
+    the fixed profit. Nothing depends on dates or time elapsed (payroll R48). Refused before the sale invoice is
+    posted (``sale_not_posted``) or beyond the receivable (``over_collected``).
+    """
+    entity = Entity.objects.get(pk=source.entity_id)
+    _require_collecting_approver(user, entity, "invoicing.post_deferred_profit")
+    system = access.system_user(DEFERRED_SALE_SYSTEM)
+    amount = _money(collected_amount, "collected amount", positive=True, currency=SAR)
+    ref = str(source_ref or "").strip()[:100]
+    if not ref or not isinstance(collected_on, date_type):
+        raise error("The collection needs its reference and date.", "يحتاج التحصيل إلى مرجعه وتاريخه.",
+                    code="collection_required")
+    with transaction.atomic():
+        sale = _live_deferred_sale(entity, source, lock=True)
+        if sale is None:
+            raise error("No bai' ajel sale was invoiced for this contract (R112).",
+                        "لم تصدر فاتورة بيع آجل لهذا العقد.", code="no_deferred_sale")
+        existing = DeferredProfitRelease.objects.filter(deferred_sale=sale, source_ref=ref,
+                                                        status=DeferredProfitRelease.Status.POSTED).first()
+        if existing is not None:
+            if existing.collected_amount != amount:
+                raise error(f"Collection {ref} was recognised for {existing.collected_amount}, not {amount}; reverse it "
+                            "first.", f"سُجّل التحصيل {ref} بمبلغ {existing.collected_amount} لا {amount}؛ اعكسه أولًا.",
+                            code="collection_changed")
+            return existing
+        doc = sale.sales_document
+        if doc.status != Status.FINAL or doc.journal_entry_id is None:
+            raise error(f"The sale invoice {doc.number} is not posted yet (it waits for ZATCA reporting); its profit is "
+                        "recognised once it is posted (R41, R112).", f"فاتورة البيع {doc.number} لم تُرحَّل بعد (بانتظار "
+                        "الإبلاغ للهيئة)؛ تتحقق أرباحها بعد ترحيلها.", code="sale_not_posted")
+        posted = DeferredProfitRelease.objects.filter(deferred_sale=sale, status=DeferredProfitRelease.Status.POSTED)
+        collected_before = Decimal(posted.aggregate(t=Sum("collected_amount"))["t"] or ZERO).quantize(CENT)
+        profit_before = Decimal(posted.aggregate(t=Sum("profit_amount"))["t"] or ZERO).quantize(CENT)
+        after = collected_before + amount
+        if after > sale.receivable:
+            raise error(f"{after} collected is more than the receivable {sale.receivable} (sale price + VAT).",
+                        f"المحصل {after} أكبر من المستحق {sale.receivable} (ثمن البيع مع الضريبة).",
+                        code="over_collected")
+        release = DeferredProfitRelease(
+            entity=entity, deferred_sale=sale, source_ref=ref, date=collected_on, collected_amount=amount,
+            collected_to_date=after, profit_amount=_profit_figures(sale, after, profit_before), created_by=user,
+        )
+        release._service_write = True
+        release.save()
+        if release.profit_amount > ZERO:
+            grant = access.require(system, entity, "invoicing.post_deferred_profit", document=release)
+            with _posting_as(system):
+                entry = ledger.create_entry(
+                    entity, collected_on, f"Bai' ajel profit {doc.number} / أرباح البيع الآجل {doc.number}", None,
+                    user=system, reference=doc.number, post=True, grant=grant, document=release,
+                )
+            release.journal_entry = entry
+            release._service_write = True
+            release.save(update_fields=["journal_entry"])
+    return release
+
+
+def reverse_deferred_profit(source, *, user, source_ref, date=None, reason=""):
+    """Reverse the profit recognised for collection ``source_ref`` (a reversed payroll run gives its instalment
+    back): the reversal of its own entry, through ``ledger.reverse_entry`` with the person's ``payroll.reverse_run``
+    grant for the recognition. The next recognition is computed from what stays collected."""
+    entity = Entity.objects.get(pk=source.entity_id)
+    if access_services.kind_of(user) != Kind.HUMAN:
+        access.deny(user, entity, DEFERRED_PROFIT_REVERSAL, "agent_forbidden")
+    ref = str(source_ref or "").strip()[:100]
+    with transaction.atomic():
+        sale = _live_deferred_sale(entity, source, lock=True)
+        release = None if sale is None else (
+            DeferredProfitRelease.objects.select_for_update(of=("self",))
+            .filter(deferred_sale=sale, source_ref=ref, status=DeferredProfitRelease.Status.POSTED).first())
+        if release is None:
+            raise error(f"No posted profit recognition for collection {ref}.", f"لا يوجد تحقق أرباح مرحّل للتحصيل {ref}.",
+                        code="nothing_to_reverse")
+        grant = access.require(user, entity, DEFERRED_PROFIT_REVERSAL, document=release)
+        reversal = None
+        if release.journal_entry_id is not None:
+            token = _reversing_profit.set(release.pk)
+            try:
+                reversal = ledger.reverse_entry(release.journal_entry, grant, date=date, reason=reason)
+            finally:
+                _reversing_profit.reset(token)
+        else:
+            access.verify_grant(grant, entity, {DEFERRED_PROFIT_REVERSAL}, document=release)
+        release.status = DeferredProfitRelease.Status.REVERSED
+        release.reversal_entry = reversal
+        release.reversed_by, release.reversed_at = user, timezone.now()
+        release.reversal_reason = (reason or "")[:300]
+        release._service_write = True
+        release.save(update_fields=["status", "reversal_entry", "reversed_by", "reversed_at", "reversal_reason"])
+    return release
+
+
+def _deferred_profit_lines(release):
+    """Registered ``build_lines`` for DeferredProfitRelease (payroll E12): Dr 1241 / Cr 4610 for its profit."""
+    _require_posting_context(release, DeferredProfitRelease.Status.POSTED)
+    if release.profit_amount <= ZERO:
+        raise error("No profit to recognise.", "لا يوجد ربح للتحقق.", code="nothing_to_post")
+    number = release.deferred_sale.sales_document.number
+    label = f"{number} {release.source_ref}"
+    return [
+        {"account": DEFERRED_PROFIT, "debit": release.profit_amount,
+         "description": f"Bai' ajel profit earned {label} / ربح بيع آجل متحقق"[:300]},
+        {"account": SALE_PROFIT_INCOME, "credit": release.profit_amount,
+         "description": f"Bai' ajel profit income {label} / إيرادات أرباح البيع الآجل"[:300]},
+    ]
+
+
+def _deferred_profit_reverse_guard(release):
+    return _reversing_profit.get() == release.pk
