@@ -1354,12 +1354,30 @@ def _prior_payslips(ctx, emp):
                                        run__kind=PayrollRun.Kind.REGULAR, run__period__lt=ctx.period).select_related("run").order_by("run__period"))
 
 
+SETTLED = (FinalSettlement.Status.APPROVED, FinalSettlement.Status.PAID)
+
+
 def _booked_lines(emp, period, types):
     """Lines of approved (or paid) runs that belong to ``period``: the period's own runs and lines of later runs with
-    that period of origin."""
-    return PayslipLine.objects.filter(payslip__employee=emp, payslip__run__status__in=(RS.APPROVED, RS.PAID),
-                                      payslip__refused=False, line_type__in=types).filter(
+    that period of origin. Re-review 1: the lines of an approved (or paid) final settlement count too, by their period
+    of origin or, without one, the leaving month, as the payslip line type they were computed as (a salary paid
+    beyond the last working day and recovered from the final dues counts as less pay for the month)."""
+    out = list(PayslipLine.objects.filter(payslip__employee=emp, payslip__run__status__in=(RS.APPROVED, RS.PAID),
+                                          payslip__refused=False, line_type__in=types).filter(
         Q(origin_period=period) | (Q(origin_period="") & Q(payslip__run__period=period)))
+        .select_related("component", "account").order_by("pk"))
+    wanted = Q(slip_line_type__in=types)
+    if LT.EARNING in types:
+        wanted |= Q(slip_line_type=LT.DEDUCTION, source_ref__startswith="overpaid:")
+    for l in (FinalSettlementLine.objects.filter(settlement__employee=emp, settlement__status__in=SETTLED)
+              .filter(wanted).filter(Q(origin_period=period) | (Q(origin_period="") & Q(settlement__period=period)))
+              .select_related("component", "account", "settlement").order_by("pk")):
+        out.append(SimpleNamespace(line_type=l.slip_line_type, component_id=l.component_id, component=l.component,
+                                   source_ref=l.source_ref, amount=l.amount, gosi_branch=l.gosi_branch,
+                                   quantity=l.quantity, origin_period=l.origin_period or l.settlement.period,
+                                   account=l.account, description_en=l.description_en,
+                                   description_ar=l.description_ar, settlement_id=l.settlement_id))
+    return out
 
 
 PERIOD_TYPES = (LT.EARNING, LT.RETRO, LT.MATERNITY_TOP_UP, LT.UNPAID_DEDUCTION, LT.SICK_DEDUCTION,
@@ -1371,6 +1389,8 @@ def _net_key(line_type, component_id, source_ref):
     lines that are never netted (inputs, loans, GOSI, EOSB)."""
     if source_ref.startswith("input:"):
         return None
+    if source_ref.startswith("overpaid:"):  # salary beyond the last working day, recovered by a final settlement
+        return ("pay", component_id), -1
     if line_type == LT.RETRO and source_ref.startswith("release:"):
         return ("red:" + source_ref.split(":")[1], component_id), -1
     if line_type in (LT.EARNING, LT.RETRO):
@@ -1388,8 +1408,7 @@ def _net_against_booked(ctx, slip, emp, period, *, origin, mode, booked=None):
     pays the rest after a leave advance). ``mode``: ``current`` (the run's own period), ``prior`` (an earlier month:
     a pay decrease or a new reduction is a warning only, Art. 92) or ``final`` (a final settlement: an overpayment is a
     debt recovered from the final dues, Art. 88). Lines of other kinds are kept as they are."""
-    booked = list(booked if booked is not None else _booked_lines(emp, period, PERIOD_TYPES).select_related(
-        "component", "account"))
+    booked = list(booked if booked is not None else _booked_lines(emp, period, PERIOD_TYPES))
     if not booked and mode == "current":
         return
     never_paid = not any(_net_key(l.line_type, l.component_id, l.source_ref) for l in booked)
@@ -1518,7 +1537,7 @@ def _prior_corrections(ctx, slip, emp, versions):
                              remuneration_sar=(ps.gosi_wage_full if ps and basis == Basis.REMUNERATION else None))
         except _Refused:
             continue
-        booked = list(_booked_lines(emp, q, GOSI_TYPES).select_related("account"))
+        booked = _booked_lines(emp, q, GOSI_TYPES)
         for branch, wage, ee, er in g.branches:
             en, ar = BRANCH_TEXT[branch]
             rows = [l for l in booked if l.gosi_branch == branch]
@@ -1725,6 +1744,11 @@ def _eosb(ctx, slip, emp, info):
     """R24: required provision at period end (hr calculate_eosb, full award as on employer termination, OQ-11)
     minus the employee's sub-ledger balance; positive Dr 5120 / Cr 2500, negative the other way."""
     as_of = info.last
+    if FinalSettlement.objects.filter(employee=emp, status__in=SETTLED).exists():
+        # Re-review 6: the final settlement used and released the provision; nothing accrues after it.
+        slip.warn("EOSB provision not accrued: the final settlement is approved.",
+                  "لم يُحتسب مخصص نهاية الخدمة: المخالصة النهائية معتمدة.")
+        return
     try:
         result = hr.calculate_eosb(emp, as_of, Termination.Kind.EMPLOYER_TERMINATION, user=ctx.user)
     except hr.HrError as exc:
@@ -1815,7 +1839,7 @@ def _gosi_for_period(ctx, slip, emp, info, nclass):
     off-cycle run never charges a month's GOSI twice, review 2)."""
     g = _compute_gosi(ctx, slip, emp, info, cohort=slip.cohort, nclass=nclass, basis=emp.employment_basis)
     slip.gosi_wage, slip.gosi_wage_full = g.wage, g.wage_full
-    booked = list(_booked_lines(emp, ctx.period, GOSI_TYPES))
+    booked = _booked_lines(emp, ctx.period, GOSI_TYPES)
     if booked or Payslip.objects.filter(employee=emp, run__period=ctx.period, refused=False,
                                         run__status__in=(RS.APPROVED, RS.PAID)).exists():
         branches = []
@@ -2085,6 +2109,14 @@ def _calculate(ctx):
         if term is not None and info.start <= term.last_working_day <= info.end and emp.employment_basis != Basis.REMUNERATION:
             ctx.leavers.append((emp.employee_code, term.last_working_day))
             continue
+        settled = FinalSettlement.objects.filter(employee=emp, status__in=SETTLED, period__gte=ctx.period).first()
+        if settled is not None:
+            # Re-review 1: the approved final settlement closed this employee's payroll up to the leaving month; a run
+            # would pay or charge again what it settled. Corrections go through a later document, not a run.
+            raise error(f"{emp.employee_code} has an approved final settlement ({settled.number}) covering {ctx.period}: "
+                        "the run cannot include them (re-review 1).",
+                        f"للموظف {emp.employee_code} مخالصة نهائية معتمدة ({settled.number}) تشمل {ctx.period}: لا يدخل "
+                        "في المسير.", code="employee_settled")
         if emp.employment_basis == Basis.LOCAL_ENTITY_EMPLOYEE:
             # Never computed with Saudi parameters (R41); review 17: the skip is visible on the run.
             ctx.skipped_local += 1
@@ -2593,6 +2625,20 @@ def reverse_run(run, *, user, reason, date=None, acknowledge_wps=False, wps_reas
                                      "reason": wps_reason.strip()[:500],
                                      "message_en": "Run reversed after its salary file was generated",
                                      "message_ar": "عُكس المسير بعد إنشاء ملف الرواتب"})
+    employees = Payslip.objects.filter(run=run, refused=False).values("employee_id")
+    settlements = list(FS._base_manager.select_for_update().filter(employee_id__in=employees).exclude(
+        status=FSS.DISCARDED).order_by("pk"))
+    netted = [fs for fs in settlements if fs.status in (FSS.SUBMITTED, FSS.APPROVED, FSS.PAID)
+              and (fs.period >= run.period or FinalSettlementLine.objects.filter(settlement=fs,
+                                                                                   origin_period=run.period).exists())]
+    if netted:
+        # Re-review 2: the settlement netted its final dues against this run's lines (salary paid, GOSI booked,
+        # shares advanced); reversing the run would leave the settlement wrong.
+        raise error("A final settlement of an employee of this run is submitted or approved and was netted against it: "
+                    "return the settlement first, or correct in a later document (R13, re-review 2).",
+                    "مخالصة نهائية لموظف في هذا المسير مقدّمة أو معتمدة وقد احتُسبت مقابله: أعد المخالصة أولًا أو صحّح "
+                    "بمستند لاحق.", code="settlement_netted")
+    stale = [fs for fs in settlements if fs.status in (FSS.CALCULATED, FSS.RETURNED) and fs.period >= run.period]
     installments = _installments_of(run)
     for inst in installments:
         parent = inst.loan if isinstance(inst, LoanInstallment) else inst.contract
@@ -2633,6 +2679,13 @@ def reverse_run(run, *, user, reason, date=None, acknowledge_wps=False, wps_reas
         if _loan_outstanding_of(loan) > 0:
             loan.status = EmployeeLoan.Status.ACTIVE
             _save(loan)
+    for fs in stale:  # re-review 2: a calculated settlement netted against this run must be recalculated
+        _clear_settlement_lines(fs)
+        fs.status, fs.inputs_hash, fs.stored_hash = FSS.DRAFT, "", ""
+        fs.warnings = list(fs.warnings) + [f"Run {run.number} was reversed: recalculate (re-review 2) / عُكس المسير "
+                                           f"{run.number}: أعد الاحتساب"]
+        fs.modified_by, fs.modified_at = user, _now()
+        _save(fs)
     return run
 
 
@@ -2892,11 +2945,20 @@ def record_asset_acquisition(contract, *, user, purchase_bill, possession_date, 
                         "المستند.")
     elif purchase_bill is not None and possession_date < purchase_bill.accounting_date:
         problems.append("Possession cannot come before the purchase (R47). / لا يسبق القبض الشراء.")
+    if purchase_bill is not None and DeferredSaleContract.objects.filter(purchase_bill=purchase_bill).exclude(
+            pk=c.pk).exists():
+        problems.append("This purchase bill already backs another bai' ajel contract: one asset is sold once (R47, "
+                        "re-review 7). / فاتورة الشراء هذه مستخدمة لعقد بيع آجل آخر: الأصل يُباع مرة واحدة.")
     if problems:
         raise _problems(problems, "acquisition_invalid")
     c.purchase_bill, c.possession_date, c.possession_evidence_ref = purchase_bill, possession_date, possession_evidence_ref
     c.status, c.modified_by, c.modified_at = DeferredSaleContract.Status.ASSET_ACQUIRED, user, _now()
-    return _save(c)
+    try:
+        with transaction.atomic():
+            return _save(c)
+    except IntegrityError:  # the same bill recorded for another contract at the same moment
+        raise error("This purchase bill already backs another bai' ajel contract (R47, re-review 7).",
+                    "فاتورة الشراء هذه مستخدمة لعقد بيع آجل آخر.", code="acquisition_invalid") from None
 
 
 @transaction.atomic
@@ -2964,8 +3026,15 @@ def _settlement_draft(settlement_input, user):
     EOSB (hr R40) points the open draft at the new input. Remuneration staff have no statutory settlement (H17): their
     last month is paid by the run."""
     si = settlement_input
-    if not si.includes_statutory_lines or PayrollSettings.objects.filter(entity=si.entity).first() is None:
+    # Re-review 12: KSA employees only (remuneration staff are paid by the run, H17; local entity staff by their local
+    # payroll, R41). Without payroll settings nobody could prepare it: the termination is refused until payroll is set.
+    if not si.includes_statutory_lines or si.employee.employment_basis != Basis.KSA_EMPLOYEE:
         return None
+    if PayrollSettings.objects.filter(entity=si.entity).first() is None:
+        raise error("Payroll is not set up for this entity: set up payroll before approving the termination, so the "
+                    "final settlement can be drafted (R34, re-review 12).",
+                    "الرواتب غير مهيأة لهذا الكيان: هيّئ الرواتب قبل اعتماد إنهاء الخدمة لتُعد المخالصة النهائية.",
+                    code="payroll_not_set_up")
     t = si.termination
     fs = FS._base_manager.select_for_update().filter(termination=t).first()
     if fs is not None and fs.status not in (FSS.DRAFT, FSS.CALCULATED, FSS.RETURNED):
@@ -3023,6 +3092,7 @@ class SLine:
     rate: Decimal = None
     source_ref: str = ""
     origin_period: str = ""
+    slip_type: str = ""  # re-review 1: the payslip line type of a line computed by _calc_ksa
 
 
 @dataclass
@@ -3035,6 +3105,7 @@ class Settlement:
     loan_effects: list = field(default_factory=list)  # [(installment pk, amount)]
     sale_effects: list = field(default_factory=list)
     sale_outstanding: list = field(default_factory=list)  # installment pks left after exit
+    loan_outstanding: list = field(default_factory=list)  # re-review 8: loan installment pks left after exit
     eosb_award: Decimal = ZERO
     provision: Decimal = ZERO
     eosb_calc_id: int = None
@@ -3096,7 +3167,7 @@ def _compute_settlement(fs, user, *, separate_amount, consent_ref):
                 ltype = FSL.SALARY_TO_LAST_DAY
             out.lines.append(SLine(ltype, l.amount, l.account, l.desc_en, l.desc_ar, component=l.component,
                                    branch=l.branch, quantity=l.quantity, rate=l.rate, source_ref=l.source_ref,
-                                   origin_period=l.origin_period))
+                                   origin_period=l.origin_period, slip_type=l.line_type))
     salaries = ctx.account(SALARIES)
     # 2. Leave encashment (Art. 111: balance x actual daily wage / 30, from hr).
     if si.leave_encashment > 0:
@@ -3107,7 +3178,8 @@ def _compute_settlement(fs, user, *, separate_amount, consent_ref):
     # 3. Notice pay when the employer gave short notice (Art. 76); a worker's short notice is not deducted (Art. 92).
     if si.notice_shortfall_days:
         if not si.worker_initiated:
-            amount = _round(Fraction(si.daily_wage) * si.notice_shortfall_days)
+            # Re-review 9: wage x days / divisor, rounded once by hr (never the rounded daily wage x days).
+            amount = si.notice_shortfall_wage
             out.lines.append(SLine(FSL.NOTICE_PAY, amount, salaries,
                                    f"Notice pay {si.notice_shortfall_days} days (Art. 76)",
                                    f"بدل الإشعار {si.notice_shortfall_days} يوم (المادة 76)",
@@ -3168,13 +3240,18 @@ def _compute_settlement(fs, user, *, separate_amount, consent_ref):
                                    f"{INTEREST_FREE[0]} {loan.number} recovered from the final dues",
                                    f"{INTEREST_FREE[1]} {loan.number} مسترد من المستحقات النهائية",
                                    source_ref=f"loan:{loan.pk}"))
-            rest = take
-            for inst in loan.installments.filter(status=LoanInstallment.Status.PLANNED).order_by("period", "pk"):
-                part = min(inst.amount, rest)
-                out.loan_effects.append((inst.pk, part))
-                rest -= part
             loan_room -= take
             room -= take
+        # Re-review 8: only installments with a recovered part are settled (a partly recovered one is split in
+        # _settlement_effects); the rest stays on 1230 as outstanding after exit (write-off: OQ-7).
+        rest = take
+        for inst in loan.installments.filter(status=LoanInstallment.Status.PLANNED).order_by("period", "pk"):
+            part = min(inst.amount, rest)
+            if part > 0:
+                out.loan_effects.append((inst.pk, part))
+            if part < inst.amount:
+                out.loan_outstanding.append(inst.pk)
+            rest -= part
         if outstanding > take:
             out.warn(f"Loan {loan.number}: {outstanding - take} not covered by the final dues"
                      f"{'' if allowed else ' other than the EOSB (PAYROLL_EOSB_DEDUCTION_ALLOWED off)'}; a write-off "
@@ -3210,18 +3287,37 @@ def _compute_settlement(fs, user, *, separate_amount, consent_ref):
 def _settlement_fingerprint(fs, out):
     def line(l):
         return [l.line_type, str(l.amount), l.account.code, l.component.pk if l.component else None, l.branch,
-                str(l.quantity), str(l.rate), l.source_ref, l.origin_period]
+                str(l.quantity), str(l.rate), l.source_ref, l.origin_period, l.slip_type]
     data = [fs.settlement_input_id, out.eosb_calc_id, str(out.eosb_award), str(out.provision), [line(l) for l in out.lines],
             sorted(out.loan_effects), sorted(out.sale_effects), sorted(out.sale_outstanding), sorted(out.input_ids),
-            sorted(out.notices)]
+            sorted(out.notices), sorted(out.loan_outstanding)]
     return hashlib.sha256(json.dumps(data, default=str).encode()).hexdigest()
 
 
+# Re-review 3: the header fields the entry and the effects are built from are part of the stored hash.
+SETTLEMENT_HEADER = ("entity_id", "employee_id", "termination_id", "settlement_input_id", "eosb_calculation_id", "kind",
+                     "last_working_day", "period", "gross", "total_deductions", "net", "eosb_award",
+                     "eosb_provision_balance", "separate_settlement_amount", "written_consent_ref", "input_ids",
+                     "calc_version")
+
+
 def _settlement_stored_hash(fs):
+    """Review 6, re-review 3: every stored line (all columns) and the header fields, read from the database."""
     names = [f.attname for f in FinalSettlementLine._meta.concrete_fields]
     rows = [[str(r[n]) for n in names] for r in FinalSettlementLine._base_manager.filter(settlement=fs)
             .order_by("pk").values(*names)]
-    return hashlib.sha256(json.dumps(rows, default=str).encode()).hexdigest()
+    header = FS._base_manager.filter(pk=fs.pk).values(*SETTLEMENT_HEADER).first() or {}
+    data = [[k, str(header.get(k))] for k in SETTLEMENT_HEADER] + rows
+    return hashlib.sha256(json.dumps(data, default=str).encode()).hexdigest()
+
+
+def _settlement_header(fs, out):
+    """Re-review 3: the header as the calculation gives it (compared at approval with the stored header)."""
+    gross = out.total(FinalSettlementLine.EARNINGS) - out.total(FinalSettlementLine.REDUCTIONS)
+    deductions = out.total(FinalSettlementLine.DEDUCTIONS)
+    return {"gross": gross, "total_deductions": deductions, "net": gross - deductions, "eosb_award": out.eosb_award,
+            "eosb_provision_balance": out.provision, "eosb_calculation_id": out.eosb_calc_id,
+            "input_ids": sorted(out.input_ids)}
 
 
 @transaction.atomic
@@ -3236,27 +3332,27 @@ def prepare_final_settlement(settlement, *, user, separate_settlement_amount=Non
         raise error(f"A {fs.status} final settlement is not recalculated.", f"لا يُعاد احتساب مخالصة بحالة {fs.status}.",
                     code="settlement_status")
     separate = _dec(separate_settlement_amount, "separate_settlement_amount") if separate_settlement_amount else ZERO
-    if separate < 0:
-        raise error("The separate settlement is zero or more.", "التسوية المنفصلة صفر أو أكثر.", code="separate_settlement")
+    if separate < 0 or not fx.has_places(separate, 2):  # re-review 10: SAR, at most 2 decimals (R5)
+        raise error("The separate settlement is zero or more, in SAR with at most 2 decimals.",
+                    "التسوية المنفصلة صفر أو أكثر بالريال وبخانتين عشريتين على الأكثر.", code="separate_settlement")
     out = _compute_settlement(fs, user, separate_amount=separate, consent_ref=written_consent_ref)
     _clear_settlement_lines(fs)
     for l in out.lines:
         _save(FinalSettlementLine(entity=fs.entity, settlement=fs, line_type=l.line_type, component=l.component,
                                   gosi_branch=l.branch, quantity=l.quantity, rate=l.rate, amount=l.amount,
                                   account=l.account, description_en=l.desc_en[:300], description_ar=l.desc_ar[:300],
-                                  source_ref=l.source_ref[:80], origin_period=l.origin_period))
-    fs.gross = out.total(FinalSettlementLine.EARNINGS) - out.total(FinalSettlementLine.REDUCTIONS)
-    fs.total_deductions = out.total(FinalSettlementLine.DEDUCTIONS)
-    fs.net = fs.gross - fs.total_deductions
-    fs.eosb_award, fs.eosb_provision_balance = out.eosb_award, out.provision
+                                  source_ref=l.source_ref[:80], origin_period=l.origin_period,
+                                  slip_line_type=l.slip_type))
+    for k, v in _settlement_header(fs, out).items():
+        setattr(fs, k, v)
     fs.separate_settlement_amount, fs.written_consent_ref = separate, written_consent_ref or ""
     fs.settlement_input = _settlement_input_now(fs)
-    fs.eosb_calculation_id = out.eosb_calc_id
-    fs.input_ids, fs.warnings, fs.notes = sorted(out.input_ids), out.warnings, out.notes
+    fs.warnings, fs.notes = out.warnings, out.notes
     fs.status, fs.calc_version = FSS.CALCULATED, fs.calc_version + 1
     fs.inputs_hash = _settlement_fingerprint(fs, out)
-    fs.stored_hash = _settlement_stored_hash(fs)
     fs.calculated_by, fs.calculated_at, fs.modified_by, fs.modified_at = user, _now(), user, _now()
+    _save(fs)
+    fs.stored_hash = _settlement_stored_hash(fs)  # from the saved rows (re-review 3)
     return _save(fs)
 
 
@@ -3307,15 +3403,21 @@ def approve_final_settlement(settlement, *, user):
     if _settlement_fingerprint(fs, out) != fs.inputs_hash:
         raise error("A source changed after the calculation: recalculate the final settlement (R8).",
                     "تغيّر مصدر بعد الاحتساب: أعد احتساب المخالصة النهائية.", code="recalculate")
-    if _settlement_stored_hash(fs) != fs.stored_hash:
-        raise error("The stored lines of this final settlement changed after the calculation: recalculate it.",
-                    "تغيّرت بنود هذه المخالصة المخزنة بعد الاحتساب: أعد احتسابها.", code="payslips_changed")
+    if _settlement_stored_hash(fs) != fs.stored_hash or any(
+            getattr(fs, k) != v for k, v in _settlement_header(fs, out).items()):
+        # Review 6, re-review 3: the entry and the effects are built from the stored lines and header.
+        access_services.log_denial(actor=user, entity=fs.entity, permission="payroll.approve_final_settlement",
+                                   details={"reason": "stored_settlement_changed", "settlement": fs.pk})
+        raise error("The stored lines or totals of this final settlement changed after the calculation: recalculate it.",
+                    "تغيّرت بنود هذه المخالصة أو مجاميعها المخزنة بعد الاحتساب: أعد احتسابها.", code="payslips_changed")
+    _settlement_months_check(fs, emp)
+    on = _open_posting_date(fs.entity, fs.last_working_day)  # re-review 11: a closed month posts in the next open one
     fs.number = _next_number(fs.entity, "FS", fs.last_working_day.year)
     fs.status, fs.approved_by, fs.approved_at = FSS.APPROVED, user, _now()
     _save(fs)
     try:
         with _marker(_posting, fs):
-            entry = ledger.create_entry(fs.entity, fs.last_working_day,
+            entry = ledger.create_entry(fs.entity, on,
                                         f"Final settlement {fs.number} / مخالصة نهائية {fs.number}", None, user=user,
                                         reference=fs.number, post=True, grant=grant, document=fs)
     except LedgerError as exc:
@@ -3326,12 +3428,68 @@ def approve_final_settlement(settlement, *, user):
     return fs
 
 
+def _open_posting_date(entity, original):
+    """Re-review 11: ``original`` when its fiscal period is open, else the first day of the next open period."""
+    period = FiscalPeriod.objects.filter(entity=entity, start_date__lte=original, end_date__gte=original).first()
+    if period is not None and period.status == FiscalPeriod.Status.OPEN:
+        return original
+    later = FiscalPeriod.objects.filter(entity=entity, status=FiscalPeriod.Status.OPEN, start_date__gt=original) \
+        .order_by("start_date").first()
+    if later is None:
+        raise error("No open period to post the final settlement in.", "لا توجد فترة مفتوحة لترحيل المخالصة النهائية.",
+                    code="no_open_period")
+    return later.start_date
+
+
+def _settlement_months_check(fs, emp):
+    """Re-review 6: the settlement closes the employee's payroll. Every month from the hire month (or the entity's
+    first approved regular run, when payroll went live later: earlier months were paid outside the ERP) to the month
+    before leaving has an approved regular run, and no run up to the leaving month is waiting for approval with the
+    employee in it (a later approval would pay or accrue again what the settlement settles)."""
+    regular = PayrollRun.objects.filter(entity=fs.entity, payroll_group=PayrollGroup.IN_COUNTRY,
+                                        kind=PayrollRun.Kind.REGULAR)
+    approved_periods = set(regular.filter(status__in=(RS.APPROVED, RS.PAID)).values_list("period", flat=True))
+    hire_p = _period_of(emp.hire_date)
+    problems = []
+    if approved_periods:
+        q = max(hire_p, min(approved_periods))
+        missing = []
+        while q < fs.period:
+            if q not in approved_periods:
+                missing.append(q)
+            q = _next_period(q)
+        if missing:
+            problems.append(f"No approved regular run for {', '.join(missing)}: approve it before the final settlement "
+                            f"(re-review 6). / لا يوجد مسير عادي معتمد لفترة {', '.join(missing)}: اعتمده قبل المخالصة "
+                            "النهائية.")
+    waiting = PayrollRun.objects.filter(entity=fs.entity, status=RS.SUBMITTED, period__lte=fs.period).filter(
+        Q(period__lt=fs.period, period__gte=hire_p) | Q(payslips__employee=emp)).distinct()
+    if waiting.exists():
+        periods = ", ".join(sorted({r.period for r in waiting}))
+        problems.append(f"A run for {periods} is submitted: approve or return it before the final settlement "
+                        f"(re-review 6). / مسير لفترة {periods} مقدّم: اعتمده أو أعده قبل المخالصة النهائية.")
+    if problems:
+        raise _problems(problems, "settlement_runs_open")
+
+
 def _settlement_effects(fs, out, user):
     """Installments settled in the final settlement (or outstanding after exit), loans settled, EOSB sub-ledger
     utilisation and release (E5), inputs taken, GOSI catch-up notices (R58)."""
     for pk, amount in out.loan_effects:
         inst = _lock(LoanInstallment, pk)
+        if amount < inst.amount:  # re-review 8: the unrecovered part of a partly recovered installment stays after exit
+            _save(LoanInstallment(entity=inst.entity, loan=inst.loan, schedule_version=inst.schedule_version,
+                                  period=inst.period, amount=inst.amount - amount, carried_from=inst,
+                                  status=LoanInstallment.Status.OUTSTANDING_AFTER_EXIT))
+            inst.amount = amount
         inst.status, inst.deducted_amount = LoanInstallment.Status.SETTLED_IN_FINAL, amount
+        _save(inst)
+    settled_loans = {pk for pk, _ in out.loan_effects}
+    for pk in out.loan_outstanding:
+        if pk in settled_loans:
+            continue
+        inst = _lock(LoanInstallment, pk)
+        inst.status = LoanInstallment.Status.OUTSTANDING_AFTER_EXIT
         _save(inst)
     for pk, amount in out.sale_effects:
         inst = _lock(DeferredSaleInstallment, pk)
@@ -3368,6 +3526,9 @@ def _settlement_effects(fs, out, user):
                         "أُخذ مدخل من هذه المخالصة في الأثناء: أعد الاحتساب.", code="recalculate")
         inp.final_settlement = fs
         _save(inp)
+    for origin, amount, en, ar in out.notices:  # re-review 5: R58 notice for a share recovered from the final dues
+        _save(GosiCatchUpNotice(entity=fs.entity, employee_id=fs.employee_id, final_settlement=fs,
+                                period_of_origin=origin, amount=amount, text_en=en, text_ar=ar))
 
 
 def _settlement_lines(fs):
@@ -3425,12 +3586,23 @@ def _run_payable(run, currency):
     return total, paid
 
 
+def _settlement_credits_2340(entity, period):
+    """Re-review 4: the lines of approved (or paid) final settlements credited to 2340, under the settlement's
+    leaving month (as a run's lines are under the run's period): both shares, a share borne by the employer and the
+    advanced (uncollected) employee share."""
+    return FinalSettlementLine.objects.filter(entity=entity, settlement__period=period,
+                                              settlement__status__in=SETTLED).filter(
+        Q(line_type__in=(FSL.EMPLOYER_GOSI, FSL.GOSI_UNCOLLECTED))
+        | Q(line_type__in=(FSL.EMPLOYEE_GOSI, FSL.GOSI_RECOVERY), account__code=GOSI_PAYABLE))
+
+
 def _gosi_booked(entity, period, exclude_run=None):
     qs = _credits_2340(PayslipLine.objects.filter(entity=entity, payslip__run__period=period, payslip__refused=False,
                                                   payslip__run__status__in=(RS.APPROVED, RS.PAID)))
     if exclude_run is not None:
         qs = qs.exclude(payslip__run=exclude_run)
-    return qs.aggregate(t=Sum("amount"))["t"] or ZERO
+    runs = qs.aggregate(t=Sum("amount"))["t"] or ZERO
+    return runs + (_settlement_credits_2340(entity, period).aggregate(t=Sum("amount"))["t"] or ZERO)
 
 
 def _gosi_paid(entity, period):
@@ -3671,9 +3843,10 @@ FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
 
 
 def _cell(value):
-    """Review 7: a CSV cell a spreadsheet would read as a formula is prefixed with an apostrophe."""
+    """Review 7: a CSV cell a spreadsheet would read as a formula is prefixed with an apostrophe; re-review 14: also
+    when the formula character follows leading whitespace (spreadsheets ignore it)."""
     text = "" if value is None else str(value)
-    return "'" + text if text.startswith(FORMULA_START) else text
+    return "'" + text if text.startswith(FORMULA_START) or text.lstrip().startswith(FORMULA_START) else text
 
 
 def _wps_amounts(ps):
@@ -3965,6 +4138,16 @@ def gosi_report(entity, period, *, user):
             r = rows.setdefault(l.payslip.employee.employee_code, {"employee_code": l.payslip.employee.employee_code,
                                                                    "gosi_wage": l.payslip.gosi_wage, "employee": ZERO,
                                                                    "employer": ZERO})
+            r[side] += l.amount
+    for l in _settlement_credits_2340(entity, period).select_related("settlement__employee"):  # re-review 4
+        side = "employer" if l.line_type == FSL.EMPLOYER_GOSI and not l.source_ref.startswith("borne:") else "employee"
+        b_ = branches.setdefault(l.gosi_branch or "", {"branch": l.gosi_branch or "", "employee": ZERO, "employer": ZERO})
+        b_[side] += l.amount
+        if detail:
+            code = l.settlement.employee.employee_code
+            r = rows.setdefault(code, {"employee_code": code, "gosi_wage": ZERO, "employee": ZERO, "employer": ZERO})
+            if not l.origin_period and l.quantity is not None and l.line_type != FSL.GOSI_UNCOLLECTED:
+                r["gosi_wage"] = max(r["gosi_wage"], l.quantity)
             r[side] += l.amount
     if detail:
         access_services.log(AccessLog.Event.PERSONAL_DATA_VIEWED, actor=user, entity=entity,

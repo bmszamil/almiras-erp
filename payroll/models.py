@@ -651,7 +651,11 @@ class GosiCatchUpNotice(ServiceWritten):
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     employee = models.ForeignKey("hr.Employee", on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Employee", "الموظف"))
-    run = models.ForeignKey(PayrollRun, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Run", "المسير"))
+    # Re-review 5: a final settlement recovering an advanced share has its notice too (then ``run`` is empty).
+    run = models.ForeignKey(PayrollRun, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+                            verbose_name=bi("Run", "المسير"))
+    final_settlement = models.ForeignKey("FinalSettlement", null=True, blank=True, on_delete=models.PROTECT,
+                                         related_name="+", verbose_name=bi("Final settlement", "المخالصة النهائية"))
     period_of_origin = models.CharField(bi("Period of origin", "فترة المنشأ"), max_length=7)
     amount = _money("Amount", "المبلغ")
     text_en = models.TextField(bi("Text (English)", "النص (بالإنجليزية)"))
@@ -665,6 +669,8 @@ class GosiCatchUpNotice(ServiceWritten):
         base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("GOSI catch-up notice", "إشعار استدراك التأمينات")
         verbose_name_plural = bi("GOSI catch-up notices", "إشعارات استدراك التأمينات")
+        constraints = [models.CheckConstraint(condition=Q(run__isnull=False) | Q(final_settlement__isnull=False),
+                                              name="payroll_notice_has_document")]
 
 
 # --- loans (3.6) -----------------------------------------------------------------------------------
@@ -723,6 +729,8 @@ class LoanInstallment(ServiceWritten):
         DEDUCTED = "deducted", bi("Deducted", "مستقطع")
         SUPERSEDED = "superseded", bi("Superseded by a new schedule", "استُبدل بجدول جديد")
         SETTLED_IN_FINAL = "settled_in_final", bi("Settled in the final settlement", "سُدد في المخالصة النهائية")
+        # Re-review 8: what the final dues did not cover stays on 1230 after exit (write-off: OQ-7).
+        OUTSTANDING_AFTER_EXIT = "outstanding_after_exit", bi("Outstanding after exit", "قائم بعد انتهاء الخدمة")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     loan = models.ForeignKey(EmployeeLoan, on_delete=models.PROTECT, related_name="installments",
@@ -731,7 +739,7 @@ class LoanInstallment(ServiceWritten):
     period = models.CharField(bi("Period", "الفترة"), max_length=7)
     amount = _money("Amount", "المبلغ")
     deducted_amount = _money("Deducted", "المستقطع", default=ZERO)
-    status = models.CharField(bi("Status", "الحالة"), max_length=18, choices=Status.choices, default=Status.PLANNED)
+    status = models.CharField(bi("Status", "الحالة"), max_length=24, choices=Status.choices, default=Status.PLANNED)
     run = models.ForeignKey(PayrollRun, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
                             verbose_name=bi("Run", "المسير"))
     carried_from = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
@@ -791,6 +799,9 @@ class DeferredSaleContract(Tracked, ServiceWritten):
         base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
         verbose_name = bi("bai' ajel contract", "عقد بيع آجل")
         verbose_name_plural = bi("bai' ajel contracts", "عقود البيع الآجل")
+        # Re-review 7: one purchase bill backs one contract (one asset is sold once).
+        constraints = [models.UniqueConstraint(fields=["purchase_bill"], condition=Q(purchase_bill__isnull=False),
+                                               name="payroll_sale_one_purchase_bill")]
 
     @property
     def sale_price(self):
@@ -955,6 +966,9 @@ class FinalSettlementLine(ServiceWritten):
     description_ar = models.CharField(bi("Description (Arabic)", "الوصف (بالعربية)"), max_length=300)
     source_ref = models.CharField(bi("Source", "المصدر"), max_length=80, blank=True)
     origin_period = models.CharField(bi("Period of origin", "فترة المنشأ"), max_length=7, blank=True)
+    # Re-review 1: the payslip line type the line was computed as (blank for settlement-only lines such as leave
+    # encashment, EOSB or recoveries), so later calculations net a period against what the settlement booked for it.
+    slip_line_type = models.CharField(bi("Computed as", "احتُسب بوصفه"), max_length=28, blank=True)
 
     class Meta:
         base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
