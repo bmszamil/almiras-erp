@@ -11,7 +11,7 @@ from django.db import connection, connections
 
 from payroll import services
 from payroll.conftest import D, approved, saudi, slip
-from payroll.models import EmployeeLoan, PayrollPayment, PayrollRun
+from payroll.models import EmployeeLoan, FinalSettlement, PayrollPayment, PayrollRun
 
 pytestmark = [pytest.mark.skipif(connection.vendor != "postgresql", reason="row locks need PostgreSQL"),
               # Committed transactions: the threads see each other's rows.
@@ -137,3 +137,32 @@ def test_review17_two_loans_of_one_employee_approved_at_once_respect_the_cap(w, 
     assert sorted(results) == ["loan_cap", "ok"]
     assert EmployeeLoan.objects.filter(employee=s1, status="active").count() == 1
     assert D("20000.00") == sum(x.principal for x in EmployeeLoan.objects.filter(employee=s1, status="active"))
+
+
+# Re-review 15 (reviewer's test_zz_pgprobe.py): final settlement payment and approval races.
+
+def test_rr15_two_final_settlement_payments_approved_at_once_never_exceed_the_net(w, monkeypatch):
+    from payroll.test_final_settlement import leaver, settle, terminate
+
+    fs = services.approve_final_settlement(settle(w, terminate(w, leaver(w))), user=w.c)
+    payments = []
+    for user in (w.p, w.p2):
+        p = services.record_payment(w.alm, user=user, kind="final_settlement", final_settlement=fs,
+                                    payment_date=date(2027, 3, 20), amount=str(fs.net))
+        payments.append(services.submit_payment(p, user=user))
+    results = _race(monkeypatch, "_payment_room",
+                    [(services.approve_payment, dict(payment=p, user=w.c)) for p in payments])
+    assert sorted(results) == ["ok", "overpayment"]
+    assert sum(p.amount for p in PayrollPayment.objects.filter(final_settlement=fs, status="approved")) == fs.net
+    assert FinalSettlement.objects.get(pk=fs.pk).status == "paid"
+
+
+def test_rr15_two_approvals_of_one_final_settlement_at_once_post_once(w, monkeypatch):
+    from payroll.test_final_settlement import leaver, settle, terminate
+
+    fs = settle(w, terminate(w, leaver(w)))
+    results = _race(monkeypatch, "_compute_settlement",
+                    [(services.approve_final_settlement, dict(settlement=fs, user=u)) for u in (w.c, w.mp)])
+    assert sorted(results) == ["ok", "settlement_status"]
+    fs = FinalSettlement.objects.get(pk=fs.pk)
+    assert fs.status == "approved" and fs.number.endswith("000001") and fs.journal_entry_id
