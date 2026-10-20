@@ -231,3 +231,16 @@ def test_review13_run_warnings_are_counts_only(w):
     assert "1 payslip(s) have warnings" in text and "1 employee(s) with an approved termination" in text
     assert any(leaver.employee_code in x for x in run.employee_notes)
     assert any("31(2)" in x for x in slip(run, n1).warnings)
+
+
+def test_review4_sick_leave_reduction_on_day_31_carries_nothing(w):
+    """Probe P9: a sick day on the 31st was reduced although day 31 carries no pay on the 30-day basis. Sick from
+    2027-10-01: days 1 to 30 full pay, 31 to 90 at 75% (to 12-29), 91 to 120 without pay (Art. 117)."""
+    n1 = expat(w)
+    req = hr.request_leave(n1, "SICK", user=w.h, start_date=date(2027, 10, 1), end_date=date(2027, 12, 31),
+                           document_ref="MED-1")
+    hr.approve_leave(req, user=w.h2)
+    dec = calculated(w, "2027-12")
+    # December 1 to 29 at 25% off (29/30), December 30 fully off (1/30), December 31 weight 0.
+    assert amount(dec, n1, "sick_deduction") == D("2200.00")
+    assert slip(dec, n1).gross == D("5800.00")
