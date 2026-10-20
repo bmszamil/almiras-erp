@@ -214,6 +214,44 @@ EG_ROWS = (
     ("levy.martyrs_fund", "2021-01-01", {"rate": "0.0005", "base": "gross_monthly_salary"},
      "https://taxsummaries.pwc.com/egypt/individual/other-taxes", "Law 4/2021 (M; who bears it disputed)"),
 )
+# Slice 2 (§10.8 item 7): the rows the Egypt calculation reads beyond slice 1's (research §1.2, §1.3, §2.3, §2.5).
+EG_PWC = "https://taxsummaries.pwc.com/egypt/individual/taxes-on-personal-income"
+EG_SLICE2_ROWS = (
+    ("si.insurable_components", "2020-01-01",
+     {"codes": ["BASIC", "HOUSING", "TRANSPORT", "OTHER", "COMMISSION", "PROFIT_SHARE"], "one_off_inputs": False},
+     "https://eg.andersen.com/wp-content/uploads/2025/06/Law-No.-148-of-the-Year-2019-and-its-executive-regulation.pdf",
+     "Law 148/2019 Art. 1 (insurable wage = cash remuneration for the main job; per-component inclusion needs local "
+     "sign-off) (L)"),
+    ("si.partial_month", "2020-01-01", {"rule": "prorate_paid_days"}, "https://eg.andersen.com/social-insurance-in-egypt/",
+     "Joining and leaving months: insurable wage x paid days / divisor (team reading, not in the research) (L)"),
+    ("tax.salary.bracket_exclusion", "2024-03-01", {"columns": [
+        {"income_upto": "600000.00", "rates": ["0", "0.10", "0.15", "0.20", "0.225", "0.25", "0.275"]},
+        {"income_upto": "700000.00", "rates": ["0.10", "0.10", "0.15", "0.20", "0.225", "0.25", "0.275"]},
+        {"income_upto": "800000.00", "rates": ["0.15", "0.15", "0.15", "0.20", "0.225", "0.25", "0.275"]},
+        {"income_upto": "900000.00", "rates": ["0.20", "0.20", "0.20", "0.20", "0.225", "0.25", "0.275"]},
+        {"income_upto": "1200000.00", "rates": ["0.225", "0.225", "0.225", "0.225", "0.225", "0.25", "0.275"]},
+        {"income_upto": None, "rates": ["0.25", "0.25", "0.25", "0.25", "0.25", "0.25", "0.275"]}]},
+     "https://www.a-h-g.net/ar/income-tax-brackets-table/", "Law 7/2024 amending Art. 8: high-income band exclusion, "
+     "column by annual net taxable income (reconstructed from secondary sources; sources conflict, C7) (L to M)"),
+    ("tax.salary.zero_band_residents_only", "2024-03-01", {"apply": True, "non_resident_first_band_rate": "0.10"},
+     "https://taxsummaries.pwc.com/egypt/individual/deductions", "PwC: the 0% band applies to residents only (L)"),
+    ("tax.salary.method", "2020-01-01", {"method": "cumulative_annualised", "year": "calendar"},
+     "https://www.activpayroll.com/global-insights/egypt",
+     "Monthly withholding: annualise year-to-date taxable pay, tax the year, withhold the year-to-date share less "
+     "what was withheld (standard ETA practice; rounding rule not found) (M)"),
+    ("uhi.rates", "2018-07-01", {"employee": "0.01", "employer": "0.04", "employer_min_monthly": "50.00",
+                                 "spouse_not_working": "0.03", "per_dependent_child": "0.01",
+                                 "base": "si_contribution_wage"},
+     "https://manshurat.org/node/63712", "Universal Health Insurance Law 2/2018 Art. 40 and Table 1 (employee and "
+     "family rates unconfirmed) (L)"),
+    ("uhi.governorates_live", "2018-07-01",
+     {"governorates": ["port_said", "ismailia", "luxor", "south_sinai", "suez", "aswan"]},
+     "https://www.madamasr.com/en/2026/07/30/feature/politics/cracks-in-the-universal-health-insurance-system-an-accounting-of-phase-1/",
+     "UHI phase 1 governorates (live); phase 2 (Minya first, 2026) not dated in the research (L)"),
+    ("eosb.monthly_accrual", "2025-09-01", {"accrue": False}, "https://eg.andersen.com/egypts-labour-law-14-2025/",
+     "Labour Law 14/2025: no statutory end-of-service gratuity for resignation or expiry; compensation only on a "
+     "termination event (research §2.1, §4 item 12) (M)"),
+)
 EG_NOTE = " | Research 2026-10-18 from search-engine extracts, not the Gazette; Egyptian adviser to confirm (OQ-28)"
 
 
@@ -231,5 +269,5 @@ def apply(StatutoryParameter):
     apply_rows(StatutoryParameter, {"wps.bank_codes": WPS_BANK_CODES}, valid_from=WPS_FROM)
     for jurisdiction, row in ACTIVE.items():
         apply_rows(StatutoryParameter, {"jurisdiction.active": row}, jurisdiction=jurisdiction, valid_from=ACTIVE_FROM)
-    for code, valid_from, value, url, ref in EG_ROWS:
+    for code, valid_from, value, url, ref in EG_ROWS + EG_SLICE2_ROWS:
         apply_rows(StatutoryParameter, {code: (value, url, ref + EG_NOTE)}, jurisdiction="EG", valid_from=valid_from)

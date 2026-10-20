@@ -243,7 +243,7 @@ SETTINGS_FIELDS = frozenset({
     "enabled", "default_pay_day", "input_cutoff_day", "out_of_country_cutoff_day", "salary_bank", "day_basis",
     "day_basis_ref", "salary_bank_account", "wps_format", "wps_bank_code", "employer_bank_iban",
     "gosi_oh_rate_override", "gosi_oh_override_ref", "gosi_oh_override_from", "gosi_oh_override_to",
-    "gosi_housing_in_kind_exempt_ref", "wps_deductions_field",
+    "gosi_housing_in_kind_exempt_ref", "wps_deductions_field", "loan_write_off_account", "work_governorate",
 })
 
 
@@ -292,7 +292,7 @@ def configure_settings(entity, *, user, **fields):
                                          "gosi_oh_override_to")}
     bank_before = {k: getattr(s, k) for k in BANK_SETTINGS}
     for name, value in fields.items():
-        if name == "salary_bank_account" and not isinstance(value, Account):
+        if name in ("salary_bank_account", "loan_write_off_account") and value and not isinstance(value, Account):
             value = _account(entity, value)
         if name == "gosi_oh_rate_override" and value is not None:
             value = _dec(value, name)
@@ -310,6 +310,11 @@ def configure_settings(entity, *, user, **fields):
     if s.wps_format and s.wps_format not in ("generic_csv", "mudad_placeholder") and s.wps_format != s.salary_bank:
         problems.append("The WPS format must be the salary bank's own format (R51). / يجب أن تكون صيغة ملف حماية "
                         "الأجور صيغة بنك الرواتب نفسه.")
+    wo = s.loan_write_off_account
+    if wo is not None and (wo.entity_id != entity.pk or wo.type != "expense" or not wo.is_postable
+                           or (wo.sharia_prohibited and entity.sharia_enforced)):
+        problems.append("The loan write-off account is a postable expense account of the entity, never Sharia-"
+                        "prohibited (OQ-7). / حساب شطب القروض حساب مصروف قابل للترحيل من حسابات الكيان وغير محظور شرعًا.")
     acc = s.salary_bank_account
     if acc.entity_id != entity.pk or acc.type != "asset" or not acc.is_postable:
         problems.append("The salary bank account is a postable asset account of the entity. / حساب بنك الرواتب "
@@ -370,12 +375,38 @@ def _jurisdiction_gate(entity, use):
         raise error(f"Jurisdiction {jurisdiction} is not activated for payroll (hr R68, R4).",
                     f"الولاية القانونية {jurisdiction} غير مفعلة للرواتب.", code="jurisdiction_not_activated")
     use._take(row)
-    if jurisdiction != "SA":
-        raise error(f"Jurisdiction {jurisdiction} is not configured for payroll: its local parameters are unverified "
-                    "research and the local calculation is not built (R4, OQ-28).",
-                    f"الولاية القانونية {jurisdiction} غير مهيأة للرواتب: معاييرها المحلية بحث غير متحقق منه والحساب "
-                    "المحلي غير مبني.", code="jurisdiction_not_configured")
+    if jurisdiction not in CALCULATED_JURISDICTIONS:
+        raise error(f"Jurisdiction {jurisdiction} is not configured for payroll: the local calculation is not built "
+                    "(R4, OQ-28).", f"الولاية القانونية {jurisdiction} غير مهيأة للرواتب: الحساب المحلي غير مبني.",
+                    code="jurisdiction_not_configured")
     return s
+
+
+# R4 (P19(f)): the jurisdictions with a payroll calculation. Egypt (slice 2, §10.8 item 7) is calculated from its
+# research rows; a run there is refused at submission and approval while any row it read is unverified.
+CALCULATED_JURISDICTIONS = ("SA", "EG")
+
+
+def _jurisdiction_of(entity):
+    hs = HrSettings.objects.filter(entity=entity).first()
+    return hs.jurisdiction if hs is not None else "SA"
+
+
+def _local_unverified(run):
+    """§10.8 item 7: an Egypt run reads research rows; it activates only once a person verifies every row it read,
+    whatever ``HR_REQUIRE_VERIFIED_PARAMETERS`` says."""
+    if _jurisdiction_of(run.entity) == "SA":
+        return []
+    return list(StatutoryParameter.objects.filter(pk__in=run.parameter_ids).exclude(
+        status=StatutoryParameter.Status.VERIFIED).order_by("jurisdiction", "code", "valid_from"))
+
+
+def _refuse_unverified_local(rows):
+    names = ", ".join(f"{r.jurisdiction} {r.code} ({r.valid_from})" for r in rows)
+    raise error(f"This Egypt run reads unverified research parameters: {names}. A person verifies each row before an "
+                "Egypt run is submitted or approved (R4, OQ-28; hr R7).",
+                f"يقرأ مسير مصر هذا معايير بحثية غير متحقق منها: {names}. يتحقق شخص من كل صف قبل تقديم مسير مصر أو "
+                "اعتماده.", code="parameter_unverified")
 
 
 # =====================================================================================================
@@ -440,6 +471,11 @@ def _input_problems(inp, use):
     emp = inp.employee
     problems = []
     basis = emp.employment_basis
+    if basis == Basis.LOCAL_ENTITY_EMPLOYEE:
+        return _eg_input_problems(inp)
+    if inp.kind == IK.ONE_OFF_DEDUCTION and inp.deduction_basis == PayrollInput.DeductionBasis.NAFAQA:
+        problems.append("A nafaqa (maintenance) deduction basis is for Egypt payroll; in KSA a court-ordered debt is "
+                        "'court_order' (Art. 92(6)). / أساس النفقة لرواتب مصر؛ وفي المملكة يكون الدين بحكم قضائي.")
     if inp.kind == IK.LEAVE_ENCASHMENT:
         problems.append("Cash instead of leave during service is not allowed; leave is encashed only in the final "
                         "settlement (Labour Law Art. 109(2), R34). / لا يجوز صرف بدل نقدي عن الإجازة أثناء الخدمة؛ "
@@ -846,6 +882,7 @@ class Slip:
     input_ids: list = field(default_factory=list)  # inputs the payslip takes (review 9)
     iban_hash: str = ""  # review 8: the IBAN the payslip was calculated with
     termination_ref: int = None  # review 8: the approved termination known at calculation
+    taxable_income: Decimal = ZERO  # Egypt: the month's taxable salary (cumulative withholding, §10.8 item 7)
 
     def warn(self, en, ar):
         text = f"{self.employee.employee_code}: {en} / {self.employee.employee_code}: {ar}"
@@ -873,6 +910,7 @@ class Ctx:
     def __init__(self, run, user, s):
         self.run, self.user, self.s = run, user, s
         self.entity = run.entity
+        self.jurisdiction = _jurisdiction_of(run.entity)
         self.period = run.period
         self.start, self.end = _period_bounds(run.period)
         self.use = hr.ParamUse()
@@ -2068,6 +2106,10 @@ def create_run(entity, *, user, period, payroll_group=PayrollGroup.IN_COUNTRY, k
     if kind == PayrollRun.Kind.OFF_CYCLE and (not reason_ar.strip() or not employees):
         raise error("An off-cycle run needs a reason in Arabic and the named employees (R6).",
                     "يحتاج المسير خارج الدورة إلى سبب بالعربية وأسماء الموظفين.", code="off_cycle_reason")
+    if _jurisdiction_of(entity) != "SA" and (kind != PayrollRun.Kind.REGULAR
+                                              or payroll_group != PayrollGroup.IN_COUNTRY):
+        raise error("Egypt payroll runs are regular in-country runs (off-cycle runs there are not built; §10.8).",
+                    "مسيرات مصر مسيرات عادية داخل البلد (لم تُبنَ المسيرات خارج الدورة هناك).", code="off_cycle_not_built")
     if kind == PayrollRun.Kind.OFF_CYCLE and payroll_group == PayrollGroup.OUT_OF_COUNTRY:
         raise error("Off-cycle remuneration runs are not built yet (review 2): correct in the next regular run.",
                     "لم تُبنَ المسيرات خارج الدورة للمكافآت بعد: صحّح في المسير العادي التالي.", code="off_cycle_not_built")
@@ -2125,11 +2167,12 @@ def _calculate(ctx):
             # count warning and a note), never the whole run refused; corrections go through a later document.
             ctx.settled.append((emp.employee_code, settled.number))
             continue
-        if emp.employment_basis == Basis.LOCAL_ENTITY_EMPLOYEE:
+        if emp.employment_basis == Basis.LOCAL_ENTITY_EMPLOYEE and ctx.jurisdiction != "EG":
             # Never computed with Saudi parameters (R41); review 17: the skip is visible on the run.
             ctx.skipped_local += 1
             continue
-        calc = _calc_remuneration if emp.employment_basis == Basis.REMUNERATION else _calc_ksa
+        calc = (_calc_eg if emp.employment_basis == Basis.LOCAL_ENTITY_EMPLOYEE
+                else _calc_remuneration if emp.employment_basis == Basis.REMUNERATION else _calc_ksa)
         slip = calc(ctx, emp, versions, info)
         if ctx.run.kind == PayrollRun.Kind.OFF_CYCLE and not slip.refusal and not slip.lines:
             ctx.nothing_due.append(emp.employee_code)
@@ -2215,7 +2258,8 @@ def _store(ctx, slips):
                      pending_gosi_amount=s.pending_gosi_amount, legal_clearance_ref=s.legal_clearance_ref,
                      leave_balance_snapshot=s.leave_balance, document_flag=s.document_flag[:10],
                      refused=bool(s.refusal), refusal=s.refusal, warnings=s.warnings, notes=s.notes,
-                     input_ids=sorted(s.input_ids), iban_hash=s.iban_hash, termination_ref=s.termination_ref)
+                     input_ids=sorted(s.input_ids), iban_hash=s.iban_hash, termination_ref=s.termination_ref,
+                     taxable_income=s.taxable_income)
         gross = s.total(PayslipLine.EARNINGS) - s.total(PayslipLine.REDUCTIONS)
         ded = s.total(PayslipLine.DEDUCTIONS)
         ps.gross, ps.total_deductions, ps.net = gross, ded, gross - ded
@@ -2297,6 +2341,11 @@ def calculate_run(run, *, user):
     run.parameter_ids = ctx.use.ids
     _pay_date_warning(ctx)
     run.warnings = ctx.warnings + _summary_warnings(slips)
+    unverified = _local_unverified(run)
+    if unverified:
+        run.warnings.append(f"{len(unverified)} unverified research parameter(s) read: the run cannot be submitted or "
+                            f"approved until they are verified (R4, OQ-28) / قُرئ {len(unverified)} من المعايير البحثية "
+                            "غير المتحقق منها: لا يُقدم المسير ولا يُعتمد حتى يُتحقق منها")
     # Review 13: per-employee details stay on the payslips (payroll.view_payslip); the run shows counts only.
     run.employee_notes = ([f"{code}: last working day {lwd}: final settlement (R10) / {code}: آخر يوم عمل {lwd}: "
                            "المخالصة النهائية" for code, lwd in ctx.leavers]
@@ -2327,6 +2376,9 @@ def submit_run(run, *, user, exclude_refused=False):
                          "صحّحها أو قدّمه دونها وادفعها بمسير خارج الدورة.", *refused], "payslips_refused")
     if not Payslip.objects.filter(run=run, refused=False).exists():
         raise error("The run has no payslips to pay.", "لا توجد قسائم للصرف في المسير.", code="run_empty")
+    unverified = _local_unverified(run)
+    if unverified:
+        _refuse_unverified_local(unverified)
     if refused:
         n = len(refused)
         run.warnings = list(run.warnings) + [
@@ -2425,6 +2477,10 @@ def approve_run(run, *, user):
         raise error("The stored payslips of this run changed after the calculation: recalculate the run (R8, review 6).",
                     "تغيّرت قسائم هذا المسير المخزنة بعد الاحتساب: أعد احتساب المسير.", code="payslips_changed")
     ctx.use.check_verified()
+    if ctx.jurisdiction != "SA":  # §10.8 item 7: Egypt activates only on verified rows
+        bad = [r for r in ctx.use.rows.values() if r.status != StatutoryParameter.Status.VERIFIED]
+        if bad:
+            _refuse_unverified_local(bad)
     run.number = _next_number(run.entity, "PAY", int(run.period[:4]))
     run.status, run.approved_by, run.approved_at = RS.APPROVED, user, _now()
     _save(run)
@@ -2541,6 +2597,9 @@ def _run_lines(run):
             elif t in (LT.EMPLOYER_GOSI, LT.GOSI_UNCOLLECTED):
                 add(l.account, l.amount)
                 add(_account(run.entity, GOSI_PAYABLE), -l.amount)
+            elif t in EG_EMPLOYER_PAYABLE:  # Egypt: employer social insurance and UHI, Dr expense / Cr payable
+                add(l.account, l.amount)
+                add(_account(run.entity, EG_ACCOUNTS[EG_EMPLOYER_PAYABLE[t]]), -l.amount)
             elif t == LT.EOSB_ACCRUAL:
                 add(l.account, l.amount)
                 add(_account(run.entity, EOSB_PROVISION), -l.amount)
@@ -4198,7 +4257,7 @@ def payslip_data(payslip, *, user):
         "loan_balance": ps.loan_balance, "leave_balance": ps.leave_balance_snapshot,
         "interest_free": any(l.line_type == LT.LOAN_INSTALLMENT for l in lines), "notes": ps.notes,
         "notices": list(GosiCatchUpNotice.objects.filter(run=ps.run, employee_id=ps.employee_id)),
-        "wht": _payslip_wht(ps), "payslip": ps,
+        "wht": _payslip_wht(ps), "payslip": ps, "jurisdiction": _jurisdiction_of(ps.entity),
     }
 
 
@@ -4378,6 +4437,8 @@ def send_alerts(*, today=None, entity=None):
     sent = 0
     for e in entities:
         roles = ("payroll_officer", "hr_officer")
+        if _jurisdiction_of(e) != "SA":  # WPS, Mudad and GOSI are Saudi (Egypt research §2.4, §2.5)
+            continue
         prev = _period_of(today.replace(day=1) - timedelta(days=1))
         # C-C5: Mudad counts from the pay date: alerts 7, 10 and 15 days after it while no submission is recorded.
         for offset in MUDAD_ALERT_DAYS:
@@ -5353,3 +5414,268 @@ def approved_secondment_cost(assignment, period):
     return SimpleNamespace(total=line.total, currency=r.entity.base_currency_id, days=line.days,
                            days_in_month=line.days_in_month, report_id=r.pk, version=r.version,
                            approved_at=r.approved_at)
+
+
+# =====================================================================================================
+# Slice 2 (§10.8 item 7): Egypt payroll (jurisdiction EG; docs/compliance/egypt-payroll-2026-10-18.md)
+# =====================================================================================================
+
+# Accounts of the Egypt lines (defaults on the group chart, CFO to approve dedicated ones, research §2.5 item 3):
+# social insurance (NOSI) on the social-insurance payable and expense accounts (2340 / 5110, "التأمينات الاجتماعية"),
+# salary tax withheld on 2220 (withholding tax payable), Martyrs' Fund and Universal Health Insurance on 2300.
+EG_ACCOUNTS = {"si_payable": GOSI_PAYABLE, "si_expense": GOSI_EXPENSE, "tax_payable": WHT_PAYABLE,
+               "martyrs_payable": "2300", "uhi_payable": "2300", "uhi_expense": GOSI_EXPENSE}
+EG_EMPLOYER_PAYABLE = {LT.SI_EMPLOYER: "si_payable", LT.UHI_EMPLOYER: "uhi_payable"}
+EG_STATUTORY = (LT.SI_EMPLOYEE, LT.SALARY_TAX, LT.MARTYRS_FUND, LT.UHI_EMPLOYEE)
+EG_INPUT_KINDS = (IK.ONE_OFF_EARNING, IK.BONUS, IK.ONE_OFF_DEDUCTION, IK.UNPAID_DAYS)
+EG_DEDUCTION_BASES = (PayrollInput.DeductionBasis.WRITTEN_CONSENT, PayrollInput.DeductionBasis.COURT_ORDER,
+                      PayrollInput.DeductionBasis.NAFAQA, PayrollInput.DeductionBasis.STATUTORY_OTHER)
+
+
+def _eg_input_problems(inp):
+    """Egypt inputs (Labour Law 14/2025, research rows): one-off earnings and bonuses, unpaid days and one-off
+    deductions with their basis (written consent, court order, maintenance (nafaqa) order, other statutory). Overtime
+    is refused until its base is confirmed (research §4 item 15); the Saudi Art. 91 damage basis does not apply."""
+    problems = []
+    if inp.kind not in EG_INPUT_KINDS:
+        problems.append(f"{inp.kind} is not built for Egypt payroll (overtime base and premiums to confirm, research "
+                        "§4 item 15). / هذا النوع غير مبني لرواتب مصر.")
+        return problems
+    if not (inp.reason_ar or "").strip():
+        problems.append("The reason in Arabic is required. / السبب بالعربية مطلوب.")
+    if inp.kind == IK.UNPAID_DAYS:
+        if inp.quantity is None or inp.quantity <= 0 or inp.amount is not None:
+            problems.append("Unpaid days are a quantity above zero. / الأيام بدون أجر كمية أكبر من صفر.")
+        return problems
+    cur = inp.employee.entity.base_currency
+    if inp.amount is None or inp.amount <= 0 or inp.quantity is not None:
+        problems.append("This input is an amount above zero. / هذا المدخل مبلغ أكبر من صفر.")
+    elif not fx.has_places(inp.amount, cur.minor_units):
+        problems.append(f"{cur.code} amounts have at most {cur.minor_units} decimals (R5). / مبالغ {cur.code} بحد أقصى "
+                        f"{cur.minor_units} خانات عشرية.")
+    if inp.component_id is not None and inp.component.entity_id != inp.entity_id:
+        problems.append("The component belongs to another entity (R1). / المكوّن يخص كيانًا آخر.")
+    if inp.kind == IK.ONE_OFF_DEDUCTION:
+        if inp.deduction_basis not in EG_DEDUCTION_BASES:
+            problems.append("An Egypt deduction states its basis: written consent, court order, maintenance (nafaqa) "
+                            "order or another statutory deduction (Labour Law 14/2025 Art. 113). / يذكر الاستقطاع أساسه.")
+        elif inp.deduction_basis == PayrollInput.DeductionBasis.WRITTEN_CONSENT and not inp.consent_ref.strip():
+            problems.append("A deduction for a debt needs the worker's written consent (Art. 113). / يحتاج الاستقطاع "
+                            "لدين إلى موافقة العامل الكتابية.")
+    return problems
+
+
+def _eg(ctx, code, on=None):
+    return ctx.use.get("EG", code, on or ctx.end, "Egypt payroll", "رواتب مصر")
+
+
+def _eg_row(ctx, code, on=None):
+    row = hr.param("EG", code, on or ctx.end, required=False)
+    if row is None:
+        raise hr._not_configured("EG", code, on or ctx.end, "Egypt payroll", "رواتب مصر")
+    ctx.use._take(row)
+    return row
+
+
+def _eg_annual_tax(ctx, income, resident):
+    """Salary tax of a year's net taxable income (Law 91/2005 Art. 8 as amended by Law 7/2024; research §1.3): the
+    brackets with the high-income exclusion, the column chosen by the whole income; the 0% band for residents only
+    (research rows, unverified)."""
+    income = Fraction(income)
+    if income <= 0:
+        return Fraction(0)
+    bands = _eg(ctx, "tax.salary.brackets")["bands"]
+    columns = _eg(ctx, "tax.salary.bracket_exclusion")["columns"]
+    zero = _eg(ctx, "tax.salary.zero_band_residents_only")
+    col = next(c for c in columns if c["income_upto"] is None or income <= Fraction(c["income_upto"]))
+    rates = list(col["rates"])
+    if not resident and zero.get("apply") and Fraction(rates[0]) == 0:
+        rates[0] = zero["non_resident_first_band_rate"]
+    tax, lower = Fraction(0), Fraction(0)
+    for band, rate in zip(bands, rates):
+        upper = Fraction(band["to"]) if band["to"] is not None else None
+        if income <= lower:
+            break
+        top = income if upper is None else min(income, upper)
+        tax += (top - lower) * Fraction(rate)
+        if upper is None:
+            break
+        lower = upper
+    return tax
+
+
+def _eg_salary_tax(ctx, slip, emp, taxable):
+    """Monthly withholding, cumulative over the calendar year (research §2.3; ``tax.salary.method``): annualise the
+    year-to-date taxable pay, deduct the personal exemption, tax the year, withhold the year-to-date share less what
+    earlier runs withheld; a negative result is not refunded by payroll (annual settlement, warning)."""
+    method = _eg(ctx, "tax.salary.method")
+    if method.get("method") != "cumulative_annualised":
+        slip.refuse(f"Unknown salary tax method {method.get('method')!r}.", "طريقة ضريبة كسب العمل غير معروفة.")
+    exemption = Fraction(_eg(ctx, "tax.salary.personal_exemption_annual")["amount"])
+    year = ctx.period[:4]
+    prev = Payslip.objects.filter(employee=emp, run__period__startswith=f"{year}-", run__period__lt=ctx.period,
+                                  refused=False, run__status__in=(RS.APPROVED, RS.PAID))
+    ytd = Fraction(sum((p.taxable_income for p in prev), ZERO) + taxable)
+    months = len(set(prev.values_list("run__period", flat=True))) + 1
+    withheld = PayslipLine.objects.filter(payslip__in=prev, line_type=LT.SALARY_TAX).aggregate(t=Sum("amount"))["t"] \
+        or ZERO
+    annual = ytd * 12 / months
+    resident = (emp.country_of_residence or "EG") == "EG"
+    annual_tax = _eg_annual_tax(ctx, max(annual - exemption, Fraction(0)), resident)
+    due = _round(annual_tax * months / 12) - withheld
+    if due < 0:
+        slip.warn(f"Salary tax withheld so far exceeds the year-to-date tax by {-due}: settled in the annual employer "
+                  "settlement, not refunded by payroll.", f"تجاوزت الضريبة المستقطعة حتى الآن الضريبة المستحقة بمبلغ "
+                  f"{-due}: تُسوى في التسوية السنوية.")
+        due = ZERO
+    return due
+
+
+def _eg_insurable_wage(ctx, slip, info):
+    """Social insurance (Law 148/2019): the insurable wage of the version in force on the first employed day from
+    the components listed in ``si.insurable_components``, clamped to the year's minimum and maximum
+    (``si.wage_limits``, valid from 1 January of the run's year: NOSI announces each year's limits, so a year without
+    its row is refused), prorated in a joining or leaving month per ``si.partial_month``."""
+    row = _eg_row(ctx, "si.wage_limits")
+    if row.valid_from.year != int(ctx.period[:4]):
+        slip.refuse(f"Social insurance wage limits for {ctx.period[:4]} are not configured (si.wage_limits; NOSI "
+                    "announces them each November).", f"حدود الأجر التأميني لسنة {ctx.period[:4]} غير مهيأة.")
+    codes = set(_eg(ctx, "si.insurable_components")["codes"])
+    v = info.version_on(info.first)
+    full = sum((Fraction(c.monthly_amount) for c in _components(v) if c.component.code in codes), Fraction(0))
+    full = min(max(full, Fraction(row.value["min_monthly"])), Fraction(row.value["max_monthly"]))
+    wage = full
+    if not info.full_month:
+        rule = _eg(ctx, "si.partial_month")["rule"]
+        if rule != "prorate_paid_days":
+            slip.refuse(f"Unknown partial-month rule {rule!r}.", "قاعدة الشهر الجزئي غير معروفة.")
+        wage = full * info.paid_days / info.divisor
+        slip.notes.append("Joining or leaving month: insurable wage prorated by paid days (si.partial_month, "
+                          "unverified). / شهر الالتحاق أو الترك: الأجر التأميني بنسبة الأيام المدفوعة.")
+    return _round(full), _round(wage)
+
+
+def _eg_caps(ctx, slip, emp):
+    """Labour Law 14/2025 Art. 113/114 (research rows): on the wage after income tax and social insurance, a
+    maintenance (nafaqa) order at most 50% and first; all other debts at most 25%, and with the nafaqa at most 50% in
+    total; loans and advances at most 10% (payroll loans are KSA only today, OQ-32). A fixed deduction above its cap
+    refuses the payslip (the Saudi caps are never used for Egypt)."""
+    debt = _eg(ctx, "deduction.debt_max_pct")
+    loan_pct = Fraction(_eg(ctx, "deduction.loan_max_pct")["pct"])
+    gross = slip.total(PayslipLine.EARNINGS) - slip.total(PayslipLine.REDUCTIONS)
+    after = gross - slip.total(set(EG_STATUTORY))
+    if after <= 0:
+        return
+    nafaqa = sum((l.amount for l in slip.lines if l.line_type == LT.DEDUCTION and l.basis == "nafaqa"), ZERO)
+    debts = sum((l.amount for l in slip.lines if l.line_type == LT.DEDUCTION and l.basis != "nafaqa"), ZERO)
+    nafaqa_cap = _round(Fraction(after) * Fraction(debt["nafaqa"]))
+    debt_cap = min(_round(Fraction(after) * Fraction(debt["debt"])), nafaqa_cap - nafaqa)
+    if nafaqa > nafaqa_cap:
+        slip.refuse(f"The maintenance (nafaqa) deduction {nafaqa} exceeds half of the wage after tax and insurance "
+                    f"({nafaqa_cap}) (Art. 113).", f"استقطاع النفقة {nafaqa} يتجاوز نصف الأجر بعد الضريبة والتأمينات "
+                    f"({nafaqa_cap}).")
+    if debts > debt_cap:
+        slip.refuse(f"Debt deductions {debts} exceed {debt_cap}: a quarter of the wage after tax and insurance, and "
+                    "half together with a nafaqa (Art. 113).", f"استقطاعات الديون {debts} تتجاوز {debt_cap}: ربع الأجر "
+                    "بعد الضريبة والتأمينات، والنصف مع النفقة.")
+    if any(l.line_type == LT.LOAN_INSTALLMENT for l in slip.lines):
+        loan_cap = _round(Fraction(after) * loan_pct)
+        if slip.total({LT.LOAN_INSTALLMENT}) > loan_cap:
+            slip.refuse(f"Loan installments exceed 10% of the wage after tax ({loan_cap}) (Art. 113).",
+                        f"أقساط القروض تتجاوز 10% من الأجر بعد الضريبة ({loan_cap}).")
+
+
+def _calc_eg(ctx, emp, versions, info):
+    """§10.8 item 7: one Egypt payslip (local entity employee, EGP) from the EG parameters only (never a Saudi row,
+    R51): prorated contract earnings, unpaid days, approved inputs; social insurance 11% employee / 18.75% employer
+    on the insurable wage within the year's limits; Universal Health Insurance where the work governorate is live
+    (employee 1%, employer 4% with the monthly minimum); Martyrs' Fund 0.05% of the gross; salary tax by cumulative
+    annualised withholding with the band exclusion; the Egypt deduction caps; no EOSB accrual (no statutory gratuity,
+    ``eosb.monthly_accrual``). All rows are unverified research until a person verifies them."""
+    v_last = info.version_on(info.last)
+    slip = Slip(employee=emp, basis=emp.employment_basis, nationality_class=_nationality_class(emp), cohort="",
+                currency=ctx.entity.base_currency, contract=v_last, paid_days=Decimal(info.paid_days),
+                iban_hash=_iban_hash(emp.iban), termination_ref=getattr(_termination(emp), "pk", None))
+    try:
+        inputs = _employee_inputs(ctx, emp)
+        slip.input_ids = [i.pk for i in inputs]
+        for pk, (comp, amount) in _component_earnings(info).items():
+            if amount:
+                slip.lines.append(Line(LT.EARNING, amount, comp.expense_account, comp.name_en, comp.name_ar,
+                                       component=comp, quantity=Decimal(info.paid_days)))
+        employed = {d for d, _ in info.days}
+        unpaid = sorted(hr._unpaid_days(emp, info.start, info.end) & employed)
+        if unpaid:
+            weight = Decimal(_weight(info, unpaid))
+            slip.lines.extend(_reduction_lines(LT.UNPAID_DEDUCTION,
+                                               _by_component(info, unpaid, "deducted_for_unpaid_leave"),
+                                               f"Unpaid leave {weight} days", f"إجازة بدون أجر {weight} يوم", weight))
+        for inp in inputs:
+            problems = _eg_input_problems(inp)
+            if problems:
+                slip.refuse(problems[0].split(" / ")[0], problems[0].split(" / ")[-1])
+        for inp in inputs:  # never _input_lines: it reads Saudi overtime rows (R51)
+            if inp.kind == IK.UNPAID_DAYS:
+                parts = _by_component(info, [info.last], "deducted_for_unpaid_leave", Fraction(inp.quantity),
+                                      weighted=False)
+                slip.lines.extend(_reduction_lines(LT.UNPAID_DEDUCTION, parts, f"Unpaid absence {inp.quantity} days",
+                                                   f"غياب بدون أجر {inp.quantity} يوم", inp.quantity, f"input:{inp.pk}"))
+            elif inp.kind in (IK.ONE_OFF_EARNING, IK.BONUS):
+                slip.lines.append(Line(LT.ONE_OFF_EARNING if inp.kind == IK.ONE_OFF_EARNING else LT.BONUS,
+                                       _round(inp.amount), _expense(ctx, inp.component), inp.reason_en or inp.kind,
+                                       inp.reason_ar, component=inp.component, source_ref=f"input:{inp.pk}"))
+            elif inp.kind == IK.ONE_OFF_DEDUCTION:
+                slip.lines.append(Line(LT.DEDUCTION, _round(inp.amount), _expense(ctx, inp.component),
+                                       inp.reason_en or "Deduction", inp.reason_ar, component=inp.component,
+                                       source_ref=f"input:{inp.pk}", basis=inp.deduction_basis))
+        gross = slip.total(PayslipLine.EARNINGS) - slip.total(PayslipLine.REDUCTIONS)
+        # Social insurance.
+        full, wage = _eg_insurable_wage(ctx, slip, info)
+        slip.gosi_wage, slip.gosi_wage_full = wage, full
+        si = _eg(ctx, "si.rates")
+        acc = {k: ctx.account(v) for k, v in EG_ACCOUNTS.items()}
+        ee = _round(Fraction(wage) * Fraction(si["employee"]))
+        er = _round(Fraction(wage) * Fraction(si["employer"]))
+        slip.lines.append(Line(LT.SI_EMPLOYEE, ee, acc["si_payable"], f"Social insurance employee {si['employee']}",
+                               f"التأمينات الاجتماعية حصة العامل {si['employee']}", quantity=wage,
+                               rate=Decimal(si["employee"])))
+        slip.lines.append(Line(LT.SI_EMPLOYER, er, acc["si_expense"], f"Social insurance employer {si['employer']}",
+                               f"التأمينات الاجتماعية حصة صاحب العمل {si['employer']}", quantity=wage,
+                               rate=Decimal(si["employer"])))
+        # Universal Health Insurance (where the work governorate is live).
+        live = _eg(ctx, "uhi.governorates_live")["governorates"]
+        gov = (ctx.s.work_governorate or "").strip()
+        if not gov:
+            slip.warn("Work governorate not set in payroll settings: Universal Health Insurance not computed.",
+                      "لم تُحدد محافظة مقر العمل: لم يُحتسب التأمين الصحي الشامل.")
+        elif gov in live:
+            uhi = _eg(ctx, "uhi.rates")
+            uee = _round(Fraction(wage) * Fraction(uhi["employee"]))
+            uer = max(_round(Fraction(wage) * Fraction(uhi["employer"])), Decimal(uhi["employer_min_monthly"]))
+            slip.lines.append(Line(LT.UHI_EMPLOYEE, uee, acc["uhi_payable"], "Universal health insurance employee",
+                                   "التأمين الصحي الشامل حصة العامل", quantity=wage, rate=Decimal(uhi["employee"])))
+            slip.lines.append(Line(LT.UHI_EMPLOYER, uer, acc["uhi_expense"], "Universal health insurance employer",
+                                   "التأمين الصحي الشامل حصة صاحب العمل", quantity=wage, rate=Decimal(uhi["employer"])))
+            slip.warn("Family UHI contributions (non-working spouse, children) are not computed: dependants are not "
+                      "recorded.", "لم تُحتسب اشتراكات التأمين الصحي للأسرة: لا توجد بيانات المعالين.")
+        # Martyrs' Fund (employee-borne, withheld; who bears it is disputed, research C8).
+        mf = _eg(ctx, "levy.martyrs_fund")
+        martyrs = _round(Fraction(max(gross, ZERO)) * Fraction(mf["rate"]))
+        if martyrs:
+            slip.lines.append(Line(LT.MARTYRS_FUND, martyrs, acc["martyrs_payable"], "Martyrs' and Victims' Fund",
+                                   "صندوق تكريم الشهداء والضحايا", quantity=max(gross, ZERO), rate=Decimal(mf["rate"])))
+        # Salary tax.
+        slip.taxable_income = max(gross - ee, ZERO)
+        tax = _eg_salary_tax(ctx, slip, emp, slip.taxable_income)
+        if tax:
+            slip.lines.append(Line(LT.SALARY_TAX, tax, acc["tax_payable"], "Salary tax withheld",
+                                   "ضريبة كسب العمل المستقطعة", quantity=slip.taxable_income))
+        _eg_caps(ctx, slip, emp)
+        if _eg(ctx, "eosb.monthly_accrual").get("accrue"):
+            slip.refuse("An Egypt EOSB accrual is configured but not built.", "استحقاق نهاية الخدمة لمصر غير مبني.")
+        net = slip.total(PayslipLine.EARNINGS) - slip.total(PayslipLine.REDUCTIONS) - slip.total(PayslipLine.DEDUCTIONS)
+        if net < 0:
+            slip.refuse(f"Net pay would be negative ({net}).", f"سيكون صافي الراتب سالبًا ({net}).")
+    except _Refused:
+        slip.lines = []
+    return slip

@@ -10,7 +10,8 @@
   <p>تاريخ الصرف / <span lang="en" dir="ltr">Pay date</span>: {{ pay_date|date:"Y-m-d" }} &middot; الأيام المدفوعة / <span lang="en" dir="ltr">Paid days</span>: {{ paid_days }}</p>
   <p>الموظف / <span lang="en" dir="ltr">Employee</span>: {{ employee_code }} &middot; {{ name_ar }} / <span lang="en" dir="ltr">{{ name_en }}</span></p>
   <p>الآيبان / <span lang="en" dir="ltr">IBAN</span>: <span dir="ltr">{{ iban }}</span> &middot; العملة / <span lang="en" dir="ltr">Currency</span>: {{ currency }}</p>
-  <p>الأجر الخاضع للاشتراك في التأمينات / <span lang="en" dir="ltr">GOSI contributory wage</span>: {{ gosi_wage }}</p>
+  {% if jurisdiction == "EG" %}<p>الأجر التأميني / <span lang="en" dir="ltr">Insurable wage (social insurance)</span>: {{ gosi_wage }}</p>
+  {% else %}<p>الأجر الخاضع للاشتراك في التأمينات / <span lang="en" dir="ltr">GOSI contributory wage</span>: {{ gosi_wage }}</p>{% endif %}
 </header>
 <table>
   <thead><tr><th>البند / <span lang="en" dir="ltr">Item</span></th><th>المبلغ / <span lang="en" dir="ltr">Amount</span></th></tr></thead>
