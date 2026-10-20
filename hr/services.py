@@ -1155,7 +1155,7 @@ CONTRACT_FIELDS = frozenset({
     "probation_agreement_ref", "renewal_count", "extended_hours_ref", "job_title_en",
     "job_title_ar", "occupation_code", "weekly_hours", "daily_hours", "annual_leave_days", "notice_days_employer",
     "notice_days_employee", "currency", "department", "grade", "qiwa_contract_ref", "suspension_agreement_ref", "paid_monthly",
-    "housing_in_kind",
+    "housing_in_kind", "pay_rate_basis",
 })
 
 
@@ -1433,6 +1433,11 @@ def _contract_problems(contract, *, statutory, use):
                             "يلزم للعقد محدد المدة تاريخ نهاية بعد تاريخ بدايته.")
     elif contract.end_date is not None:
         problems.append("An open-ended contract has no end date (R16). / لا تاريخ نهاية للعقد غير محدد المدة.")
+    if contract.pay_rate_basis not in EmploymentContract.PayRateBasis.values:
+        problems.append(f"Unknown wage basis {contract.pay_rate_basis!r}. / أساس الأجر {contract.pay_rate_basis!r} غير معروف.")
+    elif contract.pay_rate_basis != EmploymentContract.PayRateBasis.MONTHLY and contract.paid_monthly:
+        problems.append("A daily or hourly wage is not paid monthly under Art. 75 (set paid_monthly False). / الأجر "
+                        "اليومي أو بالساعة ليس أجرًا شهريًا وفق المادة 75.")
     if contract.calendar_basis not in EmploymentContract.CalendarBasis.values:
         problems.append(f"Unknown calendar basis {contract.calendar_basis!r}. / التقويم {contract.calendar_basis!r} غير معروف.")
     elif (basis == Basis.KSA_EMPLOYEE and contract.calendar_basis == EmploymentContract.CalendarBasis.GREGORIAN

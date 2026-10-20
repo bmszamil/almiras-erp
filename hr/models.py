@@ -667,6 +667,17 @@ class EmploymentContract(Tracked, ServiceGuarded):
     notice_days_employee = models.PositiveSmallIntegerField(bi("Notice days (employee)", "مدة الإشعار (الموظف)"))
     # R37 (Art. 75): monthly-paid workers' notice is 60 (employer) / 30 (worker); otherwise 30 either side.
     paid_monthly = models.BooleanField(bi("Paid monthly", "يتقاضى أجره شهريًا"), default=True)
+    # GOSI Regs Art. 18 (payroll slice 2): how the wage is stated in the contract. The components stay monthly
+    # amounts (the monthly equivalent payroll pays); the basis decides the GOSI wage rule: monthly as stated, daily
+    # rate x 30 (Art. 18(1)), hourly per the Governor's rules (Art. 18(3), not published: payroll refuses the GOSI
+    # calculation until its parameter is configured).
+    class PayRateBasis(models.TextChoices):
+        MONTHLY = "monthly", bi("Monthly wage", "أجر شهري")
+        DAILY = "daily", bi("Daily rate", "أجر يومي")
+        HOURLY = "hourly", bi("Hourly rate", "أجر بالساعة")
+
+    pay_rate_basis = models.CharField(bi("Wage stated as", "أساس تحديد الأجر"), max_length=8,
+                                      choices=PayRateBasis.choices, default=PayRateBasis.MONTHLY)
     currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Currency", "العملة"))
     department = models.ForeignKey(Department, null=True, blank=True, on_delete=models.PROTECT, related_name="+",

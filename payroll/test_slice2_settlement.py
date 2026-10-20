@@ -402,3 +402,15 @@ def test_slice2_pg_documents_locked_in_the_database(w):
             cursor.execute(sql, [p.pk])
     assert GosiFine.objects.get(pk=fine.pk).status == "approved"
     assert SettlementCorrection.objects.get(pk=c.pk).status == "approved"
+
+
+def test_oq7_write_off_account_setting_is_data_checked_as_an_expense(w):
+    with pytest.raises(PayrollError) as exc:
+        services.configure_settings(w.alm, user=w.c, loan_write_off_account="1100")
+    assert exc.value.code == "settings_invalid"
+    with pytest.raises(PayrollError):
+        services.configure_settings(w.alm, user=w.c, loan_write_off_account="5610")  # Sharia-prohibited in ALM
+    services.configure_settings(w.alm, user=w.c, loan_write_off_account="5900")
+    n1, loan, fs = _loan_left_after_exit(w)
+    services.approve_final_settlement(fs, user=w.c)
+    assert services.prepare_loan_write_off(loan, user=w.p, reason_ar="سبب").expense_account.code == "5900"
