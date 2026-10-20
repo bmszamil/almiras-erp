@@ -69,7 +69,7 @@ Conventions: every model has `entity` FK → `core.Entity` (`PROTECT`, required)
 | date_of_birth | Date | Y | | PD |
 | gender | Choice `male`, `female` | Y | | PD. Needed only for gender-specific statutory leave (3.7) |
 | phone / email / address | Char / Email / Text | N | | PD |
-| bank_name / iban | Char(100) / Char(34) | N | | PD. IBAN checksum validated; used by WPS (payroll R31) |
+| bank_name / iban | Char(100) / Char(34) | N | | PD. IBAN checksum validated; used by WPS (payroll R31). *Amended 2026-10-19 (payroll review 8):* changed for an active employee only through an `IbanChangeRequest` approved by a second person, logged (As built, end of this spec) |
 | gosi_number / gosi_registered_on | Char(20) / Date | N | | Recorded only (GOSI registration is done on the GOSI portal) |
 | gosi_cohort | Choice `legacy_m33`, `new_m273`, null | Y for a Saudi before payroll (payroll R56) | | *Added 2026-10-17 (GOSI check).* Entered from the GOSI record, **never derived from `hire_date`**: `legacy_m33` = uncompensated contribution periods under the Civil Pension Law or SIL M/33 before 2024-07-03 (SIL Royal Decree Clause Second(1), Fourth). PD-light (masked like `gosi_number`). Changes logged. Rehires: OQ-41 |
 | gosi_first_coverage_date | Date, null | Y for a Saudi before payroll (payroll R55, R56) | | *Added 2026-10-17 (GOSI check).* Date the person first became subject to GOSI, from the GOSI record; drives the age limits (SIL Art. 14(2), 43). PD-light |
@@ -645,3 +645,10 @@ Built with payroll slice 1 (`docs/specs/payroll.md` §10), on the GOSI Implement
 - **3.7** the GOSI maternity case is a payroll record (`payroll.MaternityGosiCase`, recorded by the hr_officer with `payroll.record_maternity_case`), with `medical_report_ref` (Regs Art. 72). Stays abroad for GOSI OH (Regs Art. 23) are `payroll.GosiAbroadPeriod` (exit, re-entry, purpose) instead of leave-request fields.
 - **R68** `jurisdiction.active` rows are seeded for SA and EG (unverified); payroll refuses non-active jurisdictions; hr's own refusal for contract approval is not built yet.
 - **OQ-48** mirrored from payroll: secondment between two KSA group entities and GOSI registration (Regs Art. 20(3)(a)), legal sign-off.
+
+## As built: payroll review fixes (2026-10-19)
+
+From the code review of payroll slice 1 (`docs/specs/payroll.md` §10.5), on the owner's instruction "proceed on recommendations":
+- **IBAN control (payroll review 8; R10 note).** An active (non-draft) employee's `iban` or `bank_name` is no longer changed by `update_employee` (refused, en/ar). `request_iban_change(employee, iban, bank_name, reason_ar)` (`hr.manage_employee`) records an `IbanChangeRequest` (new IBAN and bank encrypted, one pending per employee); `approve_iban_change` by a second holder of `hr.manage_employee` (never the requester, never the employee) applies it; `reject_iban_change` needs an Arabic reason. Requests, approvals, rejections and IBAN edits of draft employees are logged in the access log (`profile_changed`) with the employee code and the last four characters only. Payroll snapshots a keyed hash of the IBAN on each payslip and lists an employee whose IBAN changed since the calculation as a WPS exception.
+- **Salary-file safety (payroll review 7).** `full_name_en`, `full_name_ar` and `bank_name` may not start (also after leading spaces) with `=`, `+`, `-`, `@`, a tab or a carriage return (refused, en/ar); payroll also escapes such cells in every CSV it writes.
+- **Final settlement (hr R38, R40, R41; payroll C-A11).** `payroll.hr_port.PayrollHrPort` now creates the payroll `FinalSettlement` draft inside the termination approval (KSA employees), points it at a recalculated settlement input, discards it on withdrawal and reports it approved; hr then refuses EOSB recalculation and withdrawal as R40 and R41 say.
