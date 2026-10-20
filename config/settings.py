@@ -179,6 +179,9 @@ WEB_SESSION_IDLE_MFA_SECONDS = 15 * 60
 # R18, OQ-9 defaults: 5 failed sign-ins per username + IP lock that pair for 15 minutes.
 WEB_LOGIN_MAX_FAILURES = 5
 WEB_LOGIN_LOCK_SECONDS = 15 * 60
+# MFA (web.md R13 to R16) is not built yet. The deploy check (manage.py check --deploy, web.E001) fails while DEBUG
+# is off unless this is switched on explicitly: password-only sign-in is a go-live blocker.
+WEB_ALLOW_PASSWORD_ONLY_LOGIN = os.environ.get("DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN", "0") == "1"
 
 LOGIN_URL = "web:login"
 LOGIN_REDIRECT_URL = "web:home"

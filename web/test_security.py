@@ -168,3 +168,28 @@ def test_r34_no_float_in_the_web_code_path():
                 assert name == "services.py", (name, node.lineno)  # only the Accept-Language q value
     for path in TEMPLATES:
         assert "floatformat" not in path.read_text(encoding="utf-8"), path
+
+
+# --- review item 3: no MFA yet, so a production deploy check refuses password-only sign-in ----------------------
+
+def test_web_e001_deploy_check_refuses_password_only_login_outside_debug(settings):
+    from web.checks import password_only_login
+
+    settings.DEBUG, settings.WEB_ALLOW_PASSWORD_ONLY_LOGIN = False, False
+    (error,) = password_only_login()
+    assert error.id == "web.E001" and error.is_serious()
+    settings.WEB_ALLOW_PASSWORD_ONLY_LOGIN = True  # explicit opt-in (CI deploy-check only)
+    assert password_only_login() == []
+    settings.DEBUG, settings.WEB_ALLOW_PASSWORD_ONLY_LOGIN = True, False
+    assert password_only_login() == []
+
+
+def test_web_e001_is_a_deploy_check_only_and_off_by_default():
+    from django.core.checks import registry
+
+    assert "password_only_login" in {c.__name__ for c in registry.registry.get_checks(include_deployment_checks=True)}
+    assert "password_only_login" not in {c.__name__ for c in registry.registry.get_checks()}  # migrate, jobs: no
+    settings_py = (WEB.parent / "config/settings.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN", "0") == "1"' in settings_py
+    compose = (WEB.parent / "deploy/docker-compose.yml").read_text(encoding="utf-8")
+    assert "DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN: ${DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN:-0}" in compose
