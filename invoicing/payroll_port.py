@@ -13,9 +13,12 @@ Interface (every method runs inside the caller's transaction; refusals raise ``I
 - ``sale_state(contract) -> SaleState | None``: the live sale invoice of the contract (number, status, posted,
   VAT, profit recognised so far); payroll marks the contract sold once ``posted`` (payroll R47 as amended).
 - ``recognise_bai_ajel_profit(contract, *, amount, on, source_ref, user) -> ProfitResult``: an instalment (or a
-  final-settlement recovery) of ``amount`` was collected by the payroll approval of ``user`` on ``on``; posts the
-  profit share Dr 1241 / Cr 4610. Idempotent per ``source_ref``. Codes: ``sale_not_posted``, ``over_collected``,
-  ``collection_changed``, ``no_deferred_sale``.
+  final-settlement recovery) of ``amount`` was collected by the payroll approval of ``user`` (holder of
+  ``payroll.approve_run``, ``payroll.approve_final_settlement`` or ``payroll.approve_profit_recognition``), with its
+  entry dated ``on``; posts the profit share Dr 1241 / Cr 4610 (fixed profit x collected / receivable, rounded once;
+  the collection completing the receivable releases the rest). Idempotent per ``source_ref``. Codes:
+  ``sale_not_posted``, ``over_collected``, ``collection_changed``, ``no_deferred_sale``; a closed period of ``on`` is
+  refused by the ledger.
 - ``reverse_bai_ajel_profit(contract, *, source_ref, user, on=None, reason="") -> ProfitResult``: a reversed run gives
   the collection back; ``user`` holds ``payroll.reverse_run``. Code: ``nothing_to_reverse``.
 

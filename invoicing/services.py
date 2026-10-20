@@ -4555,9 +4555,11 @@ DEFERRED_SALE_COLLECTED_BY_PAYROLL = (
     "(R112).",
     "تُحصَّل فاتورة البيع الآجل من خلال أقساط الرواتب على الحساب 1240، لا بسندات القبض أو التخصيص هنا.",
 )
-# The payroll approvals that collect instalments (a run deducts them, a final settlement recovers the balance); one of
-# them must be held by the person whose approval the profit recognition follows (owner decision A6).
-COLLECTING_APPROVALS = ("payroll.approve_run", "payroll.approve_final_settlement")
+# The payroll approvals that collect instalments (a run deducts them, a final settlement recovers the balance) or
+# approve payroll's periodic profit recognition (slice 2, payroll E12); one of them must be held by the person whose
+# approval the profit recognition follows (owner decision A6).
+COLLECTING_APPROVALS = ("payroll.approve_run", "payroll.approve_final_settlement",
+                        "payroll.approve_profit_recognition")
 DEFERRED_PROFIT_REVERSAL = "payroll.reverse_run"
 # (release pk) while reverse_deferred_profit reverses that release (registered reverse_guard).
 _reversing_profit = ContextVar("invoicing_reversing_profit", default=None)
@@ -4872,9 +4874,10 @@ def recognise_deferred_profit(source, *, user, collected_amount, collected_on, s
     """R112 / payroll E12, E13: recognise the profit of the bai' ajel sale approved in ``source`` as payroll collects
     its instalments: Dr 1241 / Cr 4610, dated ``collected_on`` (the date of the payroll entry that collected it).
 
-    ``user`` is the person whose payroll approval collected ``collected_amount`` (a run deducting an instalment, a
-    final settlement recovering the balance; holder of ``payroll.approve_run`` or ``payroll.approve_final_settlement``
-    in the entity); the deferred-sale system user posts after that approval (owner decision A6). ``source_ref``
+    ``user`` is the person whose payroll approval collected ``collected_amount`` or approved payroll's profit
+    recognition for it (holder of ``payroll.approve_run``, ``payroll.approve_final_settlement`` or
+    ``payroll.approve_profit_recognition`` in the entity); the deferred-sale system user posts after that approval
+    (owner decision A6). ``source_ref``
     names the collection (e.g. ``payroll.deferredsaleinstallment:42``) and makes the call idempotent: the same
     reference returns the recognition already posted (refused if the amount differs).
 
