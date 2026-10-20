@@ -2470,6 +2470,7 @@ def calculate_run(run, *, user):
     use = hr.ParamUse()
     ctx = Ctx(run, user, _jurisdiction_gate(run.entity, use))
     ctx.use = use
+    refresh_deferred_sales(run.entity)  # slice 2: sales posted on ZATCA reporting since enter the run (R47)
     slips = _calculate(ctx)
     _store(ctx, slips)
     run.status = RS.CALCULATED
@@ -2629,14 +2630,15 @@ def approve_run(run, *, user):
         raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
     run.journal_entry = entry
     _save(run)
-    _apply_effects(run, slips)
+    _apply_effects(run, slips, user)
     ctx.use.mark_used()
     return run
 
 
-def _apply_effects(run, slips):
+def _apply_effects(run, slips, user=None):
     """Approval effects: installments deducted (a reduced one carries its remainder to the next period, R18),
-    EOSB sub-ledger rows (R24), catch-up notices (R58)."""
+    EOSB sub-ledger rows (R24), catch-up notices (R58); slice 2: the bai' ajel profit of each collected installment
+    recognised through invoicing (E12, Dr 1241 / Cr 4610 by collected share)."""
     for s in slips:
         if s.refusal:
             continue
@@ -2652,6 +2654,8 @@ def _apply_effects(run, slips):
         for ref, amount in s.sale_effects:
             inst = _lock(DeferredSaleInstallment, int(ref.split(":")[1]))
             _deduct_installment(inst, amount, run, DeferredSaleInstallment)
+            if amount > 0 and user is not None:
+                _recognise_profit(inst.contract, amount, run.entry_date, _collection_ref(inst), user)
         if s.eosb and s.eosb[0]:
             _save(EosbProvisionEntry(entity=run.entity, employee=s.employee, date=run.entry_date,
                                      kind=EosbProvisionEntry.Kind.ACCRUAL, amount=s.eosb[0], run=run,
@@ -2870,6 +2874,9 @@ def reverse_run(run, *, user, reason, date=None, acknowledge_wps=False, wps_reas
         raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "reversal_refused") from None
     run.status, run.reversal_entry, run.reversed_by, run.reversed_at = RS.REVERSED, reversal, user, _now()
     _save(run)
+    for inst in installments:  # slice 2: the profit recognised on a collection the reversal gives back (E12)
+        if isinstance(inst, DeferredSaleInstallment) and inst.deducted_amount > 0:
+            _reverse_profit(inst.contract, _collection_ref(inst), user, on, reason.strip())
     # The run is reversed before its installments are freed: the PostgreSQL trigger lets a deducted installment go
     # back to planned only when its run is reversed (review 5).
     for inst in installments:
@@ -3190,6 +3197,8 @@ def approve_deferred_sale(contract, *, user, sale_date=None):
     if c.status == DeferredSaleContract.Status.TERMS_APPROVED:
         raise error("The company must buy the asset and take possession before selling it (R47, review 11).",
                     "يجب أن تشتري الشركة الأصل وتقبضه قبل بيعه.", code="asset_not_acquired")
+    if c.status == DeferredSaleContract.Status.SALE_INVOICED:
+        return _reissue_rejected_sale(c, user)
     if c.status != DeferredSaleContract.Status.ASSET_ACQUIRED:
         raise error("The terms must be approved first (R47).", "يجب اعتماد الشروط أولًا.", code="sale_status")
     sale_date = sale_date or _today()
@@ -3202,10 +3211,13 @@ def approve_deferred_sale(contract, *, user, sale_date=None):
     if not c.consent_ref.strip():
         raise error("The sale needs the employee's signed consent to salary deductions (R49).",
                     "يحتاج البيع إلى موافقة الموظف الموقعة على الاستقطاع من الراتب.", code="consent_required")
-    result = invoicing_port.get_port().create_bai_ajel_sale(c, user=user)
+    c.sale_date = sale_date  # the port reads it (sale on or after possession, invoicing R112)
+    port = invoicing_port.get_port()
+    result = port.create_bai_ajel_sale(c, user=user)
     c.sale_document_ref, c.vat_amount = result.document_ref, _dec(result.vat_amount, "vat_amount")
     c.number = _next_number(c.entity, "BAJ", int(c.first_period[:4]))
-    c.status, c.sale_date = DeferredSaleContract.Status.SOLD, sale_date
+    # Slice 2 (R47 as amended): sold once the invoice is posted on ZATCA reporting; until then installments wait.
+    c.status = DeferredSaleContract.Status.SOLD if _sale_posted(port, c) else DeferredSaleContract.Status.SALE_INVOICED
     _save(c)
     total = c.receivable
     n = int(c.term_months)
@@ -3757,6 +3769,8 @@ def _settlement_effects(fs, out, user):
             inst.amount = amount
         inst.status, inst.deducted_amount = DeferredSaleInstallment.Status.SETTLED_IN_FINAL, amount
         _save(inst)
+        if amount > 0:  # slice 2 (E13): recovered from the final dues; the last collection releases the rest
+            _recognise_profit(inst.contract, amount, fs.journal_entry.date, _collection_ref(inst), user)
     taken = {pk for pk, _ in out.sale_effects}
     for pk in out.sale_outstanding:
         if pk in taken:
@@ -4575,6 +4589,7 @@ def send_alerts(*, today=None, entity=None):
         roles = ("payroll_officer", "hr_officer")
         if _jurisdiction_of(e) != "SA":  # WPS, Mudad and GOSI are Saudi (Egypt research §2.4, §2.5)
             continue
+        sent += len(refresh_deferred_sales(e))  # slice 2: bai' ajel sales posted on ZATCA reporting (R47)
         prev = _period_of(today.replace(day=1) - timedelta(days=1))
         # C-C5: Mudad counts from the pay date: alerts 7, 10 and 15 days after it while no submission is recorded.
         for offset in MUDAD_ALERT_DAYS:
@@ -5902,3 +5917,80 @@ def leave_liability_report(entity, as_of, *, user):
             "rows": rows if detail else [], "employees": len(rows),
             "note_en": "Not booked: leave accrual (2350 / 5130) waits for hr OQ-6.",
             "note_ar": "غير مقيد: استحقاق الإجازات (2350 / 5130) بانتظار قرار OQ-6."}
+
+
+# =====================================================================================================
+# Slice 2 (§10.8 item 8): bai' ajel through the real invoicing port (invoicing R112, E28; E12, E13)
+# =====================================================================================================
+
+def _sale_posted(port, contract):
+    """True once invoicing reports the sale invoice posted (``sale_state``); a port without it (slice 1 fakes) posts
+    at once."""
+    state_of = getattr(port, "sale_state", None)
+    if state_of is None:
+        return True
+    state = state_of(contract)
+    return bool(state is not None and state.posted)
+
+
+def _collection_ref(inst):
+    """The collection reference invoicing keys the profit recognition by (idempotent per installment row)."""
+    return f"payroll.deferredsaleinstallment:{inst.pk}"
+
+
+def _recognise_profit(contract, amount, on, ref, user):
+    """E12 / E13 (invoicing R112, owner decision A6): the profit share of a collected installment moves from 1241 to
+    4610 by collected share, never by time, posted by invoicing's bai' ajel system user after this approval."""
+    port = invoicing_port.get_port()
+    recognise = getattr(port, "recognise_bai_ajel_profit", None)
+    if recognise is None:
+        return None
+    try:
+        return recognise(contract, amount=amount, on=on, source_ref=ref, user=user)
+    except LedgerError as exc:
+        raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
+
+
+def _reverse_profit(contract, ref, user, on, reason):
+    port = invoicing_port.get_port()
+    reverse = getattr(port, "reverse_bai_ajel_profit", None)
+    if reverse is None:
+        return None
+    try:
+        return reverse(contract, source_ref=ref, user=user, on=on, reason=reason or "payroll run reversed")
+    except LedgerError as exc:
+        raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "reversal_refused") from None
+
+
+def _reissue_rejected_sale(c, user):
+    """R47 / invoicing R112: an approved sale whose invoice ZATCA rejected is approved again: invoicing issues a new
+    invoice (new number) for the same fixed price; the schedule is unchanged. Refused while the invoice is live."""
+    port = invoicing_port.get_port()
+    state = port.sale_state(c) if hasattr(port, "sale_state") else None
+    if state is None or state.status != "rejected":
+        raise error("The sale is approved and its invoice is waiting for ZATCA reporting; it is approved again only "
+                    "after ZATCA rejects the invoice.", "البيع معتمد وفاتورته بانتظار الإبلاغ للهيئة؛ ولا يُعتمد ثانية "
+                    "إلا بعد رفض الهيئة للفاتورة.", code="sale_status")
+    result = port.create_bai_ajel_sale(c, user=user)
+    if _dec(result.vat_amount, "vat_amount") != c.vat_amount:
+        raise error("The new sale invoice's VAT differs from the approved sale.", "تختلف ضريبة الفاتورة الجديدة عن البيع "
+                    "المعتمد.", code="vat_mismatch")
+    c.sale_document_ref, c.modified_by, c.modified_at = result.document_ref, user, _now()
+    if _sale_posted(port, c):
+        c.status = DeferredSaleContract.Status.SOLD
+    return _save(c)
+
+
+def refresh_deferred_sales(entity):
+    """R47 as amended (slice 2): contracts whose sale invoice was posted on ZATCA reporting since become ``sold`` (their
+    installments then enter the runs). Called before every run calculation and by the daily alerts job; reads
+    invoicing through the port only. Returns the contracts marked sold."""
+    port = invoicing_port.get_port()
+    out = []
+    for c in DeferredSaleContract._base_manager.select_for_update().filter(
+            entity=entity, status=DeferredSaleContract.Status.SALE_INVOICED).order_by("pk"):
+        state = port.sale_state(c) if hasattr(port, "sale_state") else None
+        if state is not None and state.posted:
+            c.status, c.sale_document_ref = DeferredSaleContract.Status.SOLD, state.document_ref
+            out.append(_save(c))
+    return out

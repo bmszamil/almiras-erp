@@ -792,6 +792,10 @@ class DeferredSaleContract(Tracked, ServiceWritten):
         TERMS_SUBMITTED = "terms_submitted", bi("Terms submitted", "الشروط مقدمة")
         TERMS_APPROVED = "terms_approved", bi("Terms approved", "الشروط معتمدة")
         ASSET_ACQUIRED = "asset_acquired", bi("Asset bought and possessed", "الأصل مشترى ومقبوض")
+        # Slice 2 (R47 as amended, invoicing R112): the sale is approved and its invoice issued; it posts when ZATCA
+        # reports it, and only then is the contract sold and its installments deducted.
+        SALE_INVOICED = "sale_invoiced", bi("Sale approved, invoice awaiting ZATCA reporting",
+                                            "البيع معتمد والفاتورة بانتظار الإبلاغ للهيئة")
         SOLD = "sold", bi("Sold (invoice posted)", "مبيع (الفاتورة مرحّلة)")
         SETTLED = "settled", bi("Settled", "مسدد")
 
