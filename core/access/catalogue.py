@@ -250,6 +250,27 @@ _PERMS = [
     _p("payroll.prepare_final_settlement", "Prepare final settlements", "إعداد المخالصات النهائية"),
     _p("payroll.approve_final_settlement", "Approve and post final settlements", "اعتماد المخالصات النهائية وترحيلها",
        APPROVAL, POSTS),
+    # Payroll slice 2 (payroll.md §10.8): corrections of approved final settlements (a second person approves and
+    # posts), loan write-offs on exit (the entity's top authority, OQ-7 default), employee cost items and the fully
+    # loaded secondment cost report (R35, R63; billing R71), GOSI late-payment fines (E14) and payment reversals,
+    # bai' ajel profit recognition (E12).
+    _p("payroll.prepare_settlement_correction", "Prepare final settlement corrections", "إعداد تصحيحات المخالصات النهائية"),
+    _p("payroll.approve_settlement_correction", "Approve and post final settlement corrections",
+       "اعتماد تصحيحات المخالصات النهائية وترحيلها", APPROVAL, POSTS),
+    _p("payroll.prepare_loan_write_off", "Prepare loan write-offs on exit", "إعداد شطب القروض عند انتهاء الخدمة"),
+    _p("payroll.approve_loan_write_off", "Approve and post loan write-offs", "اعتماد شطب القروض وترحيله", APPROVAL,
+       POSTS),
+    _p("payroll.manage_cost_items", "Enter employee cost items", "إدخال بنود تكاليف الموظفين"),
+    _p("payroll.approve_cost_item", "Approve employee cost items", "اعتماد بنود تكاليف الموظفين", APPROVAL),
+    _p("payroll.prepare_cost_report", "Prepare secondment cost reports", "إعداد تقارير تكلفة الإعارة"),
+    _p("payroll.approve_cost_report", "Approve secondment cost reports", "اعتماد تقارير تكلفة الإعارة", APPROVAL),
+    _p("payroll.record_gosi_fine", "Record GOSI late-payment fines", "تسجيل غرامات تأخير التأمينات"),
+    _p("payroll.approve_gosi_fine", "Approve and post GOSI late-payment fines", "اعتماد غرامات تأخير التأمينات وترحيلها",
+       APPROVAL, POSTS),
+    _p("payroll.reverse_payment", "Reverse payroll payments", "عكس مدفوعات الرواتب", POSTS),
+    _p("payroll.prepare_profit_recognition", "Prepare bai' ajel profit recognition", "إعداد إثبات أرباح البيع الآجل"),
+    _p("payroll.approve_profit_recognition", "Approve bai' ajel profit recognition", "اعتماد إثبات أرباح البيع الآجل",
+       APPROVAL),
     _p("payroll.generate_wps_file", "Generate salary (WPS) files", "إنشاء ملفات الرواتب (حماية الأجور)"),
     _p("payroll.record_mudad_submission", "Record Mudad submissions", "تسجيل الرفع على منصة مدد"),
     # banking (banking.md §7). Agents may view (masked), suggest matches and draft bank transactions only (R43).
@@ -341,7 +362,8 @@ SYSTEM_EXTRA = {
 #   banking.reverse_bank_transaction / tax.reverse_document for its document.
 #   Reversal grants only reverse: they never post a new entry.
 REVERSE_PERMISSIONS = frozenset({"ledger.reverse_entry", "invoicing.reverse_document",
-                                 "banking.reverse_bank_transaction", "tax.reverse_document", "payroll.reverse_run"})
+                                 "banking.reverse_bank_transaction", "tax.reverse_document", "payroll.reverse_run",
+                                 "payroll.reverse_payment"})
 DRAFT_POST_PERMISSIONS = frozenset({"ledger.post_entry"})
 DOCUMENT_POST_PERMISSIONS = frozenset(c for c, p in CATALOGUE.items() if p.posts) - DRAFT_POST_PERMISSIONS - REVERSE_PERMISSIONS
 POST_PERMISSIONS = DRAFT_POST_PERMISSIONS | DOCUMENT_POST_PERMISSIONS

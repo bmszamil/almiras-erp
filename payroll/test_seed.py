@@ -3,7 +3,7 @@ from datetime import date
 
 from core.access import catalogue
 from core.access.models import Role
-from core.access.seed import ROLE_SEED, ROLE_SEED_V12, ROLE_SEED_V13, ROLE_SEED_V14
+from core.access.seed import ROLE_SEED, ROLE_SEED_V12, ROLE_SEED_V13, ROLE_SEED_V14, ROLE_SEED_V16
 from hr.models import StatutoryParameter
 from ledger.models import Account
 from payroll import statutory_seed
@@ -31,7 +31,7 @@ def test_r68_only_sa_and_eg_are_active_and_egypt_rows_are_research(db):
 
 
 def test_v13_seed_payroll_rights(db):
-    assert ROLE_SEED is ROLE_SEED_V14
+    assert ROLE_SEED is ROLE_SEED_V16
     perms = {code: set(row[5]) for code, row in ROLE_SEED.items()}
     assert {c for c, p in perms.items() if "payroll.approve_run" in p} == {"hr_officer", "managing_partner"}
     assert {c for c, p in perms.items() if "payroll.approve_loan" in p} == {"managing_partner"}
@@ -63,3 +63,23 @@ def test_approved_payroll_accounts_in_new_charts(db):
     codes = set(Account.objects.filter(entity=e).values_list("code", flat=True))
     assert {"1230", "1240", "2330", "2340", "5120"} <= codes
     assert date  # noqa
+
+
+def test_v16_seed_payroll_slice2_rights(db):
+    """Slice 2 (§10.8): preparers prepare, approvers approve; the preparer never holds the approval; loan write-offs
+    by the group parent's top authority (MP); no agent or system right (R38)."""
+    perms = {code: set(row[5]) for code, row in ROLE_SEED_V16.items()}
+    for prepare, approve, approvers in (
+            ("payroll.prepare_settlement_correction", "payroll.approve_settlement_correction", {"approver", "managing_partner"}),
+            ("payroll.prepare_loan_write_off", "payroll.approve_loan_write_off", {"managing_partner"}),
+            ("payroll.manage_cost_items", "payroll.approve_cost_item", {"approver", "managing_partner"}),
+            ("payroll.prepare_cost_report", "payroll.approve_cost_report", {"approver", "managing_partner"}),
+            ("payroll.record_gosi_fine", "payroll.approve_gosi_fine", {"approver", "managing_partner"})):
+        assert {c for c, p in perms.items() if prepare in p} == {"payroll_officer"}, prepare
+        assert {c for c, p in perms.items() if approve in p} == approvers, approve
+        assert catalogue.APPROVAL in catalogue.get(approve).flags
+    assert {c for c, p in perms.items() if "payroll.reverse_payment" in p} == {"approver"}
+    assert "payroll.reverse_payment" in catalogue.REVERSE_PERMISSIONS
+    assert {c for c, p in perms.items() if "payroll.prepare_profit_recognition" in p} == {"payroll_officer", "accountant"}
+    assert not any(c.startswith("payroll.") for r, p in perms.items() if r.startswith("system_") for c in p)
+    assert not [c for c, p in catalogue.CATALOGUE.items() if c.startswith("payroll.") and p.agent_ok]

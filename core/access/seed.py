@@ -332,8 +332,27 @@ ROLE_SEED_V15 = {
         ("invoicing.create_deferred_sale", "invoicing.post_deferred_profit"),
     ),
 }
+# V16 (migration core.0025, payroll slice 2, payroll.md §10.8): the payroll officer prepares settlement corrections,
+# loan write-offs, employee cost items, the secondment cost report, GOSI fines and bai' ajel profit recognition; the
+# approver (CFO) approves (and posts) corrections, cost items, the cost report and GOSI fines, reverses payments and
+# approves profit recognition (OQ-36 default); the managing partner approves loan write-offs (the group parent's top
+# authority; the ``ceo`` of other entities waits for the access build, A28) and holds the other approvals as fallback
+# (OQ-1). The accountant may prepare profit recognition (§7). No right goes to an agent or system user (R38).
+_PAYROLL_SLICE2_APPROVALS = ("payroll.approve_settlement_correction", "payroll.approve_cost_item",
+                             "payroll.approve_cost_report", "payroll.approve_gosi_fine",
+                             "payroll.approve_profit_recognition")
+ROLE_SEED_V16 = {
+    **ROLE_SEED_V15,
+    "payroll_officer": _plus(ROLE_SEED_V15, "payroll_officer", "payroll.prepare_settlement_correction",
+                             "payroll.prepare_loan_write_off", "payroll.manage_cost_items", "payroll.prepare_cost_report",
+                             "payroll.record_gosi_fine", "payroll.prepare_profit_recognition"),
+    "approver": _plus(ROLE_SEED_V15, "approver", *_PAYROLL_SLICE2_APPROVALS, "payroll.reverse_payment"),
+    "managing_partner": _plus(ROLE_SEED_V15, "managing_partner", *_PAYROLL_SLICE2_APPROVALS,
+                              "payroll.approve_loan_write_off"),
+    "accountant": _plus(ROLE_SEED_V15, "accountant", "payroll.prepare_profit_recognition"),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V15
+ROLE_SEED = ROLE_SEED_V16
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
