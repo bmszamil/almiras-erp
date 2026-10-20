@@ -1,11 +1,12 @@
 """Fixtures for the web UI tests (web.md §8): anonymised entities and users only, made-up identifiers.
 
 Entities: ALM (group parent), SUB (``full``), PART (``full``, 60 %), MIN (``equity``), INACT (inactive ``full`` child).
-Users: accountant in ALM (``acc``), accountant in SUB + viewer in MIN (``u``), group viewer on ALM (``g``), viewer in
-ALM (``viewer``), HR officer in ALM (``hr``, no ``invoicing.view``), receivables clerk (``clerk``) and approver
-(``cfo``) in ALM, accountant in INACT (``inact``), a superuser without memberships (``su``), an agent and the
-billing system user. Data: journal entries in ALM and SUB, sales documents in ALM (business and individual buyer)
-and SUB.
+Users: accountant in ALM (``acc``); accountant in SUB + viewer in MIN (``u``); accountants in PART (``part_acc``) and
+MIN (``min_acc``); group viewer on ALM (``g``); viewer in ALM (``viewer``); HR officer in ALM (``hr``, no
+``invoicing.view``); receivables clerk (``clerk``) and approver (``cfo``) in ALM; accountant in INACT (``inact_acc``);
+a superuser without memberships (``su``); an agent and the billing system user. Data: journal entries in ALM, SUB,
+PART and MIN; sales documents in ALM (business and individual buyer), SUB and PART. Every record outside ALM carries
+"<CODE>-ONLY-SECRET", so a leak into another entity's page shows.
 """
 from datetime import date
 from decimal import Decimal
@@ -56,11 +57,8 @@ def zatca():
 def w(db, zatca):
     alm = make_entity("ALM", "parent", vat="300000000000003", cr="1010000001", unified="7000000001")
     sub = make_entity("SUB", "full", alm, vat="311111111100003", cr="1010000002")
-    # No records in PART and MIN: no chart of accounts needed (keeps the fixture fast).
-    part = Entity.objects.create(code="PART", name_en="Part Owned Co", name_ar="شركة مملوكة جزئيًا",
-                                 consolidation="full", parent=alm, ownership_pct=Decimal("60"))
-    minority = Entity.objects.create(code="MIN", name_en="Minority Co", name_ar="شركة أقلية", consolidation="equity",
-                                     parent=alm, ownership_pct=Decimal("20"))
+    part = make_entity("PART", "full", alm, vat="322222222200003", ownership_pct=Decimal("60"))
+    minority = make_entity("MIN", "equity", alm, ownership_pct=Decimal("20"))
     inact = Entity.objects.create(code="INACT", name_en="Dormant Co", name_ar="شركة خاملة", consolidation="full",
                                   parent=alm, is_active=False)
     ns = SimpleNamespace(alm=alm, sub=sub, part=part, min=minority, inact=inact, zatca=zatca)
@@ -73,6 +71,8 @@ def w(db, zatca):
     ns.cfo = person("cfo", (alm, "approver"))
     ns.inact_acc = person("inact_acc", (inact, "accountant"))
     ns.sub_clerk = person("sub_clerk", (sub, "receivables_clerk"))
+    ns.part_acc = person("part_acc", (part, "accountant"))
+    ns.min_acc = person("min_acc", (minority, "accountant"))
     ns.su = person("su")
     ns.su.is_superuser = ns.su.is_staff = True
     ns.su.save(update_fields=["is_superuser", "is_staff"])
@@ -88,6 +88,9 @@ def w(db, zatca):
     to_post = entry(alm, ns.acc, "ALM posted entry")
     ns.alm_posted = ledger.post_entry(to_post, access.require(ns.cfo, alm, "ledger.post_entry", document=to_post))
     ns.sub_entry = entry(sub, ns.u, "SUB-ONLY-SECRET description")
+    # PART and MIN have records too, so a leak into another entity's pages would show (review item 11).
+    ns.part_entry = entry(part, ns.part_acc, "PART-ONLY-SECRET description")
+    ns.min_entry = entry(minority, ns.min_acc, "MIN-ONLY-SECRET description")
 
     # Sales documents: a business buyer and an individual buyer in ALM; one in SUB.
     ns.customer = invoicing.create_customer(
@@ -105,6 +108,11 @@ def w(db, zatca):
     ns.alm_invoice = draft_invoice(alm, ns.clerk, ns.customer, submit=True)
     ns.alm_person_invoice = draft_invoice(alm, ns.clerk, ns.individual, price="250.00")
     ns.sub_invoice = draft_invoice(sub, ns.sub_clerk, ns.sub_customer, price="999.00")
+    ns.part_customer = invoicing.create_customer(
+        part, user=ns.part_acc, code="PT01", name_en="PART-ONLY-SECRET Buyer", name_ar="مشتري خاص بالشركة الجزئية",
+        is_vat_registered=True, vat_number="310000000300003", **ADDRESS,
+    )
+    ns.part_invoice = draft_invoice(part, ns.part_acc, ns.part_customer, price="777.00")
     return ns
 
 

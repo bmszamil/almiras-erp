@@ -11,7 +11,7 @@ from web.models import UiPreference
 
 pytestmark = pytest.mark.django_db
 
-SECRET = "SUB-ONLY-SECRET"  # appears only in SUB's records (web/conftest.py)
+SECRET = "-ONLY-SECRET"  # appears only in the records of SUB, PART and MIN (web/conftest.py)
 
 
 def entity_urls(code):
@@ -19,7 +19,10 @@ def entity_urls(code):
 
 
 def detail_urls(code, w):
-    return [f"/e/{code}/ledger/entries/{w.sub_entry.pk}/", f"/e/{code}/sales/documents/{w.sub_invoice.pk}/"]
+    """Detail URLs, under ``code``, of records that belong to SUB, PART and MIN."""
+    entries = (w.sub_entry, w.part_entry, w.min_entry)
+    return ([f"/e/{code}/ledger/entries/{e.pk}/" for e in entries]
+            + [f"/e/{code}/sales/documents/{d.pk}/" for d in (w.sub_invoice, w.part_invoice)])
 
 
 def test_unauthenticated_requests_are_redirected_to_sign_in(w, client):
@@ -45,18 +48,20 @@ def test_wt1_lists_show_only_the_url_entity_and_other_entities_are_404(w, signed
     sales = client.get("/e/ALM/sales/documents/")
     body = sales.content.decode()
     assert sales.status_code == 200 and "C001" in body and "S001" not in body and SECRET not in body
-    for url in entity_urls("SUB") + entity_urls("MIN") + entity_urls("NOPE"):
+    assert "PT01" not in body
+    for url in entity_urls("SUB") + entity_urls("PART") + entity_urls("MIN") + entity_urls("NOPE"):
         assert client.get(url).status_code == 404, url
 
 
 def test_wt2_a_record_of_another_entity_is_404_with_the_same_page_and_no_data(w, signed_in):
     client = signed_in(w.acc)
     bodies = set()
-    for url in detail_urls("ALM", w) + detail_urls("SUB", w) + ["/e/ALM/ledger/entries/999999/"]:
+    for url in (detail_urls("ALM", w) + detail_urls("SUB", w) + detail_urls("PART", w) + detail_urls("MIN", w)
+                + ["/e/ALM/ledger/entries/999999/"]):
         response = client.get(url)
         assert response.status_code == 404, url
         body = response.content.decode()
-        assert SECRET not in body and "S001" not in body
+        assert SECRET not in body and "S001" not in body and "PT01" not in body
         assert "غير موجود" in body and "Not found" in body  # bilingual (R25)
         bodies.add(body.replace(url, ""))
     assert len(bodies) == 1  # the same page whether the record exists elsewhere or not at all
@@ -67,6 +72,21 @@ def test_wt2_the_owner_sees_the_record_only_under_its_own_entity(w, signed_in):
     assert client.get(f"/e/SUB/ledger/entries/{w.sub_entry.pk}/").status_code == 200
     assert client.get(f"/e/MIN/ledger/entries/{w.sub_entry.pk}/").status_code == 404  # R4: entity in the URL
     assert client.get(f"/e/SUB/ledger/entries/{w.alm_draft.pk}/").status_code == 404
+
+
+def test_each_user_sees_exactly_the_records_of_the_entity_in_the_url(w, signed_in, client):
+    g = signed_in(w.g)  # group viewer on ALM: covers PART (full), not MIN (equity)
+    part = g.get("/e/PART/ledger/entries/").content.decode()
+    assert "PART-ONLY-SECRET" in part and "SUB-ONLY-SECRET" not in part and "MIN-ONLY-SECRET" not in part
+    assert g.get("/e/PART/sales/documents/").status_code == 403  # group_viewer holds no invoicing.view
+    assert g.get(f"/e/MIN/ledger/entries/{w.min_entry.pk}/").status_code == 404
+    assert g.get(f"/e/PART/ledger/entries/{w.min_entry.pk}/").status_code == 404
+    client.post("/logout/")
+    u = signed_in(w.u)  # viewer in MIN, accountant in SUB
+    minority = u.get("/e/MIN/ledger/entries/").content.decode()
+    assert "MIN-ONLY-SECRET" in minority and "PART-ONLY-SECRET" not in minority and "SUB-ONLY-SECRET" not in minority
+    assert u.get(f"/e/MIN/ledger/entries/{w.part_entry.pk}/").status_code == 404
+    assert u.get("/e/PART/").status_code == 404
 
 
 def switcher_codes(response):

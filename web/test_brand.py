@@ -56,11 +56,35 @@ def test_ht_rakik_only_through_the_brand_font_face_rules():
     assert "--alm-font-display: 'Bricolage Grotesque', 'IBM Plex Sans Arabic', sans-serif;" in CSS
 
 
+FONT_SUFFIXES = (".woff2", ".woff", ".otf", ".ttf")
+
+
+def _repository_files():
+    """Tracked files; without version control (an exported tree, a container), every file on disk except the
+    host-only font folder deploy/brand-fonts/, which is where the licensed files are allowed to live."""
+    try:
+        listed = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True).stdout
+        return listed.splitlines()
+    except (OSError, subprocess.CalledProcessError):
+        skip = {".git", "__pycache__", "node_modules"}
+        return [p.relative_to(REPO).as_posix() for p in REPO.rglob("*")
+                if p.is_file() and not skip & set(p.relative_to(REPO).parts)
+                and not p.relative_to(REPO).as_posix().startswith("deploy/brand-fonts/")]
+
+
 def test_no_ht_rakik_font_file_anywhere_in_the_repository():
-    tracked = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True).stdout
-    assert not [f for f in tracked.splitlines() if "rakik" in f.lower()]
-    on_disk = [p for p in WEB.rglob("*") if "rakik" in p.name.lower()]
-    assert not on_disk
+    assert not [f for f in _repository_files() if "rakik" in f.lower()]
+    assert not [p for p in WEB.rglob("*") if "rakik" in p.name.lower()]  # also not untracked in the app
+
+
+def test_the_fallback_file_scan_works_without_version_control(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError("no version control here")
+
+    monkeypatch.setattr(subprocess, "run", unavailable)
+    files = _repository_files()
+    assert "web/test_brand.py" in files and not [f for f in files if f.startswith("deploy/brand-fonts/")]
+    assert not [f for f in files if "rakik" in f.lower() and f.endswith(FONT_SUFFIXES)]
 
 
 def test_logo_files_are_the_brand_files_or_their_defined_variants():
