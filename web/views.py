@@ -10,7 +10,7 @@ from decimal import Decimal
 from functools import wraps
 
 from django.conf import settings
-from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required
 from django.core.paginator import Paginator
 from django.http import HttpResponseRedirect
@@ -62,10 +62,6 @@ def _safe_next(request, value):
     return None
 
 
-def _client_ip(request):
-    return request.META.get("REMOTE_ADDR", "")
-
-
 # --- sign-in, sign-out, language (R12, R17, R18, R26, R27) -------------------------------------------------------
 
 @never_cache
@@ -75,26 +71,19 @@ def login_view(request):
     lang = request.web_lang
     next_url = _safe_next(request, request.POST.get("next") or request.GET.get("next"))
     if request.user.is_authenticated and request.method == "GET":
-        return redirect(next_url or "web:home")
+        return HttpResponseRedirect(next_url or reverse("web:home"))
     form = LoginForm(request.POST or None, lang=lang)
     error = None
-    if request.method == "POST":
-        username = request.POST.get("username", "")
-        ip = _client_ip(request)
-        if services.login_locked(username, ip):
-            return _error(request, 429)
-        if form.is_valid():
-            user = authenticate(request, username=form.cleaned_data["username"],
-                                password=form.cleaned_data["password"])
-            if user is not None and services.is_web_user(user):
-                login(request, user)  # rotates the session key (R17)
-                start_session(request)
-                services.clear_login_failures(username, ip)
-                services.log_login(user)
-                return HttpResponseRedirect(next_url or reverse("web:home"))
-            if services.record_login_failure(username, ip):
-                return _error(request, 429)
-            error = text("login_failed", lang)  # same answer for unknown, agent, system and inactive users (R12)
+    if request.method == "POST" and form.is_valid():
+        result = services.sign_in(request, form.cleaned_data["username"], form.cleaned_data["password"])
+        if result.locked:
+            return _error(request, 429, body_key="error_429_user_body" if result.locked == "user" else None)
+        if result.user is not None:
+            login(request, result.user)  # rotates the session key (R17)
+            start_session(request)
+            services.log_login(result.user)
+            return HttpResponseRedirect(next_url or reverse("web:home"))
+        error = text("login_failed", lang)  # same answer for unknown, agent, system and inactive users (R12)
     return render(request, "web/login.html", {"form": form, "error": error, "next": next_url or ""})
 
 
@@ -223,7 +212,7 @@ def sales_documents(request, entity):
     rows = invoicing_services.list_sales_documents(entity, user=request.user, **form.filters())
     listing = _listing(request, form, rows)
     for doc in listing["page"].object_list:
-        doc.customer_display = invoicing_services.party_list_name(doc.customer, request.web_lang)
+        doc.customer_display = invoicing_services.listed_customer_name(doc, request.web_lang)
         doc.totals_ready = doc.status in invoicing_services.PRICED_STATUSES
     return _page(request, "web/sales_documents.html", entity, {**listing, "active": "sales"})
 

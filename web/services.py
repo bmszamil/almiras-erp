@@ -5,6 +5,7 @@ No business data is read or written here. Business screens call the owning modul
 """
 import hashlib
 import hmac
+from dataclasses import dataclass
 from datetime import timedelta
 
 from django.conf import settings
@@ -13,7 +14,7 @@ from django.http import Http404
 from django.utils import timezone
 
 from core.access import services as access_services
-from core.access.models import AccessLog, Kind, Membership
+from core.access.models import AccessLog, Kind
 
 from .models import LoginThrottle, UiPreference
 
@@ -118,18 +119,16 @@ def is_web_user(user):
                 and access_services.kind_of(user) == Kind.HUMAN)
 
 
-def requires_mfa(user):
+def _requires_mfa(user):
     """R13 (W-D6 list, OQ-3 default): superusers and holders of an active MFA role membership in any entity."""
     if not is_web_user(user):
         return False
-    if user.is_superuser:
-        return True
-    return Membership.objects.active().filter(user=user, role__code__in=MFA_ROLES).exists()
+    return user.is_superuser or access_services.holds_any_role(user, MFA_ROLES)
 
 
 def idle_timeout(user):
     """OQ-8 default: 15 minutes for users who need MFA, 30 minutes for the others."""
-    if requires_mfa(user):
+    if _requires_mfa(user):
         return timedelta(seconds=_setting("WEB_SESSION_IDLE_MFA_SECONDS", 15 * 60))
     return timedelta(seconds=_setting("WEB_SESSION_IDLE_SECONDS", 30 * 60))
 
@@ -144,45 +143,110 @@ def log_login(user):
     return access_services.log(AccessLog.Event.LOGIN_SUCCEEDED, actor=user, subject_user=user)
 
 
-def log_logout(user):
-    """R26: ``logout`` in the access log."""
-    return access_services.log(AccessLog.Event.LOGOUT, actor=user, subject_user=user)
+def log_logout(user, reason="sign_out"):
+    """R26: ``logout`` in the access log, with why the session ended (``sign_out``, ``idle_timeout``,
+    ``absolute_timeout``)."""
+    return access_services.log(AccessLog.Event.LOGOUT, actor=user, subject_user=user, details={"reason": reason})
 
 
-# --- sign-in throttle (R18, OQ-9 thresholds) -------------------------------------------------------------------
+# --- sign-in with the throttle (R12, R18; OQ-9 thresholds, OQ-27) ---------------------------------------------
 
-def _throttle_key(username, ip):
-    secret = settings.SECRET_KEY.encode()
-    message = f"{(username or '').strip().lower()}|{ip or ''}".encode()
-    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+def client_ip(request):
+    """The client's address for the lockout (OQ-27).
+
+    Behind the TLS proxy (``WEB_CLIENT_IP_HEADER``, set when ``DJANGO_BEHIND_TLS_PROXY=1``) it is the header the
+    proxy itself writes (Caddy ``header_up X-Real-IP {remote_host}``, which overwrites any client value).
+    ``X-Forwarded-For`` is never read: a client can send it. Without the proxy it is ``REMOTE_ADDR``.
+    """
+    header = _setting("WEB_CLIENT_IP_HEADER", None)
+    if header:
+        value = request.META.get(header, "").strip()
+        if value:
+            return value
+    return request.META.get("REMOTE_ADDR", "")
 
 
-def login_locked(username, ip):
-    """True while (username, IP) is locked out after repeated failures (R18)."""
-    row = LoginThrottle.objects.filter(key=_throttle_key(username, ip)).first()
-    return bool(row and row.locked_until and row.locked_until > timezone.now())
+def _key(*parts):
+    message = "|".join(parts).encode()
+    return hmac.new(settings.SECRET_KEY.encode(), message, hashlib.sha256).hexdigest()
 
 
-@transaction.atomic
-def record_login_failure(username, ip):
-    """Count one failed sign-in; lock (username, IP) after ``WEB_LOGIN_MAX_FAILURES`` failures within the lock
-    window, for ``WEB_LOGIN_LOCK_SECONDS`` (OQ-9: 5 failures, 15 minutes). Returns True when now locked."""
-    now = timezone.now()
-    window = timedelta(seconds=_setting("WEB_LOGIN_LOCK_SECONDS", 15 * 60))
-    row, created = LoginThrottle.objects.select_for_update().get_or_create(
-        key=_throttle_key(username, ip), defaults={"first_failure_at": now},
-    )
+def _pair_key(username, ip):
+    return _key("pair", (username or "").strip().lower(), ip or "")
+
+
+def _user_key(username):
+    return _key("user", (username or "").strip().lower())
+
+
+def _window():
+    return timedelta(seconds=_setting("WEB_LOGIN_LOCK_SECONDS", 15 * 60))
+
+
+def _locked_row(key, now):
+    """The throttle row of ``key``, locked for this transaction (created when missing); a lock or a counting window
+    that has run out starts again from zero."""
+    row, _ = LoginThrottle.objects.select_for_update().get_or_create(key=key, defaults={"first_failure_at": now})
     expired_lock = row.locked_until is not None and row.locked_until <= now
-    stale = row.locked_until is None and now - row.first_failure_at > window
-    if not created and (expired_lock or stale):
+    stale = row.locked_until is None and now - row.first_failure_at > _window()
+    if expired_lock or stale:
         row.failures, row.first_failure_at, row.locked_until = 0, now, None
-    row.failures += 1
-    if row.failures >= _setting("WEB_LOGIN_MAX_FAILURES", 5):
-        row.locked_until = now + window
-    row.save()
-    return row.locked_until is not None
+    return row
 
 
-def clear_login_failures(username, ip):
-    """A successful sign-in clears the failures of (username, IP)."""
-    LoginThrottle.objects.filter(key=_throttle_key(username, ip)).delete()
+def _purge(now):
+    """Throttle rows whose window and lock have both run out are of no use: removed on every sign-in attempt."""
+    old = now - _window()
+    LoginThrottle.objects.filter(first_failure_at__lt=old).exclude(locked_until__gt=now).delete()
+
+
+@dataclass(frozen=True)
+class SignIn:
+    """Result of :func:`sign_in`: ``user`` when the password was right; ``locked`` = ``"pair"`` (this username from
+    this address) or ``"user"`` (this username from everywhere); ``tried`` = the password was checked."""
+
+    user: object = None
+    locked: str = ""
+    tried: bool = False
+
+
+def sign_in(request, username, password):
+    """Check a password under the lockout (R18), in one transaction holding the throttle rows.
+
+    Both rows are locked before anything is read, so concurrent attempts are counted one after the other: the
+    attempt is counted **before** the password is checked, a locked pair or username is refused without checking
+    it, and a right password clears the pair's failures. Limits (OQ-9 defaults): ``WEB_LOGIN_MAX_FAILURES`` (5)
+    per username + IP and ``WEB_LOGIN_MAX_USER_FAILURES`` (20) per username from all addresses, each within
+    ``WEB_LOGIN_LOCK_SECONDS`` (15 min), locking for the same time. The username cap bounds guessing spread over
+    many addresses; its price is that anyone can lock a username for 15 minutes (web.md, as built).
+    Only active people are returned (R12); everyone else gets the same answer as a wrong password.
+    """
+    from django.contrib.auth import authenticate
+
+    ip = client_ip(request)
+    now = timezone.now()
+    with transaction.atomic():
+        _purge(now)
+        pair = _locked_row(_pair_key(username, ip), now)
+        user_row = _locked_row(_user_key(username), now)
+        for row, scope in ((pair, "pair"), (user_row, "user")):
+            if row.locked_until is not None:
+                return SignIn(locked=scope)
+        limits = ((pair, _setting("WEB_LOGIN_MAX_FAILURES", 5)), (user_row, _setting("WEB_LOGIN_MAX_USER_FAILURES", 20)))
+        for row, limit in limits:
+            row.failures += 1
+            if row.failures >= limit:
+                row.locked_until = now + _window()
+            row.save()
+        user = authenticate(request, username=username, password=password)
+        if user is not None and is_web_user(user):
+            pair.delete()  # the username row keeps counting: guesses from elsewhere are not forgiven
+            if user_row.failures:
+                user_row.failures -= 1  # the right password is not a failure
+                user_row.locked_until = None
+                user_row.save()
+            return SignIn(user=user, tried=True)
+        for row, scope in ((pair, "pair"), (user_row, "user")):
+            if row.locked_until is not None:
+                return SignIn(locked=scope, tried=True)
+        return SignIn(tried=True)

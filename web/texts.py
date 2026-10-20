@@ -155,6 +155,10 @@ TEXTS = {
     "error_429_title": ("Too many attempts", "محاولات كثيرة جدًا"),
     "error_429_body": ("Too many failed sign-ins. Wait 15 minutes and try again, or ask your access administrator.",
                        "محاولات دخول فاشلة كثيرة. انتظر 15 دقيقة وحاول مرة أخرى، أو تواصل مع مسؤول الصلاحيات."),
+    "error_429_user_body": ("This account had too many failed sign-ins from several places and is locked for 15 "
+                            "minutes. Wait and try again, or ask your access administrator.",
+                            "تعددت محاولات الدخول الفاشلة لهذا الحساب من عدة أماكن، فقُفل 15 دقيقة. انتظر وحاول مرة "
+                            "أخرى، أو تواصل مع مسؤول الصلاحيات."),
     "error_500_title": ("Something went wrong", "حدث خطأ"),
     "error_500_body": ("The error was recorded. Try again later.", "تم تسجيل الخطأ. حاول مرة أخرى لاحقًا."),
     "go_home": ("Go to the start page", "الذهاب إلى صفحة البداية"),

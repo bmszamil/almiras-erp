@@ -1,13 +1,13 @@
 {% load web_tags %}{% if paginator.num_pages > 1 %}<nav class="alm-pagination" aria-label="{% t 'pagination' %}">
   <ul class="pagination pagination-sm">
     {% if page.has_previous %}
-    <li class="page-item"><a class="page-link" href="{% page_url page.previous_page_number %}" rel="prev">{% t "previous" %}</a></li>
+    <li class="page-item"><a class="page-link" href="{% page_url form page.previous_page_number %}" rel="prev">{% t "previous" %}</a></li>
     {% else %}
     <li class="page-item disabled"><span class="page-link">{% t "previous" %}</span></li>
     {% endif %}
     <li class="page-item active" aria-current="page"><span class="page-link">{% t "page_of" page=page.number pages=paginator.num_pages %}</span></li>
     {% if page.has_next %}
-    <li class="page-item"><a class="page-link" href="{% page_url page.next_page_number %}" rel="next">{% t "next" %}</a></li>
+    <li class="page-item"><a class="page-link" href="{% page_url form page.next_page_number %}" rel="next">{% t "next" %}</a></li>
     {% else %}
     <li class="page-item disabled"><span class="page-link">{% t "next" %}</span></li>
     {% endif %}

@@ -138,11 +138,16 @@ def status(kind, value, label=None):
     )
 
 
-@register.simple_tag(takes_context=True)
-def page_url(context, page_number):
-    """The current list URL with ``page`` set and every filter kept (filters are enumerated values, R23)."""
-    request = context["request"]
-    query = request.GET.copy()
+@register.simple_tag
+def page_url(form, page_number):
+    """The list URL for ``page_number``, keeping only the filter form's own fields with valid values (R23): no
+    other query parameter is ever copied into a link."""
+    from django.http import QueryDict
+
+    query = QueryDict(mutable=True)
+    if form is not None:
+        for name in form.filters():
+            query[name] = form.data.get(name)
     query["page"] = page_number
     return f"?{query.urlencode()}"
 

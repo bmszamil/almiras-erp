@@ -65,8 +65,13 @@ class WebMiddleware:
         if login_at is None or seen_at is None:  # e.g. a session opened by the admin login
             session[LOGIN_AT] = login_at = login_at or now
             session[SEEN_AT] = seen_at = now
-        if (now - login_at > services.absolute_timeout().total_seconds()
-                or now - seen_at > services.idle_timeout(user).total_seconds()):
+        reason = None
+        if now - login_at > services.absolute_timeout().total_seconds():
+            reason = "absolute_timeout"
+        elif now - seen_at > services.idle_timeout(user).total_seconds():
+            reason = "idle_timeout"
+        if reason:
+            services.log_logout(user, reason=reason)  # R26: why the session ended
             logout(request)  # flushes the session: the old key is no longer valid
             return
         if now - seen_at >= SEEN_RESOLUTION:

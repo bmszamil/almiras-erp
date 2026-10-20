@@ -1014,6 +1014,14 @@ def visible_entities(user):
     return Entity.objects.filter(pk__in=ids).order_by("code")
 
 
+def holds_any_role(user, role_codes):
+    """True if ``user`` holds an active membership in any entity in one of the roles ``role_codes`` (e.g. the MFA
+    roles of web.md R13). Reads the user's own memberships; grants nothing."""
+    if not _is_active_human(user):
+        return False
+    return Membership.objects.active(now()).filter(user=user, role__code__in=list(role_codes)).exists()
+
+
 def set_preferred_language(user, language):
     """Change ``user``'s own UI and message language (web.md R27), logged as ``profile_changed`` (R27).
 

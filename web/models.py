@@ -45,12 +45,14 @@ class UiPreference(models.Model):
 class LoginThrottle(models.Model):
     """Failed sign-ins per (username, IP), for the lockout of web.md R18 (OQ-9 thresholds).
 
-    ``key`` is a keyed hash of the lower-cased username and the client IP, so neither is stored in clear.
+    ``key`` is a keyed hash of the lower-cased username and the client IP (or of the username alone, for the
+    per-username cap), so neither is stored in clear. Rows whose window and lock have run out are purged on every
+    sign-in attempt (web.services.sign_in).
     """
 
     key = models.CharField(bi("Key (keyed hash)", "المفتاح (تجزئة)"), max_length=64, unique=True)
     failures = models.PositiveIntegerField(bi("Failed sign-ins", "محاولات الدخول الفاشلة"), default=0)
-    first_failure_at = models.DateTimeField(bi("First failure at", "وقت أول محاولة فاشلة"))
+    first_failure_at = models.DateTimeField(bi("First failure at", "وقت أول محاولة فاشلة"), db_index=True)
     locked_until = models.DateTimeField(bi("Locked until", "مقفل حتى"), null=True, blank=True)
 
     class Meta:

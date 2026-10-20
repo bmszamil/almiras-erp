@@ -50,6 +50,23 @@ def test_r27_before_sign_in_cookie_then_accept_language_then_arabic(w, client):
     assert not AccessLog.objects.filter(event="profile_changed").exists()  # nobody signed in
 
 
+def test_language_switch_never_redirects_off_site(w, client):  # review item 11
+    for target in ("https://evil.example/", "//evil.example/x", "javascript:alert(1)"):
+        response = client.post("/language/", {"language": "en", "next": target})
+        assert response.status_code == 302 and response["Location"] == "/", target
+    assert client.post("/language/", {"language": "en", "next": "/login/"})["Location"] == "/login/"
+
+
+def test_page_links_keep_only_the_forms_valid_filters(w, signed_in, monkeypatch):  # review item 8
+    import web.views
+
+    monkeypatch.setattr(web.views, "PAGE_SIZE", 1)
+    body = signed_in(w.acc).get(
+        "/e/ALM/ledger/entries/?status=draft&utm_source=x&name=Made+Up+Person&date_from=bad").content.decode()
+    links = re.findall(r'href="(\?[^"]*page=[^"]*)"', body)
+    assert links and all(link == "?status=draft&amp;page=2" for link in links)
+
+
 def test_language_switch_is_post_only_and_refuses_unknown_languages(w, client):
     assert client.get("/language/").status_code == 405
     assert client.post("/language/", {"language": "fr"}).status_code == 400

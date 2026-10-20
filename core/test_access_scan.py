@@ -35,9 +35,11 @@ ALLOW = {
     "core/access/services.py:visible_access_log": "the scope mechanism for access-log rows (entities_for + group parent)",
     "core/access/services.py:visible_entities": "the scope mechanism of the web entity switcher (union of "
                                                  "entities_for over the catalogue, web.md R9)",
+    "core/access/services.py:holds_any_role": "reads the user's own memberships (web session timeout, R13); "
+                                               "grants nothing",
     "core/access/services.py:set_preferred_language": "the signed-in person's own UI language; logged "
                                                        "profile_changed (web.md R27)",
-    "invoicing/services.py:party_list_name": "pure: masks an individual's name on a row the caller read through "
+    "invoicing/services.py:listed_customer_name": "pure: masks an individual's name on a row the caller read through "
                                              "list_sales_documents (checked); never unmasks (web.md R24, R51)",
     # web/services.py: UI preferences, sessions and the sign-in throttle (web.md §1); no business data.
     "web/services.py:language_for": "pure: picks the UI language from the profile, cookie or header (R27)",
@@ -47,14 +49,12 @@ ALLOW = {
     "web/services.py:start_entity": "the user's own remembered entity, only among the visible ones (R10)",
     "web/services.py:remember_entity": "the user's own UI preference, only for a visible entity (R10, R11)",
     "web/services.py:is_web_user": "helper: active human users only (R12)",
-    "web/services.py:requires_mfa": "reads the user's own memberships for the session timeout (R13, OQ-8)",
     "web/services.py:idle_timeout": "session timeout setting (OQ-8)",
     "web/services.py:absolute_timeout": "session timeout setting (OQ-8)",
     "web/services.py:log_login": "writes the access log (R26)",
     "web/services.py:log_logout": "writes the access log (R26)",
-    "web/services.py:login_locked": "sign-in throttle, before any user is known (R18)",
-    "web/services.py:record_login_failure": "sign-in throttle, before any user is known (R18)",
-    "web/services.py:clear_login_failures": "sign-in throttle, after a successful sign-in (R18)",
+    "web/services.py:client_ip": "pure: the client address for the sign-in throttle (OQ-27)",
+    "web/services.py:sign_in": "the password check itself, under the sign-in throttle (R12, R18)",
     "ledger/services.py:counterparty_choices": "choice list for admin; posting checks every line",
     "invoicing/services.py:party_problems": "pure check of a party record the caller passes (model clean, services)",
     "invoicing/services.py:deferred_sale_of": "payroll invoicing port only: the live bai' ajel sale of a contract payroll "

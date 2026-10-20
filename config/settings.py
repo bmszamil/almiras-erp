@@ -176,9 +176,14 @@ SESSION_COOKIE_AGE = 10 * 3600
 WEB_SESSION_ABSOLUTE_SECONDS = 10 * 3600
 WEB_SESSION_IDLE_SECONDS = 30 * 60
 WEB_SESSION_IDLE_MFA_SECONDS = 15 * 60
-# R18, OQ-9 defaults: 5 failed sign-ins per username + IP lock that pair for 15 minutes.
+# R18, OQ-9 defaults: 5 failed sign-ins per username + IP lock that pair for 15 minutes; 20 per username from all
+# addresses lock the username for 15 minutes (bounds guessing spread over many addresses; web.md "As built").
 WEB_LOGIN_MAX_FAILURES = 5
+WEB_LOGIN_MAX_USER_FAILURES = 20
 WEB_LOGIN_LOCK_SECONDS = 15 * 60
+# OQ-27: the request header holding the client address. None = REMOTE_ADDR. Set below behind the TLS proxy, which
+# writes X-Real-IP itself (deploy/proxy/Caddyfile). X-Forwarded-For is never trusted.
+WEB_CLIENT_IP_HEADER = None
 # MFA (web.md R13 to R16) is not built yet. The deploy check (manage.py check --deploy, web.E001) fails while DEBUG
 # is off unless this is switched on explicitly: password-only sign-in is a go-live blocker.
 WEB_ALLOW_PASSWORD_ONLY_LOGIN = os.environ.get("DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN", "0") == "1"
@@ -315,6 +320,7 @@ if os.environ.get("DJANGO_BEHIND_TLS_PROXY", "0") == "1":
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+    WEB_CLIENT_IP_HEADER = "HTTP_X_REAL_IP"  # written by the proxy (header_up X-Real-IP {remote_host}), OQ-27
 
 
 # Email
