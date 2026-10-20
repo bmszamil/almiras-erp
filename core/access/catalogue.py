@@ -29,7 +29,7 @@ FLAGS = frozenset({APPROVAL, SEGREGATED, DUAL_CONTROL, GROUP_ONLY, AGENT_OK, POS
 # Flags an agent user can never use, whatever its role says (R12, A7).
 AGENT_FORBIDDEN_FLAGS = frozenset({APPROVAL, SEGREGATED, DUAL_CONTROL, GROUP_ONLY, POSTS})
 
-SYSTEM_CODES = ("billing", "zatca_queue", "fx_import")
+SYSTEM_CODES = ("billing", "zatca_queue", "fx_import", "deferred_sale")
 
 
 @dataclass(frozen=True)
@@ -114,6 +114,14 @@ _PERMS = [
     _p("invoicing.create_adjustment_from_billing", "Create draft correction notes from billing",
        "إنشاء مسودات إشعارات التصحيح من نظام الفوترة", system="billing"),
     _p("invoicing.post_on_clearance", "Post sales on ZATCA clearance", "ترحيل المبيعات عند الاعتماد من الهيئة", POSTS, system="zatca_queue"),
+    # invoicing R112 (payroll R47, owner decision E8): the bai' ajel sale invoice is created and issued by the
+    # deferred-sale system user once the matrix approver (MP in Almiras) approved the sale in payroll; it posts on
+    # ZATCA reporting like any sales document. The profit recognised as instalments are collected (Dr 1241 / Cr 4610)
+    # is posted by the same system user after the payroll approval that collected them (owner decision A6).
+    _p("invoicing.create_deferred_sale", "Create bai' ajel sale invoices approved in payroll",
+       "إنشاء فواتير البيع الآجل المعتمدة في الرواتب", system="deferred_sale"),
+    _p("invoicing.post_deferred_profit", "Post bai' ajel profit recognised on collected instalments",
+       "ترحيل أرباح البيع الآجل المحققة من الأقساط المحصلة", POSTS, system="deferred_sale"),
     _p("invoicing.create_bill", "Create draft bills", "إنشاء مسودات فواتير الموردين", AGENT_OK),
     _p("invoicing.create_vendor_payment", "Create vendor payments", "إنشاء مدفوعات الموردين"),
     _p("invoicing.submit_bill", "Submit bills", "تقديم فواتير الموردين"),
@@ -322,6 +330,7 @@ SYSTEM_EXTRA = {
     "billing": frozenset({"billing.start_run", "ledger.view_rates"}),
     "zatca_queue": frozenset(),
     "fx_import": frozenset(),
+    "deferred_sale": frozenset(),
 }
 
 # Ledger postings (R23, R30): which P grants each ledger service accepts.

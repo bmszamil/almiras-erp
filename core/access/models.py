@@ -26,6 +26,7 @@ class SystemCode(models.TextChoices):
     BILLING = "billing", "Billing"
     ZATCA_QUEUE = "zatca_queue", "ZATCA queue"
     FX_IMPORT = "fx_import", "FX import"
+    DEFERRED_SALE = "deferred_sale", "Bai' ajel sales"  # invoicing R112: the sale invoice and its profit recognition
 
 
 class AppendOnlyError(ValidationError):

@@ -320,8 +320,20 @@ ROLE_SEED_V14 = {
     "approver": _plus(ROLE_SEED_V13, "approver", "payroll.approve_final_settlement"),
     "managing_partner": _plus(ROLE_SEED_V13, "managing_partner", "payroll.approve_final_settlement"),
 }
+# V15 (migration core.0024, invoicing R112, payroll R47, owner decision E8 of 2026-10-18): the bai' ajel system user.
+# Its role creates and issues the sale invoice after the matrix approver approved the sale in payroll, and posts the
+# profit recognised from 1241 to 4610 as payroll collects the instalments (owner decision A6: system users issue and
+# post after a person's prior approval). No human role changes; no payroll right is given to a system user (payroll
+# R38).
+ROLE_SEED_V15 = {
+    **ROLE_SEED_V14,
+    "system_deferred_sale": (
+        "Bai' ajel system user", "مستخدم نظام البيع الآجل", "entity", "system", "deferred_sale",
+        ("invoicing.create_deferred_sale", "invoicing.post_deferred_profit"),
+    ),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V14
+ROLE_SEED = ROLE_SEED_V15
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
@@ -329,6 +341,13 @@ SYSTEM_USERS_V1 = {
     "zatca_queue": ("system.zatca_queue", "ZATCA queue worker", "مستخدم نظام طابور فاتورة"),
     "fx_import": ("system.fx_import", "FX rate import user", "مستخدم نظام استيراد أسعار الصرف"),
 }
+# V2 (migration core.0024, invoicing R112): the bai' ajel system user.
+SYSTEM_USERS_V2 = {
+    **SYSTEM_USERS_V1,
+    "deferred_sale": ("system.deferred_sale", "Bai' ajel system user", "مستخدم نظام البيع الآجل"),
+}
+# The current system users: what a fresh (or flushed test) database is seeded with.
+SYSTEM_USERS = SYSTEM_USERS_V2
 
 
 def apply_seed(Role, RolePermission, roles=ROLE_SEED):
@@ -353,7 +372,7 @@ class SeedConflict(RuntimeError):
     """A system username is taken by a user that is not that system user (R20)."""
 
 
-def apply_system_users(User, UserProfile, users=SYSTEM_USERS_V1):
+def apply_system_users(User, UserProfile, users=SYSTEM_USERS):
     """Create one system user per system code (R20). Idempotent.
 
     A username that already exists must belong to the matching system
