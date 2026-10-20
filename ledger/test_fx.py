@@ -1017,7 +1017,8 @@ def test_r33_fx_accounts_are_ordinary_and_template_accounts_are_bilingual(w):
     monetary = set(Account.objects.filter(entity=w.alm, is_monetary=True).values_list("code", flat=True))
     assert monetary == {"1100", "1110", "1140", "1200", "1210", "1220", "1300", "1310", "2100", "2110", "2200", "2210",
                         "2220", "2300", "2400", "2500", "2600",
-                        "1230", "1240", "2330", "2340"}  # payroll accounts (payroll P19(g))
+                        "1230", "1240", "2330", "2340",  # payroll accounts (payroll P19(g))
+                        "1241"}  # bai' ajel deferred profit, contra 1240 (invoicing R112, ledger 0021)
 
 
 # --- AT-24, AT-25, AT-26: other functional currencies, intercompany, translation ------------

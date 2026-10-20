@@ -276,7 +276,8 @@ def test_setup_command_is_idempotent(setup_file):
     assert Entity.objects.filter(code="ALM").values().get() == first
     e = Entity.objects.get(code="ALM")
     # 55 + 6 proposed FX (ledger-fx 5.0) + 5 income + 2 WHT (invoicing §5) + 1140 purification bank (D31b)
-    assert Account.objects.filter(entity=e).count() == 74  # + payroll 1230, 1240, 2330, 2340, 5120
+    # + payroll 1230, 1240, 2330, 2340, 5120 + bai' ajel 1241, 1250, 4610 (invoicing R112, ledger 0021)
+    assert Account.objects.filter(entity=e).count() == 77
     assert FiscalPeriod.objects.filter(entity=e).count() == 12
 
 

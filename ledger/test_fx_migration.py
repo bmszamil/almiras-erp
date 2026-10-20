@@ -95,6 +95,6 @@ def test_at2_backfill_sets_currency_fields_and_leaves_amounts_and_status_alone()
                .values_list("code", flat=True)) == {"3400", "4700", "4710", "5750", "5760", "5770"}
     # (0016 later adds the proposed WHT payable 2220, monetary, to every chart, invoicing D14; 0017 the proposed
     # purification bank account 1140, monetary, D31b; payroll 0002 the approved payroll accounts 1230, 1240, 2330 and
-    # 2340, monetary, payroll P19(g))
+    # 2340, monetary, payroll P19(g); ledger 0021 the bai' ajel deferred profit 1241, monetary, invoicing R112)
     assert set(Account.objects.filter(entity__code="SUB", is_monetary=True).values_list("code", flat=True)) == {
-        "1100", "1140", "1210", "2220", "1230", "1240", "2330", "2340"}
+        "1100", "1140", "1210", "2220", "1230", "1240", "2330", "2340", "1241"}

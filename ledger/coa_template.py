@@ -26,6 +26,11 @@ TEMPLATE = [
     # Approved by the CFO 2026-10-17 (payroll.md §5, P19(g)): payroll control accounts (payroll documents only).
     ("1230", "Employee loans and advances", "قروض وسلف الموظفين", A, {"monetary": True}),
     ("1240", "Employee deferred-sale (bai' ajel) receivable", "ذمم البيع الآجل للموظفين", A, {"monetary": True}),
+    # Approved by the CFO 2026-10-17 (payroll.md §5, P19(g); invoicing.md R112, E28; owner decision E8 of 2026-10-18):
+    # bai' ajel. 1241 is a contra account of 1240 (credit balance: profit not yet earned, shown as a deduction from
+    # 1240); 1250 holds the cost of an asset the company bought in its own name until it is sold to the employee.
+    ("1241", "Deferred bai' ajel profit (contra 1240)", "أرباح البيع الآجل المؤجلة", A, {"monetary": True}),
+    ("1250", "Assets acquired for employee deferred sale", "أصول مشتراة للبيع الآجل للموظفين", A, {}),
     ("1300", "Sharia-compliant deposits (e.g. murabaha, wakala)", "ودائع متوافقة مع الشريعة", A, {"monetary": True}),
     ("1310", "VAT input", "ضريبة القيمة المضافة - مدخلات", A, {"monetary": True}),
     ("1320", "Prepayments", "مصروفات مدفوعة مقدماً", A, {}),
@@ -74,6 +79,9 @@ TEMPLATE = [
     ("4400", "Dividend income", "إيرادات توزيعات الأرباح", I, {}),
     ("4500", "Share of profit of associates", "الحصة من أرباح الشركات الزميلة", I, {}),
     ("4600", "Islamic deposit profit", "أرباح الودائع الإسلامية", I, {}),
+    # Approved by the CFO 2026-10-17 (payroll.md §5, P19(g)): bai' ajel profit, recognised from 1241 as the
+    # instalments are collected (invoicing R112). Sharia-compliant sale profit: never purified, never interest.
+    ("4610", "Bai' ajel profit income", "إيرادات أرباح البيع الآجل", I, {}),
     ("4700", "Foreign exchange gain – realised", "أرباح فروقات العملة المحققة", I, {}),  # PROPOSED (OQ-6)
     ("4710", "Foreign exchange gain – unrealised", "أرباح فروقات العملة غير المحققة", I, {}),  # PROPOSED (OQ-6)
     ("4900", "Non-compliant income (to purify)", "إيرادات غير متوافقة (للتطهير)", I, {"purify": True}),
