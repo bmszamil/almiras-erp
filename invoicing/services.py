@@ -23,13 +23,13 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 from zoneinfo import ZoneInfo
 
 from django.db import IntegrityError, transaction
-from django.db.models import Q, Sum
+from django.db.models import Count, Q, Sum
 from django.utils import timezone
 
 from core import access
 from core.access import services as access_services
 from core.access.models import AccessLog, Kind, Membership
-from core.models import Currency, Entity, validate_country_code, validate_vat_number
+from core.models import Currency, Entity, label_part, validate_country_code, validate_vat_number
 from core.services import entity_ready_to_issue
 from ledger import fx
 from ledger import restricted as ledger_restricted
@@ -566,6 +566,79 @@ def sales_documents(user, entity=None):
 def purchase_documents(user, entity=None):
     qs = access.scope(PurchaseDocument.objects.all(), user, "invoicing.view")
     return qs.filter(entity=entity) if entity is not None else qs
+
+
+# --- read-only lists for the web UI (web.md R3, R24, R37, R38; slice 1) ------------------------------------------
+
+def list_sales_documents(entity, *, user, doc_type=None, status=None, zatca_status=None, date_from=None, date_to=None,
+                         number=None):
+    """Sales documents of ``entity`` for ``user`` (``invoicing.view`` there), newest first.
+
+    Refused (AccessDenied, logged) without ``invoicing.view`` in ``entity``; rows also pass through
+    :func:`sales_documents` (access.scope). Filters are enumerated values, dates and document numbers (web.md R23).
+    Customers are selected in the same query (R37). Names of individual customers are personal data: render them
+    with :func:`party_list_name`, which masks them (R24, R51, R86).
+    """
+    access.require(user, entity, "invoicing.view")
+    qs = sales_documents(user, entity)
+    if doc_type:
+        qs = qs.filter(doc_type=doc_type)
+    if status:
+        qs = qs.filter(status=status)
+    if zatca_status:
+        qs = qs.filter(zatca_status=zatca_status)
+    if date_from:
+        qs = qs.filter(issue_date__gte=date_from)
+    if date_to:
+        qs = qs.filter(issue_date__lte=date_to)
+    if number:
+        qs = qs.filter(number__icontains=number)
+    return qs.select_related("entity", "customer", "currency").order_by("-issue_date", "-id")
+
+
+def party_list_name(party, language):
+    """The name of a customer or vendor for a list or label, in ``language`` (``en``/``ar``).
+
+    An individual's name is personal data and is always masked here (web.md R24, invoicing R51, R86): lists never
+    unmask. Business and government names are shown, the other language filling an empty one.
+    """
+    if _is_individual(party) or getattr(party, "employee_id", None):
+        return label_part(MASK, language)
+    first, other = (party.name_ar, party.name_en) if language == "ar" else (party.name_en, party.name_ar)
+    return first or other or party.code
+
+
+# Header totals, SAR amounts and the buyer snapshot are set when a document is issued (approve_sales_document);
+# before that only the lines are priced, so screens say "calculated at issue" instead of showing zero totals.
+PRICED_STATUSES = frozenset({SalesDocument.Status.ISSUED, SalesDocument.Status.FINAL, SalesDocument.Status.REJECTED})
+
+
+def sales_document_detail(entity, pk, *, user):
+    """One sales document of ``entity`` for the read-only screen (``invoicing.view``; web.md R3, R4, R24, R40).
+
+    Returns ``{"document", "lines", "buyer", "masked"}``. A document of another entity, or one the user may not see,
+    is "not found" (Http404), never 403. An individual buyer's snapshot is **masked** for everybody here, without
+    writing a personal-data row: unmasking is an explicit, logged action (R24, R51), not part of a GET page.
+    """
+    access.require(user, entity, "invoicing.view")
+    qs = sales_documents(user, entity).select_related(
+        "entity", "customer", "currency", "original_document", "journal_entry",
+    )
+    doc = access.get_scoped_or_404(qs, user, "invoicing.view", pk=pk)
+    lines = list(doc.lines.select_related("income_type", "vat_rate").order_by("line_no"))
+    masked = _is_individual(doc.customer) or bool(doc.customer.employee_id)
+    buyer = {name: (MASK if masked else getattr(doc, name)) for name in BUYER_FIELDS}
+    return {"document": doc, "lines": lines, "buyer": buyer, "masked": masked,
+            "totals_ready": doc.status in PRICED_STATUSES}
+
+
+def sales_document_counts(entity, *, user):
+    """``{status: count}`` of ``entity``'s sales documents, for the dashboard card (``invoicing.view``; R38)."""
+    access.require(user, entity, "invoicing.view")
+    rows = sales_documents(user, entity).values("status").annotate(n=Count("id")).order_by()
+    counts = {s: 0 for s in SalesDocument.Status.values}
+    counts.update({r["status"]: r["n"] for r in rows})
+    return counts
 
 
 def _same_entity(entity, obj, what_en, what_ar):

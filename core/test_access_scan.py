@@ -37,6 +37,8 @@ ALLOW = {
                                                  "entities_for over the catalogue, web.md R9)",
     "core/access/services.py:set_preferred_language": "the signed-in person's own UI language; logged "
                                                        "profile_changed (web.md R27)",
+    "invoicing/services.py:party_list_name": "pure: masks an individual's name on a row the caller read through "
+                                             "list_sales_documents (checked); never unmasks (web.md R24, R51)",
     "ledger/services.py:counterparty_choices": "choice list for admin; posting checks every line",
     "invoicing/services.py:party_problems": "pure check of a party record the caller passes (model clean, services)",
     "invoicing/services.py:deferred_sale_of": "payroll invoicing port only: the live bai' ajel sale of a contract payroll "

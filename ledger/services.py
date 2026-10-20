@@ -2277,3 +2277,61 @@ def set_functional_currency(entity, currency, *, user):
             details={"before": {"base_currency": before}, "after": {"base_currency": entity.base_currency_id}},
         )
     return entity
+
+
+# --- read-only lists for the web UI (web.md R3, R37, R38; slice 1) ------------------------------------------
+
+def journal_entries(entity, *, user, status=None, source=None, date_from=None, date_to=None, number=None):
+    """Journal entries of ``entity`` for ``user`` (``ledger.view`` there; access R2), newest first.
+
+    A user without ``ledger.view`` in ``entity`` is refused (AccessDenied, logged); the rows are also passed through
+    :func:`core.access.scope`, so nothing of another entity can appear. Filters are the enumerated values and
+    dates the list offers (web.md R23). Each row carries ``debit_total`` (functional currency) and ``lines_total``
+    computed in the same query, so a page costs the same whatever its length (R37).
+    """
+    access.require(user, entity, "ledger.view")
+    qs = access.scope(JournalEntry.objects.all(), user, "ledger.view").filter(entity=entity)
+    if status:
+        qs = qs.filter(status=status)
+    if source:
+        qs = qs.filter(source=source)
+    if date_from:
+        qs = qs.filter(date__gte=date_from)
+    if date_to:
+        qs = qs.filter(date__lte=date_to)
+    if number:
+        qs = qs.filter(number__icontains=number)
+    return (
+        qs.select_related("entity", "entity__base_currency", "period")
+        .annotate(debit_total=Sum("lines__debit"), lines_total=models.Count("lines"))
+        .order_by("-date", "-id")
+    )
+
+
+def journal_entry(entity, pk, *, user):
+    """One journal entry of ``entity`` with its lines, for ``user`` (``ledger.view``).
+
+    An entry of another entity, or one the user may not see, is "not found" (Http404), never 403, so its existence
+    is not revealed (access R2, web.md R3, R4).
+    """
+    access.require(user, entity, "ledger.view")
+    lines = JournalLine.objects.select_related("account", "currency", "counterparty_entity").order_by("id")
+    qs = (
+        JournalEntry.objects.filter(entity=entity)
+        .select_related("entity", "entity__base_currency", "period", "reversal_of", "reversed_by",
+                        "created_by__access_profile", "posted_by__access_profile")
+        .prefetch_related(models.Prefetch("lines", queryset=lines))
+    )
+    return access.get_scoped_or_404(qs, user, "ledger.view", pk=pk)
+
+
+def entry_counts(entity, *, user):
+    """``{status: count}`` of ``entity``'s journal entries, for the dashboard card (``ledger.view``; web.md R38)."""
+    access.require(user, entity, "ledger.view")
+    rows = (
+        access.scope(JournalEntry.objects.all(), user, "ledger.view").filter(entity=entity)
+        .values("status").annotate(n=models.Count("id")).order_by()
+    )
+    counts = {s: 0 for s in JournalEntry.Status.values}
+    counts.update({r["status"]: r["n"] for r in rows})
+    return counts
