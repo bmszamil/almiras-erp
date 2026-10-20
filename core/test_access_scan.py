@@ -50,6 +50,8 @@ ALLOW = {
     "payroll/services.py:setup_entity": "payroll_setup_entity command only (operator setup of a new entity, R3)",
     "payroll/services.py:send_alerts": "payroll_alerts job only (R10, R22, R53; retention nomination)",
     "payroll/services.py:skip_installment": "always refuses (R27: a skip needs a new approved schedule)",
+    "invoicing/services.py:register_wht_return_source": "called once from an AppConfig.ready() to add another module's "
+                                                        "WHT rows to the return (payroll R43, OQ-30); no user action",
     "hr/services.py:employees": "the scope mechanism for employees (access.scope with hr.view, R2)",
     "invoicing/services.py:send_charity_recipient_alerts": "invoicing_charity_recipient_alerts job only (owner "
                                                             "decision C3: expiry alerts 30 and 7 days before)",

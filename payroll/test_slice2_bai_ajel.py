@@ -54,7 +54,7 @@ def test_r47_rejected_invoice_is_approved_again_never_while_it_is_live(w):
     assert c.status == "sale_invoiced" and c.sale_document_ref.endswith("-2") and len(w.invoicing.calls) == 2
     assert c.installments.count() == 12  # the same schedule, the same fixed price
     w.invoicing.posted, w.invoicing.status = True, "final"
-    assert services.refresh_deferred_sales(w.alm) == [DeferredSaleContract.objects.get(pk=c.pk)]
+    assert services._refresh_deferred_sales(w.alm) == [DeferredSaleContract.objects.get(pk=c.pk)]
 
 
 def test_e13_final_settlement_recovery_recognises_the_profit_through_invoicing(w):

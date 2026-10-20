@@ -2470,7 +2470,7 @@ def calculate_run(run, *, user):
     use = hr.ParamUse()
     ctx = Ctx(run, user, _jurisdiction_gate(run.entity, use))
     ctx.use = use
-    refresh_deferred_sales(run.entity)  # slice 2: sales posted on ZATCA reporting since enter the run (R47)
+    _refresh_deferred_sales(run.entity)  # slice 2: sales posted on ZATCA reporting since enter the run (R47)
     slips = _calculate(ctx)
     _store(ctx, slips)
     run.status = RS.CALCULATED
@@ -4589,7 +4589,7 @@ def send_alerts(*, today=None, entity=None):
         roles = ("payroll_officer", "hr_officer")
         if _jurisdiction_of(e) != "SA":  # WPS, Mudad and GOSI are Saudi (Egypt research §2.4, §2.5)
             continue
-        sent += len(refresh_deferred_sales(e))  # slice 2: bai' ajel sales posted on ZATCA reporting (R47)
+        sent += len(_refresh_deferred_sales(e))  # slice 2: bai' ajel sales posted on ZATCA reporting (R47)
         prev = _period_of(today.replace(day=1) - timedelta(days=1))
         # C-C5: Mudad counts from the pay date: alerts 7, 10 and 15 days after it while no submission is recorded.
         for offset in MUDAD_ALERT_DAYS:
@@ -5176,7 +5176,7 @@ def _fines_2340(entity, period):
     return GF.objects.filter(entity=entity, period=period, status=GFS.APPROVED).aggregate(t=Sum("amount"))["t"] or ZERO
 
 
-def gosi_fine_estimate(entity, period, paid_on):
+def _gosi_fine_estimate(entity, period, paid_on):
     """R37 (Law Art. 9(3); Regs Art. 24, 25): 2% of the contributions due for each month of delay or part of a month,
     counted from the day after the due day (the 15th of the following month). An estimate shown next to GOSI's
     figure; GOSI's invoice governs and the ERP never posts a fine by itself. Returns (estimate, months late)."""
@@ -5209,7 +5209,7 @@ def record_gosi_fine(entity, *, user, period, amount, fine_date, gosi_invoice_re
         raise error("A GOSI fine needs the amount (SAR, 2 decimals), its date and GOSI's invoice reference (E14).",
                     "تحتاج غرامة التأمينات إلى المبلغ وتاريخها ومرجع فاتورة التأمينات.", code="fine_invalid")
     _account(entity, GOSI_FINES)
-    estimate, months = gosi_fine_estimate(entity, period, paid_on or fine_date)
+    estimate, months = _gosi_fine_estimate(entity, period, paid_on or fine_date)
     if estimate != amount:
         note_en = (note_en + " " if note_en else "") + (f"ERP estimate {estimate} ({months} month(s) at 2%); GOSI's "
                                                          "figure governs (Regs Art. 25 waivers).")
@@ -5552,7 +5552,7 @@ def cost_report_data(report, *, user):
                       for l in r.lines.select_related("assignment", "receiving_entity").order_by("pk")]}
 
 
-def approved_secondment_cost(assignment, period):
+def _approved_secondment_cost(assignment, period):
     """Billing R71 seam (``payroll.billing_port``): the approved fully loaded cost of ``assignment`` for ``period``
     in the seconding entity's functional currency, or None while no report of that month is approved. Totals only,
     no personal data (R35); service to service, no user (billing's system user holds no payroll right, R38)."""
@@ -5981,7 +5981,7 @@ def _reissue_rejected_sale(c, user):
     return _save(c)
 
 
-def refresh_deferred_sales(entity):
+def _refresh_deferred_sales(entity):
     """R47 as amended (slice 2): contracts whose sale invoice was posted on ZATCA reporting since become ``sold`` (their
     installments then enter the runs). Called before every run calculation and by the daily alerts job; reads
     invoicing through the port only. Returns the contracts marked sold."""

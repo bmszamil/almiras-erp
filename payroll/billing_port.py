@@ -32,9 +32,9 @@ class PayrollCostPort:
     """Default port (``BILLING_PAYROLL_COST_PORT`` may name another for tests)."""
 
     def approved_cost(self, assignment, period):
-        from .services import approved_secondment_cost
+        from .services import _approved_secondment_cost
 
-        row = approved_secondment_cost(assignment, period)
+        row = _approved_secondment_cost(assignment, period)
         if row is None:
             return None
         return SecondmentCost(total=row.total, currency=row.currency, days=row.days, days_in_month=row.days_in_month,

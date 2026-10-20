@@ -293,10 +293,10 @@ def test_e14_gosi_fine_estimate_record_and_post_on_5930(w):
     saudi(w)
     run = approved(w, "2027-03")
     booked = services._gosi_booked(w.alm, "2027-03")
-    est, months = services.gosi_fine_estimate(w.alm, "2027-03", date(2027, 4, 20))
+    est, months = services._gosi_fine_estimate(w.alm, "2027-03", date(2027, 4, 20))
     assert months == 1 and est == (booked * D("0.02")).quantize(D("0.01"))
-    assert services.gosi_fine_estimate(w.alm, "2027-03", date(2027, 4, 15)) == (D("0"), 0)
-    assert services.gosi_fine_estimate(w.alm, "2027-03", date(2027, 5, 16))[1] == 2  # a part of a month counts
+    assert services._gosi_fine_estimate(w.alm, "2027-03", date(2027, 4, 15)) == (D("0"), 0)
+    assert services._gosi_fine_estimate(w.alm, "2027-03", date(2027, 5, 16))[1] == 2  # a part of a month counts
     with pytest.raises(PayrollError):
         services.record_gosi_fine(w.alm, user=w.p, period="2027-03", amount="10.00", fine_date=date(2027, 4, 30),
                                   gosi_invoice_ref="")
