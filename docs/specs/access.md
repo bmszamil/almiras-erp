@@ -1,6 +1,6 @@
 # Access: users, roles and permissions per entity (user × entity × role)
 
-Django app: `core` (package `core/access/`: `models.py`, `services.py`, `catalogue.py`, `backends.py`). Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (A11, A12: billing versions/corrections, unseal delegation). Amended 2026-10-16 (A13, R27, R30 to R33, AT-29 to AT-32: build decisions and reviewer hardening). Amended 2026-10-16 (A14, R23, R30, R32, R34 to R42, AT-33 to AT-40, OQ-19, OQ-20: ledger document registry, entity lifecycle, clearance approver; code on branch `claude/funny-davinci-7yd88s`, commits aad0126..b690c12). Amended 2026-10-16 (A15, 3.6 flag I, 3.7, R34, R35, R37 to R39, R43, R44, AT-33, AT-37, AT-41 to AT-46, OQ-21, OQ-22: registry creator and line hooks, reversal integrity, explicit reactivation, recovery command scope, SQLite limitation; commits b6ed6e1..497cb09). Amended 2026-10-17 (project-owner decisions A16 to A20: receipts posted by their recorder, `chairman` role and two-step Sharia switch-off, inactive subsidiaries, `zatca_admin` as add-on role, hierarchical ZATCA keys; 3.1, 3.6, R17, R19, R35, R38, R46 to R51, AT-28, AT-37, AT-49 to AT-55, OQ-18, OQ-19, OQ-21, OQ-23 to OQ-27). Amended 2026-10-17 (project-owner HR/payroll decisions A21, A22: roles `hr_officer` and `payroll_officer`, HR officer approves payroll, MP approves loans and bai' ajel, overtime approval routing; 3.1, 3.6, R52 to R54, AT-55, AT-56, OQ-2, OQ-28; detail in hr.md H9 to H16 and payroll.md P8 to P15). Amended 2026-10-17 (A23, project owner / CFO decision pack: receipts posted by their recorder only without a bank charge, records kept indefinitely with human "burn" decisions, new permissions from the pack, legacy system Falcon; R46 note, new R55, R56, §6, AT-57, AT-58, OQ-10, new OQ-29). Amended 2026-10-18 (project-owner answers A24 to A32, `docs/approvals/owner-answers-2026-10-18.md` §A, B7: authority per company, per-entity authority matrix as data, self-approval only by the entity's top authority, no cascade of group roles, CEO and new roles, system users issue/post after prior human approval, one approval engine (option C), custom user model, delegation, retention by internal audit committee minute; notes on A1, A8, A21, A22, 3.1, 3.2, R6, R14, R16, R18, R53, R54, R55; new 3.8 to 3.10, R57 to R68, AT-59 to AT-72, OQ updates, new OQ-30 to OQ-41; all **to build**).
+Django app: `core` (package `core/access/`: `models.py`, `services.py`, `catalogue.py`, `backends.py`). Status: **draft spec**. Written 2026-10-16 by the spec-writer agent. Revised 2026-10-16 (A11, A12: billing versions/corrections, unseal delegation). Amended 2026-10-16 (A13, R27, R30 to R33, AT-29 to AT-32: build decisions and reviewer hardening). Amended 2026-10-16 (A14, R23, R30, R32, R34 to R42, AT-33 to AT-40, OQ-19, OQ-20: ledger document registry, entity lifecycle, clearance approver; code on branch `claude/funny-davinci-7yd88s`, commits aad0126..b690c12). Amended 2026-10-16 (A15, 3.6 flag I, 3.7, R34, R35, R37 to R39, R43, R44, AT-33, AT-37, AT-41 to AT-46, OQ-21, OQ-22: registry creator and line hooks, reversal integrity, explicit reactivation, recovery command scope, SQLite limitation; commits b6ed6e1..497cb09). Amended 2026-10-17 (project-owner decisions A16 to A20: receipts posted by their recorder, `chairman` role and two-step Sharia switch-off, inactive subsidiaries, `zatca_admin` as add-on role, hierarchical ZATCA keys; 3.1, 3.6, R17, R19, R35, R38, R46 to R51, AT-28, AT-37, AT-49 to AT-55, OQ-18, OQ-19, OQ-21, OQ-23 to OQ-27). Amended 2026-10-17 (project-owner HR/payroll decisions A21, A22: roles `hr_officer` and `payroll_officer`, HR officer approves payroll, MP approves loans and bai' ajel, overtime approval routing; 3.1, 3.6, R52 to R54, AT-55, AT-56, OQ-2, OQ-28; detail in hr.md H9 to H16 and payroll.md P8 to P15). Amended 2026-10-17 (A23, project owner / CFO decision pack: receipts posted by their recorder only without a bank charge, records kept indefinitely with human "burn" decisions, new permissions from the pack, legacy system Falcon; R46 note, new R55, R56, §6, AT-57, AT-58, OQ-10, new OQ-29). Amended 2026-10-18 (project-owner answers A24 to A32, `docs/approvals/owner-answers-2026-10-18.md` §A, B7: authority per company, per-entity authority matrix as data, self-approval only by the entity's top authority, no cascade of group roles, CEO and new roles, system users issue/post after prior human approval, one approval engine (option C), custom user model, delegation, retention by internal audit committee minute; notes on A1, A8, A21, A22, 3.1, 3.2, R6, R14, R16, R18, R53, R54, R55; new 3.8 to 3.10, R57 to R68, AT-59 to AT-72, OQ updates, new OQ-30 to OQ-41; all **to build**). Amended 2026-10-20 (new §10 "Authority matrix, top-authority self-approval and governance report (to build)": owner answers A1 to A5, A10, A13, G3, G8 and payroll §10.4; matrix rows with currency, named approver and delegation flag, code defaults where no row exists, matrix versions under dual control, the full list of approvable documents routed through the one engine, the list of activities where self-approval is never allowed, the monthly governance report, delegation with expiry, rights of the five new roles; R69 to R90, AT-73 to AT-96, OQ-42 to OQ-55; replaces the "missing row is refused" part of R57 and the OQ-31 default; all **to build**).
 Depended on by: `docs/specs/invoicing.md` (OQ-25, OQ-42), `docs/specs/billing.md` §7, `docs/specs/zatca.md` §7, R-41, OQ-14, OQ-25, `docs/specs/ledger-fx.md` §7. Gateway design: `docs/ai-agent-gateway.md`.
 Role names and permission codenames in this spec replace the provisional names in those four specs (reconciliation table in §3.1).
 
@@ -274,6 +274,7 @@ delegate_approval(actor, delegate, entity, valid_from, valid_to, reason) -> Memb
 ### 3.8 Authority matrix (added 2026-10-18, A25; to build)
 
 Per-entity data, read by the approval engine (3.10). A new subsidiary gets its matrix as setup data, never code.
+*Note 2026-10-20:* extended and partly replaced by §10.3 (matrix versions, currency, named approver, delegation flag, code defaults). Where §10 and this subsection differ, §10 applies.
 
 **`EntityGovernance`** (one per entity)
 
@@ -441,6 +442,7 @@ Enforcement: **S** = `core/access/services.py`; **M** = model `save`/`delete`/`c
 
 **Project-owner answers 2026-10-18 (A24 to A32; all to build)**
 57. **Authority matrix (A25).** Every approvable document is approved only by users eligible under its entity's `AuthorityRule` rows for (activity, amount basis value, date): for each step, an active human membership in **that entity** whose role is in `approver_roles` and holds `activity.permission`. Bands of one activity and entity may not overlap on any date; a gap or missing row means **no rule**: submission is refused (`no_authority_rule`, en/ar, naming entity, activity and amount) and the document stays draft; nothing falls back to a group role or the MP. The seed for each entity copies today's decided holders (catalogue 3.6, A21, A22 for Almiras) as rows, marked `seed`, until the entity's own matrix is entered (OQ-30). The amount is measured in the entity's functional currency at the document's booking rate (default, OQ-35). **[S in approvals + core; DB exclusion on overlapping bands (PostgreSQL); test AT-59]**
+    *Amended 2026-10-20 (§10, R70, R71):* when an entity has **no row at all** for an activity, the code default (today's behaviour) applies instead of a refusal; only a gap **inside** an entity's own bands is refused. Rows are no longer copied as seed data. Named-user approvers, band currency and the delegation flag: R72 to R74.
 58. **Self-approval by the top authority only (A26).** The engine accepts a decision by a user who is the document's creator, submitter or last modifier **only** when (a) the user holds the entity's `EntityGovernance.top_authority_role` in that entity, (b) that role is an eligible approver for the step under R57, and (c) the permission is **A** (or **A, P**) and not **S!**, **DC** or **G**. It then calls `require(..., document=doc, allow_self_approval=True)`; the ledger registry accepts that grant for posting only when its `AccessLog` row has `self_approval=true` and `top_authority=true` (R35 amended). Any other self-approval is refused (`self_approval`, en/ar), for every role, including CEO in Almiras and MP outside Almiras. **[S in approvals + core + ledger registry; test AT-60, AT-61]**
 59. **Monthly governance report (A26).** `core.services.governance_report(entity, month, *, user)` lists, per entity, every self-approval (document, activity, amount, user, time, grant log id), every decision by a delegate (`on_behalf_of`), every approval outside the seed rows' bands, and every `AuthorityRule` and `EntityGovernance` change in the month; en/ar; CSV/PDF export. It is generated on the 1st of each month for the previous month by a system job and readable by the roles in `governance_report_recipients` with a membership in that entity (default OQ-33). Viewing it is logged. **[svc + job; test AT-62]**
 60. **New roles (A28).** `ceo`, `internal_auditor`, `personal_assistant`, `business_analyst`, `external_auditor` are seeded entity roles (3.1). `internal_auditor`, `business_analyst` and `external_auditor` hold view permissions only (never **A**, **P**, **DC**, **S!** or create). An `external_auditor` membership without `valid_to` is refused (`valid_to_required`, en/ar); its maximum length: OQ-36. `personal_assistant` holds create (draft) permissions only, never submit, approve or post. `ceo` may hold the `accountant` permissions together with **A**/**P** ones; segregation still applies to the CEO except under R58. **[catalogue + M clean + S; test AT-64, AT-65]**
@@ -633,6 +635,288 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 *Update 2026-10-18 (A24 to A32):* resolved OQ-1, OQ-3, OQ-9 (user model), OQ-7 in part; amended OQ-2, OQ-28, OQ-29; new OQ-30 (GL per entity: matrix content) to OQ-41 (defaults).
 **Blocking:** OQ-13 blocks wiring zatca onboarding permissions (not the access module itself). **Go-live:** OQ-30 (each entity's matrix, added 2026-10-18), OQ-4, OQ-10, and requirement R45 (application database role privileges, AT-47; added 2026-10-17). This spec also unblocks invoicing OQ-25 (views/APIs) once built.
 
+## 10. Authority matrix, top-authority self-approval and governance report (to build)
+
+*Added 2026-10-20 by the spec-writer agent.* Sources: `docs/approvals/owner-answers-2026-10-18.md` A1 to A5, A10, A13, G3, G8; this spec's A24 to A32, 3.8 to 3.10, R57 to R68, OQ-28 to OQ-41; `docs/specs/payroll.md` §10.4 (still not built: "the authority matrix, top-authority self-approval and the governance report (access build); the `ceo` role"). Nothing in §10 is built. It extends §§3.8 to 3.10 and R57 to R68; where they differ, §10 applies.
+
+### 10.1 Purpose
+
+Each entity (Almiras, every subsidiary, partly-owned or minority entity, and any entity added later as data) has its own **authority matrix**. The matrix says who approves each activity or document type, optionally by amount band and currency, and whether a delegate may act. Where an entity has no row for an activity, today's coded behaviour applies. Every approvable document goes through one approval engine. Only the entity's top authority may approve their own document, and only for activities where no law or accounting rule requires separation of duties. Every self-approval, delegation and matrix change is logged and appears in a monthly bilingual governance / internal-audit report. Matrix changes are versioned and need dual control. Rights are granted per entity only. Group-level settings stay group-level. Nothing here relaxes Sharia, period, balance or entity checks (R7).
+
+### 10.2 Decisions
+
+| # | Decision (owner's words condensed) | Source | Date |
+|---|---|---|---|
+| A1 → A24 | Authority in each company lies with its CEO or General Manager. The Almiras Managing Partner sits on the board or acts as shareholder representative only. | Owner | 2026-10-18 |
+| A2 → A25 | The MP does not approve everything. Each company has its own authority matrix for every task and activity. "Contracted payroll needs no MP approval; overtime in Almiras needs the MP; other companies have their own approval structures." | Owner | 2026-10-18 |
+| A3 → A26 | Self-approval only by the highest authority of each entity: the MP in Almiras, the CEO in every other company. "No other role may ever self-approve." Every self-approval is logged and listed in the monthly governance / internal-audit report. | Owner | 2026-10-18 |
+| A4 → A27 | Each company is granted separately. Group roles do not cascade. | Owner | 2026-10-18 |
+| A5 → A28 | The CEO can approve, post and act as accountant. Roles also needed: internal audit, personal assistant, business analyst, external auditor. | Owner | 2026-10-18 |
+| A10 → A25 | All approvable documents go through the same approval engine. | Owner | 2026-10-18 |
+| A13 → A31 | The CEO approves and reviews, and may delegate this to another user. | Owner | 2026-10-18 |
+| G3 | VAT returns keep three different people (preparer, reviewer, approver). Top-authority self-approval (A3) does **not** apply to VAT returns. | Owner, on team recommendation | 2026-10-18 |
+| G8 | Group-level settings (global exchange rates, the Sharia switch under dual control) stay group-level. Everything else is granted per company. | Owner, on team recommendation | 2026-10-18 |
+| T1 | Team design, adopted under the owner's standing instruction "go with your recommendations" (G, 2026-10-18; I1, 2026-10-19). Owner to confirm. (a) Where no matrix row exists, today's coded behaviour applies. (b) Matrix changes are versioned and need dual control (replaces the OQ-31 default "no second approval"). (c) Delegations always expire. (d) The activities where self-approval is never allowed are flags in code, not data. | Coordinator brief | 2026-10-20 |
+
+### 10.3 Data model
+
+Every model has an `entity` FK to `core.Entity` (PROTECT), except the global catalogue `ApprovalActivity` (3.8). All models are append-only except where stated. User-facing text is en/ar.
+
+**`AuthorityMatrixVersion`** (new; one entity has many versions)
+
+| Field | Type | Req | Bi | Notes |
+|---|---|---|---|---|
+| entity | FK Entity | Y | | |
+| version_no | PositiveInt | Y | | 1..n per entity; unique (entity, version_no) |
+| status | Choice `draft`, `submitted`, `approved`, `rejected`, `withdrawn`, `superseded` | Y | | Only `draft` rows can be edited (R76) |
+| effective_from | Date | Y | | No earlier than the approval date (R77) |
+| summary_en / summary_ar | Text | Y | Y | What changes and why |
+| rows_hash | Char(64) | Y at submit | | SHA-256 of the version's rows. It is the `DualControlRequest.payload_hash` |
+| dual_control_request | FK DualControlRequest, null | Y at submit | | Permission `core.approve_authority_matrix` |
+| proposed_by / proposed_at | FK User / DateTime | Y | | |
+| decided_by / decided_at | FK User / DateTime | N | | Written from the DC decision. `decided_by` ≠ `proposed_by` (R19) |
+| superseded_by | FK self, null | N | | Set when a later version takes effect |
+
+**`AuthorityRule`** (3.8, amended): add `version` (FK AuthorityMatrixVersion, PROTECT, required). `valid_from`/`valid_to` come from the version's period and are no longer set per row. Added fields:
+
+| Field | Type | Req | Bi | Notes |
+|---|---|---|---|---|
+| version | FK AuthorityMatrixVersion | Y | | Rows of a non-draft version never change (DB trigger on PostgreSQL) |
+| band_currency | Char(3), null | N | | Null = the entity's functional currency (SAR). Otherwise the row applies only to documents in that transaction currency, measured in it (R73) |
+| amount_from / amount_to | Decimal(18,3) | Y / N | | Decimal places checked against the band currency's own decimals (CLAUDE.md rule 7). Null bands on both = any amount |
+| approver_roles | M2M Role | one of | | Any eligible holder (R57) |
+| approver_user | FK User, null | one of | | Named user. Exactly one of `approver_roles`/`approver_user` is set (R72) |
+| delegation_allowed | Bool, default True | Y | | False = a delegate is not eligible for this step (R74) |
+| note_en / note_ar | Char(300) | N | Y | e.g. "Board resolution 2027/04" |
+
+**`EntityGovernance`** (3.8, amended; changes only through `change_entity_settings`, R32)
+
+| Field | Type | Req | Bi | Notes |
+|---|---|---|---|---|
+| top_authority_role | FK Role | Y | | Default `managing_partner` for the group parent (Almiras), `ceo` for every other entity (R67) |
+| self_approval_enabled | Bool, default True | Y | | Per-entity data. False = nobody self-approves in that entity (R79) |
+| governance_report_recipients | M2M Role | Y | | Default `internal_auditor` and the top-authority role (OQ-33) |
+
+**`ApprovalDelegation`** (3.9, amended): `valid_to` required and at most `valid_from` + 90 days (OQ-45). Add `notified_expiry_at` (DateTime, null, written once by the reminder job) and `used_count` (derived, not stored; read from approval decisions).
+
+**`AssistantAssignment`** (new; links a `personal_assistant` to the principal they draft for)
+
+| Field | Type | Req | Bi | Notes |
+|---|---|---|---|---|
+| entity | FK Entity | Y | | |
+| assistant / principal | FK User | Y | | Both must hold active human memberships in the entity: the assistant as `personal_assistant` |
+| valid_from / valid_to | DateTime | Y / Y | | |
+| created_by, reason, revoked_* | | Y / N | | Created by the principal or the entity's top authority |
+
+Documents drafted by an assistant store `drafted_for` (FK User, null) on the approval request. For segregation the principal counts as a creator (R81).
+
+**`ApprovalRequest`** (3.10, amended): add `matrix_version` (FK, null when `rule_source = default`), `rule_source` (`matrix` / `default`), `self_approval` (bool), `top_authority` (bool), `drafted_for`. The rules are resolved and stored at submission (R77).
+
+**`GovernanceReport`** (new; one per entity and month; immutable once generated)
+
+| Field | Type | Req | Bi | Notes |
+|---|---|---|---|---|
+| entity | FK Entity | Y | | |
+| month | Date (1st of month) | Y | | Unique (entity, month, revision) |
+| revision | PositiveSmallInt | Y | | 1, or higher when re-issued (R85) |
+| generated_at / generated_by | DateTime / FK User | Y | | `system_governance` system user |
+| content | JSON | Y | | Snapshot of the sections in R84 |
+| content_hash | Char(64) | Y | | SHA-256 of `content` |
+| reviewed_by / reviewed_at / review_note_en / review_note_ar | FK User / DateTime / Text | N | Y | Written once by an `internal_auditor` (R86) |
+
+**Catalogue (code, 3.6) additions**
+
+| Codename | Flags | Holders (seed) |
+|---|---|---|
+| `core.propose_authority_matrix` | | top-authority role of the entity, `access_admin` (OQ-43) |
+| `core.approve_authority_matrix` | DC, S!, NSA | see R76 (OQ-42) |
+| `core.view_governance_report` | | roles in `governance_report_recipients`, `external_auditor` while valid (OQ-33) |
+| `core.review_governance_report` | | `internal_auditor` |
+| `core.generate_governance_report` | Sys:governance | `system_governance` (new system user, entity-scoped memberships) |
+| `core.manage_assistant_assignment` | S! | top-authority role, the principal for their own assistant |
+
+New flag **NSA** = never self-approved. It is a code flag on a catalogue permission (like **S!**) and cannot be changed in admin (R80). **S!**, **DC** and **G** imply **NSA**.
+
+### 10.4 Rules
+
+Enforcement codes as in §4. "Engine" = the approval engine of 3.10.
+
+**Matrix**
+69. **Per-entity matrix rows.** A row names: entity, activity, optional amount band and band currency, step number, minimum approvals, and **either** approver role(s) **or** one named user, plus `delegation_allowed`. A row can name only roles or users that have, or could hold, a membership **in that entity**. A role or user of another entity grants nothing (R5). **[M clean + S; test AT-73]**
+70. **Code default where no row exists.** If the effective matrix version of an entity has no row for an activity, the engine uses the **code default** for that activity (`core/access/authority_defaults.py`, 10.5 table). The default reproduces today's behaviour: the seeded holders of the activity's **A** permission in that entity, plus each module's own extra checks (e.g. payroll runs: `hr_officer` only, never the MP; Almiras overtime, loans and bai' ajel: `managing_partner`; VAT return: three people). Since there is no cascade (R64), the MP fallback of 3.6 applies only in the group parent. The request records `rule_source = default`. The governance report lists such approvals (R84). **[S; T: every activity in the catalogue has a code default; test AT-74]**
+71. **Gaps inside explicit bands are refused.** If an entity has rows for an activity but none covers the document's amount (or currency) on the submission date, submission is refused (`no_authority_rule`, en/ar, naming entity, activity and amount). The code default does **not** fill a gap. Bands of one activity, currency and version may not overlap. **[S + DB exclusion; test AT-75]**
+72. **Named-user approver.** A named user is eligible only while they hold an active human membership in the entity with the activity's permission. If they lose it, the step has no eligible approver: the request waits (R18), and the top authority and the `access_admin` get a bilingual alert. Nobody else is substituted automatically. **[S; test AT-76]**
+73. **Band currency.** A row with `band_currency` = X (not the functional currency) applies only to documents whose transaction currency is X. The amount is compared in X, at up to 3 decimals, checked against X's own decimals. Documents in any other currency use the functional-currency rows, with the amount converted at the document's booking rate (OQ-35 default). If an X-currency document finds no X rows, it uses the functional-currency rows. **[S; test AT-77]**
+74. **Delegation flag.** When `delegation_allowed = False`, an `ApprovalDelegation` does not make the delegate eligible for that step. The delegator must decide in person. **[S; test AT-78]**
+75. **One person per request.** A person decides at most one step of one approval request, as approver or as delegate. `min_approvals > 1` needs that many different persons. **[S; test AT-79]**
+
+**Matrix versions and dual control**
+76. **Dual control on every change.** Matrix rows change only through a new `AuthorityMatrixVersion`. A holder of `core.propose_authority_matrix` in the entity drafts it and submits it. Submitting opens a `DualControlRequest` for `core.approve_authority_matrix`, with `payload_hash = rows_hash`. A **different** person holding that permission in the entity approves it. Recommended deciders (OQ-42): when someone other than the top authority proposes, the entity's top authority decides. When the top authority proposes: in Almiras the group's `chairman`; in other entities a `board_representative` membership in that entity. Self-decision is refused (S!, R15). Rejecting it leaves the current version in force. The same applies to changes of `EntityGovernance.top_authority_role` and `self_approval_enabled` (R32 + R19). **[S + DC; test AT-80, AT-81]**
+77. **Versioned, never retroactive.** An approved version takes effect on `effective_from`, which is on or after the approval date. The previous version becomes `superseded` from that date. Rows of a non-draft version never change (model + PostgreSQL trigger). An approval request resolves its rules at **submission** and stores `matrix_version` and `rule_ids`. A later version does not re-route open requests (OQ-46). Returned and resubmitted documents resolve again. **[M + DB + S; test AT-82]**
+78. **Logged.** Drafting, submitting, approving, rejecting, withdrawing and the version taking effect each write an `AccessLog` row (`authority_matrix_*` events). The row holds before/after rows (diff) and the DC request id. **[S; test AT-80]**
+
+**Self-approval**
+79. **Only the top authority, configured as data.** A decision by the document's creator, submitter, last modifier or `drafted_for` principal is accepted **only** under R58 and only if all of these hold: (a) the user holds the entity's `top_authority_role` in that entity; (b) `self_approval_enabled` is True; (c) the user is eligible for that step under the matrix or the code default; (d) the activity's permission is not **NSA**; (e) the user is not the **beneficiary** of the document (R82). Every other self-approval is refused (`self_approval`, en/ar) for every role, including the CEO in Almiras, the MP outside Almiras and any delegate. If the top-authority role has more than one active holder in the entity, none of them may self-approve (OQ-47). **[S in engine + core + ledger registry; test AT-83, AT-84]**
+80. **Never self-approved (NSA): the exclusion list.** Self-approval is refused, also for the top authority, for every activity in this list. The list is held in code as the **NSA** flag; it is not data.
+
+| # | Activity (permission) | Why separation of duties is required | Status |
+|---|---|---|---|
+| a | VAT return review and approval (`tax.review_return`, `tax.approve_return`) | Three different people | **Decided (G3)** |
+| b | Tax payments, refunds and import VAT (`tax.approve_payment`), tax settings (`tax.change_settings`), VAT box verification (`tax.maintain_rates` verify; H3 proposer ≠ verifier) | Same VAT process as G3; H3 gives proposer and verifier to two different people | Recommended (OQ-48) |
+| c | Every **DC** permission: Sharia switch-off (`core.disable_sharia_enforcement`), ZATCA production switch (`zatca.switch_to_production`), matrix versions (`core.approve_authority_matrix`) | Dual control means two people by definition (R19, A17) | Decided (A17, A9) |
+| d | Every **S!** permission: memberships (`core.grant_membership`), approval delegation (`core.delegate_approval`), key custody (`zatca.grant_key_delegation`, `zatca.onboard`), retention decisions (`core.decide_retention`), bank accounts and their changes (`banking.approve_bank_account`), reopening a reconciliation (`banking.reopen_reconciliation`), charity recipients (`invoicing.approve_charity_recipient`), personal-data export (`hr.export_personal_data`), assistant assignments | Already "segregation that cannot be switched off" (R15); a retention burn needs the internal audit committee minute (A32); charities need the board (C5) | Decided (existing S!) |
+| e | Every **G** permission (entity settings, users, global rates, functional currency, statutory parameter verification `hr.verify_statutory_parameter`, non-publication day verification) | Group-level settings stay group-level (G8); they are not entity approvals | Decided (G8) for the scope; NSA recommended |
+| f | Employee IBAN changes (`hr.approve_iban_change`, second person) | Payment-fraud control on bank details; same reason as banking S! | Recommended (OQ-48) |
+| g | Purification: funding (`invoicing.approve_purification_funding`) and payout (`invoicing.approve_purification_payout`) | Sharia control: "funding needs the CFO's approval, never its recorder" (C2); money leaves the company irrevocably (C6) | Recommended (OQ-48) |
+| h | Migration account map (`migration.approve_account_map`) | Opening balances must be shown to tie out to the legacy system for the external auditor | Recommended (OQ-48) |
+| i | Bank reconciliation approval (`banking.approve_reconciliation`) | Classic separation: the preparer of a reconciliation does not approve it | Recommended (OQ-48) |
+| j | Any document where the approver is the beneficiary (R82) | Conflict of interest; payroll R39/R50 | Recommended (R82) |
+
+**[catalogue + S; T: every permission in rows a to i carries NSA; test AT-85]**
+81. **Assistant drafts count as the principal's.** When a `personal_assistant` drafts a document under an active `AssistantAssignment`, the principal counts as a creator for R14, R35 and R79. A principal who approves a PA-drafted document is self-approving: allowed only as top authority and logged; refused for anyone else. **[S; test AT-86]**
+82. **No approval for one's own benefit.** Nobody, including the top authority, approves a document of which they are the beneficiary or data subject: own payslip line, overtime, leave, loan, bai' ajel, final settlement, cost item, employment contract or assignment, own IBAN, own expense or vendor record, own membership or delegation. Such a document goes to the next eligible approver under the matrix. If there is none, it waits (R18). **[S in engine with each module's `beneficiary_of(document)` adapter; test AT-87]**
+83. **Every self-approval logged.** A self-approval writes an `AccessLog` row (`self_approval`) with entity, activity, document type and id, document version, amount and currency, matrix version or `default`, rule id, user, role and time. The single-use grant row carries `self_approval=true`, `top_authority=true` (R58). An attempted self-approval that is refused writes a `permission_denied` row with reason `self_approval`. **[S + M; test AT-83]**
+
+**Governance report**
+84. **Monthly, per entity, bilingual.** On the 1st of each month at 02:00 Riyadh time, `system_governance` generates one report per active entity for the previous month (R59). Each report has the same sections in English and Arabic: (1) self-approvals (R83); (2) delegations granted, revoked, expired and every decision made under a delegation (`on_behalf_of`); (3) matrix versions drafted, submitted, approved, rejected and taking effect, with the diff, plus changes to the top authority and `self_approval_enabled`; (4) approvals under code defaults (`rule_source = default`); (5) refused self-approval attempts; (6) assistant assignments; (7) for the group parent only, G actions (entity settings, Sharia switch requests and decisions, global-rate overrides). A month with no events produces a report saying "nothing to report / لا يوجد ما يُبلَّغ عنه". Exports are CSV and PDF. **[S + job; test AT-88, AT-89]**
+85. **Immutable.** A generated report never changes (`content_hash`). If it needs correcting (e.g. a late-committed event), a new `revision` is issued that names the earlier one. **[M + DB; test AT-90]**
+86. **Readers and review.** The report is readable only by users with `core.view_governance_report` **in that entity** (no cascade). An `internal_auditor` of the entity records the review once, with a bilingual note. Each view and export is logged. If a report is not reviewed within 30 days, the top authority gets an alert. **[S; test AT-89]**
+
+**Delegation (A13 → A31)**
+87. **Delegation always expires.** An `ApprovalDelegation` (R62) needs `valid_to`, at most 90 days after `valid_from` (OQ-45). It ends at `valid_to` without any job running: eligibility is checked at decision time. The delegator and the delegate get a bilingual reminder 3 days before expiry. A renewal is a new delegation, logged. Revoking the delegator's membership ends the delegation at once. **[S + job (reminder only); test AT-91]**
+88. **Delegation limits.** A delegate gets no more than the delegator holds in that entity on the decision date: same steps, within `amount_max`, never for steps with `delegation_allowed = False`, never self-approval (R62, R79), never **NSA** permissions in row c or d of R80. A delegate must not be a `personal_assistant`, `business_analyst`, `internal_auditor` or `external_auditor` membership holder only, nor a system or agent user. **[S; test AT-91, AT-92]**
+
+**Roles, per-entity grants and group-level settings**
+89. **Rights of the new roles (A5 → A28).** Rights per 10.7, R60 and 3.1. `internal_auditor` and `external_auditor` are **read-only** on business data: they never create, submit, approve, post or reverse. The internal auditor's only writes are the governance-report review (R86) and recording a retention decision with the committee minute (R55, OQ-29), which records the committee's decision and is not a business approval (OQ-50). An `external_auditor` membership needs `valid_to`, at most 12 months (OQ-36 amended). `business_analyst`: view and reports only, no personal data. `personal_assistant`: drafts and attachments only. `ceo`: the accountant's create/submit rights plus **A**/**P** as the matrix names it. Agents can never hold any of these roles (R11). **[catalogue + M clean + S; test AT-93]**
+90. **Per entity only; group-level stays group-level (A4, G8).** Matrix versions, rules, delegations, assistant assignments, `EntityGovernance` and governance reports exist per entity and are queried through `scope` (R2). A group-parent membership adds nothing in another entity (R64). Only the settings G8 names, plus the existing **G** permissions, stay group-level and are checked on the group parent: global exchange rates, the Sharia switch under dual control (R48), entity settings, users, functional currency and key-custody delegation. An entity's matrix is never a **G** setting. Intercompany documents are approved in each side's own entity under that entity's matrix. The buyer's mirror bill (A8) uses the buyer's matrix. **[S + Q; test AT-94, AT-95]**
+
+### 10.5 Approvable documents that must route through the one engine (A10, R61)
+
+Every row becomes an `ApprovalActivity` with an engine adapter. "Default" = the code default of R70 (today's behaviour). **NSA** = never self-approved (R80). Module functions are reached only through the adapter (AT-67).
+
+| Activity code | Module service (current) | Permission | Default approver today | Posts | NSA |
+|---|---|---|---|---|---|
+| `ledger.manual_entry` | `ledger.services.post_entry` (manual drafts) | `ledger.post_entry` | `approver`; MP in group parent | Y | |
+| `invoicing.sales_document` (incl. credit/debit notes, billing corrections, non-VAT documents) | `invoicing.services.approve_sales_document` | `invoicing.approve_sales_document` (`approve_non_vat_document`) | `approver` | Y (on clearance) | |
+| `invoicing.bill` (incl. vendor credit notes) | `approve_purchase_document` | `invoicing.approve_bill` | `approver` | Y | |
+| `invoicing.vendor_payment` | `approve_vendor_payment` | `invoicing.approve_vendor_payment` | `approver` | Y | |
+| `invoicing.purification_funding` | (invoicing R54, C2) | `invoicing.approve_purification_funding` | `approver`; MP fallback | Y | rec. |
+| `invoicing.purification_payout` | (invoicing R54) | `invoicing.approve_purification_payout` | `approver` | Y | rec. |
+| `invoicing.charity_recipient` | `approve_charity_recipient` | `invoicing.approve_charity_recipient` (S!) | MP, with board minute | | Y |
+| `invoicing.recovery_ratio`, `invoicing.art51_true_up`, `invoicing.deferred_release`, `invoicing.deposit_application` | R56 (to build) | `invoicing.approve_*` | `approver` | per R56 | |
+| `billing.contract` | `billing.services.approve_contract` | `billing.approve_contract` | `approver` | | |
+| `billing.version` (amendment, termination, cancellation) | `approve_version` | `billing.approve_version` / `approve_termination` | `approver` | | |
+| `billing.timesheet`, `billing.cost_pool_period` | (A8, go-live; to build) | to be named in billing.md | `approver` (default) | | |
+| `hr.contract` | `hr.services.approve_contract` | `hr.approve_contract` | `approver`, MP (group parent) | | R82 |
+| `hr.assignment` | `approve_assignment` | `hr.approve_assignment` | `approver` | | R82 |
+| `hr.leave` | `approve_leave` | `hr.approve_leave` | seeded holders (hr §7) | | R82 |
+| `hr.leave_adjustment` | `approve_leave_adjustment` | `hr.adjust_leave_balance` | `approver` | | R82 |
+| `hr.termination` | `approve_termination` | `hr.approve_termination` | `approver` | | R82 |
+| `hr.iban_change` | `approve_iban_change` | `hr.manage_employee` (second person) | another `hr.manage_employee` holder | | rec. |
+| `hr.statutory_parameter` (G, on group parent) | `verify_statutory_parameter` | `hr.verify_statutory_parameter` | MP | | Y (G) |
+| `payroll.input` | `payroll.services.approve_input` / `approve_maternity_support` | `payroll.approve_input` | seeded (payroll §7) | | R82 |
+| `payroll.overtime` | `approve_overtime` | `payroll.approve_overtime` | Almiras: MP (**decided A2**); others: `HrSettings.overtime_approval_route` (`department_head`) | | R82 |
+| `payroll.maternity_clearance` | `approve_maternity_clearance` | `payroll.approve_maternity_clearance` | `approver` | | |
+| `payroll.run` | `approve_run` | `payroll.approve_run` | `hr_officer`, never MP (**decided A2**) | Y | |
+| `payroll.payment` | `approve_payment` | `payroll.approve_payment` | `approver` | Y | |
+| `payroll.loan`, `payroll.loan_schedule` | `approve_loan`, `approve_schedule` | `payroll.approve_loan` | Almiras: MP; others: top authority (OQ-39) | Y | R82 |
+| `payroll.deferred_sale_terms`, `payroll.deferred_sale`, `payroll.deferred_sale_rebate` | `approve_deferred_sale_terms`, `approve_deferred_sale`, `approve_deferred_sale_rebate` | `payroll.approve_deferred_sale_terms` / `_sale` | Almiras: MP; others: top authority (OQ-39) | via invoicing | R82 |
+| `payroll.final_settlement`, `payroll.settlement_correction` | `approve_final_settlement`, `approve_settlement_correction` | `payroll.approve_final_settlement` / `_settlement_correction` | `approver` | Y | R82 |
+| `payroll.loan_write_off` | `approve_loan_write_off` | `payroll.approve_loan_write_off` | top authority (payroll OQ-7) | Y | R82 |
+| `payroll.cost_item`, `payroll.cost_report` | `approve_cost_item`, `approve_cost_report` | `payroll.approve_cost_item` / `_cost_report` | `approver` | | |
+| `payroll.gosi_fine` | `approve_gosi_fine` | `payroll.approve_gosi_fine` | `approver` | Y | |
+| `payroll.profit_recognition` | (bai' ajel E12) | `payroll.approve_profit_recognition` | `approver` | via invoicing | |
+| `banking.bank_account`, `banking.bank_account_change` | `approve_bank_account`, `approve_bank_account_change` | `banking.approve_bank_account` (S!) | `approver` | | Y |
+| `banking.bank_transaction` | `approve_bank_transaction` | `banking.approve_bank_transaction` | `approver` | Y | |
+| `banking.reconciliation` | `approve_reconciliation` | `banking.approve_reconciliation` | `approver` | | rec. |
+| `tax.vat_return` (review step + approval step) | `tax.services.complete_review`, `approve_return` | `tax.review_return`, `tax.approve_return` | three people (tax R8) | Y | **Y (G3)** |
+| `tax.tax_document` (payment, refund, import VAT) | `approve_tax_document` | `tax.approve_payment` | `approver` | Y | rec. |
+| `tax.settings` | tax settings change | `tax.change_settings` | `approver` | | rec. |
+| `tax.box_definition` | `verify_box_definition` (H3) | `tax.maintain_rates` | `approver` verifies the accountant's proposal | | rec. |
+| `migration.account_map` | `migration.services.approve_account_map` | `migration.approve_account_map` | `approver`, MP | | rec. |
+| `core.authority_matrix` (DC) | new (R76) | `core.approve_authority_matrix` | R76 | | Y |
+
+**Shown in the engine inbox but kept as dual-control requests (3.4):** Sharia switch-off (R48) and ZATCA production switch. Steps stay role-bound. The engine adds the inbox and notifications only (OQ-49). **Not approvals (stay in their module, no engine request):** receipt posting by its recorder (A16, OQ-40), WHT data verification (OQ-17), treaty-certificate verification, billing period release, bank match confirmation, non-publication-day verification (G), system-user issue/post after a prior human approval (A6 → A29, R63).
+
+### 10.6 Accounting
+
+None. The engine and the matrix post nothing. Postings happen in the module service, called with the final approver's single-use, document-bound grant (R30, R31, R61). Self-approved postings go through `ledger.services` like any other, with the same Sharia, closed-period, balance and entity checks (R7). Account codes are unchanged.
+
+### 10.7 Permissions
+
+| Action (per entity) | Top authority (MP in Almiras, `ceo` elsewhere) | `ceo` (not top authority) | `approver` (CFO) | `access_admin` | `internal_auditor` | `external_auditor` | `business_analyst` | `personal_assistant` | System | Agent |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Draft / submit a matrix version | Y | No | No (OQ-43) | Y | No | No | No | No | No | No |
+| Approve a matrix version (DC second step) | Y if not proposer (R76) | No | No | No | No | No | No | No | No | No |
+| Approve under the matrix | as rows / default name it | as rows / default | as rows / default | No | No | No | No | No | No | No |
+| Self-approve (R79) | Y, non-NSA, logged | No | No | No | No | No | No | No | No | No |
+| Delegate own approval authority | Y | Y | Y | No | No | No | No | No | No | No |
+| Create assistant assignment | Y | own assistant | own assistant | No | No | No | No | No | No | No |
+| Create drafts | Y (as accountant, A5) | Y | per 3.6 | No | No | No | No | Y (drafts, attachments) | per 3.6 | per 3.6 (Ag) |
+| View business data | Y | Y | Y | access data only | Y, all modules, read-only | Y, read-only, personal data masked, no export (OQ-36) | reports, no personal data (OQ-37) | own drafts | No | Ag only |
+| View governance report | Y | No (OQ-33) | No | No | Y | Y while valid | No | No | No | No |
+| Review governance report | No | No | No | No | Y | No | No | No | No | No |
+| Generate governance report | No | No | No | No | No | No | No | No | `system_governance` | No |
+| Change top authority / `self_approval_enabled` | via `change_entity_settings` + DC (R76) | No | No | No | No | No | No | No | No | No |
+
+Group level (G8, checked on the group parent): global exchange rates (`group_treasury`, `system_fx_import`), Sharia switch-off (MP then chairman, R48), entity settings and users (MP). No one holds rights in an entity without a membership in that entity (R64).
+
+### 10.8 Acceptance tests
+
+Fixtures as in §8: ALM (group parent, top authority `managing_partner`), SUB (`ceo`). Users: MP (MP on ALM), CH (`chairman` on ALM), CE (`ceo` SUB), CE2 (second `ceo` SUB, only where stated), CF (`approver` SUB), AA (`access_admin` SUB), AC (`accountant` SUB), PA (`personal_assistant` SUB, assigned to CE), IA (`internal_auditor` SUB), EA (`external_auditor` SUB), BA (`business_analyst` SUB), BR (`board_representative` SUB), HO (`hr_officer` SUB and ALM). All data anonymised.
+
+| # | Given | When | Then |
+|---|---|---|---|
+| AT-73 | SUB version 1 draft by AA | AA adds a row naming ALM's `approver` user U (no SUB membership); a row naming role `approver` | U row refused (`not_member_of_entity`, en/ar); role row accepted (R69) |
+| AT-74 | SUB has no rows for `invoicing.bill`; ALM has no rows for `payroll.run` or `payroll.overtime` | AC submits a SUB bill; HO prepares and MP approves an ALM run; MP approves ALM overtime | Bill routed to SUB `approver` holders, `rule_source=default`; ALM run: MP refused, HO allowed; ALM overtime: MP allowed. All three listed under "code defaults" in the governance report (R70) |
+| AT-75 | SUB rows for `invoicing.bill`: 0–50,000.00 only | AC submits a bill of 60,000.00 | Refused `no_authority_rule` (en/ar, entity, activity, amount); bill stays draft; the code default is not used (R71) |
+| AT-76 | SUB row names user CF for `invoicing.vendor_payment`; CF's membership is revoked | AC submits a payment; CE tries to approve | Request open, step has no eligible approver; CE refused; alert to CE and AA (en/ar) (R72, R18) |
+| AT-77 | SUB rows: SAR 0–50,000.00 → CF; USD 0–10,000.000 → CE | AC submits a USD 9,000.000 bill; a USD 12,000.000 bill; a EUR bill worth SAR 40,000.00; a USD row with amount 1.0005 | USD 9,000 → CE; USD 12,000 refused (gap inside USD bands); EUR → CF on SAR rows; 4-decimal amount refused (R73) |
+| AT-78 | Row with `delegation_allowed=False` for `invoicing.vendor_payment`; CF delegated payments to AC | AC approves a payment | Refused (`delegation_not_allowed`); CF approves in person (R74) |
+| AT-79 | Two-step SUB bill: step 1 `approver`, step 2 `ceo`; CF holds both roles | CF approves step 1 and then step 2 | Step 2 refused (`same_person_two_steps`) (R75) |
+| AT-80 | AA drafts SUB version 2 | AA submits; AA decides own request; CF decides; CE approves | Submit opens a DC request with `rows_hash`; AA self-decision refused; CF refused (no permission); CE approval accepted; `authority_matrix_*` rows in `AccessLog` with the diff (R76, R78) |
+| AT-81 | CE drafts SUB version 3; MP drafts ALM version 2 | CE decides own; BR decides SUB; MP decides own; CH decides ALM | Self-decisions refused; BR and CH accepted (R76, OQ-42 default) |
+| AT-82 | SUB version 2 approved 2027-03-10 with `effective_from` 2027-03-01; version 3 with `effective_from` 2027-04-01; a bill submitted 2027-03-30 under version 2 | Approve version 2; edit a row of version 3 after approval; approve the open bill on 2027-04-02 | Backdated `effective_from` refused; row edit refused (also raw SQL on PostgreSQL); the open bill keeps version 2 rules (R77) |
+| AT-83 | SUB `ceo` CE is top authority; matrix gives `ceo` 0–50,000.00 bills | CE creates, submits and approves bill B 30,000.00 | Posted; grant `self_approval=true`, `top_authority=true`; `self_approval` `AccessLog` row with all R83 fields (R79, R83) |
+| AT-84 | Same; plus CE2 granted `ceo` in SUB | CE self-approves another bill; CF self-approves own bill; delegate AC (of CE) approves a bill AC created; ALM `ceo` CA self-approves in ALM; SUB `self_approval_enabled=False` and CE self-approves | All refused (`self_approval`): two holders (OQ-47), not top authority, delegate, not ALM's top authority, switched off; each with a `permission_denied` row (R79) |
+| AT-85 | CE is preparer of SUB's VAT return | CE reviews and approves it; CE approves own tax payment; CE approves own bank account change; CE decides own matrix version; MP self-approves the ALM account map | All refused (NSA); catalogue scan finds NSA on every R80 a–i permission (R80) |
+| AT-86 | PA drafts a SUB bill for principal CE | CE approves it; CF approves it; PA submits it | CE: allowed only as top-authority self-approval, logged with `drafted_for=CE`; CF allowed (not self); PA submit refused (R81, R60) |
+| AT-87 | CE has an overtime input and a loan in SUB; SUB matrix `payroll.overtime` → `ceo`, then `approver` | CE approves own overtime and own loan | Refused (`beneficiary`); overtime goes to the next step (`approver`); with no next step it waits (R82) |
+| AT-88 | March 2027 events in SUB: AT-83 self-approval, a delegation granted and used, version 2 approved, a default-rule approval, a refused self-approval | Job runs 2027-04-01 02:00 Riyadh | One SUB report, revision 1, sections 1–6 filled, en and ar labels, CSV and PDF, `content_hash` stored; ALM report includes section 7 G actions; an entity with no events gets "nothing to report" (R84) |
+| AT-89 | SUB report for March | IA, EA (valid), CE, AC, BA, MP (no SUB membership) open it; IA reviews it twice | IA, EA, CE allowed and logged; AC, BA, MP refused; first review saved, second refused; unreviewed report after 30 days alerts CE (R86) |
+| AT-90 | Generated report | Raw UPDATE on `content` (PostgreSQL); re-issue | Update refused; revision 2 created naming revision 1 (R85) |
+| AT-91 | CF delegates bills to AC 2027-03-01 to 2027-06-15; then 2027-03-01 to 2027-05-29 | Save both; AC approves on 2027-05-30; reminders job on 2027-05-26 | First refused (over 90 days); second saved; 05-30 refused (expired); reminder sent to CF and AC on 05-26, en/ar (R87) |
+| AT-92 | CF delegates to IA; CE delegates matrix approval to CF; CF delegates to a system user | Save each | All refused (R88) |
+| AT-93 | IA, EA, BA in SUB | IA creates a draft bill; EA exports the ZATCA archive; EA membership granted with `valid_to` 13 months away; BA opens an employee's IBAN; agent user granted `internal_auditor` | All refused (R89, R11) |
+| AT-94 | MP on ALM only; SUB matrix and reports | MP lists SUB matrix versions, delegations and reports | "Not found" (404) for each (R90, R64) |
+| AT-95 | Intercompany: SUB sells to ALM; mirror bill created by `system_intercompany` in ALM | Approve the mirror bill | Routed under ALM's matrix (or ALM default); SUB's matrix not used; MP may self-approve only if ALM's rules make MP eligible and the bill is not NSA (R90) |
+| AT-96 | Code scan | List every **A** permission in the catalogue | Each has an `ApprovalActivity`, an engine adapter and a code default (R70, R61) |
+
+### 10.9 Open questions (with recommended defaults)
+
+The owner asked for recommendations. Each default below is what the builder implements unless the owner says otherwise. **D** = default in force; **GL** = must be confirmed before go-live.
+
+| # | Question | Recommended default | Blocks? |
+|---|---|---|---|
+| OQ-42 | Who is the second person for a matrix change when the top authority proposes it? | Almiras: the group's `chairman` (as for Sharia switch-off). Other entities: a new entity role `board_representative` (human; holds only `core.approve_authority_matrix` and `core.view_governance_report`), named by that company's board and granted by its top authority under R8 (never to self). The Almiras MP may hold it in a subsidiary as shareholder representative (A1) through an explicit membership. When someone else proposes: the top authority decides | D; GL per entity to name the holder |
+| OQ-43 | Who may draft a matrix version? | Top authority and `access_admin` of the entity; not the CFO (it would set its own limits) | D |
+| OQ-44 | Should code defaults stay forever, or must each entity enter a full matrix before go-live? | Defaults stay, so a new subsidiary works on day one. The governance report shows every default-rule approval, so the gap stays visible. Replaces OQ-30's GL status with "recommended before go-live" | D (was GL) |
+| OQ-45 | Maximum length of an approval delegation (A13; OQ-16 had no maximum) | 90 days, renewable as a new logged delegation; reminder 3 days before expiry | D |
+| OQ-46 | Does a new matrix version re-route requests that are already open? | No: rules are fixed at submission; a returned and resubmitted document resolves again | D |
+| OQ-47 | If an entity has two active holders of its top-authority role (e.g. two `ceo` memberships during a hand-over), may either self-approve? | Neither: self-approval needs exactly one active holder; the hand-over is a revoke + grant | D |
+| OQ-48 | Exclusion list R80 rows b, f, g, h, i (team recommendations, not owner decisions) | Adopt all five as NSA. They follow from G3 (tax), payment-fraud control (IBAN), C2/C6 (purification), the opening-balance tie-out (migration) and reconciliation control (banking) | D; owner to confirm |
+| OQ-49 | A10 says "all approvable documents" use one engine. Do dual-control requests (Sharia switch-off, ZATCA production, matrix versions) become engine requests too? | They appear in the engine's inbox and notifications. Their rules stay `DualControlRequest` (payload hash, role-bound steps, single use, expiry) | D |
+| OQ-50 | "Auditors read-only": may the internal auditor still record retention decisions (R55, OQ-29) and the report review? | Yes. Both record a committee decision or an audit fact, not a business transaction. No other write | D |
+| OQ-51 | Should a self-approval also trigger an immediate notification (not only the monthly report)? | No immediate notification; the monthly report only. An entity may add `internal_auditor` notification later as data | D |
+| OQ-52 | Is there an amount ceiling on top-authority self-approval? | No ceiling (A3 sets none). An entity may limit it in effect by not making the top authority eligible above a band | D |
+| OQ-53 | `internal_audit` (owner's wording) vs the seeded code `internal_auditor` | Keep `internal_auditor` (already in 3.1); `name_en` "Internal auditor", `name_ar` "المدقق الداخلي" | D |
+| OQ-54 | Does the governance report go to the board or to external parties outside the ERP? | In-app only. The internal auditor exports PDF/CSV for the internal audit committee or the board when they ask, and every export is logged | D |
+| OQ-55 | Timesheets and cost pools (A8, needed at go-live) have no approval permissions yet | billing.md names `billing.approve_timesheet` and `billing.approve_cost_pool_period` (A); default approver `approver`; added to 10.5 when that spec is amended | D |
+
+Earlier OQs changed by §10: **OQ-16** delegation maximum → OQ-45. **OQ-30** → OQ-44 (no longer GL). **OQ-31** "no second approval" → replaced by R76 (dual control), OQ-42, OQ-43. **OQ-32** stands (an active delegation does not stop the delegator). **OQ-33** recipients stand; `external_auditor` added as a reader while valid. **OQ-36** external auditor maximum → 12 months.
+
+Arabic labels of new roles, events and report sections are marked [AR-review] for the Arabic reviewer: `board_representative` "ممثل مجلس الإدارة", "مصفوفة الصلاحيات" (authority matrix), "تقرير الحوكمة الشهري" (monthly governance report), "اعتماد ذاتي" (self-approval).
+
 ## Appendix: existing code that must change
 
 | File | Change |
@@ -658,3 +942,8 @@ Fixtures: entities ALM (parent), SUB (child, `full`, 100%), PART (child, `full`,
 | `core` `RetentionNomination` | `committee_minute_ref`, `committee_minute_date` required for `burn` (R55) |
 | `hr` (`HrSettings.overtime_approval_route`), `payroll` overtime/loan approval | Read the matrix instead (R53, R54) |
 | Tests built on cascade (AT-3, AT-56, payroll AT-29) and on `segregation_required=False` (AT-7, AT-49 part) | Expectations change as amended above |
+| *To build (2026-10-20, §10):* `core/access/models.py`, migrations | `AuthorityMatrixVersion`, `AssistantAssignment`, `GovernanceReport`; `AuthorityRule.version`, `band_currency`, `approver_user`, `delegation_allowed`; `EntityGovernance.self_approval_enabled`; PostgreSQL triggers freezing non-draft versions and generated reports (R77, R85) |
+| `core/access/authority_defaults.py` (new) | Code default per activity reproducing today's holders and module checks (R70); test that every **A** permission has one (AT-96) |
+| `core/access/catalogue.py` | Flag **NSA** and the R80 list; new codenames of 10.3; `system_governance` system user; recommended `board_representative` role (OQ-42) |
+| `payroll/approvals.py`, `hr` overtime route, `tax` three-people checks | Become adapters / code defaults of the engine; module-level checks stay (R70) |
+| Every module `approve_*` service in 10.5 | Reached only through its engine adapter; `beneficiary_of(document)` adapter per type (R82) |
