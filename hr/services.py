@@ -310,7 +310,22 @@ def _jurisdiction(employee, what_en="statutory calculations", what_ar="الحس�
     if jurisdiction == "SA":  # R51: a Saudi rule never applies to a local entity employee
         raise error("A local entity employee is never computed with Saudi parameters (R51).",
                     "لا يُحسب موظف الشركة المحلية بالمعايير السعودية أبدًا.", code="saudi_rule_for_local")
+    _require_active(jurisdiction, what_en, what_ar)
     return jurisdiction
+
+
+def _require_active(jurisdiction, what_en="statutory calculations", what_ar="الحسابات النظامية"):
+    """R68 (H20(d)): statutory calculations for local entity employees run only in a jurisdiction whose
+    ``jurisdiction.active`` row is true (and verified when verified parameters are required, R7): SA and EG today
+    ("activate only Egypt for now"). China, UAE and any other country keep master data only. Activating a country
+    is a new parameter row, never code."""
+    row = param(jurisdiction, "jurisdiction.active", _today(), required=False)
+    if row is None or not (row.value or {}).get("active"):
+        raise error(f"Jurisdiction {jurisdiction} is not activated: no {what_en} (R68).",
+                    f"الولاية القانونية {jurisdiction} غير مفعلة: لا {what_ar}.", code="jurisdiction_not_activated")
+    if _required_verified() and row.status != StatutoryParameter.Status.VERIFIED:
+        raise _unverified_error([row])
+    return row
 
 
 @transaction.atomic
@@ -1246,8 +1261,48 @@ def _probation_end(use, contract, jurisdiction="SA"):
         d += timedelta(days=1)
 
 
+def _local_contract_problems(contract, emp, use, jurisdiction):
+    """R68 (Egypt activated, payroll R4): the local checks of an activated non-Saudi jurisdiction, from its own
+    parameters only (never a Saudi row, R51): probation, hours, statutory annual leave and notice. Egypt (Labour Law
+    14/2025, research rows unverified, OQ-26): probation at most ``probation.max_days`` (Art. 90), 8 / 48 hours (Art.
+    117), annual leave at least the ``from_year_2`` days, notice at least ``termination.notice_days`` either side
+    (Art. 156). The Saudi 30-day leave ceiling (H14, R56) is not applied (Egypt research §2.5)."""
+    problems, warnings = [], []
+    on = contract.effective_date
+    periods = contract.probation_periods or []
+    if not isinstance(periods, list) or any(not isinstance(p, int) or isinstance(p, bool) or p <= 0 for p in periods):
+        problems.append("Probation periods are a list of whole days above zero. / فترات التجربة قائمة بأيام صحيحة أكبر من صفر.")
+    else:
+        maximum = int(use.get(jurisdiction, "probation.max_days", on)["days"])
+        if sum(periods) > maximum:
+            problems.append(f"Probation totals {sum(periods)} days; the maximum in {jurisdiction} is {maximum} days. / "
+                            f"مجموع فترة التجربة {sum(periods)} يومًا؛ والحد الأقصى في {jurisdiction} {maximum} يومًا.")
+    max_daily = _decimal(use.get(jurisdiction, "hours.max_daily", on)["hours"], "hours")
+    max_weekly = _decimal(use.get(jurisdiction, "hours.max_weekly", on)["hours"], "hours")
+    if contract.daily_hours > max_daily or contract.weekly_hours > max_weekly:
+        problems.append(f"Working hours exceed {max_daily} a day or {max_weekly} a week ({jurisdiction}). / "
+                        f"ساعات العمل تتجاوز {max_daily} يوميًا أو {max_weekly} أسبوعيًا.")
+    leave = use.get(jurisdiction, "leave.annual.days", on)
+    minimum = int(Decimal(leave["from_year_2"]))
+    if contract.annual_leave_days < minimum:
+        problems.append(f"Annual leave {contract.annual_leave_days} days is below the statutory {minimum} days in "
+                        f"{jurisdiction}. / الإجازة السنوية {contract.annual_leave_days} يومًا أقل من الحد النظامي "
+                        f"{minimum} يومًا.")
+    notice = int(use.get(jurisdiction, "termination.notice_days", on)["days"])
+    if contract.notice_days_employer < notice or contract.notice_days_employee < notice:
+        problems.append(f"Notice is at least {notice} days on both sides in {jurisdiction}. / مدة الإشعار {notice} يومًا "
+                        "على الأقل للطرفين.")
+    if contract.calendar_basis != EmploymentContract.CalendarBasis.GREGORIAN:
+        problems.append(f"Contracts in {jurisdiction} use the Gregorian calendar. / تستخدم العقود في {jurisdiction} "
+                        "التقويم الميلادي.")
+    return problems, warnings
+
+
 def _statutory_contract_problems(contract, emp, use, jurisdiction):
-    """Saudi statutory checks (R16, R17, R19, R21, R37, R56) with parameters valid on the effective date."""
+    """Saudi statutory checks (R16, R17, R19, R21, R37, R56) with parameters valid on the effective date. Another
+    activated jurisdiction has its own checks (R68)."""
+    if jurisdiction != "SA":
+        return _local_contract_problems(contract, emp, use, jurisdiction)
     problems, warnings = [], []
     on = contract.effective_date
     # R17 as corrected (Art. 53-54, Regs Art. 19): one maximum, consecutive periods, one probation per employer.
@@ -1408,6 +1463,12 @@ def _contract_problems(contract, *, statutory, use):
         if not 0 <= currency.minor_units <= 3 or not currency.is_active:  # nit 14: 0-decimal currencies too
             problems.append(f"Currency {currency.code} is not supported (0 to 3 decimals, active). / "
                             f"العملة {currency.code} غير مدعومة.")
+        if emp.nationality == "SA" and not (emp.gosi_employment_relationship or "").strip():
+            # R69 (H20(b)): a Saudi remuneration person is covered for GOSI annuities only with subordination; the
+            # relationship (and its reference) is recorded before the contract is approved.
+            problems.append("A Saudi remuneration person needs the GOSI employment relationship (subordinate or "
+                            "non-subordinate, with its reference) before the contract (R69). / يلزم تسجيل علاقة العمل "
+                            "لدى التأمينات (تابع أو غير تابع مع مرجعها) لصاحب المكافأة السعودي قبل العقد.")
     else:
         # R18, R53: one BASIC, the entity's functional currency.
         if codes.count("BASIC") != 1:

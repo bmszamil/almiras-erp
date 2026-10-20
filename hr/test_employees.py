@@ -234,8 +234,10 @@ def test_at26_basis_per_jurisdiction_and_fixed_after_approval(w, monkeypatch):
     monkeypatch.setattr(services, "param", spy)
     with pytest.raises(HrError) as exc:
         services.approve_contract(c, user=w.ce)
-    assert exc.value.code == "jurisdiction_not_configured"
-    assert "غير مهيأة" in exc.value.messages[0]
+    # Slice 2 (hr R68): Egypt is activated, so its own (research) rows check the contract: Egypt's 90-day notice
+    # either side refuses the Saudi 60 / 30 days; no Saudi row is read (R51).
+    assert exc.value.code == "contract_invalid"
+    assert any("Notice is at least 90 days" in m and "مدة الإشعار" in m for m in exc.value.messages)
     assert seen and "SA" not in seen
     monkeypatch.undo()
     ksa = hired(w)
