@@ -33,6 +33,10 @@ ALLOW = {
     "core/access/services.py:group_parent_of": "helper (walks parent links)",
     "core/access/services.py:recorded_approvers": "reads the access log for a ledger check that already verified a grant",
     "core/access/services.py:visible_access_log": "the scope mechanism for access-log rows (entities_for + group parent)",
+    "core/access/services.py:visible_entities": "the scope mechanism of the web entity switcher (union of "
+                                                 "entities_for over the catalogue, web.md R9)",
+    "core/access/services.py:set_preferred_language": "the signed-in person's own UI language; logged "
+                                                       "profile_changed (web.md R27)",
     "ledger/services.py:counterparty_choices": "choice list for admin; posting checks every line",
     "invoicing/services.py:party_problems": "pure check of a party record the caller passes (model clean, services)",
     "invoicing/services.py:deferred_sale_of": "payroll invoicing port only: the live bai' ajel sale of a contract payroll "
@@ -92,7 +96,9 @@ EXTRA_MODULES = ("ledger/services_setup.py", "ledger/fx.py")
 def service_modules():
     extra = [REPO / name for name in EXTRA_MODULES]
     for path in sorted(REPO.glob("*/services.py")) + sorted(REPO.glob("*/*/services.py")) + extra:
-        if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.parts):
+        # Parts relative to the repository: a checkout inside a dot-folder (e.g. a git worktree under .claude/)
+        # must not make the scan skip every module.
+        if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.relative_to(REPO).parts):
             continue
         yield path
 
