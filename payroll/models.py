@@ -461,6 +461,10 @@ class PayrollRun(Tracked, ServiceWritten):
                                                              "أجر الإجازة السنوية مقدمًا (المادة 109)"))])
     leave_request = models.ForeignKey("hr.LeaveRequest", null=True, blank=True, on_delete=models.PROTECT,
                                       related_name="+", verbose_name=bi("Annual leave", "الإجازة السنوية"))
+    # Slice 3 (R70, OQ-49): ``period_closed`` when an off-cycle run of the out-of-country group or of Egypt is dated
+    # the first day of the next open period because its own period is closed.
+    entry_date_reason = models.CharField(bi("Entry date reason", "سبب تاريخ القيد"), max_length=30, blank=True,
+                                         default="")
 
     class Meta:
         base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
@@ -1239,6 +1243,7 @@ class PayrollAlert(models.Model):
                                                     "قرار حالة الأمومة: أيام مرحّلة للتسوية")
         BAI_AJEL_REBATE = "bai_ajel_rebate", bi("Bai' ajel rebate credit note rejected",
                                                 "رُفض الإشعار الدائن لإبراء بيع آجل")
+        MUDAD_JUSTIFICATION = "mudad_justification", bi("Mudad justification due", "موعد مبرر مدد")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="payroll_alerts",
@@ -1574,3 +1579,257 @@ class GosiFine(Tracked, ServiceWritten):
                 raise error(f"A GOSI fine does not move from {stored} to {self.status}.",
                             f"لا تنتقل غرامة التأمينات من {stored} إلى {self.status}.", code="fine_status")
         super().save(*args, **kwargs)
+
+
+# =====================================================================================================
+# Slice 3 (docs/specs/payroll.md §11): Mudad justifications (R79 to R81) and liability reports (R75 to R78)
+# =====================================================================================================
+
+class MudadJustification(Tracked, ServiceWritten):
+    """11.3.2: why a KSA employee of an approved in-country run was paid less, nothing or late (R79). Not registered in
+    the ledger (it posts nothing). Rows are never deleted: a wrong one is ``withdrawn`` with a reason (R80). The Mudad
+    codes come from ``wps.mudad.justification_codes`` **[verify: Mudad code list]**; the internal reasons (11.6) are
+    payroll's."""
+
+    class Kind(models.TextChoices):
+        NON_PAYMENT = "non_payment", bi("Non-payment", "عدم صرف")
+        PARTIAL_PAYMENT = "partial_payment", bi("Partial payment", "صرف جزئي")
+        AMOUNT_DIFFERENCE = "amount_difference", bi("Amount difference", "اختلاف المبلغ")
+        LATE_PAYMENT = "late_payment", bi("Late payment", "تأخر الصرف")
+
+    class Reason(models.TextChoices):
+        # Arabic labels [AR-review]; the likely Mudad category of each is [verify] (11.6).
+        UNPAID_LEAVE = "unpaid_leave", bi("Leave without pay", "إجازة بدون أجر")
+        SICK_LEAVE_REDUCED = "sick_leave_reduced", bi("Sick leave at reduced pay", "إجازة مرضية بأجر مخفض")
+        MATERNITY_GOSI = "maternity_gosi", bi("Maternity leave (GOSI compensation)", "إجازة وضع (تعويض التأمينات)")
+        JOINER_LEAVER = "joiner_leaver_proration", bi("Joined or left during the month", "التحاق أو انتهاء خلال الشهر")
+        FINAL_SETTLEMENT = "final_settlement", bi("Paid in the final settlement", "تُصرف في التسوية النهائية")
+        CONTRACT_SUSPENDED = "contract_suspended", bi("Contract suspended", "عقد موقوف")
+        COURT_ORDER = "court_order_deduction", bi("Court-ordered deduction", "حسم بأمر قضائي")
+        BANK_REJECTED = "bank_rejected", bi("Bank rejected the transfer", "رفض البنك للتحويل")
+        IBAN_EXCEPTION = "iban_exception", bi("Invalid bank account", "حساب بنكي غير صالح")
+        PAID_OFF_CYCLE = "paid_off_cycle", bi("Paid by an off-cycle run", "صُرف في مسير إضافي")
+        PAYROLL_CORRECTION = "payroll_correction", bi("Payroll correction", "تصحيح مسير الرواتب")
+        OTHER = "other", bi("Other", "أخرى")
+
+    class Status(models.TextChoices):
+        SUGGESTED = "suggested", bi("Suggested", "مقترح")
+        DRAFT = "draft", bi("Draft", "مسودة")
+        APPROVED = "approved", bi("Approved", "معتمد")
+        SUBMITTED = "submitted", bi("Submitted to Mudad", "مرفوع على مدد")
+        ACCEPTED = "accepted", bi("Accepted by Mudad", "مقبول من مدد")
+        REJECTED = "rejected", bi("Rejected by Mudad", "مرفوض من مدد")
+        WITHDRAWN = "withdrawn", bi("Withdrawn", "مسحوب")
+
+    class WorkerResponse(models.TextChoices):
+        NONE = "none", bi("No response", "لا رد")
+        AGREED = "agreed", bi("Agreed", "موافق")
+        DISPUTED = "disputed", bi("Disputed", "معترض")
+
+    class Source(models.TextChoices):
+        SYSTEM = "system", bi("Suggested by the system", "مقترح من النظام")
+        MANUAL = "manual", bi("Entered by hand", "مُدخل يدويًا")
+        IMPORT = "import", bi("Imported", "مستورد")
+
+    TRANSITIONS = frozenset({
+        ("suggested", "draft"), ("draft", "approved"), ("approved", "submitted"), ("submitted", "accepted"),
+        ("submitted", "rejected"), ("suggested", "withdrawn"), ("draft", "withdrawn"), ("approved", "withdrawn"),
+    })
+    FINAL = ("accepted", "rejected", "withdrawn")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    payslip = models.ForeignKey(Payslip, on_delete=models.PROTECT, related_name="mudad_justifications",
+                                verbose_name=bi("Payslip (run line)", "القسيمة (بند المسير)"))
+    run = models.ForeignKey(PayrollRun, on_delete=models.PROTECT, related_name="mudad_justifications",
+                            verbose_name=bi("Run", "المسير"))
+    wps_file = models.ForeignKey(WpsFile, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Exported in WPS file", "صُدّر في ملف حماية الأجور"))
+    employee_code = models.CharField(bi("Employee code", "رقم الموظف"), max_length=30)
+    kind = models.CharField(bi("Kind", "النوع"), max_length=20, choices=Kind.choices)
+    reason = models.CharField(bi("Reason", "السبب"), max_length=30, choices=Reason.choices)
+    mudad_code = models.CharField(bi("Mudad code", "رمز مدد"), max_length=20, null=True, blank=True)
+    expected_amount = _money("Expected (contract wage)", "المتوقع (أجر العقد)")
+    paid_amount = _money("Paid", "المدفوع")
+    description_ar = models.TextField(bi("Justification (Arabic)", "المبرر (بالعربية)"), max_length=500)
+    description_en = models.TextField(bi("Justification (English)", "المبرر (بالإنجليزية)"), max_length=500, blank=True)
+    evidence_ref = models.CharField(bi("Evidence reference", "مرجع الإثبات"), max_length=200, null=True, blank=True)
+    mudad_notice_date = models.DateField(bi("Mudad notice date", "تاريخ إشعار مدد"), null=True, blank=True)
+    due_date = models.DateField(bi("Justification due (notice + 10 days)", "موعد المبرر (الإشعار + 10 أيام)"),
+                                null=True, blank=True)
+    submitted_on = models.DateField(bi("Submitted on", "تاريخ الرفع"), null=True, blank=True)
+    worker_response_due = models.DateField(bi("Worker response due (submission + 3 days)",
+                                              "موعد رد العامل (الرفع + 3 أيام)"), null=True, blank=True)
+    worker_response = models.CharField(bi("Worker response", "رد العامل"), max_length=10, choices=WorkerResponse.choices,
+                                       default=WorkerResponse.NONE)
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    source = models.CharField(bi("Source", "المصدر"), max_length=10, choices=Source.choices, default=Source.MANUAL)
+    approved_by = _user("Approved by", "اعتمده")
+    approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+    mudad_reference = models.CharField(bi("Mudad reference", "مرجع مدد"), max_length=60, blank=True)
+    withdrawn_reason_ar = models.TextField(bi("Withdrawal reason (Arabic)", "سبب السحب (بالعربية)"), blank=True)
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("Mudad justification", "مبرر مدد")
+        verbose_name_plural = bi("Mudad justifications", "مبررات مدد")
+        ordering = ["run", "employee_code", "id"]
+        constraints = [
+            models.UniqueConstraint(fields=["payslip", "reason"], condition=~Q(status="withdrawn"),
+                                    name="payroll_mudad_justification_once"),
+            models.CheckConstraint(condition=Q(expected_amount__gte=0) & Q(paid_amount__gte=0),
+                                   name="payroll_mudad_justification_amounts"),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self)._base_manager.filter(pk=self.pk).values_list("status", flat=True).first()
+            if stored in self.FINAL:
+                raise error("An accepted, rejected or withdrawn Mudad justification is final (R80).",
+                            "مبرر مدد المقبول أو المرفوض أو المسحوب نهائي.", code="justification_status")
+            if stored is not None and stored != self.status and (stored, self.status) not in self.TRANSITIONS:
+                raise error(f"A Mudad justification does not move from {stored} to {self.status} (R80).",
+                            f"لا ينتقل مبرر مدد من {stored} إلى {self.status}.", code="justification_status")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error("Mudad justifications are never deleted; withdraw a wrong one with a reason (R80).",
+                    "لا تُحذف مبررات مدد؛ يُسحب الخاطئ منها مع ذكر السبب.", code="retention")
+
+
+class MudadJustificationExport(ServiceWritten):
+    """R81: the bilingual list of a run's approved justifications as exported (CSV or HTML), stored encrypted and kept
+    like WPS files (R31: indefinitely; after 10 years only nominated for a human burn decision)."""
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    run = models.ForeignKey(PayrollRun, on_delete=models.PROTECT, related_name="mudad_justification_exports",
+                            verbose_name=bi("Run", "المسير"))
+    format_code = models.CharField(bi("Format", "الصيغة"), max_length=10)
+    generated_by = _user("Generated by", "أنشأه", null=False)
+    generated_at = models.DateTimeField(bi("Generated at", "تاريخ الإنشاء"))
+    sha256 = models.CharField(bi("SHA-256", "البصمة"), max_length=64)
+    row_count = models.PositiveIntegerField(bi("Justifications", "عدد المبررات"))
+    justification_ids = models.JSONField(bi("Justifications exported", "المبررات المصدّرة"), default=list, blank=True)
+    warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
+    content = EncryptedTextField(bi("File (encrypted)", "الملف (مشفر)"))
+    nominated_for_burn_at = models.DateTimeField(bi("Nominated for a burn decision", "رُشح لقرار الإتلاف"), null=True,
+                                                 blank=True)
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("Mudad justification export", "تصدير مبررات مدد")
+        verbose_name_plural = bi("Mudad justification exports", "تصديرات مبررات مدد")
+
+    def delete(self, *args, **kwargs):
+        raise error("Justification exports are kept like WPS files; destruction is a human burn decision (R31, R81).",
+                    "تُحفظ تصديرات المبررات مثل ملفات حماية الأجور؛ والإتلاف قرار بشري.", code="retention")
+
+
+class PayrollLiabilityReport(ServiceWritten):
+    """11.3.3 (R75 to R78): a stored, read-only snapshot of the leave liability or the EOSB provision of one entity as
+    at a date. Nothing is posted (hr OQ-6). Never edited once sealed (``sha256`` set): a later report of the same
+    entity, kind and date supersedes it, the only change a sealed report takes."""
+
+    class Kind(models.TextChoices):
+        LEAVE = "leave", bi("Leave liability", "التزام الإجازات")
+        EOSB = "eosb", bi("End-of-service provision", "مخصص مكافأة نهاية الخدمة")
+
+    class Status(models.TextChoices):
+        GENERATED = "generated", bi("Generated", "مُنشأ")
+        SUPERSEDED = "superseded", bi("Superseded", "مُستبدل")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    kind = models.CharField(bi("Kind", "النوع"), max_length=10, choices=Kind.choices)
+    as_of = models.DateField(bi("As at", "كما في"))
+    currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Currency", "العملة"))
+    basis_en = models.TextField(bi("Basis and assumptions (English)", "الأساس والافتراضات (بالإنجليزية)"))
+    basis_ar = models.TextField(bi("Basis and assumptions (Arabic)", "الأساس والافتراضات (بالعربية)"))
+    parameter_ids = models.JSONField(bi("Parameters read", "المعايير المقروءة"), default=list, blank=True)
+    contract_version_ids = models.JSONField(bi("Contract versions read", "نسخ العقود المقروءة"), default=list,
+                                            blank=True)
+    excluded = models.JSONField(bi("Excluded groups and counts", "الفئات المستبعدة وأعدادها"), default=dict, blank=True)
+    total_days = models.DecimalField(bi("Total days", "مجموع الأيام"), max_digits=9, decimal_places=2, default=ZERO)
+    total_amount = _money("Total", "الإجمالي", default=ZERO)
+    account_2500_memo = _money("Account 2500 on the date (memo)", "رصيد الحساب 2500 في التاريخ (للعلم)", null=True,
+                               blank=True)
+    generated_by = _user("Generated by", "أنشأه", null=False)
+    generated_at = models.DateTimeField(bi("Generated at", "تاريخ الإنشاء"))
+    sha256 = models.CharField(bi("SHA-256 of header and lines", "بصمة الرأس والبنود"), max_length=64, blank=True)
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.GENERATED)
+    superseded_by = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+                                      verbose_name=bi("Superseded by", "استُبدل بـ"))
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("payroll liability report", "تقرير التزامات الرواتب")
+        verbose_name_plural = bi("payroll liability reports", "تقارير التزامات الرواتب")
+        ordering = ["entity", "kind", "-as_of", "-id"]
+        constraints = [models.UniqueConstraint(fields=["entity", "kind", "as_of"], condition=Q(status="generated"),
+                                               name="payroll_one_current_liability_report")]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self)._base_manager.filter(pk=self.pk).values().first()
+            if stored is not None and stored["sha256"]:
+                changed = {f.attname for f in self._meta.concrete_fields
+                           if stored[f.attname] != getattr(self, f.attname)}
+                ok = changed <= {"status", "superseded_by_id"} and self.status == "superseded"
+                if "status" in changed:
+                    ok = ok and stored["status"] == "generated"
+                if "superseded_by_id" in changed:
+                    ok = ok and stored["superseded_by_id"] is None
+                if changed and not ok:
+                    raise error("A liability report is never edited; a new report supersedes it (R75).",
+                                "لا يُعدّل تقرير الالتزامات؛ يحل محله تقرير جديد.", code="report_locked")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error("Liability reports are kept; a new one supersedes (R75).",
+                    "تُحفظ تقارير الالتزامات؛ ويحل محلها تقرير جديد.", code="report_locked")
+
+
+class PayrollLiabilityReportLine(AppendOnly):
+    """One employee of a liability report (append-only; codes only, no names or ID numbers)."""
+
+    class Valuation(models.TextChoices):
+        VALUED = "valued", bi("Valued", "مُقيّم")
+        NOT_VALUED = "not_valued", bi("Not valued", "غير مُقيّم")
+        EXCLUDED = "excluded", bi("Excluded", "مستبعد")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    report = models.ForeignKey(PayrollLiabilityReport, on_delete=models.PROTECT, related_name="lines",
+                               verbose_name=bi("Report", "التقرير"))
+    employee = models.ForeignKey("hr.Employee", on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Employee", "الموظف"))
+    employee_code = models.CharField(bi("Employee code", "رقم الموظف"), max_length=30)
+    employment_basis = models.CharField(bi("Employment basis", "أساس التوظيف"), max_length=24)
+    jurisdiction = models.CharField(bi("Jurisdiction", "الولاية القانونية"), max_length=2)
+    valuation = models.CharField(bi("Valuation", "التقييم"), max_length=10, choices=Valuation.choices)
+    reason_en = models.TextField(bi("Reason (English)", "السبب (بالإنجليزية)"), blank=True)
+    reason_ar = models.TextField(bi("Reason (Arabic)", "السبب (بالعربية)"), blank=True)
+    balance_days = models.DecimalField(bi("Ledger balance (days)", "رصيد السجل (أيام)"), max_digits=9, decimal_places=2,
+                                       null=True, blank=True)
+    pro_rata_days = models.DecimalField(bi("Pro rata of the open month (days)", "نسبة الشهر المفتوح (أيام)"),
+                                        max_digits=9, decimal_places=2, null=True, blank=True)
+    future_leave_days = models.DecimalField(bi("Approved leave after the date (days)",
+                                               "إجازة معتمدة بعد التاريخ (أيام)"), max_digits=9, decimal_places=2,
+                                            null=True, blank=True)
+    untaken_days = models.DecimalField(bi("Untaken days", "الأيام غير المستخدمة"), max_digits=9, decimal_places=2,
+                                       null=True, blank=True)
+    daily_wage = _money("Daily wage", "الأجر اليومي", null=True, blank=True)
+    service_start = models.DateField(bi("Service start", "بداية الخدمة"), null=True, blank=True)
+    service_days = models.PositiveIntegerField(bi("Service days", "أيام الخدمة"), null=True, blank=True)
+    excluded_days = models.PositiveIntegerField(bi("Excluded (suspended) days", "الأيام المستبعدة (الموقوفة)"),
+                                                null=True, blank=True)
+    wage_basis = _money("Wage basis", "أساس الأجر", null=True, blank=True)
+    art84_full_award = _money("Art. 84 full award", "المكافأة الكاملة (المادة 84)", null=True, blank=True)
+    art85_resignation_memo = _money("Art. 85 resignation (memo)", "الاستقالة وفق المادة 85 (للعلم)", null=True,
+                                    blank=True)
+    subledger_balance_memo = _money("EOSB sub-ledger balance (memo)", "رصيد سجل المخصص (للعلم)", null=True, blank=True)
+    amount = _money("Amount", "المبلغ", default=ZERO)
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("liability report line", "بند تقرير الالتزامات")
+        verbose_name_plural = bi("liability report lines", "بنود تقارير الالتزامات")
+        ordering = ["report", "employee_code", "id"]

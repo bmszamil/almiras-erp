@@ -252,6 +252,20 @@ EG_SLICE2_ROWS = (
      "Labour Law 14/2025: no statutory end-of-service gratuity for resignation or expiry; compensation only on a "
      "termination event (research §2.1, §4 item 12) (M)"),
 )
+# Slice 3 (§11.3.4): seeded empty and unverified. The Mudad justification codes are not in the HRSD sources
+# [verify: Mudad code list]; the internal reasons (§11.6) are exported with an empty code and a warning until a person
+# fills and verifies this row. Egypt's untaken-leave valuation basis waits for the Egyptian adviser (OQ-55): while it
+# is empty or unverified the leave liability report shows Egypt's days, not valued.
+MUDAD = "https://mudad.com.sa/"
+SLICE3_SA = {
+    "wps.mudad.justification_codes": ({"codes": {}}, MUDAD,
+                                      "Internal reason to Mudad justification code (payroll §11.6) [verify: Mudad code "
+                                      "list, not in HRSD sources] | seeded empty 2026-10-20 (OQ-56)"),
+}
+SLICE3_EG = {
+    "leave.encashment_basis": ({}, EG_ANDERSEN, "Labour Law 14/2025: cash for untaken leave on exit; which wage and "
+                               "divisor [verify: Egypt adviser] (OQ-55) | seeded empty 2026-10-20"),
+}
 EG_NOTE = " | Research 2026-10-18 from search-engine extracts, not the Gazette; Egyptian adviser to confirm (OQ-28)"
 
 
@@ -271,3 +285,6 @@ def apply(StatutoryParameter):
         apply_rows(StatutoryParameter, {"jurisdiction.active": row}, jurisdiction=jurisdiction, valid_from=ACTIVE_FROM)
     for code, valid_from, value, url, ref in EG_ROWS + EG_SLICE2_ROWS:
         apply_rows(StatutoryParameter, {code: (value, url, ref + EG_NOTE)}, jurisdiction="EG", valid_from=valid_from)
+    apply_rows(StatutoryParameter, SLICE3_SA, valid_from=WPS_FROM)
+    apply_rows(StatutoryParameter, {code: (value, url, ref + EG_NOTE) for code, (value, url, ref) in SLICE3_EG.items()},
+               jurisdiction="EG", valid_from="2025-09-01")
