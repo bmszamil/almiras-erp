@@ -3291,10 +3291,36 @@ def _compute_settlement(fs, user, *, separate_amount, consent_ref):
     return out
 
 
+def _settlement_line_key(l):
+    """One computed settlement line in the ``_settlement_fingerprint`` line format."""
+    return [l.line_type, str(l.amount), l.account.code, l.component.pk if l.component else None, l.branch,
+            str(l.quantity), str(l.rate), l.source_ref, l.origin_period, l.slip_type]
+
+
+def _settlement_lines_hash(fs, out):
+    """Verification 2: the stored lines (read from the database, in creation order) and the computed lines, each in
+    the ``_settlement_fingerprint`` line format, hashed. Amounts are compared at their stored precision (2 decimals,
+    quantity 2, rate 4), so the same lines give the same hash on SQLite and PostgreSQL. Returns (stored, computed)."""
+    def norm(v, places):
+        return None if v is None else str(Decimal(v).quantize(Decimal(1).scaleb(-places)))
+
+    def key(t, amount, code, component, branch, quantity, rate, ref, origin, slip_type):
+        return [t, norm(amount, 2), code, component, branch or "", norm(quantity, 2), norm(rate, 4), ref or "",
+                origin or "", slip_type or ""]
+
+    stored = [key(r.line_type, r.amount, r.account.code, r.component_id, r.gosi_branch, r.quantity, r.rate,
+                  r.source_ref, r.origin_period, r.slip_line_type)
+              for r in FinalSettlementLine._base_manager.filter(settlement=fs).select_related("account").order_by("pk")]
+    computed = [key(l.line_type, l.amount, l.account.code, l.component.pk if l.component else None, l.branch,
+                    l.quantity, l.rate, l.source_ref[:80], l.origin_period, l.slip_type) for l in out.lines]
+
+    def h(rows):
+        return hashlib.sha256(json.dumps(rows, default=str).encode()).hexdigest()
+    return h(stored), h(computed)
+
+
 def _settlement_fingerprint(fs, out):
-    def line(l):
-        return [l.line_type, str(l.amount), l.account.code, l.component.pk if l.component else None, l.branch,
-                str(l.quantity), str(l.rate), l.source_ref, l.origin_period, l.slip_type]
+    line = _settlement_line_key
     data = [fs.settlement_input_id, out.eosb_calc_id, str(out.eosb_award), str(out.provision), [line(l) for l in out.lines],
             sorted(out.loan_effects), sorted(out.sale_effects), sorted(out.sale_outstanding), sorted(out.input_ids),
             sorted(out.notices), sorted(out.loan_outstanding)]
@@ -3410,9 +3436,12 @@ def approve_final_settlement(settlement, *, user):
     if _settlement_fingerprint(fs, out) != fs.inputs_hash:
         raise error("A source changed after the calculation: recalculate the final settlement (R8).",
                     "تغيّر مصدر بعد الاحتساب: أعد احتساب المخالصة النهائية.", code="recalculate")
-    if _settlement_stored_hash(fs) != fs.stored_hash or any(
+    stored_lines, computed_lines = _settlement_lines_hash(fs, out)
+    if _settlement_stored_hash(fs) != fs.stored_hash or stored_lines != computed_lines or any(
             getattr(fs, k) != v for k, v in _settlement_header(fs, out).items()):
-        # Review 6, re-review 3: the entry and the effects are built from the stored lines and header.
+        # Review 6, re-review 3: the entry and the effects are built from the stored lines and header; verification
+        # 2: the stored lines are also compared with the recomputed ones, so a raw edit with the stored hash recomputed
+        # is refused too.
         access_services.log_denial(actor=user, entity=fs.entity, permission="payroll.approve_final_settlement",
                                    details={"reason": "stored_settlement_changed", "settlement": fs.pk})
         raise error("The stored lines or totals of this final settlement changed after the calculation: recalculate it.",

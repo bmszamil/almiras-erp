@@ -3,18 +3,21 @@
 
 Every date is fixed (the hr clock 2027-06-01, the payroll clock 2027-03-20, conftest); nothing reads the real date."""
 import pytest
+from django.db import connection
 
+from ledger.models import Account
 from payroll import services
 from payroll.conftest import D, approved, saudi, slip
 from payroll.models import FinalSettlement, PayrollError
 from payroll.test_final_settlement import leaver, lines, settle, terminate
+
 
 def _approve(w, fs):
     return services.approve_final_settlement(fs, user=w.c)
 
 
 def _has_arabic(text):
-    return any("؀" <= ch <= "ۿ" for ch in text)
+    return any("\u0600" <= ch <= "\u06ff" for ch in text)  # the Arabic block
 
 
 def _again(w, fs):
@@ -160,3 +163,49 @@ def test_v1_a_run_calculated_with_the_employee_before_the_settlement_is_refused_
     assert exc.value.code == "recalculate"
     jan = services.calculate_run(services.return_run(jan, user=w.h, reason_ar="أعد الاحتساب"), user=w.p)
     assert not jan.payslips.filter(employee=n1).exists()
+
+
+# --- 2. stored lines compared with the recomputed ones (B3) -------------------------------------------------------
+
+def test_v2_b3_moved_line_with_the_stored_hash_recomputed_is_refused(w):
+    saudi(w)
+    n1 = leaver(w)
+    t = terminate(w, n1)
+    approved(w, "2027-03")
+    fs = services.prepare_final_settlement(FinalSettlement.objects.get(termination=t), user=w.p)
+    stored, computed = services._settlement_lines_hash(fs, services._compute_settlement(
+        fs, w.p, separate_amount=fs.separate_settlement_amount, consent_ref=fs.written_consent_ref))
+    assert stored == computed  # untouched: the same lines on SQLite and PostgreSQL
+    line = fs.lines.filter(line_type="employer_gosi").first()
+    other = Account.objects.get(entity=w.alm, code="1230")
+    with connection.cursor() as c:  # calculated: lines not locked yet in the database
+        c.execute("UPDATE payroll_finalsettlementline SET account_id=%s WHERE id=%s", [other.pk, line.pk])
+    fs = FinalSettlement.objects.get(pk=fs.pk)
+    with connection.cursor() as c:
+        c.execute("UPDATE payroll_finalsettlement SET stored_hash=%s WHERE id=%s",
+                  [services._settlement_stored_hash(fs), fs.pk])
+    fs = services.submit_final_settlement(FinalSettlement.objects.get(pk=fs.pk), user=w.p)
+    with pytest.raises(PayrollError) as exc:
+        _approve(w, fs)
+    assert exc.value.code == "payslips_changed"
+    fs = FinalSettlement.objects.get(pk=fs.pk)
+    assert fs.status == "submitted" and fs.journal_entry_id is None
+
+
+@pytest.mark.parametrize("column, value", [("amount", "1.00"), ("origin_period", "2026-12"), ("source_ref", "x"),
+                                           ("line_type", "other_earning")])
+def test_v2_any_stored_line_field_changed_with_the_hash_recomputed_is_refused(w, column, value):
+    saudi(w)
+    n1 = leaver(w)
+    t = terminate(w, n1)
+    approved(w, "2027-03")
+    fs = services.prepare_final_settlement(FinalSettlement.objects.get(termination=t), user=w.p)
+    line = fs.lines.order_by("pk").first()
+    with connection.cursor() as c:
+        c.execute(f"UPDATE payroll_finalsettlementline SET {column}=%s WHERE id=%s", [value, line.pk])
+        c.execute("UPDATE payroll_finalsettlement SET stored_hash=%s WHERE id=%s",
+                  [services._settlement_stored_hash(fs), fs.pk])
+    fs = services.submit_final_settlement(FinalSettlement.objects.get(pk=fs.pk), user=w.p)
+    with pytest.raises(PayrollError) as exc:
+        _approve(w, fs)
+    assert exc.value.code == "payslips_changed"
