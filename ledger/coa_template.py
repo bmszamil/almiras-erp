@@ -104,4 +104,6 @@ TEMPLATE = [
     ("5900", "General and administrative", "مصروفات عمومية وإدارية", X, {}),
     # PROPOSED (invoicing.md §5, E21, D18, D29): WHT the entity bears when it grosses up a payment (R63).
     ("5920", "Withholding tax borne (gross-up)", "ضريبة استقطاع محملة على الشركة", X, {}),
+    # payroll.md §5 E14 (CFO approval P19(g)): GOSI late fines only; tax penalties have their own account (P20(f)).
+    ("5930", "GOSI late-payment fines", "غرامات تأخير التأمينات", X, {}),
 ]

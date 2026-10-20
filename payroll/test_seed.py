@@ -61,7 +61,24 @@ def test_approved_payroll_accounts_in_new_charts(db):
     e = Entity.objects.create(code="NEWP", name_en="New", name_ar="جديد")
     install_chart_of_accounts(e)
     codes = set(Account.objects.filter(entity=e).values_list("code", flat=True))
-    assert {"1230", "1240", "2330", "2340", "5120"} <= codes
+    assert {"1230", "1240", "2330", "2340", "5120", "5930"} <= codes
+    fines = Account.objects.get(entity=e, code="5930")  # E14: an ordinary expense, never interest or purified (R37)
+    assert (fines.type, fines.sharia_prohibited, fines.requires_purification) == ("expense", False, False)
+    assert fines.name_ar == "غرامات تأخير التأمينات"
+
+
+def test_e14_migration_adds_5930_to_existing_charts(db):
+    import importlib
+
+    from django.apps import apps
+    from core.models import Entity
+    from ledger.services_setup import install_chart_of_accounts
+    e = Entity.objects.create(code="OLDP", name_en="Old", name_ar="قديم")
+    install_chart_of_accounts(e)
+    Account.objects.filter(entity=e, code="5930").delete()  # a chart from before the template had it
+    importlib.import_module("payroll.migrations.0012_gosi_fines_account").forwards(apps, None)
+    row = Account.objects.get(entity=e, code="5930")
+    assert row.parent.code == "5000" and row.is_postable and row.type == "expense"
     assert date  # noqa
 
 
