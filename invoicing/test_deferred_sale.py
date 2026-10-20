@@ -488,6 +488,10 @@ def test_a_profit_entry_posts_only_through_invoicing(sold):
     with pytest.raises(ValidationError):
         DeferredSale.objects.filter(pk=release.deferred_sale_id).update(cost=D("1.00"))
     with pytest.raises(ValidationError):
+        DeferredSale._base_manager.filter(pk=release.deferred_sale_id).update(cost=D("1.00"))
+    with pytest.raises(ValidationError):
+        DeferredProfitRelease._base_manager.filter(pk=release.pk).delete()
+    with pytest.raises(ValidationError):
         release.delete()
 
 

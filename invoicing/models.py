@@ -2170,6 +2170,7 @@ class DeferredSale(_DeferredSaleWritten):
                                               "يصبح غير نشط إذا رفضت الهيئة فاتورة البيع واستُبدلت بأخرى"))
 
     class Meta:
+        base_manager_name = "objects"  # like the other guarded models: _base_manager writes are refused too
         verbose_name = bi("bai' ajel sale", "بيع آجل")
         verbose_name_plural = bi("bai' ajel sales", "عمليات البيع الآجل")
         ordering = ["entity", "-created_at"]
@@ -2235,6 +2236,7 @@ class DeferredProfitRelease(_DeferredSaleWritten):
     created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
 
     class Meta:
+        base_manager_name = "objects"
         verbose_name = bi("bai' ajel profit recognition", "تحقق أرباح البيع الآجل")
         verbose_name_plural = bi("bai' ajel profit recognitions", "تحقق أرباح البيع الآجل")
         ordering = ["deferred_sale", "date", "id"]
