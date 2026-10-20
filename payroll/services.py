@@ -37,6 +37,7 @@ from hr.models import (
     EmploymentContract,
     HrSettings,
     LeaveRequest,
+    SalaryComponent,
     SickLeaveDay,
     StatutoryParameter,
     Termination,
@@ -49,15 +50,18 @@ from . import approvals, invoicing_port
 from .models import (
     DeferredSaleContract,
     DeferredSaleInstallment,
+    EmployeeCostItem,
     EmployeeLoan,
     EosbProvisionEntry,
     FinalSettlement,
     FinalSettlementLine,
     GosiAbroadPeriod,
     GosiCatchUpNotice,
+    GosiFine,
     GosiReconciliation,
     GosiVariableWageBase,
     LoanInstallment,
+    LoanWriteOff,
     MaternityGosiCase,
     MudadSubmission,
     PayrollAlert,
@@ -70,6 +74,10 @@ from .models import (
     PayrollSettings,
     Payslip,
     PayslipLine,
+    SecondmentCostLine,
+    SecondmentCostReport,
+    SettlementCorrection,
+    SettlementCorrectionLine,
     WpsFile,
     error,
 )
@@ -2715,7 +2723,10 @@ def _loan_outstanding_of(loan):
     deducted = loan.installments.filter(status__in=(LoanInstallment.Status.DEDUCTED,
                                                     LoanInstallment.Status.SETTLED_IN_FINAL)) \
         .aggregate(t=Sum("deducted_amount"))["t"] or ZERO
-    return loan.principal - deducted
+    # Slice 2 (OQ-7 default): an approved write-off removes what it wrote off.
+    written_off = loan.installments.filter(status=LoanInstallment.Status.WRITTEN_OFF).aggregate(t=Sum("amount"))["t"] \
+        or ZERO
+    return loan.principal - deducted - written_off
 
 
 def _loan_outstanding(emp):
@@ -3657,7 +3668,8 @@ def _gosi_booked(entity, period, exclude_run=None):
     if exclude_run is not None:
         qs = qs.exclude(payslip__run=exclude_run)
     runs = qs.aggregate(t=Sum("amount"))["t"] or ZERO
-    return runs + (_settlement_credits_2340(entity, period).aggregate(t=Sum("amount"))["t"] or ZERO)
+    return (runs + (_settlement_credits_2340(entity, period).aggregate(t=Sum("amount"))["t"] or ZERO)
+            + _correction_credits_2340(entity, period) + _fines_2340(entity, period))
 
 
 def _gosi_paid(entity, period):
@@ -3735,9 +3747,10 @@ def _payment_room(p, run):
                         code="settlement_status")
         paid = PayrollPayment.objects.filter(final_settlement=fs, status=PayrollPayment.Status.APPROVED) \
             .aggregate(t=Sum("amount"))["t"] or ZERO
-        if p.amount > fs.net - paid:
-            raise error(f"The payment exceeds the open net {fs.net - paid} of the final settlement (R29).",
-                        f"الدفعة تتجاوز صافي المخالصة المتبقي {fs.net - paid}.", code="overpayment")
+        due = _settlement_due(fs)  # slice 2: with its approved corrections
+        if p.amount > due - paid:
+            raise error(f"The payment exceeds the open net {due - paid} of the final settlement (R29).",
+                        f"الدفعة تتجاوز صافي المخالصة المتبقي {due - paid}.", code="overpayment")
     elif p.kind == PayrollPayment.Kind.NET_SALARIES:
         if run.status not in (RS.APPROVED, RS.PAID):
             raise error("Only an approved run is paid.", "يُدفع المسير المعتمد فقط.", code="run_status")
@@ -3798,6 +3811,8 @@ def approve_payment(payment, *, user):
                    ledger.get_rate(p.entity, p.currency_id, p.entity.base_currency_id, p.payment_date, user=user).rate)
         p.wht_amount_sar = fx.convert(p.wht_amount, fx_rate) if p.currency_id != p.entity.base_currency_id \
             else p.wht_amount
+        # Slice 2 (R43, OQ-30): the base of the WHT return row, in SAR at the same rate.
+        p.wht_base_sar = fx.convert(p.amount, fx_rate) if p.currency_id != p.entity.base_currency_id else p.amount
     p.status, p.approved_by, p.approved_at = PayrollPayment.Status.APPROVED, user, _now()
     _save(p)
     try:
@@ -3813,7 +3828,7 @@ def approve_payment(payment, *, user):
     if fs is not None:
         paid = PayrollPayment.objects.filter(final_settlement=fs, status=PayrollPayment.Status.APPROVED) \
             .aggregate(t=Sum("amount"))["t"] or ZERO
-        if paid >= fs.net and fs.status == FSS.APPROVED:
+        if paid >= _settlement_due(fs) and fs.status == FSS.APPROVED:
             fs.status = FSS.PAID
             _save(fs)
     if run is not None:
@@ -3866,9 +3881,52 @@ def _payment_lines(p):
     return lines
 
 
+def _split(total, weights):
+    """Split ``total`` (2 dp) over ``weights`` {key: Decimal}, rounded so the parts add up exactly."""
+    whole = sum(weights.values(), ZERO)
+    if not whole:
+        return {k: ZERO for k in weights}
+    parts = {k: Fraction(total) * Fraction(v) / Fraction(whole) for k, v in weights.items()}
+    return _allocate(parts)
+
+
+def _wht_return_source(entity, start, end):
+    """OQ-30 (R43; registered with ``invoicing.register_wht_return_source``): the remuneration WHT of payroll payments
+    for invoicing's monthly WHT return, in its row shape: one row per WHT category, payee (employee code only, R36)
+    and rate. A payment of a run is split over the run's remuneration payslips in its currency by their net pay (the
+    parts add up to the payment's base and WHT exactly). A payment reversed in the month shows as a negative row."""
+    rows = {}
+
+    def add(p, sign):
+        slips = {ps.employee: ps.net_txn for ps in Payslip.objects.filter(run=p.run, refused=False,
+                                                                          currency_id=p.currency_id,
+                                                                          employment_basis=Basis.REMUNERATION)
+                 .select_related("employee")}
+        base, wht = _split(p.wht_base_sar, slips), _split(p.wht_amount_sar, slips)
+        for emp in slips:
+            key = (p.wht_category.code, emp.employee_code, p.wht_category.rate)
+            r = rows.setdefault(key, {
+                "category": p.wht_category.code, "return_line_code": p.wht_category.return_line_code,
+                "vendor": emp.employee_code, "country": emp.country_of_residence or "", "rate": p.wht_category.rate,
+                "treaty_certificate": None, "treaty_country": "", "base_sar": ZERO, "wht_sar": ZERO, "gross_up": False,
+                "source": "payroll", "payee_kind": "employee"})
+            r["base_sar"] += sign * base[emp]
+            r["wht_sar"] += sign * wht[emp]
+
+    qs = PayrollPayment.objects.filter(entity=entity, wht_category__isnull=False, run__isnull=False) \
+        .select_related("wht_category", "run")
+    for p in qs.filter(status__in=(PayrollPayment.Status.APPROVED, PayrollPayment.Status.REVERSED),
+                       payment_date__range=(start, end)):
+        add(p, 1)
+    for p in qs.filter(status=PayrollPayment.Status.REVERSED, reversal_entry__date__range=(start, end)):
+        add(p, -1)
+    return list(rows.values())
+
+
 def wht_return_rows(entity, month, *, user):
-    """R43, OQ-30 seam: payroll's remuneration WHT for invoicing's monthly WHT return data (invoicing must include
-    these rows; not wired into ``invoicing.wht_return_data`` in slice 1). Employees by code only."""
+    """R43: payroll's own list of the remuneration WHT of approved payments in ``month`` (one row per payment;
+    ``payroll.view_cost_reports``). The rows that go into invoicing's monthly WHT return come from
+    :func:`_wht_return_source` (slice 2, OQ-30: wired into ``invoicing.wht_return_data``)."""
     _require(user, entity, "payroll.view_cost_reports")
     start = month.replace(day=1)
     end = date(start.year, start.month, calendar.monthrange(start.year, start.month)[1])
@@ -4204,6 +4262,20 @@ def gosi_report(entity, period, *, user):
             if not l.origin_period and l.quantity is not None and l.line_type != FSL.GOSI_UNCOLLECTED:
                 r["gosi_wage"] = max(r["gosi_wage"], l.quantity)
             r[side] += l.amount
+    start, end = _period_bounds(period)
+    for l in SCL.objects.filter(entity=entity, correction__status=SCS.APPROVED,  # slice 2: settlement corrections
+                                correction__journal_entry__date__range=(start, end),
+                                line_type__in=("employee_gosi", "employer_gosi")) \
+            .select_related("correction__employee", "account"):
+        if l.line_type == "employee_gosi" and l.account.code != GOSI_PAYABLE:
+            continue
+        side = "employer" if l.line_type == "employer_gosi" else "employee"
+        b_ = branches.setdefault(l.gosi_branch or "", {"branch": l.gosi_branch or "", "employee": ZERO, "employer": ZERO})
+        b_[side] += l.sign * l.amount
+        if detail:
+            code = l.correction.employee.employee_code
+            r = rows.setdefault(code, {"employee_code": code, "gosi_wage": ZERO, "employee": ZERO, "employer": ZERO})
+            r[side] += l.sign * l.amount
     if detail:
         access_services.log(AccessLog.Event.PERSONAL_DATA_VIEWED, actor=user, entity=entity,
                             permission="payroll.view_payslip",
@@ -4212,8 +4284,10 @@ def gosi_report(entity, period, *, user):
     ns = _period_bounds(_next_period(period))[0]
     fine = hr.param("SA", "gosi.late_fine_pct", _period_bounds(period)[1]).value
     total = sum((b_["employee"] + b_["employer"] for b_ in branches.values()), ZERO)
+    fines = _fines_2340(entity, period)
     return {"period": period, "rows": sorted(rows.values(), key=lambda r: r["employee_code"]),
             "branches": sorted(branches.values(), key=lambda b_: b_["branch"]), "total": total,
+            "fines": fines, "total_due": total + fines,
             "due_date": ns.replace(day=due_day), "open": _gosi_open(entity, period),
             "late_fine_en": f"Late payment: {fine['pct']}% of the due contribution per month or part (Law Art. 9(3)); a "
                             f"delay of up to {fine['full_waiver_max_delay_days']} days may be fully waived (Regs Art. 25); "
@@ -4369,3 +4443,913 @@ def send_alerts(*, today=None, entity=None):
             _save(f, update_fields=["nominated_for_burn_at"])
             sent += 1
     return sent
+
+
+# =====================================================================================================
+# Slice 2 (§10.8): final settlement corrections and the settlement statement (item 1)
+# =====================================================================================================
+
+SC = SettlementCorrection
+SCS = SettlementCorrection.Status
+SCL = SettlementCorrectionLine
+CORRECTION_ACCOUNTS = {"eosb": EOSB_EXPENSE, "employee_gosi": GOSI_PAYABLE, "employer_gosi": GOSI_EXPENSE}
+CORRECTION_TEXT = {
+    "salary_to_last_day": ("Salary to the last working day", "الأجر حتى آخر يوم عمل"),
+    "retro": ("Earlier months (retro)", "أشهر سابقة (بأثر رجعي)"),
+    "leave_encashment": ("Leave encashment (Art. 111)", "بدل الإجازة (المادة 111)"),
+    "eosb": ("End-of-service award", "مكافأة نهاية الخدمة"),
+    "notice_pay": ("Notice pay (Art. 76)", "بدل الإشعار (المادة 76)"),
+    "separate_settlement": ("Separate settlement (mutual agreement)", "تسوية منفصلة (اتفاق الطرفين)"),
+    "other_earning": ("Other earning", "استحقاق آخر"),
+    "other_deduction": ("Other deduction", "استقطاع آخر"),
+    "employee_gosi": ("Employee GOSI", "حصة الموظف في التأمينات"),
+    "employer_gosi": ("Employer GOSI", "حصة صاحب العمل في التأمينات"),
+}
+
+
+def _corrections_net(fs):
+    """The approved corrections' change of the net due to the employee (positive: more due)."""
+    return SC.objects.filter(settlement=fs, status=SCS.APPROVED).aggregate(t=Sum("net_change"))["t"] or ZERO
+
+
+def _settlement_due(fs):
+    """What the employee is owed by the settlement with its approved corrections."""
+    return fs.net + _corrections_net(fs)
+
+
+def _booked_by_type(fs, exclude=None):
+    """Amount booked per (line type, GOSI branch) by the settlement and its approved corrections; a decrease may
+    never take a line type below zero."""
+    out = {}
+    for l in FinalSettlementLine.objects.filter(settlement=fs):
+        key = (l.line_type, l.gosi_branch if l.line_type in ("employee_gosi", "employer_gosi") else "")
+        out[key] = out.get(key, ZERO) + l.amount
+    qs = SCL.objects.filter(correction__settlement=fs, correction__status=SCS.APPROVED)
+    if exclude is not None:
+        qs = qs.exclude(correction=exclude)
+    for l in qs:
+        key = (l.line_type, l.gosi_branch)
+        out[key] = out.get(key, ZERO) + l.sign * l.amount
+    return out
+
+
+def _correction_account(entity, line_type, component):
+    if component is not None and line_type in SCL.EARNINGS and line_type != "eosb":
+        return component.expense_account
+    return _account(entity, CORRECTION_ACCOUNTS.get(line_type, SALARIES))
+
+
+def _correction_problems(c, rows, fs):
+    """Checks of a correction's difference lines (creation and again at submission and approval)."""
+    problems = []
+    if not (c.reason_ar or "").strip():
+        problems.append("The reason in Arabic is required. / السبب بالعربية مطلوب.")
+    if not rows:
+        problems.append("A correction has at least one difference line. / يتضمن التصحيح بند فرق واحدًا على الأقل.")
+    booked = _booked_by_type(fs, exclude=c if c.pk else None)
+    delta = {}
+    for r in rows:
+        key = (r.line_type, r.gosi_branch)
+        delta[key] = delta.get(key, ZERO) + r.sign * r.amount
+        if r.account.entity_id != c.entity_id or not r.account.is_postable:
+            problems.append(f"{r.line_type}: the account is a postable account of the entity. / الحساب حساب قابل "
+                            "للترحيل من حسابات الكيان.")
+        elif r.account.sharia_prohibited and c.entity.sharia_enforced:
+            problems.append(f"{r.line_type}: account {r.account.code} is Sharia-prohibited in {c.entity.code} (R19). / "
+                            f"الحساب {r.account.code} محظور شرعًا.")
+        if r.line_type == "separate_settlement" and r.sign > 0 and (
+                fs.kind != Termination.Kind.MUTUAL_AGREEMENT or not (c.written_consent_ref or "").strip()):
+            problems.append("A separate settlement is for a mutual agreement, with the worker's written consent (R34, "
+                            "P19(i)). / التسوية المنفصلة لاتفاق الطرفين مع موافقة العامل الكتابية.")
+    for key, change in delta.items():
+        if booked.get(key, ZERO) + change < 0:
+            en, ar = CORRECTION_TEXT[key[0]]
+            problems.append(f"{en}{' ' + key[1] if key[1] else ''}: the decrease {-change} is more than the settlement "
+                            f"booked ({booked.get(key, ZERO)}). / {ar}: النقص {-change} يتجاوز ما قيدته المخالصة "
+                            f"({booked.get(key, ZERO)}).")
+    return problems
+
+
+def _correction_net(rows):
+    net = ZERO
+    for r in rows:
+        if r.line_type in SCL.EARNINGS:
+            net += r.sign * r.amount
+        elif r.line_type in SCL.DEDUCTIONS:
+            net -= r.sign * r.amount
+    return net
+
+
+def _correction_warnings(c, rows, fs):
+    out = []
+    paid = PayrollPayment.objects.filter(final_settlement=fs, status=PayrollPayment.Status.APPROVED) \
+        .aggregate(t=Sum("amount"))["t"] or ZERO
+    due = _settlement_due(fs) + _correction_net(rows)
+    if due < paid:
+        out.append(f"After this correction the employee was paid {paid - due} more than is due: recover it only with "
+                   f"the worker's written consent or a judgment (Labour Law Art. 92), outside payroll / بعد هذا التصحيح "
+                   f"دُفع للموظف {paid - due} أكثر من المستحق: لا يُسترد إلا بموافقته الكتابية أو بحكم (المادة 92)")
+    if any(r.line_type in ("employee_gosi", "employer_gosi") for r in rows):
+        out.append("GOSI shares change: update the GOSI record and the GOSI reconciliation of the month (R23) / تتغير "
+                   "حصص التأمينات: حدّث سجل التأمينات ومطابقة الشهر")
+    if any(r.line_type == "eosb" for r in rows):
+        out.append("The EOSB award changes without an hr recalculation (hr R40): keep the calculation note with the "
+                   "correction / تتغير مكافأة نهاية الخدمة دون إعادة احتساب في الموارد البشرية: احتفظ بمذكرة الاحتساب")
+    return out
+
+
+def _correction_hash(c):
+    names = [f.attname for f in SCL._meta.concrete_fields]
+    rows = [[str(r[n]) for n in names] for r in SCL._base_manager.filter(correction=c).order_by("pk").values(*names)]
+    header = SC._base_manager.filter(pk=c.pk).values("settlement_id", "employee_id", "net_change", "reason_ar",
+                                                     "written_consent_ref").first()
+    return hashlib.sha256(json.dumps([sorted((header or {}).items()), rows], default=str).encode()).hexdigest()
+
+
+@transaction.atomic
+def create_settlement_correction(settlement, *, user, reason_ar, lines, reason_en="", written_consent_ref=""):
+    """§10.8 item 1: a correction of an approved (or paid) final settlement, drafted by the payroll officer
+    (``payroll.prepare_settlement_correction``) with difference lines only: ``lines`` = [{line_type, direction
+    (increase/decrease), amount, gosi_branch (GOSI lines), component (earnings, optional), description_ar,
+    description_en}]. Nothing changes on the settlement or its entry; the correction posts its own entry at approval.
+    A decrease never takes a line type below what the settlement booked; recoveries of loans, bai' ajel and GOSI
+    shares are not corrected here."""
+    fs = FS.objects.select_related("entity", "employee").get(pk=settlement.pk)
+    _require(user, fs.entity, "payroll.prepare_settlement_correction")
+    if fs.status not in (FSS.APPROVED, FSS.PAID):
+        raise error("Only an approved final settlement is corrected; before approval recalculate it instead.",
+                    "تُصحح المخالصة المعتمدة فقط؛ وقبل الاعتماد أعد احتسابها.", code="settlement_status")
+    if SC.objects.filter(settlement=fs, status__in=(SCS.DRAFT, SCS.SUBMITTED, SCS.RETURNED)).exists():
+        raise error("Another correction of this settlement is open: approve or discard it first.",
+                    "يوجد تصحيح آخر مفتوح لهذه المخالصة: اعتمده أو ألغه أولًا.", code="correction_open")
+    c = SC(entity=fs.entity, settlement=fs, employee=fs.employee, reason_ar=reason_ar or "", reason_en=reason_en,
+           written_consent_ref=written_consent_ref or "", created_by=user)
+    rows = []
+    for spec in lines:
+        spec = dict(spec)
+        unknown = set(spec) - {"line_type", "direction", "amount", "gosi_branch", "component", "description_ar",
+                               "description_en"}
+        if unknown:
+            raise error(f"Unknown correction line fields: {sorted(unknown)}.", f"حقول غير معروفة: {sorted(unknown)}.",
+                        code="fields")
+        ltype, direction = spec.get("line_type"), spec.get("direction")
+        if ltype not in SCL.ALLOWED or direction not in SCL.Direction.values:
+            raise error(f"A correction line is one of {sorted(SCL.ALLOWED)}, increase or decrease; loan, bai' ajel and "
+                        "GOSI-share recoveries are not corrected here.",
+                        "بند التصحيح من الأنواع المسموح بها، زيادة أو نقص؛ ولا تُصحح هنا استردادات القروض والبيع الآجل.",
+                        code="correction_line_type")
+        amount = _dec(spec.get("amount"), "amount")
+        if amount <= 0 or not fx.has_places(amount, 2):
+            raise error("A difference is above zero, in SAR with at most 2 decimals (R5).",
+                        "الفرق أكبر من صفر بالريال وبخانتين عشريتين على الأكثر.", code="amount_invalid")
+        branch = spec.get("gosi_branch", "") or ""
+        if ltype in ("employee_gosi", "employer_gosi") and branch not in PayslipLine.Branch.values:
+            raise error("A GOSI difference names its branch.", "يحدد فرق التأمينات فرعه.", code="correction_branch")
+        comp = spec.get("component")
+        if comp is not None and not hasattr(comp, "pk"):
+            comp = SalaryComponent.objects.filter(entity=fs.entity, code=comp).first()
+            if comp is None:
+                raise error("Unknown component.", "مكوّن غير معروف.", code="component")
+        if comp is not None and (comp.entity_id != fs.entity_id or ltype not in SCL.EARNINGS):
+            raise error("A component of the entity is named on earnings lines only.",
+                        "يُذكر مكوّن الكيان على بنود الاستحقاقات فقط.", code="component")
+        en, ar = CORRECTION_TEXT[ltype]
+        rows.append(SCL(entity=fs.entity, line_type=ltype, direction=direction, amount=amount, gosi_branch=branch,
+                        component=comp, account=_correction_account(fs.entity, ltype, comp),
+                        description_en=(spec.get("description_en") or f"Correction: {en} ({direction})")[:300],
+                        description_ar=(spec.get("description_ar") or f"تصحيح: {ar}")[:300]))
+    problems = _correction_problems(c, rows, fs)
+    if problems:
+        raise _problems(problems, "correction_invalid")
+    if not _correction_entry_amounts(fs.entity, rows):
+        raise error("The difference lines book nothing (they cancel out on the same accounts).",
+                    "بنود الفرق لا تقيد شيئًا (تتقابل على الحسابات نفسها).", code="correction_empty")
+    c.net_change = _correction_net(rows)
+    c.warnings = _correction_warnings(c, rows, fs)
+    _save(c)
+    for r in rows:
+        r.correction = c
+        _save(r)
+    c.stored_hash = _correction_hash(c)
+    return _save(c)
+
+
+def _correction_rows(c):
+    return list(SCL._base_manager.filter(correction=c).select_related("account", "component").order_by("pk"))
+
+
+@transaction.atomic
+def submit_settlement_correction(correction, *, user):
+    c = _lock(SC, correction.pk)
+    _require(user, c.entity, "payroll.prepare_settlement_correction")
+    if c.status not in (SCS.DRAFT, SCS.RETURNED):
+        raise error("Only a draft or returned correction is submitted.", "يُقدَّم التصحيح المسودة أو المعاد فقط.",
+                    code="correction_status")
+    fs = FS.objects.get(pk=c.settlement_id)
+    problems = _correction_problems(c, _correction_rows(c), fs)
+    if problems:
+        raise _problems(problems, "correction_invalid")
+    c.status, c.submitted_by, c.submitted_at, c.modified_by, c.modified_at = SCS.SUBMITTED, user, _now(), user, _now()
+    return _save(c)
+
+
+@transaction.atomic
+def return_settlement_correction(correction, *, user, reason_ar):
+    c = _lock(SC, correction.pk)
+    grant = _require(user, c.entity, "payroll.approve_settlement_correction", document=c)
+    approvals.check(grant, c.entity, "payroll.settlement_correction")
+    if c.status != SCS.SUBMITTED or not (reason_ar or "").strip():
+        raise error("Only a submitted correction is returned, with a reason in Arabic.",
+                    "يُعاد التصحيح المقدّم فقط مع سبب بالعربية.", code="correction_status")
+    c.status, c.returned_reason_ar = SCS.RETURNED, reason_ar
+    return _save(c)
+
+
+@transaction.atomic
+def discard_settlement_correction(correction, *, user):
+    c = _lock(SC, correction.pk)
+    _require(user, c.entity, "payroll.prepare_settlement_correction")
+    if c.status not in (SCS.DRAFT, SCS.RETURNED):
+        raise error("Only a draft or returned correction is discarded.", "يُلغى التصحيح المسودة أو المعاد فقط.",
+                    code="correction_status")
+    c.status, c.modified_by, c.modified_at = SCS.DISCARDED, user, _now()
+    return _save(c)
+
+
+@transaction.atomic
+def approve_settlement_correction(correction, *, user):
+    """§10.8 item 1: a second person approves (``payroll.approve_settlement_correction``, A, P; never the preparer,
+    submitter or the employee; matrix row ``payroll.settlement_correction``). The stored lines are checked against the
+    hash taken when they were written and the limits checked again; approval posts the correction's own entry, dated
+    the approval day, through the registry: earnings Dr their accounts (an increase) or Cr (a decrease), EOSB on 5120
+    (the provision was used up by the settlement), deductions the other way, employer GOSI Dr 5110 / Cr 2340, the
+    change of the net on 2330. The final settlement and its entry are not touched (CLAUDE.md rule 1)."""
+    c = SC.objects.select_related("entity").get(pk=correction.pk)
+    grant = _require(user, c.entity, "payroll.approve_settlement_correction", document=c)
+    approvals.check(grant, c.entity, "payroll.settlement_correction")
+    emp = Employee.objects.get(pk=c.employee_id)
+    if user.pk in {c.created_by_id, c.submitted_by_id, c.modified_by_id} or (emp.user_id and emp.user_id == user.pk):
+        access.deny(user, c.entity, "payroll.approve_settlement_correction", "self_approval")
+    _entity_lock(c.entity)
+    fs = _lock(FS, c.settlement_id)
+    c = _lock(SC, c.pk)
+    if c.status != SCS.SUBMITTED:
+        raise error("Only a submitted correction is approved.", "يُعتمد التصحيح المقدّم فقط.", code="correction_status")
+    rows = _correction_rows(c)
+    if _correction_hash(c) != c.stored_hash or _correction_net(rows) != c.net_change:
+        access_services.log_denial(actor=user, entity=c.entity, permission="payroll.approve_settlement_correction",
+                                   details={"reason": "stored_correction_changed", "correction": c.pk})
+        raise error("The stored lines of this correction changed after they were entered: discard it and enter it "
+                    "again.", "تغيّرت بنود هذا التصحيح المخزنة بعد إدخالها: ألغه وأدخله مجددًا.", code="payslips_changed")
+    problems = _correction_problems(c, rows, fs)
+    if problems:
+        raise _problems(problems, "correction_invalid")
+    c.warnings = _correction_warnings(c, rows, fs)
+    c.number = _next_number(c.entity, "FSC", _today().year)
+    c.status, c.approved_by, c.approved_at = SCS.APPROVED, user, _now()
+    _save(c)
+    try:
+        with _marker(_posting, c):
+            entry = ledger.create_entry(c.entity, _today(), f"Final settlement correction {c.number} / تصحيح مخالصة "
+                                        f"نهائية {c.number}", None, user=user, reference=c.number, post=True,
+                                        grant=grant, document=c)
+    except LedgerError as exc:
+        raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
+    c.journal_entry = entry
+    _save(c)
+    access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=c.entity,
+                        permission="payroll.approve_settlement_correction",
+                        details={"action": "settlement_correction_approved", "correction": c.pk, "settlement": fs.pk,
+                                 "net_change": str(c.net_change), "message_en": "Final settlement correction approved",
+                                 "message_ar": "اعتُمد تصحيح المخالصة النهائية"})
+    return c
+
+
+def _correction_entry_amounts(entity, rows):
+    """{account pk: [account, signed amount]} of a correction (debit positive)."""
+    sums = {}
+
+    def add(acc, amount):
+        sums.setdefault(acc.pk, [acc, ZERO])[1] += amount
+
+    net = ZERO
+    for r in rows:
+        signed = r.sign * r.amount
+        if r.line_type in SCL.EARNINGS:
+            add(r.account, signed)
+            net += signed
+        elif r.line_type in SCL.DEDUCTIONS:
+            add(r.account, -signed)
+            net -= signed
+        else:  # employer GOSI
+            add(r.account, signed)
+            add(_account(entity, GOSI_PAYABLE), -signed)
+    add(_account(entity, SALARIES_PAYABLE), -net)
+    return {k: v for k, v in sums.items() if v[1]}
+
+
+def _correction_lines(c):
+    """Registered ``build_lines`` for SettlementCorrection: the difference lines summarised per account (R36: the
+    number only in descriptions)."""
+    _require_posting(c)
+    label = f"{c.number}"
+    out = []
+    for acc, amount in _correction_entry_amounts(c.entity, _correction_rows(c)).values():
+        out.append({"account": acc, "debit" if amount > 0 else "credit": abs(amount), "description": label})
+    return out
+
+
+def _correction_credits_2340(entity, period):
+    """Signed 2340 credits of approved corrections whose entry is dated in ``period`` (GOSI tie-outs, R23, R29)."""
+    start, end = _period_bounds(period)
+    total = ZERO
+    for l in SCL.objects.filter(entity=entity, correction__status=SCS.APPROVED,
+                                correction__journal_entry__date__range=(start, end),
+                                line_type__in=("employee_gosi", "employer_gosi")):
+        if l.line_type == "employer_gosi" or l.account.code == GOSI_PAYABLE:
+            total += l.sign * l.amount
+    return total
+
+
+def settlement_statement_data(settlement, *, user):
+    """§10.8 item 1: the printable bilingual statement of a final settlement (Arabic first, "the Arabic text
+    prevails"): header, every line as stored, the approved corrections with their difference lines, payments and the
+    balance still due. Individual pay: ``payroll.view_payslip``; each view is logged (PDPL)."""
+    fs = FS.objects.select_related("entity", "employee", "termination").get(pk=settlement.pk)
+    _require(user, fs.entity, "payroll.view_payslip")
+    if fs.status in (FSS.DRAFT, FSS.DISCARDED):
+        raise error("A statement is printed from a calculated or approved final settlement.",
+                    "يُطبع البيان من مخالصة محتسبة أو معتمدة.", code="settlement_status")
+    emp = Employee.objects.get(pk=fs.employee_id)
+    access_services.log(AccessLog.Event.PERSONAL_DATA_VIEWED, actor=user, entity=fs.entity,
+                        permission="payroll.view_payslip",
+                        details={"action": "settlement_statement_viewed", "settlement": fs.pk,
+                                 "employee_code": emp.employee_code})
+    lines = list(fs.lines.order_by("pk"))
+    corrections = [{"correction": c, "lines": list(c.lines.order_by("pk"))}
+                   for c in SC.objects.filter(settlement=fs, status=SCS.APPROVED).order_by("approved_at", "pk")]
+    payments = list(PayrollPayment.objects.filter(final_settlement=fs, status=PayrollPayment.Status.APPROVED)
+                    .order_by("payment_date", "pk"))
+    paid = sum((p.amount for p in payments), ZERO)
+    due = _settlement_due(fs)
+    term = fs.termination
+    return {
+        "settlement": fs, "final": fs.status in (FSS.APPROVED, FSS.PAID),
+        "entity_en": fs.entity.legal_name_en or fs.entity.name_en, "entity_ar": fs.entity.legal_name_ar or fs.entity.name_ar,
+        "employee_code": emp.employee_code, "name_en": emp.full_name_en, "name_ar": emp.full_name_ar,
+        "kind_en": term.get_kind_display(), "kind": fs.kind,
+        "earnings": [l for l in lines if l.line_type in FinalSettlementLine.EARNINGS],
+        "reductions": [l for l in lines if l.line_type in FinalSettlementLine.REDUCTIONS],
+        "deductions": [l for l in lines if l.line_type in FinalSettlementLine.DEDUCTIONS],
+        "employer": [l for l in lines if l.line_type in FinalSettlementLine.EMPLOYER],
+        "corrections": corrections, "payments": payments, "paid": paid, "due": due, "balance": due - paid,
+        "interest_free": any(l.line_type == FSL.LOAN_RECOVERY for l in lines),
+    }
+
+
+def render_settlement_statement(settlement, *, user):
+    """Bilingual HTML statement (both languages on one page, print-ready)."""
+    return render_to_string("payroll/settlement_statement.html", settlement_statement_data(settlement, user=user))
+
+
+# =====================================================================================================
+# Slice 2 (§10.8 item 2): loan write-off on exit (OQ-7 default)
+# =====================================================================================================
+
+WO = LoanWriteOff
+WOS = LoanWriteOff.Status
+
+
+def _write_off_account(entity, account):
+    s = _settings_of(entity)
+    acc = account if isinstance(account, Account) else (_account(entity, account) if account else
+                                                        (s.loan_write_off_account or _account(entity, SALARIES)))
+    if acc.entity_id != entity.pk or acc.type != "expense" or not acc.is_postable:
+        raise error("The write-off is charged to a postable expense account of the entity (OQ-7).",
+                    "يُحمّل الشطب على حساب مصروف قابل للترحيل من حسابات الكيان.", code="write_off_account")
+    if acc.sharia_prohibited and entity.sharia_enforced:
+        raise error(f"Account {acc.code} is Sharia-prohibited in {entity.code} (R37).",
+                    f"الحساب {acc.code} محظور شرعًا في {entity.code}.", code="write_off_account")
+    return acc
+
+
+def _write_off_amount(loan):
+    """What the final dues did not cover: the loan's installments outstanding after exit (re-review 8)."""
+    rows = loan.installments.filter(status=LoanInstallment.Status.OUTSTANDING_AFTER_EXIT)
+    planned = loan.installments.filter(status__in=(LoanInstallment.Status.PLANNED, LoanInstallment.Status.PROPOSED))
+    return _round(rows.aggregate(t=Sum("amount"))["t"] or ZERO), planned.exists()
+
+
+@transaction.atomic
+def prepare_loan_write_off(loan, *, user, reason_ar, reason_en="", expense_account=None):
+    """§10.8 item 2 (OQ-7 default): after the leaver's final settlement is approved, the part of an interest-free loan
+    the final dues did not cover (installments ``outstanding_after_exit``) may be written off. The payroll officer
+    drafts it (``payroll.prepare_loan_write_off``) with the reason; the expense account is the settings' write-off
+    account (default 5100, CFO to confirm). Nothing posts until approval."""
+    loan = EmployeeLoan.objects.select_related("entity", "employee").get(pk=loan.pk)
+    _require(user, loan.entity, "payroll.prepare_loan_write_off")
+    if not (reason_ar or "").strip():
+        raise error("The reason in Arabic is required.", "السبب بالعربية مطلوب.", code="reason_required")
+    if loan.status != EmployeeLoan.Status.ACTIVE:
+        raise error("Only an active loan with a balance outstanding after exit is written off.",
+                    "يُشطب القرض النشط ذو الرصيد القائم بعد انتهاء الخدمة فقط.", code="loan_status")
+    if not FS.objects.filter(employee=loan.employee, status__in=SETTLED).exists():
+        raise error("A loan is written off only after the employee's final settlement is approved: the final dues are "
+                    "used first (R28, P17).", "لا يُشطب القرض إلا بعد اعتماد المخالصة النهائية للموظف: تُستخدم "
+                    "المستحقات النهائية أولًا.", code="write_off_before_settlement")
+    amount, planned = _write_off_amount(loan)
+    if planned or amount <= 0 or amount != _round(_loan_outstanding_of(loan)):
+        raise error("Only the balance left outstanding after exit is written off (nothing planned may remain).",
+                    "يُشطب الرصيد القائم بعد انتهاء الخدمة فقط (دون أقساط مخططة متبقية).", code="write_off_amount")
+    acc = _write_off_account(loan.entity, expense_account)
+    try:
+        with transaction.atomic():
+            return _save(WO(entity=loan.entity, loan=loan, employee=loan.employee, amount=amount, expense_account=acc,
+                            reason_ar=reason_ar, reason_en=reason_en, created_by=user))
+    except IntegrityError:
+        raise error("A write-off of this loan is already open or approved.", "يوجد شطب مفتوح أو معتمد لهذا القرض.",
+                    code="write_off_exists") from None
+
+
+@transaction.atomic
+def submit_loan_write_off(write_off, *, user):
+    w = _lock(WO, write_off.pk)
+    _require(user, w.entity, "payroll.prepare_loan_write_off")
+    if w.status != WOS.DRAFT:
+        raise error("Only a draft write-off is submitted.", "يُقدّم الشطب المسودة فقط.", code="write_off_status")
+    w.status, w.submitted_by, w.submitted_at, w.modified_by, w.modified_at = WOS.SUBMITTED, user, _now(), user, _now()
+    return _save(w)
+
+
+@transaction.atomic
+def reject_loan_write_off(write_off, *, user, reason_ar):
+    w = _lock(WO, write_off.pk)
+    grant = _require(user, w.entity, "payroll.approve_loan_write_off", document=w)
+    approvals.check(grant, w.entity, "payroll.loan_write_off")
+    if w.status not in (WOS.DRAFT, WOS.SUBMITTED) or not (reason_ar or "").strip():
+        raise error("An open write-off is rejected with a reason in Arabic.", "يُرفض الشطب المفتوح مع سبب بالعربية.",
+                    code="write_off_status")
+    w.status, w.rejected_reason_ar = WOS.REJECTED, reason_ar
+    return _save(w)
+
+
+@transaction.atomic
+def approve_loan_write_off(write_off, *, user):
+    """§10.8 item 2: the matrix approver (``payroll.approve_loan_write_off``, A, P: the Managing Partner in Almiras,
+    the entity's CEO elsewhere, ``payroll.approvals``; never the preparer, submitter or the employee) approves; the
+    amount is checked again against what is outstanding after exit; approval posts Dr expense / Cr 1230 through the
+    registry, dated the approval day, marks the installments written off and the loan ``written_off``, and logs it."""
+    w = WO.objects.select_related("entity", "loan").get(pk=write_off.pk)
+    grant = _require(user, w.entity, "payroll.approve_loan_write_off", document=w)
+    approvals.check(grant, w.entity, "payroll.loan_write_off")
+    emp = Employee.objects.get(pk=w.employee_id)
+    if user.pk in {w.created_by_id, w.submitted_by_id, w.modified_by_id} or (emp.user_id and emp.user_id == user.pk):
+        access.deny(user, w.entity, "payroll.approve_loan_write_off", "self_approval")
+    _entity_lock(w.entity)
+    loan = _lock(EmployeeLoan, w.loan_id)
+    w = _lock(WO, w.pk)
+    if w.status != WOS.SUBMITTED:
+        raise error("Only a submitted write-off is approved.", "يُعتمد الشطب المقدّم فقط.", code="write_off_status")
+    amount, planned = _write_off_amount(loan)
+    if planned or amount != w.amount or loan.status != EmployeeLoan.Status.ACTIVE:
+        raise error("The loan's balance outstanding after exit changed: reject this write-off and prepare a new one.",
+                    "تغيّر رصيد القرض القائم بعد انتهاء الخدمة: ارفض هذا الشطب وأعدّ شطبًا جديدًا.",
+                    code="write_off_amount")
+    _write_off_account(w.entity, w.expense_account)
+    w.number = _next_number(w.entity, "LWO", _today().year)
+    w.status, w.approved_by, w.approved_at = WOS.APPROVED, user, _now()
+    _save(w)
+    try:
+        with _marker(_posting, w):
+            entry = ledger.create_entry(w.entity, _today(), f"Loan write-off {w.number} / شطب قرض {w.number}", None,
+                                        user=user, reference=w.number, post=True, grant=grant, document=w)
+    except LedgerError as exc:
+        raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
+    w.journal_entry = entry
+    _save(w)
+    for inst in LoanInstallment._base_manager.select_for_update().filter(
+            loan=loan, status=LoanInstallment.Status.OUTSTANDING_AFTER_EXIT).order_by("pk"):
+        inst.status = LoanInstallment.Status.WRITTEN_OFF
+        _save(inst)
+    loan.status = EmployeeLoan.Status.WRITTEN_OFF
+    _save(loan)
+    access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=w.entity,
+                        permission="payroll.approve_loan_write_off",
+                        details={"action": "loan_written_off", "write_off": w.pk, "loan": loan.pk,
+                                 "employee_code": emp.employee_code, "amount": str(w.amount),
+                                 "account": w.expense_account.code, "message_en": "Interest-free loan written off on exit",
+                                 "message_ar": "شُطب قرض حسن عند انتهاء الخدمة"})
+    return w
+
+
+def _write_off_lines(w):
+    """Registered ``build_lines`` for LoanWriteOff: Dr expense / Cr 1230 (no interest or fee, R26)."""
+    _require_posting(w)
+    label = f"{w.number} (interest-free / قرض حسن)"
+    return [{"account": w.expense_account, "debit": w.amount, "description": label},
+            {"account": _account(w.entity, LOANS), "credit": w.amount, "description": label}]
+
+
+# =====================================================================================================
+# Slice 2 (§10.8 item 4): GOSI late-payment fines (E14) and payment reversals
+# =====================================================================================================
+
+GOSI_FINES = "5930"
+GF = GosiFine
+GFS = GosiFine.Status
+
+
+def _fines_2340(entity, period):
+    """Approved GOSI fines of a contribution period (Cr 2340): paid to GOSI with that period's contributions."""
+    return GF.objects.filter(entity=entity, period=period, status=GFS.APPROVED).aggregate(t=Sum("amount"))["t"] or ZERO
+
+
+def gosi_fine_estimate(entity, period, paid_on):
+    """R37 (Law Art. 9(3); Regs Art. 24, 25): 2% of the contributions due for each month of delay or part of a month,
+    counted from the day after the due day (the 15th of the following month). An estimate shown next to GOSI's
+    figure; GOSI's invoice governs and the ERP never posts a fine by itself. Returns (estimate, months late)."""
+    _check_period(period)
+    end = _period_bounds(period)[1]
+    due_day = int(hr.param("SA", "gosi.payment_due_day", end).value["new_m273"])
+    due = _period_bounds(_next_period(period))[0].replace(day=due_day)
+    if paid_on <= due:
+        return ZERO, 0
+    months, cursor = 0, due
+    while cursor < paid_on:
+        months += 1
+        y, m = (cursor.year + (cursor.month // 12), cursor.month % 12 + 1)
+        cursor = cursor.replace(year=y, month=m, day=min(due_day, calendar.monthrange(y, m)[1]))
+    pct = Fraction(hr.param("SA", "gosi.late_fine_pct", end).value["pct"])
+    base = _gosi_booked(entity, period) - _fines_2340(entity, period)
+    return _round(Fraction(base) * pct / 100 * months), months
+
+
+@transaction.atomic
+def record_gosi_fine(entity, *, user, period, amount, fine_date, gosi_invoice_ref, paid_on=None, note_ar="",
+                     note_en=""):
+    """E14 (R37): the payroll officer records the late-payment fine from GOSI's invoice (``payroll.record_gosi_fine``)
+    with GOSI's reference; the ERP estimate (2% a month or part, ``paid_on``: the day the contributions were paid,
+    default the fine date) is stored next to it and a difference is a warning only. Posts nothing until approval."""
+    _require(user, entity, "payroll.record_gosi_fine")
+    _check_period(period)
+    amount = _dec(amount, "amount")
+    if amount <= 0 or not fx.has_places(amount, 2) or not (gosi_invoice_ref or "").strip() or fine_date is None:
+        raise error("A GOSI fine needs the amount (SAR, 2 decimals), its date and GOSI's invoice reference (E14).",
+                    "تحتاج غرامة التأمينات إلى المبلغ وتاريخها ومرجع فاتورة التأمينات.", code="fine_invalid")
+    _account(entity, GOSI_FINES)
+    estimate, months = gosi_fine_estimate(entity, period, paid_on or fine_date)
+    if estimate != amount:
+        note_en = (note_en + " " if note_en else "") + (f"ERP estimate {estimate} ({months} month(s) at 2%); GOSI's "
+                                                         "figure governs (Regs Art. 25 waivers).")
+        note_ar = (note_ar + " " if note_ar else "") + f"تقدير النظام {estimate} ({months} شهر بنسبة 2%)؛ والمعتمد رقم التأمينات."
+    return _save(GF(entity=entity, period=period, fine_date=fine_date, amount=amount, estimate=estimate,
+                    gosi_invoice_ref=gosi_invoice_ref, note_ar=note_ar, note_en=note_en, created_by=user))
+
+
+@transaction.atomic
+def submit_gosi_fine(fine, *, user):
+    f = _lock(GF, fine.pk)
+    _require(user, f.entity, "payroll.record_gosi_fine")
+    if f.status != GFS.DRAFT:
+        raise error("Only a draft fine is submitted.", "تُقدّم الغرامة المسودة فقط.", code="fine_status")
+    f.status, f.submitted_by, f.modified_by, f.modified_at = GFS.SUBMITTED, user, user, _now()
+    return _save(f)
+
+
+@transaction.atomic
+def approve_gosi_fine(fine, *, user):
+    """E14: the approver (``payroll.approve_gosi_fine``, A, P; never the recorder) posts Dr 5930 GOSI late-payment
+    fines / Cr 2340 GOSI payable, dated the fine date (or the first day of the next open period). 5930 is never an
+    interest account and carries no purification flag (R37); tax penalties never go there (P20(f))."""
+    f = GF.objects.select_related("entity").get(pk=fine.pk)
+    grant = _require(user, f.entity, "payroll.approve_gosi_fine", document=f)
+    approvals.check(grant, f.entity, "payroll.gosi_fine")
+    if user.pk in {f.created_by_id, f.submitted_by_id, f.modified_by_id}:
+        access.deny(user, f.entity, "payroll.approve_gosi_fine", "self_approval")
+    _entity_lock(f.entity)
+    f = _lock(GF, f.pk)
+    if f.status != GFS.SUBMITTED:
+        raise error("Only a submitted fine is approved.", "تُعتمد الغرامة المقدّمة فقط.", code="fine_status")
+    acc = _account(f.entity, GOSI_FINES)
+    if acc.sharia_prohibited or acc.type != "expense" or getattr(acc, "requires_purification", False):
+        raise error("Account 5930 must be a plain expense account (no interest, no purification; R37).",
+                    "يجب أن يكون الحساب 5930 حساب مصروف عاديًا (لا فوائد ولا تطهير).", code="fine_account")
+    on = _open_posting_date(f.entity, f.fine_date)
+    f.number = _next_number(f.entity, "GFN", on.year)
+    f.status, f.approved_by, f.approved_at = GFS.APPROVED, user, _now()
+    _save(f)
+    try:
+        with _marker(_posting, f):
+            entry = ledger.create_entry(f.entity, on, f"GOSI late-payment fine {f.number} {f.period} / غرامة تأخير "
+                                        f"التأمينات {f.number}", None, user=user, reference=f.gosi_invoice_ref[:60],
+                                        post=True, grant=grant, document=f)
+    except LedgerError as exc:
+        raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
+    f.journal_entry = entry
+    return _save(f)
+
+
+def _fine_lines(f):
+    """Registered ``build_lines`` for GosiFine: E14, Dr 5930 / Cr 2340."""
+    _require_posting(f)
+    label = f"{f.number} {f.period}"
+    return [{"account": _account(f.entity, GOSI_FINES), "debit": f.amount, "description": label},
+            {"account": _account(f.entity, GOSI_PAYABLE), "credit": f.amount, "description": label}]
+
+
+@transaction.atomic
+def reverse_payment(payment, *, user, reason, date=None):
+    """§10.8 item 4: an approved payroll payment (salaries, GOSI or final settlement) that the bank did not execute,
+    or that went out wrong, is reversed with ``ledger.reverse_entry`` (``payroll.reverse_payment``, P; never its
+    recorder or approver), dated in an open period; the payment becomes ``reversed`` and is never edited; a paid run
+    or final settlement goes back to ``approved`` so the net is open again; the WHT of a remuneration payment shows
+    as a negative row in the WHT return of the reversal month."""
+    p = PayrollPayment.objects.select_related("entity", "journal_entry").get(pk=payment.pk)
+    grant = _require(user, p.entity, "payroll.reverse_payment", document=p)
+    approvals.check(grant, p.entity, "payroll.payment_reversal")
+    if user.pk in {p.created_by_id, p.submitted_by_id, p.approved_by_id}:
+        access.deny(user, p.entity, "payroll.reverse_payment", "self_approval")
+    if not (reason or "").strip():
+        raise error("A reason is required.", "السبب مطلوب.", code="reason_required")
+    _entity_lock(p.entity)
+    run = _lock(PayrollRun, p.run_id) if p.run_id else None
+    fs = _lock(FinalSettlement, p.final_settlement_id) if p.final_settlement_id else None
+    p = _lock(PayrollPayment, p.pk)
+    if p.status != PayrollPayment.Status.APPROVED or p.journal_entry_id is None:
+        raise error("Only an approved payment is reversed.", "تُعكس الدفعة المعتمدة فقط.", code="payment_status")
+    on = _reversal_date(p.entity, p.payment_date, date)
+    try:
+        with _marker(_reversing, p):
+            reversal = ledger.reverse_entry(p.journal_entry, grant, date=on, reason=reason.strip())
+    except LedgerError as exc:
+        raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "reversal_refused") from None
+    p.status, p.reversal_entry, p.reversed_by, p.reversed_at = PayrollPayment.Status.REVERSED, reversal, user, _now()
+    p.reversal_reason = reason.strip()
+    _save(p)
+    if run is not None and run.status == RS.PAID:
+        run.status = RS.APPROVED
+        _save(run)
+    if fs is not None and fs.status == FSS.PAID:
+        fs.status = FSS.APPROVED
+        _save(fs)
+    return p
+
+
+# =====================================================================================================
+# Slice 2 (§10.8 item 3): employee cost items (R63) and the fully loaded secondment cost report (R35; billing R71)
+# =====================================================================================================
+
+CI = EmployeeCostItem
+CIS = EmployeeCostItem.Status
+CR = SecondmentCostReport
+CRS = SecondmentCostReport.Status
+VAT_INPUT = "1310"
+
+
+def _source_of(entity, source_bill, source_entry):
+    """The posted source document of a cost item (R63) and the cost it booked: its journal entry's debits other
+    than recoverable input VAT (1310). Returns (entry, cost, month)."""
+    if (source_bill is None) == (source_entry is None):
+        raise error("A cost item references exactly one source document: a posted vendor bill or a posted journal "
+                    "entry of the same entity (R63).", "يشير بند التكلفة إلى مستند مصدر واحد: فاتورة مورد مرحّلة أو "
+                    "قيد مرحّل للكيان نفسه.", code="cost_item_source")
+    if source_bill is not None:
+        if (source_bill.entity_id != entity.pk or source_bill.doc_type != "bill" or source_bill.status != "posted"
+                or source_bill.journal_entry_id is None):
+            raise error("The source bill must be a posted vendor bill of the same entity (R63).",
+                        "يجب أن تكون فاتورة المصدر فاتورة مورد مرحّلة للكيان نفسه.", code="cost_item_source")
+        entry = source_bill.journal_entry
+    else:
+        entry = source_entry
+        if entry.entity_id != entity.pk or entry.status != "posted":
+            raise error("The source journal entry must be a posted entry of the same entity (R63).",
+                        "يجب أن يكون قيد المصدر قيدًا مرحّلًا للكيان نفسه.", code="cost_item_source")
+    cost = JournalLine.objects.filter(entry=entry).exclude(account__code=VAT_INPUT).aggregate(t=Sum("debit"))["t"] \
+        or ZERO
+    return entry, _round(cost), _period_of(entry.date)
+
+
+@transaction.atomic
+def create_cost_item(employee, *, user, kind, amount, description_ar, source_bill=None, source_entry=None,
+                     description_en="", month=None):
+    """R63: a cost paid outside payroll that belongs to one employee (``payroll.manage_cost_items``). It references
+    its posted source document (vendor bill or journal entry) of the same entity; its month is the source's
+    accounting month (default, billing OQ-37); the items on one source never exceed the cost it booked. Posts
+    nothing."""
+    emp = Employee.objects.select_related("entity").get(pk=employee.pk)
+    _require(user, emp.entity, "payroll.manage_cost_items")
+    if kind not in CI.Kind.values or not (description_ar or "").strip():
+        raise error("A cost item needs its kind and a description in Arabic (R63).",
+                    "يحتاج بند التكلفة إلى نوعه ووصف بالعربية.", code="cost_item_invalid")
+    amount = _dec(amount, "amount")
+    if amount <= 0 or not fx.has_places(amount, 2):
+        raise error("The amount is above zero, in the functional currency with 2 decimals (R5).",
+                    "المبلغ أكبر من صفر بالعملة الوظيفية وبخانتين عشريتين.", code="amount_invalid")
+    entry, cost, source_month = _source_of(emp.entity, source_bill, source_entry)
+    if month is not None and month != source_month:
+        raise error(f"A cost item belongs to its source's accounting month {source_month} (R63, billing OQ-37).",
+                    f"ينتمي بند التكلفة إلى شهر قيد مصدره {source_month}.", code="cost_item_month")
+    used = CI.objects.filter(entity=emp.entity, status__in=(CIS.DRAFT, CIS.APPROVED)).filter(
+        Q(source_bill__journal_entry=entry) | Q(source_entry=entry)).aggregate(t=Sum("amount"))["t"] or ZERO
+    if used + amount > cost:
+        raise error(f"The cost items on this source ({used + amount}) would exceed the cost it booked ({cost}).",
+                    f"بنود التكلفة على هذا المصدر ({used + amount}) تتجاوز التكلفة المقيدة فيه ({cost}).",
+                    code="cost_item_exceeds_source")
+    return _save(CI(entity=emp.entity, employee=emp, month=source_month, kind=kind, amount=amount,
+                    description_ar=description_ar, description_en=description_en, source_bill=source_bill,
+                    source_entry=source_entry if source_bill is None else None, created_by=user))
+
+
+@transaction.atomic
+def approve_cost_item(item, *, user):
+    """R63: the approver (``payroll.approve_cost_item``, A: never its creator) approves; nothing is posted."""
+    i = CI.objects.select_related("entity").get(pk=item.pk)
+    grant = _require(user, i.entity, "payroll.approve_cost_item", document=i)
+    approvals.check(grant, i.entity, "payroll.cost_item")
+    i = _lock(CI, i.pk)
+    if i.status != CIS.DRAFT:
+        raise error("Only a draft cost item is approved.", "يُعتمد بند التكلفة المسودة فقط.", code="cost_item_status")
+    i.status, i.approved_by, i.approved_at = CIS.APPROVED, user, _now()
+    return _save(i)
+
+
+@transaction.atomic
+def reject_cost_item(item, *, user):
+    i = CI.objects.select_related("entity").get(pk=item.pk)
+    grant = _require(user, i.entity, "payroll.approve_cost_item", document=i)
+    approvals.check(grant, i.entity, "payroll.cost_item")
+    i = _lock(CI, i.pk)
+    if i.status != CIS.DRAFT:
+        raise error("Only a draft cost item is rejected.", "يُرفض بند التكلفة المسودة فقط.", code="cost_item_status")
+    i.status, i.modified_by, i.modified_at = CIS.REJECTED, user, _now()
+    return _save(i)
+
+
+def _secondments(entity, period):
+    start, end = _period_bounds(period)
+    for a in Assignment.objects.filter(entity=entity, kind=Assignment.Kind.SECONDMENT, start_date__lte=end) \
+            .exclude(status__in=(Assignment.Status.DRAFT, Assignment.Status.SUBMITTED, Assignment.Status.CANCELLED)) \
+            .select_related("employee", "receiving_entity").order_by("employee__employee_code", "pk"):
+        if a.end_date and a.end_date < start:
+            continue
+        yield a, (min(a.end_date or end, end) - max(a.start_date, start)).days + 1, (end - start).days + 1
+
+
+def _cost_lines(entity, period):
+    """R35 as amended (P19(c)): per secondment, the month's fully loaded cost for the days on secondment: gross pay
+    and benefits through payroll, employer GOSI and the EOSB accrual of the month's approved payslips, and the
+    employee's approved cost items of the month, prorated to the days on secondment (billing R71)."""
+    out = []
+    for a, days, dim in _secondments(entity, period):
+        share = Fraction(days, dim)
+        slips = Payslip.objects.filter(employee=a.employee, run__period=period, refused=False,
+                                       run__status__in=(RS.APPROVED, RS.PAID))
+        sums = slips.aggregate(g=Sum("gross"), e=Sum("employer_gosi"), b=Sum("eosb_accrual"))
+        items = {}
+        for i in CI.objects.filter(employee=a.employee, month=period, status=CIS.APPROVED).order_by("pk"):
+            items[i.kind] = items.get(i.kind, ZERO) + i.amount
+        items = {k: _round(Fraction(v) * share) for k, v in sorted(items.items())}
+        row = SecondmentCostLine(entity=entity, assignment=a, employee_code=a.employee.employee_code,
+                                 receiving_entity=a.receiving_entity, days=days, days_in_month=dim,
+                                 gross=_round(Fraction(sums["g"] or ZERO) * share),
+                                 employer_gosi=_round(Fraction(sums["e"] or ZERO) * share),
+                                 eosb_accrual=_round(Fraction(sums["b"] or ZERO) * share),
+                                 cost_items={k: str(v) for k, v in items.items()},
+                                 cost_items_total=sum(items.values(), ZERO))
+        row.total = row.gross + row.employer_gosi + row.eosb_accrual + row.cost_items_total
+        warnings = []
+        if not slips.exists():
+            warnings.append("No approved payslip for the month: payroll costs are zero / لا توجد قسيمة معتمدة للشهر: "
+                            "تكاليف الرواتب صفر")
+        if a.receiving_entity is not None and a.receiving_entity.country == "SA":
+            warnings.append("Receiving entity may have to register GOSI (Regs Art. 20(3)(a), OQ-48) / قد يلزم الكيان "
+                            "المستقبل التسجيل في التأمينات")
+        row.warnings = warnings
+        out.append(row)
+    return out
+
+
+def _cost_report_hash(report):
+    names = [f.attname for f in SecondmentCostLine._meta.concrete_fields]
+    rows = [[str(r[n]) for n in names] for r in SecondmentCostLine._base_manager.filter(report=report).order_by("pk")
+            .values(*names)]
+    header = CR._base_manager.filter(pk=report.pk).values("entity_id", "period", "version", "total").first()
+    return hashlib.sha256(json.dumps([sorted((header or {}).items()), rows], default=str).encode()).hexdigest()
+
+
+def _cost_fingerprint(rows):
+    return [[r.assignment_id, r.days, str(r.gross), str(r.employer_gosi), str(r.eosb_accrual),
+             sorted(r.cost_items.items()), str(r.total)] for r in rows]
+
+
+@transaction.atomic
+def prepare_cost_report(entity, period, *, user):
+    """R35, R63: the payroll officer prepares (or recalculates) the month's fully loaded secondment cost report
+    (``payroll.prepare_cost_report``) once the month's regular run is approved. A report already approved for the
+    month stays in force until a new version is approved (a later correction, billed as an adjustment by billing)."""
+    _require(user, entity, "payroll.prepare_cost_report")
+    _check_period(period)
+    if not PayrollRun.objects.filter(entity=entity, period=period, kind=PayrollRun.Kind.REGULAR,
+                                     status__in=(RS.APPROVED, RS.PAID)).exists():
+        raise error(f"The secondment cost report of {period} is prepared after the month's regular run is approved "
+                    "(R35).", f"يُعد تقرير تكلفة الإعارة لفترة {period} بعد اعتماد المسير العادي للشهر.",
+                    code="cost_report_run_missing")
+    open_ = CR._base_manager.select_for_update().filter(entity=entity, period=period,
+                                                       status__in=(CRS.DRAFT, CRS.SUBMITTED)).first()
+    if open_ is not None and open_.status == CRS.SUBMITTED:
+        raise error("The report of this month is submitted: approve it or send it back first.",
+                    "تقرير هذا الشهر مقدّم: اعتمده أو أعده أولًا.", code="cost_report_status")
+    if open_ is None:
+        last = CR.objects.filter(entity=entity, period=period).order_by("-version").first()
+        open_ = _save(CR(entity=entity, period=period, version=(last.version + 1) if last else 1, created_by=user))
+    else:
+        for line in SecondmentCostLine.objects.filter(report=open_):
+            line._service_delete = True
+            line.delete()
+        open_.modified_by, open_.modified_at = user, _now()
+    rows = _cost_lines(entity, period)
+    for r in rows:
+        r.report = open_
+        _save(r)
+    open_.total = sum((r.total for r in rows), ZERO)
+    open_.warnings = sorted({w_ for r in rows for w_ in r.warnings})
+    _save(open_)
+    open_.stored_hash = _cost_report_hash(open_)
+    return _save(open_)
+
+
+@transaction.atomic
+def submit_cost_report(report, *, user):
+    r = _lock(CR, report.pk)
+    _require(user, r.entity, "payroll.prepare_cost_report")
+    if r.status != CRS.DRAFT:
+        raise error("Only a draft report is submitted.", "يُقدّم التقرير المسودة فقط.", code="cost_report_status")
+    r.status, r.submitted_by, r.submitted_at = CRS.SUBMITTED, user, _now()
+    return _save(r)
+
+
+@transaction.atomic
+def return_cost_report(report, *, user):
+    r = CR.objects.select_related("entity").get(pk=report.pk)
+    grant = _require(user, r.entity, "payroll.approve_cost_report", document=r)
+    approvals.check(grant, r.entity, "payroll.cost_report")
+    r = _lock(CR, r.pk)
+    if r.status != CRS.SUBMITTED:
+        raise error("Only a submitted report is returned.", "يُعاد التقرير المقدّم فقط.", code="cost_report_status")
+    r.status = CRS.DRAFT
+    return _save(r)
+
+
+@transaction.atomic
+def approve_cost_report(report, *, user):
+    """R35 (P19(c)): the approver (``payroll.approve_cost_report``, A: never its preparer or submitter) approves the
+    report after a recalculation check (refused "recalculate" if a payslip or cost item changed); the earlier
+    approved version of the month is superseded. Nothing is posted; billing reads the approved totals only."""
+    r = CR.objects.select_related("entity").get(pk=report.pk)
+    grant = _require(user, r.entity, "payroll.approve_cost_report", document=r)
+    approvals.check(grant, r.entity, "payroll.cost_report")
+    if user.pk in {r.created_by_id, r.submitted_by_id, r.modified_by_id}:
+        access.deny(user, r.entity, "payroll.approve_cost_report", "self_approval")
+    r = _lock(CR, r.pk)
+    if r.status != CRS.SUBMITTED:
+        raise error("Only a submitted report is approved.", "يُعتمد التقرير المقدّم فقط.", code="cost_report_status")
+    stored = list(SecondmentCostLine.objects.filter(report=r).order_by("pk"))
+    if _cost_report_hash(r) != r.stored_hash or _cost_fingerprint(stored) != _cost_fingerprint(_cost_lines(r.entity,
+                                                                                                           r.period)):
+        raise error("A payslip, secondment or cost item changed after the report was prepared: prepare it again.",
+                    "تغيّرت قسيمة أو إعارة أو بند تكلفة بعد إعداد التقرير: أعد إعداده.", code="recalculate")
+    for old in CR._base_manager.select_for_update().filter(entity=r.entity, period=r.period, status=CRS.APPROVED):
+        old.status = CRS.SUPERSEDED
+        _save(old)
+    r.status, r.approved_by, r.approved_at = CRS.APPROVED, user, _now()
+    return _save(r)
+
+
+def cost_report_data(report, *, user):
+    """The report for accounting staff (``payroll.view_cost_reports``): codes and totals only, no names or pay
+    items (R35, PDPL)."""
+    r = CR.objects.select_related("entity").get(pk=report.pk)
+    _require(user, r.entity, "payroll.view_cost_reports")
+    return {"entity": r.entity.code, "period": r.period, "version": r.version, "status": r.status, "total": r.total,
+            "warnings": r.warnings,
+            "lines": [{"employee_code": l.employee_code, "assignment": l.assignment.reference or l.assignment_id,
+                       "receiving_entity": l.receiving_entity.code if l.receiving_entity else "", "days": l.days,
+                       "days_in_month": l.days_in_month, "gross": l.gross, "employer_gosi": l.employer_gosi,
+                       "eosb_accrual": l.eosb_accrual, "cost_items": l.cost_items,
+                       "cost_items_total": l.cost_items_total, "total": l.total, "warnings": l.warnings}
+                      for l in r.lines.select_related("assignment", "receiving_entity").order_by("pk")]}
+
+
+def approved_secondment_cost(assignment, period):
+    """Billing R71 seam (``payroll.billing_port``): the approved fully loaded cost of ``assignment`` for ``period``
+    in the seconding entity's functional currency, or None while no report of that month is approved. Totals only,
+    no personal data (R35); service to service, no user (billing's system user holds no payroll right, R38)."""
+    line = (SecondmentCostLine.objects.filter(assignment_id=getattr(assignment, "pk", assignment),
+                                              report__period=period, report__status=CRS.APPROVED)
+            .select_related("report", "report__entity").first())
+    if line is None:
+        return None
+    r = line.report
+    return SimpleNamespace(total=line.total, currency=r.entity.base_currency_id, days=line.days,
+                           days_in_month=line.days_in_month, report_id=r.pk, version=r.version,
+                           approved_at=r.approved_at)

@@ -194,6 +194,14 @@ class PayrollSettings(ServiceWritten):
     gosi_housing_in_kind_exempt_ref = models.CharField(bi("GOSI in-kind housing exemption reference",
                                                           "مرجع إعفاء السكن العيني من التأمينات"), max_length=200,
                                                        blank=True)
+    # Slice 2 (OQ-7 default): the expense account of an approved loan write-off on exit (data, CFO to confirm);
+    # empty = 5100 Salaries and benefits.
+    loan_write_off_account = models.ForeignKey("ledger.Account", null=True, blank=True, on_delete=models.PROTECT,
+                                               related_name="+", verbose_name=bi("Loan write-off expense account",
+                                                                                 "حساب مصروف شطب القروض"))
+    # Egypt (research §2.3, §2.5): the governorate of the work location; Universal Health Insurance applies where the
+    # governorate is live (parameter uhi.governorates_live). Entity-wide default (one work location per entity).
+    work_governorate = models.CharField(bi("Work location governorate", "محافظة مقر العمل"), max_length=40, blank=True)
     updated_by = _user("Updated by", "حدّثه")
     updated_at = models.DateTimeField(bi("Updated at", "تاريخ التحديث"), auto_now=True)
 
@@ -244,6 +252,9 @@ class PayrollInput(Tracked, ServiceWritten):
         COURT_ORDER = "court_order", bi("Court order (Art. 92(6))", "حكم قضائي (المادة 92(6))")
         DAMAGE_ART91 = "damage_art91", bi("Damage recovery (Art. 91)", "تعويض إتلاف (المادة 91)")
         STATUTORY_OTHER = "statutory_other", bi("Other statutory deduction", "استقطاع نظامي آخر")
+        # Egypt (Labour Law 14/2025 Art. 113/114, research rows unverified): a maintenance (nafaqa) court order ranks
+        # first, at most 50% of the wage.
+        NAFAQA = "nafaqa", bi("Maintenance (nafaqa) court order", "حكم نفقة")
 
     class Art106Case(models.TextChoices):
         INVENTORY_CLOSING = "inventory_closing", bi("Inventory, balance sheets, closing (106(1))",
@@ -406,6 +417,8 @@ class PayrollRun(Tracked, ServiceWritten):
         ("draft", "calculated"), ("calculated", "calculated"), ("calculated", "submitted"),
         ("submitted", "returned"), ("returned", "calculated"), ("submitted", "approved"), ("approved", "paid"),
         ("approved", "reversed"),
+        # Slice 2: a reversed salary payment reopens the run's net pay.
+        ("paid", "approved"),
     })
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
@@ -535,6 +548,9 @@ class Payslip(ServiceWritten):
     iban_hash = models.CharField(bi("IBAN hash at calculation", "بصمة الآيبان عند الاحتساب"), max_length=64, blank=True)
     termination_ref = models.PositiveIntegerField(bi("Approved termination at calculation", "إنهاء الخدمة المعتمد عند الاحتساب"),
                                                   null=True, blank=True)
+    # Egypt: the month's taxable salary (after the employee's social insurance share) used by the cumulative salary
+    # tax withholding of the year.
+    taxable_income = _money("Taxable income of the month", "الدخل الخاضع للضريبة عن الشهر", default=ZERO)
 
     class Meta:
         base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
@@ -572,14 +588,23 @@ class PayslipLine(ServiceWritten):
         EMPLOYER_GOSI = "employer_gosi", bi("Employer GOSI", "حصة صاحب العمل في التأمينات")
         EOSB_ACCRUAL = "eosb_accrual", bi("End-of-service provision", "مخصص نهاية الخدمة")
         EOSB_RELEASE = "eosb_release", bi("End-of-service provision released", "تحرير مخصص نهاية الخدمة")
+        # Egypt (jurisdiction EG; research rows unverified, OQ-28): social insurance (Law 148/2019), salary tax (Law
+        # 91/2005 as amended), Martyrs' Fund (Law 4/2021), Universal Health Insurance (Law 2/2018).
+        SI_EMPLOYEE = "si_employee", bi("Social insurance, employee share", "التأمينات الاجتماعية، حصة العامل")
+        SI_EMPLOYER = "si_employer", bi("Social insurance, employer share", "التأمينات الاجتماعية، حصة صاحب العمل")
+        SALARY_TAX = "salary_tax", bi("Salary tax withheld", "ضريبة كسب العمل المستقطعة")
+        MARTYRS_FUND = "martyrs_fund", bi("Martyrs' and Victims' Fund", "صندوق تكريم الشهداء والضحايا")
+        UHI_EMPLOYEE = "uhi_employee", bi("Universal health insurance, employee", "التأمين الصحي الشامل، حصة العامل")
+        UHI_EMPLOYER = "uhi_employer", bi("Universal health insurance, employer", "التأمين الصحي الشامل، حصة صاحب العمل")
 
     # Gross = positive earnings - reductions; net = gross - deductions; employer costs are not on the net.
     EARNINGS = frozenset({"earning", "overtime", "one_off_earning", "bonus", "retro", "maternity_top_up",
                           "maternity_support"})
     REDUCTIONS = frozenset({"unpaid_deduction", "sick_deduction", "maternity_suspended"})
     DEDUCTIONS = frozenset({"deduction", "employee_gosi", "gosi_catch_up", "loan_installment",
-                            "deferred_sale_installment"})
-    EMPLOYER = frozenset({"employer_gosi", "eosb_accrual", "eosb_release", "gosi_uncollected"})
+                            "deferred_sale_installment", "si_employee", "salary_tax", "martyrs_fund", "uhi_employee"})
+    EMPLOYER = frozenset({"employer_gosi", "eosb_accrual", "eosb_release", "gosi_uncollected", "si_employer",
+                          "uhi_employer"})
 
     class Branch(models.TextChoices):
         ANNUITIES = "annuities", bi("Annuities", "المعاشات")
@@ -687,6 +712,7 @@ class EmployeeLoan(Tracked, ServiceWritten):
         SUBMITTED = "submitted", bi("Submitted", "مقدّم")
         ACTIVE = "active", bi("Approved and disbursed", "معتمد ومصروف")
         SETTLED = "settled", bi("Settled", "مسدد")
+        WRITTEN_OFF = "written_off", bi("Written off on exit", "مشطوب عند انتهاء الخدمة")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     employee = models.ForeignKey("hr.Employee", on_delete=models.PROTECT, related_name="loans",
@@ -699,7 +725,7 @@ class EmployeeLoan(Tracked, ServiceWritten):
                                              verbose_name=bi("Paid from account", "يُصرف من حساب"))
     purpose_en = models.TextField(bi("Purpose (English)", "الغرض (بالإنجليزية)"), blank=True)
     purpose_ar = models.TextField(bi("Purpose (Arabic)", "الغرض (بالعربية)"))
-    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    status = models.CharField(bi("Status", "الحالة"), max_length=12, choices=Status.choices, default=Status.DRAFT)
     schedule_version = models.PositiveIntegerField(bi("Schedule version", "نسخة الجدول"), default=1)
     interest_free = models.BooleanField(bi("Interest-free", "بدون فوائد"), default=True, editable=False)
     cap_basic_at_approval = _money("Basic salary at approval", "الراتب الأساسي عند الاعتماد", null=True, blank=True)
@@ -731,6 +757,8 @@ class LoanInstallment(ServiceWritten):
         SETTLED_IN_FINAL = "settled_in_final", bi("Settled in the final settlement", "سُدد في المخالصة النهائية")
         # Re-review 8: what the final dues did not cover stays on 1230 after exit (write-off: OQ-7).
         OUTSTANDING_AFTER_EXIT = "outstanding_after_exit", bi("Outstanding after exit", "قائم بعد انتهاء الخدمة")
+        # Slice 2 (OQ-7 default): the outstanding-after-exit part written off by an approved LoanWriteOff.
+        WRITTEN_OFF = "written_off", bi("Written off", "مشطوب")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     loan = models.ForeignKey(EmployeeLoan, on_delete=models.PROTECT, related_name="installments",
@@ -862,6 +890,8 @@ class FinalSettlement(Tracked, ServiceWritten):
         ("returned", "calculated"), ("submitted", "approved"), ("approved", "paid"), ("draft", "draft"),
         ("calculated", "draft"), ("returned", "draft"), ("draft", "discarded"), ("calculated", "discarded"),
         ("returned", "discarded"), ("submitted", "discarded"),
+        # Slice 2: a reversed payment reopens the settlement's net.
+        ("paid", "approved"),
     })
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
@@ -992,6 +1022,7 @@ class PayrollPayment(Tracked, ServiceWritten):
         DRAFT = "draft", bi("Draft", "مسودة")
         SUBMITTED = "submitted", bi("Submitted", "مقدّم")
         APPROVED = "approved", bi("Approved and posted", "معتمد ومرحّل")
+        REVERSED = "reversed", bi("Reversed", "معكوس")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     kind = models.CharField(bi("Kind", "النوع"), max_length=20, choices=Kind.choices)
@@ -1011,6 +1042,8 @@ class PayrollPayment(Tracked, ServiceWritten):
                                      related_name="+", verbose_name=bi("WHT category", "فئة ضريبة الاستقطاع"))
     wht_amount = _txn("WHT (payment currency)", "ضريبة الاستقطاع (عملة الدفع)", default=ZERO)
     wht_amount_sar = _money("WHT (SAR)", "ضريبة الاستقطاع (ريال)", default=ZERO)
+    # Slice 2 (R43, OQ-30): the payment amount in SAR at the payment-date rate, the base of the WHT return row.
+    wht_base_sar = _money("WHT base (SAR)", "وعاء ضريبة الاستقطاع (ريال)", default=ZERO)
     bank_reference = models.CharField(bi("Bank reference", "المرجع البنكي"), max_length=60, blank=True)
     # C-B7: e.g. a GOSI payment above the ERP contributions, up to the recorded GOSI invoice (difference flagged).
     warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
@@ -1021,6 +1054,12 @@ class PayrollPayment(Tracked, ServiceWritten):
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
     journal_entry = models.OneToOneField("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
                                          related_name="+", verbose_name=bi("Journal entry", "القيد"))
+    # Slice 2: a payment reversed through ledger.reverse_entry (never edited or deleted).
+    reversal_entry = models.OneToOneField("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                          related_name="+", verbose_name=bi("Reversal entry", "قيد العكس"))
+    reversed_by = _user("Reversed by", "عكسه")
+    reversed_at = models.DateTimeField(bi("Reversed at", "تاريخ العكس"), null=True, blank=True)
+    reversal_reason = models.TextField(bi("Reversal reason", "سبب العكس"), blank=True)
 
     class Meta:
         base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
@@ -1126,6 +1165,8 @@ class PayrollAlert(models.Model):
         LEAVE_ADVANCE = "leave_advance", bi("Annual leave pay due in advance", "أجر إجازة سنوية مستحق مقدمًا")
         FINAL_SETTLEMENT_DUE = "final_settlement_due", bi("Final settlement due (Art. 88)",
                                                           "موعد المخالصة النهائية (المادة 88)")
+        MATERNITY_DECIDED = "maternity_decided", bi("Maternity case decided: carried days to settle",
+                                                    "قرار حالة الأمومة: أيام مرحّلة للتسوية")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="payroll_alerts",
@@ -1140,3 +1181,317 @@ class PayrollAlert(models.Model):
         verbose_name = bi("payroll alert", "تنبيه رواتب")
         verbose_name_plural = bi("payroll alerts", "تنبيهات الرواتب")
         constraints = [models.UniqueConstraint(fields=["recipient", "kind", "key"], name="payroll_alert_once")]
+
+
+# =====================================================================================================
+# Slice 2 (docs/specs/payroll.md §10.8)
+# =====================================================================================================
+
+class SettlementCorrection(Tracked, ServiceWritten):
+    """[Reg] A correction of an approved (or paid) final settlement: difference lines only, approved by a second
+    person, posted as its own entry through the ledger registry. The settlement, its lines and its entry are never
+    edited (CLAUDE.md rule 1); the correction adds to (or takes from) what the settlement booked."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", bi("Draft", "مسودة")
+        SUBMITTED = "submitted", bi("Submitted", "مقدّم")
+        RETURNED = "returned", bi("Returned", "معاد")
+        APPROVED = "approved", bi("Approved and posted", "معتمد ومرحّل")
+        DISCARDED = "discarded", bi("Discarded", "ملغى")
+
+    TRANSITIONS = frozenset({("draft", "submitted"), ("submitted", "returned"), ("returned", "submitted"),
+                             ("submitted", "approved"), ("draft", "discarded"), ("returned", "discarded"),
+                             ("returned", "draft")})
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    settlement = models.ForeignKey("FinalSettlement", on_delete=models.PROTECT, related_name="corrections",
+                                   verbose_name=bi("Final settlement", "المخالصة النهائية"))
+    employee = models.ForeignKey("hr.Employee", on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Employee", "الموظف"))
+    number = models.CharField(bi("Number", "الرقم"), max_length=40, blank=True)
+    reason_en = models.TextField(bi("Reason (English)", "السبب (بالإنجليزية)"), blank=True)
+    reason_ar = models.TextField(bi("Reason (Arabic)", "السبب (بالعربية)"))
+    written_consent_ref = models.CharField(bi("Written consent (separate settlement)", "الموافقة الكتابية (تسوية منفصلة)"),
+                                           max_length=200, blank=True)
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    net_change = _money("Change of the net due to the employee", "التغير في الصافي المستحق للموظف", default=ZERO)
+    warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
+    stored_hash = models.CharField(bi("Stored lines hash", "بصمة البنود المخزنة"), max_length=64, blank=True)
+    submitted_by = _user("Submitted by", "قدّمه")
+    submitted_at = models.DateTimeField(bi("Submitted at", "تاريخ التقديم"), null=True, blank=True)
+    approved_by = _user("Approved by", "اعتمده")
+    approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+    returned_reason_ar = models.TextField(bi("Return reason (Arabic)", "سبب الإعادة (بالعربية)"), blank=True)
+    journal_entry = models.OneToOneField("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                         related_name="+", verbose_name=bi("Journal entry", "القيد"))
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("final settlement correction", "تصحيح مخالصة نهائية")
+        verbose_name_plural = bi("final settlement corrections", "تصحيحات المخالصات النهائية")
+        constraints = [models.UniqueConstraint(fields=["entity", "number"], condition=~Q(number=""),
+                                               name="payroll_correction_number")]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self)._base_manager.filter(pk=self.pk).values_list("status", flat=True).first()
+            if stored is not None and stored != self.status and (stored, self.status) not in self.TRANSITIONS:
+                raise error(f"A settlement correction does not move from {stored} to {self.status}.",
+                            f"لا ينتقل تصحيح المخالصة من {stored} إلى {self.status}.", code="correction_status")
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.number or f"{self.settlement} correction ({self.status})"
+
+
+class SettlementCorrectionLine(ServiceWritten):
+    class Direction(models.TextChoices):
+        INCREASE = "increase", bi("Increase", "زيادة")
+        DECREASE = "decrease", bi("Decrease", "نقص")
+
+    # Line types that may be corrected (FinalSettlementLine types); recoveries of loans, bai' ajel and GOSI shares
+    # and their installments are not corrected here (their sub-ledgers moved at approval).
+    EARNINGS = frozenset({"salary_to_last_day", "retro", "leave_encashment", "eosb", "notice_pay",
+                          "separate_settlement", "other_earning"})
+    DEDUCTIONS = frozenset({"other_deduction", "employee_gosi"})
+    EMPLOYER = frozenset({"employer_gosi"})
+    ALLOWED = EARNINGS | DEDUCTIONS | EMPLOYER
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    correction = models.ForeignKey(SettlementCorrection, on_delete=models.PROTECT, related_name="lines",
+                                   verbose_name=bi("Correction", "التصحيح"))
+    line_type = models.CharField(bi("Line type", "نوع البند"), max_length=24,
+                                 choices=[(c, c) for c in sorted(ALLOWED)])
+    direction = models.CharField(bi("Direction", "الاتجاه"), max_length=8, choices=Direction.choices)
+    amount = _money("Difference", "الفرق")
+    account = models.ForeignKey("ledger.Account", on_delete=models.PROTECT, related_name="+",
+                                verbose_name=bi("Account", "الحساب"))
+    component = models.ForeignKey("hr.SalaryComponent", null=True, blank=True, on_delete=models.PROTECT,
+                                  related_name="+", verbose_name=bi("Component", "المكوّن"))
+    gosi_branch = models.CharField(bi("GOSI branch", "فرع التأمينات"), max_length=24, blank=True)
+    description_en = models.CharField(bi("Description (English)", "الوصف (بالإنجليزية)"), max_length=300)
+    description_ar = models.CharField(bi("Description (Arabic)", "الوصف (بالعربية)"), max_length=300)
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("settlement correction line", "بند تصحيح المخالصة")
+        verbose_name_plural = bi("settlement correction lines", "بنود تصحيح المخالصات")
+        ordering = ["correction", "id"]
+        constraints = [models.CheckConstraint(condition=Q(amount__gt=0), name="payroll_correction_line_positive")]
+
+    @property
+    def sign(self):
+        return 1 if self.direction == self.Direction.INCREASE else -1
+
+
+class LoanWriteOff(Tracked, ServiceWritten):
+    """[Reg] OQ-7 default (slice 2): the part of an interest-free loan the final dues did not cover
+    (``outstanding_after_exit``) written off: Dr expense / Cr 1230, approved under the entity's matrix (Managing
+    Partner in Almiras, the CEO elsewhere; payroll.approvals), logged. No interest, fee or charge ever (R26)."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", bi("Draft", "مسودة")
+        SUBMITTED = "submitted", bi("Submitted", "مقدّم")
+        APPROVED = "approved", bi("Approved and posted", "معتمد ومرحّل")
+        REJECTED = "rejected", bi("Rejected", "مرفوض")
+
+    TRANSITIONS = frozenset({("draft", "submitted"), ("submitted", "approved"), ("submitted", "rejected"),
+                             ("draft", "rejected")})
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    loan = models.ForeignKey(EmployeeLoan, on_delete=models.PROTECT, related_name="write_offs",
+                             verbose_name=bi("Loan", "القرض"))
+    employee = models.ForeignKey("hr.Employee", on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Employee", "الموظف"))
+    number = models.CharField(bi("Number", "الرقم"), max_length=40, blank=True)
+    amount = _money("Amount written off", "المبلغ المشطوب")
+    expense_account = models.ForeignKey("ledger.Account", on_delete=models.PROTECT, related_name="+",
+                                        verbose_name=bi("Expense account", "حساب المصروف"))
+    reason_en = models.TextField(bi("Reason (English)", "السبب (بالإنجليزية)"), blank=True)
+    reason_ar = models.TextField(bi("Reason (Arabic)", "السبب (بالعربية)"))
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    submitted_by = _user("Submitted by", "قدّمه")
+    submitted_at = models.DateTimeField(bi("Submitted at", "تاريخ التقديم"), null=True, blank=True)
+    approved_by = _user("Approved by", "اعتمده")
+    approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+    rejected_reason_ar = models.TextField(bi("Rejection reason (Arabic)", "سبب الرفض (بالعربية)"), blank=True)
+    journal_entry = models.OneToOneField("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                         related_name="+", verbose_name=bi("Journal entry", "القيد"))
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("loan write-off", "شطب قرض")
+        verbose_name_plural = bi("loan write-offs", "شطب القروض")
+        constraints = [models.CheckConstraint(condition=Q(amount__gt=0), name="payroll_write_off_positive"),
+                       models.UniqueConstraint(fields=["loan"], condition=Q(status__in=("draft", "submitted",
+                                                                                        "approved")),
+                                               name="payroll_one_open_write_off")]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self)._base_manager.filter(pk=self.pk).values_list("status", flat=True).first()
+            if stored is not None and stored != self.status and (stored, self.status) not in self.TRANSITIONS:
+                raise error(f"A loan write-off does not move from {stored} to {self.status}.",
+                            f"لا ينتقل شطب القرض من {stored} إلى {self.status}.", code="write_off_status")
+        super().save(*args, **kwargs)
+
+
+class EmployeeCostItem(Tracked, ServiceWritten):
+    """R63 (P19(c)): a cost paid outside payroll that belongs to one employee and month (medical insurance, iqama
+    renewal, work permit, visa, other government fees, other benefits), referencing its source document of the same
+    entity. Posts nothing (the source document booked the cost); feeds only the fully loaded secondment cost report."""
+
+    class Kind(models.TextChoices):
+        MEDICAL_INSURANCE = "medical_insurance", bi("Medical insurance", "التأمين الطبي")
+        IQAMA_RENEWAL = "iqama_renewal", bi("Iqama (residence) renewal and fees", "تجديد الإقامة ورسومها")
+        WORK_PERMIT = "work_permit", bi("Work permit fee", "رسوم رخصة العمل")
+        VISA = "visa", bi("Visa fees", "رسوم التأشيرات")
+        OTHER_GOVERNMENT_FEE = "other_government_fee", bi("Other government fee", "رسوم حكومية أخرى")
+        OTHER_BENEFIT = "other_benefit", bi("Other benefit", "مزايا أخرى")
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", bi("Draft", "مسودة")
+        APPROVED = "approved", bi("Approved", "معتمد")
+        REJECTED = "rejected", bi("Rejected", "مرفوض")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    employee = models.ForeignKey("hr.Employee", on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Employee", "الموظف"))
+    month = models.CharField(bi("Month (YYYY-MM)", "الشهر"), max_length=7)
+    kind = models.CharField(bi("Kind", "النوع"), max_length=24, choices=Kind.choices)
+    amount = _money("Amount", "المبلغ")
+    description_en = models.CharField(bi("Description (English)", "الوصف (بالإنجليزية)"), max_length=300, blank=True)
+    description_ar = models.CharField(bi("Description (Arabic)", "الوصف (بالعربية)"), max_length=300)
+    source_bill = models.ForeignKey("invoicing.PurchaseDocument", null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="+", verbose_name=bi("Source bill", "فاتورة المصدر"))
+    source_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                     related_name="+", verbose_name=bi("Source journal entry", "قيد المصدر"))
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    approved_by = _user("Approved by", "اعتمده")
+    approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("employee cost item", "بند تكلفة موظف")
+        verbose_name_plural = bi("employee cost items", "بنود تكاليف الموظفين")
+        ordering = ["entity", "month", "id"]
+        constraints = [
+            models.CheckConstraint(condition=Q(amount__gt=0), name="payroll_cost_item_positive"),
+            models.CheckConstraint(condition=(Q(source_bill__isnull=False) & Q(source_entry__isnull=True))
+                                   | (Q(source_bill__isnull=True) & Q(source_entry__isnull=False)),
+                                   name="payroll_cost_item_one_source"),
+        ]
+
+
+class SecondmentCostReport(Tracked, ServiceWritten):
+    """R35, R63 (P19(c), billing R71): the fully loaded cost of each secondment for one month, prepared by the payroll
+    officer after the month's run is approved and approved by the approver (A, not the preparer). Billing reads only
+    the approved report (``payroll.billing_port``). A later correction is a new version; the earlier one is
+    superseded. Codes only, no personal data beyond ``employee_code``."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", bi("Draft", "مسودة")
+        SUBMITTED = "submitted", bi("Submitted", "مقدّم")
+        APPROVED = "approved", bi("Approved", "معتمد")
+        SUPERSEDED = "superseded", bi("Superseded by a later version", "استُبدل بنسخة لاحقة")
+        DISCARDED = "discarded", bi("Discarded", "ملغى")
+
+    TRANSITIONS = frozenset({("draft", "submitted"), ("submitted", "draft"), ("submitted", "approved"),
+                             ("approved", "superseded"), ("draft", "discarded"), ("draft", "draft")})
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    period = models.CharField(bi("Period (YYYY-MM)", "الفترة"), max_length=7)
+    version = models.PositiveIntegerField(bi("Version", "النسخة"), default=1)
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    total = _money("Total fully loaded cost", "إجمالي التكلفة الكاملة", default=ZERO)
+    warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
+    stored_hash = models.CharField(bi("Stored lines hash", "بصمة البنود المخزنة"), max_length=64, blank=True)
+    submitted_by = _user("Submitted by", "قدّمه")
+    submitted_at = models.DateTimeField(bi("Submitted at", "تاريخ التقديم"), null=True, blank=True)
+    approved_by = _user("Approved by", "اعتمده")
+    approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("secondment cost report", "تقرير تكلفة الإعارة")
+        verbose_name_plural = bi("secondment cost reports", "تقارير تكلفة الإعارة")
+        constraints = [models.UniqueConstraint(fields=["entity", "period", "version"], name="payroll_cost_report_version"),
+                       models.UniqueConstraint(fields=["entity", "period"], condition=Q(status="approved"),
+                                               name="payroll_one_approved_cost_report")]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self)._base_manager.filter(pk=self.pk).values_list("status", flat=True).first()
+            if stored is not None and stored != self.status and (stored, self.status) not in self.TRANSITIONS:
+                raise error(f"A cost report does not move from {stored} to {self.status}.",
+                            f"لا ينتقل تقرير التكلفة من {stored} إلى {self.status}.", code="cost_report_status")
+        super().save(*args, **kwargs)
+
+
+class SecondmentCostLine(ServiceWritten):
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    report = models.ForeignKey(SecondmentCostReport, on_delete=models.PROTECT, related_name="lines",
+                               verbose_name=bi("Report", "التقرير"))
+    assignment = models.ForeignKey("hr.Assignment", on_delete=models.PROTECT, related_name="+",
+                                   verbose_name=bi("Secondment", "الإعارة"))
+    employee_code = models.CharField(bi("Employee code", "رقم الموظف"), max_length=40)
+    receiving_entity = models.ForeignKey(Entity, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+                                         verbose_name=bi("Receiving entity", "الكيان المستقبل"))
+    days = models.PositiveSmallIntegerField(bi("Days on secondment", "أيام الإعارة"))
+    days_in_month = models.PositiveSmallIntegerField(bi("Days in the month", "أيام الشهر"))
+    gross = _money("Gross pay and benefits through payroll", "إجمالي الأجر والمزايا عبر الرواتب", default=ZERO)
+    employer_gosi = _money("Employer GOSI", "حصة صاحب العمل في التأمينات", default=ZERO)
+    eosb_accrual = _money("EOSB accrual", "استحقاق مكافأة نهاية الخدمة", default=ZERO)
+    cost_items = models.JSONField(bi("Employee cost items by kind", "بنود تكاليف الموظف حسب النوع"), default=dict)
+    cost_items_total = _money("Employee cost items", "بنود تكاليف الموظف", default=ZERO)
+    total = _money("Fully loaded cost", "التكلفة الكاملة", default=ZERO)
+    warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("secondment cost line", "بند تكلفة الإعارة")
+        verbose_name_plural = bi("secondment cost lines", "بنود تكلفة الإعارة")
+        ordering = ["report", "employee_code", "id"]
+
+
+class GosiFine(Tracked, ServiceWritten):
+    """[Reg] E14 (R37): a GOSI late-payment fine recorded from GOSI's invoice: Dr 5930 / Cr 2340, approved by the
+    approver (A, P). Never interest, never purified; the ERP only shows an estimate (2% per month or part, Law Art.
+    9(3)) next to the GOSI figure. Tax penalties never use 5930 (P20(f))."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", bi("Draft", "مسودة")
+        SUBMITTED = "submitted", bi("Submitted", "مقدّم")
+        APPROVED = "approved", bi("Approved and posted", "معتمد ومرحّل")
+
+    TRANSITIONS = frozenset({("draft", "submitted"), ("submitted", "approved"), ("submitted", "draft")})
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    period = models.CharField(bi("Contribution period (YYYY-MM)", "فترة الاشتراكات"), max_length=7)
+    fine_date = models.DateField(bi("Fine date (GOSI invoice)", "تاريخ الغرامة (فاتورة التأمينات)"))
+    amount = _money("Fine per GOSI", "الغرامة وفق التأمينات")
+    estimate = _money("ERP estimate", "تقدير النظام", default=ZERO)
+    gosi_invoice_ref = models.CharField(bi("GOSI invoice reference", "مرجع فاتورة التأمينات"), max_length=60)
+    note_en = models.TextField(bi("Note (English)", "ملاحظة (بالإنجليزية)"), blank=True)
+    note_ar = models.TextField(bi("Note (Arabic)", "ملاحظة (بالعربية)"), blank=True)
+    number = models.CharField(bi("Number", "الرقم"), max_length=40, blank=True)
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    submitted_by = _user("Submitted by", "قدّمه")
+    approved_by = _user("Approved by", "اعتمده")
+    approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+    journal_entry = models.OneToOneField("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                         related_name="+", verbose_name=bi("Journal entry", "القيد"))
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("GOSI late-payment fine", "غرامة تأخير التأمينات")
+        verbose_name_plural = bi("GOSI late-payment fines", "غرامات تأخير التأمينات")
+        constraints = [models.CheckConstraint(condition=Q(amount__gt=0), name="payroll_gosi_fine_positive")]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self)._base_manager.filter(pk=self.pk).values_list("status", flat=True).first()
+            if stored is not None and stored != self.status and (stored, self.status) not in self.TRANSITIONS:
+                raise error(f"A GOSI fine does not move from {stored} to {self.status}.",
+                            f"لا تنتقل غرامة التأمينات من {stored} إلى {self.status}.", code="fine_status")
+        super().save(*args, **kwargs)

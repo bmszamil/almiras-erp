@@ -11,6 +11,11 @@ class PayrollConfig(AppConfig):
     - ``EmployeeLoan``: ``payroll.approve_loan`` (E4, interest-free).
     - ``FinalSettlement``: ``payroll.approve_final_settlement`` (E5); ``pending_documents`` for submitted ones.
 
+    Slice 2 (§10.8): ``SettlementCorrection`` (``payroll.approve_settlement_correction``, difference lines),
+    ``LoanWriteOff`` (``payroll.approve_loan_write_off``, Dr expense / Cr 1230), ``GosiFine``
+    (``payroll.approve_gosi_fine``, E14); ``PayrollPayment`` is reversed with ``payroll.reverse_payment`` only inside
+    ``payroll.services.reverse_payment``.
+
     Every type builds its own lines from stored data, only inside a ``payroll.services`` posting.
     """
 
@@ -21,14 +26,24 @@ class PayrollConfig(AppConfig):
         from ledger import documents
 
         from . import services
-        from .models import EmployeeLoan, FinalSettlement, PayrollPayment, PayrollRun
+        from .models import (EmployeeLoan, FinalSettlement, GosiFine, LoanWriteOff, PayrollPayment, PayrollRun,
+                             SettlementCorrection)
 
         documents.register(PayrollRun, post_permissions={"payroll.approve_run"},
                            reverse_permissions={"payroll.reverse_run"}, build_lines=services._run_lines,
                            pending_documents=services._pending_runs, reverse_guard=services._reverse_guard)
         documents.register(PayrollPayment, post_permissions={"payroll.approve_payment"},
-                           build_lines=services._payment_lines)
+                           reverse_permissions={"payroll.reverse_payment"}, build_lines=services._payment_lines,
+                           reverse_guard=services._reverse_guard)
         documents.register(EmployeeLoan, post_permissions={"payroll.approve_loan"},
                            build_lines=services._loan_disbursement_lines)
         documents.register(FinalSettlement, post_permissions={"payroll.approve_final_settlement"},
                            build_lines=services._settlement_lines, pending_documents=services._pending_settlements)
+        documents.register(SettlementCorrection, post_permissions={"payroll.approve_settlement_correction"},
+                           build_lines=services._correction_lines)
+        documents.register(LoanWriteOff, post_permissions={"payroll.approve_loan_write_off"},
+                           build_lines=services._write_off_lines)
+        documents.register(GosiFine, post_permissions={"payroll.approve_gosi_fine"}, build_lines=services._fine_lines)
+        # OQ-30 (R43): payroll's remuneration WHT goes into invoicing's monthly WHT return and its 2220 tie-out.
+        from invoicing import services as invoicing_services
+        invoicing_services.register_wht_return_source("payroll.payrollpayment", services._wht_return_source)

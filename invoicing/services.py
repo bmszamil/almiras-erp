@@ -2873,6 +2873,18 @@ def verify_treaty_certificate(certificate, *, user):
     return cert
 
 
+# OQ-30 (payroll R43): withholding tax that other modules book on 2220 belongs in the same monthly return. An app
+# registers its source from its AppConfig.ready(): ``rows(entity, start, end)`` returns rows in the shape below (with
+# ``"source"`` naming the app; payees by code only, R91) and ``document_type`` is the ledger document type of its
+# 2220 movements, so the 2220 tie-out covers them too. Payroll registers its remuneration WHT (payroll R43).
+_WHT_RETURN_SOURCES = {}
+
+
+def register_wht_return_source(document_type, rows):
+    """Register another module's WHT rows for :func:`wht_return_data` (idempotent per document type)."""
+    _WHT_RETURN_SOURCES[document_type] = rows
+
+
 def wht_return_data(entity, month, *, user):
     """R64: monthly WHT return data of ``entity`` (``month`` = any day of it), per category and vendor, from
     ``WhtDeduction``: base, rate, WHT (SAR), treaty reference and country. A payment reversed in the month shows
@@ -2905,10 +2917,13 @@ def wht_return_data(entity, month, *, user):
         add(d, -1)
     lines = JournalLine.objects.filter(
         entry__entity=entity, entry__status__in=ledger.BOOKED, entry__date__gte=start, entry__date__lte=end,
-        entry__document_type="invoicing.vendorpayment", account__code=WHT_PAYABLE,
+        entry__document_type__in=["invoicing.vendorpayment", *sorted(_WHT_RETURN_SOURCES)], account__code=WHT_PAYABLE,
     ).aggregate(c=Sum("credit"), d=Sum("debit"))
     ledger_total = (lines["c"] or ZERO) - (lines["d"] or ZERO)
-    out = sorted(rows.values(), key=lambda r: (r["category"], r["vendor"]))
+    out = list(rows.values())
+    for _doc_type, source in sorted(_WHT_RETURN_SOURCES.items()):
+        out.extend(source(entity, start, end))  # OQ-30: e.g. payroll remuneration WHT (payroll R43)
+    out = sorted(out, key=lambda r: (r["category"], r["vendor"], r.get("source", "")))
     total = sum((r["wht_sar"] for r in out), ZERO)
     return {"entity": entity.code, "month": start, "rows": out, "total_wht_sar": total,
             "ledger_2220_sar": ledger_total, "difference": total - ledger_total}

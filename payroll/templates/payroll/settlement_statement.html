@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head><meta charset="utf-8"><title>بيان المخالصة النهائية {{ settlement.number }} / Final settlement statement {{ settlement.number }}</title>
+<style>@media print { .no-print { display: none; } } table { border-collapse: collapse; } td, th { border: 1px solid #999; padding: 2px 6px; }</style></head>
+<body>
+<header>
+  <h1>بيان المخالصة النهائية / <span lang="en" dir="ltr">Final settlement statement</span></h1>
+  {% if not final %}<p><strong>مسودة غير معتمدة / <span lang="en" dir="ltr">DRAFT, not approved</span></strong></p>{% endif %}
+  <p><strong>النص العربي هو المعتمد / <span lang="en" dir="ltr">The Arabic text prevails</span></strong></p>
+  <p>{{ entity_ar }} / <span lang="en" dir="ltr">{{ entity_en }}</span></p>
+  <p>رقم المخالصة / <span lang="en" dir="ltr">Number</span>: {{ settlement.number|default:"-" }} &middot; الحالة / <span lang="en" dir="ltr">Status</span>: {{ settlement.get_status_display }}</p>
+  <p>الموظف / <span lang="en" dir="ltr">Employee</span>: {{ employee_code }} &middot; {{ name_ar }} / <span lang="en" dir="ltr">{{ name_en }}</span></p>
+  <p>نوع الإنهاء / <span lang="en" dir="ltr">Termination</span>: {{ kind_en }} &middot; آخر يوم عمل / <span lang="en" dir="ltr">Last working day</span>: {{ settlement.last_working_day|date:"Y-m-d" }}</p>
+  <p>موعد السداد (المادة 88) / <span lang="en" dir="ltr">Due by (Labour Law Art. 88)</span>: {{ settlement.due_date|date:"Y-m-d" }}</p>
+</header>
+<table>
+  <thead><tr><th>البند / <span lang="en" dir="ltr">Item</span></th><th>المبلغ (ريال) / <span lang="en" dir="ltr">Amount (SAR)</span></th></tr></thead>
+  <tbody>
+  {% for l in earnings %}<tr><td>{{ l.description_ar }} / <span lang="en" dir="ltr">{{ l.description_en }}</span></td><td dir="ltr">{{ l.amount }}</td></tr>{% endfor %}
+  {% for l in reductions %}<tr><td>{{ l.description_ar }} / <span lang="en" dir="ltr">{{ l.description_en }}</span></td><td dir="ltr">-{{ l.amount }}</td></tr>{% endfor %}
+  <tr><th>إجمالي المستحقات / <span lang="en" dir="ltr">Gross dues</span></th><th dir="ltr">{{ settlement.gross }}</th></tr>
+  {% for l in deductions %}<tr><td>{{ l.description_ar }} / <span lang="en" dir="ltr">{{ l.description_en }}</span></td><td dir="ltr">-{{ l.amount }}</td></tr>{% endfor %}
+  <tr><th>صافي المخالصة / <span lang="en" dir="ltr">Net of the settlement</span></th><th dir="ltr">{{ settlement.net }}</th></tr>
+  </tbody>
+</table>
+{% if interest_free %}<p>قرض حسن بدون فوائد / <span lang="en" dir="ltr">Interest-free loan (qard hasan): no interest or charge</span></p>{% endif %}
+{% if employer %}<section>
+  <h2>مساهمات صاحب العمل / <span lang="en" dir="ltr">Employer contributions</span></h2>
+  <ul>{% for l in employer %}<li>{{ l.description_ar }} / <span lang="en" dir="ltr">{{ l.description_en }}</span>: <span dir="ltr">{{ l.amount }}</span></li>{% endfor %}</ul>
+</section>{% endif %}
+{% for c in corrections %}<section>
+  <h2>تصحيح {{ c.correction.number }} / <span lang="en" dir="ltr">Correction {{ c.correction.number }}</span></h2>
+  <p>السبب / <span lang="en" dir="ltr">Reason</span>: {{ c.correction.reason_ar }}{% if c.correction.reason_en %} / <span lang="en" dir="ltr">{{ c.correction.reason_en }}</span>{% endif %}</p>
+  <ul>{% for l in c.lines %}<li>{{ l.description_ar }} / <span lang="en" dir="ltr">{{ l.description_en }}</span>: <span dir="ltr">{% if l.direction == "decrease" %}-{% endif %}{{ l.amount }}</span></li>{% endfor %}</ul>
+  <p>التغير في الصافي / <span lang="en" dir="ltr">Change of the net</span>: <span dir="ltr">{{ c.correction.net_change }}</span></p>
+</section>{% endfor %}
+<section>
+  <h2>المدفوعات / <span lang="en" dir="ltr">Payments</span></h2>
+  <ul>{% for p in payments %}<li dir="ltr">{{ p.payment_date|date:"Y-m-d" }}: {{ p.amount }}</li>{% empty %}<li>لا توجد / <span lang="en" dir="ltr">none</span></li>{% endfor %}</ul>
+  <p>المستحق مع التصحيحات / <span lang="en" dir="ltr">Due with corrections</span>: <span dir="ltr">{{ due }}</span> &middot; المدفوع / <span lang="en" dir="ltr">Paid</span>: <span dir="ltr">{{ paid }}</span> &middot; الرصيد / <span lang="en" dir="ltr">Balance</span>: <span dir="ltr">{{ balance }}</span></p>
+</section>
+<footer><p>توقيع الموظف / <span lang="en" dir="ltr">Employee signature</span>: ____________ &middot; توقيع المعتمد / <span lang="en" dir="ltr">Approver signature</span>: ____________</p></footer>
+</body>
+</html>

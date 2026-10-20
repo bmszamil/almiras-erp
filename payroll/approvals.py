@@ -12,6 +12,13 @@ Until the approval engine and matrix exist, the seed rows of payroll.md §7 / OQ
 - ``payroll.payment``, ``payroll.reversal``, ``payroll.maternity_clearance``, ``payroll.final_settlement``:
   ``approver``, ``managing_partner`` as fallback (OQ-36).
 
+- ``payroll.loan_write_off`` (slice 2, OQ-7 default): the entity's top authority: ``managing_partner`` in the group
+  parent (Almiras), ``ceo`` in every other entity (access A26, R58 default). The ``ceo`` role is part of the access
+  build (A28); until it exists a subsidiary's write-off is refused, naming the role.
+- ``payroll.settlement_correction``, ``payroll.cost_item``, ``payroll.cost_report``, ``payroll.gosi_fine``,
+  ``payroll.payment_reversal``, ``payroll.profit_recognition`` (slice 2): ``approver``, ``managing_partner`` as
+  fallback (OQ-36 default).
+
 Top-authority self-approval (access R58) needs the matrix's ``top_authority_role``; until then nobody self-approves
 in payroll (the access layer refuses the creator, submitter and last modifier of every A document).
 
@@ -31,6 +38,17 @@ SEED_ROWS = {
     "payroll.maternity_clearance": ("approver", "managing_partner"),
     "payroll.input": ("payroll_officer", "managing_partner"),
     "payroll.final_settlement": ("approver", "managing_partner"),
+    "payroll.settlement_correction": ("approver", "managing_partner"),
+    "payroll.cost_item": ("approver", "managing_partner"),
+    "payroll.cost_report": ("approver", "managing_partner"),
+    "payroll.gosi_fine": ("approver", "managing_partner"),
+    "payroll.payment_reversal": ("approver", "managing_partner"),
+    "payroll.profit_recognition": ("approver", "managing_partner"),
+}
+
+# Activities whose seed row is the entity's top authority (access A26): the MP in the group parent, the CEO elsewhere.
+TOP_AUTHORITY_ROWS = {
+    "payroll.loan_write_off": {"group_parent": ("managing_partner",), "other": ("ceo",)},
 }
 
 LABELS = {
@@ -43,11 +61,26 @@ LABELS = {
     "payroll.maternity_clearance": ("maternity legal clearances", "الإذن القانوني لأجر الأمومة"),
     "payroll.input": ("payroll inputs", "مدخلات الرواتب"),
     "payroll.final_settlement": ("final settlements", "المخالصات النهائية"),
+    "payroll.settlement_correction": ("final settlement corrections", "تصحيحات المخالصات النهائية"),
+    "payroll.loan_write_off": ("loan write-offs", "شطب القروض"),
+    "payroll.cost_item": ("employee cost items", "بنود تكاليف الموظفين"),
+    "payroll.cost_report": ("secondment cost reports", "تقارير تكلفة الإعارة"),
+    "payroll.gosi_fine": ("GOSI late-payment fines", "غرامات تأخير التأمينات"),
+    "payroll.payment_reversal": ("payroll payment reversals", "عكس مدفوعات الرواتب"),
+    "payroll.profit_recognition": ("bai' ajel profit recognition", "إثبات أرباح البيع الآجل"),
 }
 
 
+def is_group_parent(entity):
+    """The group parent (Almiras): a parent-consolidation entity without a parent (data, never a code)."""
+    return entity.parent_id is None and entity.consolidation == "parent"
+
+
 def allowed_roles(entity, activity):
-    """Role codes eligible for ``activity`` in ``entity`` (matrix seed rows; the same in every entity today)."""
+    """Role codes eligible for ``activity`` in ``entity`` (matrix seed rows; the same in every entity except the
+    top-authority rows, which differ between the group parent and the other entities)."""
+    if activity in TOP_AUTHORITY_ROWS:
+        return TOP_AUTHORITY_ROWS[activity]["group_parent" if is_group_parent(entity) else "other"]
     return SEED_ROWS[activity]
 
 
