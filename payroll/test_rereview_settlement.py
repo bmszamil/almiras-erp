@@ -18,7 +18,7 @@ from payroll import services
 from payroll.conftest import D, approved, asset_bill, saudi, slip
 from payroll.models import (DeferredSaleContract, EmployeeLoan, EosbProvisionEntry, FinalSettlement,
                             GosiCatchUpNotice, LoanInstallment, PayrollError, PayrollPayment, PayrollSettings)
-from payroll.test_final_settlement import LWD, leaver, lines, opening_provision, settle, terminate
+from payroll.test_final_settlement import LWD, go_live, leaver, lines, opening_provision, settle, terminate
 from payroll.test_review_misc import terms
 
 
@@ -36,9 +36,9 @@ def _pay_key(rows):
     return total
 
 
-# --- 1. approved settlement lines are booked; runs refuse a settled employee (P1) -------------------------------
+# --- 1. approved settlement lines are booked; runs leave a settled employee out (P1) -------------------------------
 
-def test_rr1_p1_settlement_lines_are_booked_and_an_off_cycle_run_refuses_the_settled_employee(w):
+def test_rr1_p1_settlement_lines_are_booked_and_an_off_cycle_run_leaves_the_settled_employee_out(w):
     saudi(w)
     s7 = leaver(w, cohort="")  # no GOSI cohort: refused in February
     feb = services.calculate_run(services.create_run(w.alm, user=w.p, period="2027-02"), user=w.p)
@@ -57,9 +57,9 @@ def test_rr1_p1_settlement_lines_are_booked_and_an_off_cycle_run_refuses_the_set
     assert {r.line_type for r in gosi} >= {"employee_gosi", "employer_gosi"}
     assert all(r.origin_period == "2027-02" for r in gosi)
     off = services.create_run(w.alm, user=w.p, period="2027-02", kind="off_cycle", reason_ar="تصحيح", employees=[s7])
-    with pytest.raises(PayrollError) as exc:
-        services.calculate_run(off, user=w.p)
-    assert exc.value.code == "employee_settled"
+    off = services.calculate_run(off, user=w.p)  # verification 1: the settled employee is left out, with a warning
+    assert not off.payslips.filter(employee=s7).exists()
+    assert any("approved final settlement" in x for x in off.warnings)
 
 
 def test_rr1_salary_recovered_beyond_the_last_day_counts_as_less_pay_for_the_month(w):
@@ -236,7 +236,7 @@ def test_rr6_settlement_refused_while_a_run_is_submitted(w):
     fs = settle(w, t)
     with pytest.raises(PayrollError) as exc:
         _approve(w, fs)
-    assert exc.value.code == "settlement_runs_open" and "submitted" in str(exc.value)
+    assert exc.value.code == "settlement_runs_open" and "2027-02 is not approved yet" in str(exc.value)
     services.approve_run(feb, user=w.h)
     with pytest.raises(PayrollError) as exc:  # February's EOSB accrual changed the provision balance
         _approve(w, fs)
@@ -270,7 +270,9 @@ def test_rr8_p4_partial_loan_recovery_settles_only_what_was_recovered(w):
     loan = services.create_loan(n1, user=w.p, kind="loan", principal="18000.00", disbursement_date=date(2027, 2, 1),
                                 purpose_ar="قرض حسن", installments=[(f"2027-{m:02d}", "3000.00") for m in range(7, 13)])
     services.approve_loan(services.submit_loan(loan, user=w.p), user=w.mp)
-    fs = _approve(w, settle(w, terminate(w, n1)))
+    t = terminate(w, n1)
+    go_live(w)
+    fs = _approve(w, settle(w, t))
     recovered = lines(fs, "loan_recovery")
     assert D("0") < recovered < D("18000.00") and recovered % 3000 != 0  # one installment is recovered in part
     rows = list(LoanInstallment.objects.filter(loan=loan).order_by("period", "pk"))
@@ -319,6 +321,7 @@ def test_rr10_separate_settlement_has_at_most_two_decimals(w):
 def test_rr11_settlement_of_a_closed_month_posts_in_the_next_open_period(w):
     n1 = leaver(w)
     t = terminate(w, n1)
+    go_live(w)
     fs = services.prepare_final_settlement(FinalSettlement.objects.get(termination=t), user=w.p)
     march = FiscalPeriod.objects.get(entity=w.alm, start_date=date(2027, 3, 1))
     ledger.close_period(march, user=w.c)  # a calculated settlement does not hold the month open
@@ -363,7 +366,9 @@ def test_rr12_termination_refused_while_payroll_is_not_set_up(w):
 
 def test_rr13_settlement_payments_hidden_in_the_admin_without_view_payslip(w):
     n1 = leaver(w)
-    fs = _approve(w, settle(w, terminate(w, n1)))
+    t = terminate(w, n1)
+    go_live(w)
+    fs = _approve(w, settle(w, t))
     p = services.record_payment(w.alm, user=w.p, kind="final_settlement", final_settlement=fs,
                                 payment_date=LWD + timedelta(days=5), amount=str(fs.net))
     g = services.record_payment(w.alm, user=w.p, kind="gosi", gosi_period="2027-03", payment_date=date(2027, 4, 10),
@@ -392,7 +397,9 @@ def test_rr14_plain_cells_unchanged():
 
 def test_rr_p8_two_payments_of_the_full_net_never_both_pass(w):
     n1 = leaver(w)
-    fs = _approve(w, settle(w, terminate(w, n1)))
+    t = terminate(w, n1)
+    go_live(w)
+    fs = _approve(w, settle(w, t))
     ps = [services.submit_payment(services.record_payment(w.alm, user=w.p, kind="final_settlement",
                                                           final_settlement=fs, payment_date=date(2027, 3, 20),
                                                           amount=str(fs.net)), user=w.p) for _ in range(2)]

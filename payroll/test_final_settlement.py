@@ -40,6 +40,14 @@ def opening_provision(w, emp, amount):
     row.save()
 
 
+def go_live(w, period="2027-03"):
+    """Verification 1: a final settlement waits for the entity's first approved regular run. Called after the
+    termination, an approved March run (go-live in the leaving month) leaves the leaver out (R10) and pays another
+    employee, so the leaver's figures do not change."""
+    saudi(w)
+    return approved(w, period)
+
+
 def settle(w, t, **kw):
     fs = FinalSettlement.objects.get(termination=t)
     fs = services.prepare_final_settlement(fs, user=w.p, **kw)
@@ -135,6 +143,7 @@ def test_at40_loan_larger_than_the_dues(w, settings, allowed):
                                 purpose_ar="قرض حسن", installments=[("2027-12", "18000.00")])
     services.approve_loan(services.submit_loan(loan, user=w.p), user=w.mp)
     t = terminate(w, n1)
+    go_live(w)
     fs = settle(w, t)
     eosb = lines(fs, "eosb")
     dues = fs.gross - lines(fs, "employee_gosi")  # what is left after the GOSI share

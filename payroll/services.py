@@ -873,6 +873,7 @@ class Ctx:
         self.skipped_local = 0
         self.leavers = []  # (employee_code, last working day): paid by the final settlement (R10)
         self.nothing_due = []  # off-cycle: employees with nothing left to pay
+        self.settled = []  # (employee_code, settlement number): payroll closed by an approved final settlement
 
     def account(self, code):
         if code not in self._accounts:
@@ -2111,12 +2112,11 @@ def _calculate(ctx):
             continue
         settled = FinalSettlement.objects.filter(employee=emp, status__in=SETTLED, period__gte=ctx.period).first()
         if settled is not None:
-            # Re-review 1: the approved final settlement closed this employee's payroll up to the leaving month; a run
-            # would pay or charge again what it settled. Corrections go through a later document, not a run.
-            raise error(f"{emp.employee_code} has an approved final settlement ({settled.number}) covering {ctx.period}: "
-                        "the run cannot include them (re-review 1).",
-                        f"للموظف {emp.employee_code} مخالصة نهائية معتمدة ({settled.number}) تشمل {ctx.period}: لا يدخل "
-                        "في المسير.", code="employee_settled")
+            # Re-review 1, verification 1: the approved final settlement closed this employee's payroll up to the
+            # leaving month; a run would pay or charge again what it settled. The employee is left out of the run (a
+            # count warning and a note), never the whole run refused; corrections go through a later document.
+            ctx.settled.append((emp.employee_code, settled.number))
+            continue
         if emp.employment_basis == Basis.LOCAL_ENTITY_EMPLOYEE:
             # Never computed with Saudi parameters (R41); review 17: the skip is visible on the run.
             ctx.skipped_local += 1
@@ -2142,6 +2142,11 @@ def _calculate(ctx):
         ctx.warnings.append(f"{n} employee(s) with an approved termination in the period are paid through the final "
                             f"settlement, not the run (R10) / {n} من الموظفين بإنهاء خدمة معتمد في الفترة يُدفع لهم عبر "
                             "المخالصة النهائية لا المسير")
+    if ctx.settled:
+        n = len(ctx.settled)
+        ctx.warnings.append(f"{n} employee(s) left out: an approved final settlement closed their payroll for "
+                            f"{ctx.period} (re-review 1) / استُبعد {n} من الموظفين: أغلقت مخالصة نهائية معتمدة رواتبهم "
+                            f"لفترة {ctx.period}")
     if ctx.nothing_due:
         n = len(ctx.nothing_due)
         ctx.warnings.append(f"{n} named employee(s) have nothing left to pay for the period (review 2) / لا يتبقى ما "
@@ -2285,6 +2290,8 @@ def calculate_run(run, *, user):
     # Review 13: per-employee details stay on the payslips (payroll.view_payslip); the run shows counts only.
     run.employee_notes = ([f"{code}: last working day {lwd}: final settlement (R10) / {code}: آخر يوم عمل {lwd}: "
                            "المخالصة النهائية" for code, lwd in ctx.leavers]
+                          + [f"{code}: final settlement {number} approved: left out / {code}: مخالصة نهائية معتمدة "
+                             f"{number}: مستبعد" for code, number in ctx.settled]
                           + [f"{code}: nothing left to pay / {code}: لا يتبقى ما يُدفع" for code in ctx.nothing_due])
     run.inputs_hash = _fingerprint(slips, ctx.warnings, ctx.use.ids)
     run.stored_hash = _stored_fingerprint(run)
@@ -3442,16 +3449,24 @@ def _open_posting_date(entity, original):
 
 
 def _settlement_months_check(fs, emp):
-    """Re-review 6: the settlement closes the employee's payroll. Every month from the hire month (or the entity's
-    first approved regular run, when payroll went live later: earlier months were paid outside the ERP) to the month
-    before leaving has an approved regular run, and no run up to the leaving month is waiting for approval with the
-    employee in it (a later approval would pay or accrue again what the settlement settles)."""
+    """Re-review 6, verification 1: the settlement closes the employee's payroll. The entity has an approved regular
+    in-country run (its first one, for the months before leaving or the go-live month: until then nothing tells which
+    months the runs will still pay); every month from the hire month (or the entity's first approved regular run, when
+    payroll went live later: earlier months were paid outside the ERP) to the month before leaving has an approved
+    regular run; no run up to the leaving month is submitted for an earlier month; and no run up to the leaving month
+    that is not approved yet (draft, calculated, returned or submitted) includes the employee (a later approval would
+    pay or accrue again what the settlement settles)."""
     regular = PayrollRun.objects.filter(entity=fs.entity, payroll_group=PayrollGroup.IN_COUNTRY,
                                         kind=PayrollRun.Kind.REGULAR)
     approved_periods = set(regular.filter(status__in=(RS.APPROVED, RS.PAID)).values_list("period", flat=True))
     hire_p = _period_of(emp.hire_date)
     problems = []
-    if approved_periods:
+    if not approved_periods:
+        problems.append("The entity has no approved regular payroll run yet: approve its first regular run (the months "
+                        "before leaving, or the go-live month) before the final settlement (verification 1). / لا يوجد "
+                        "للكيان مسير عادي معتمد بعد: اعتمد أول مسير عادي (الأشهر السابقة لترك العمل أو شهر بدء التشغيل) "
+                        "قبل المخالصة النهائية.")
+    else:
         q = max(hire_p, min(approved_periods))
         missing = []
         while q < fs.period:
@@ -3462,12 +3477,17 @@ def _settlement_months_check(fs, emp):
             problems.append(f"No approved regular run for {', '.join(missing)}: approve it before the final settlement "
                             f"(re-review 6). / لا يوجد مسير عادي معتمد لفترة {', '.join(missing)}: اعتمده قبل المخالصة "
                             "النهائية.")
-    waiting = PayrollRun.objects.filter(entity=fs.entity, status=RS.SUBMITTED, period__lte=fs.period).filter(
-        Q(period__lt=fs.period, period__gte=hire_p) | Q(payslips__employee=emp)).distinct()
-    if waiting.exists():
-        periods = ", ".join(sorted({r.period for r in waiting}))
-        problems.append(f"A run for {periods} is submitted: approve or return it before the final settlement "
-                        f"(re-review 6). / مسير لفترة {periods} مقدّم: اعتمده أو أعده قبل المخالصة النهائية.")
+    up_to = PayrollRun.objects.filter(entity=fs.entity, period__lte=fs.period)
+    waiting = up_to.filter(status=RS.SUBMITTED, period__lt=fs.period, period__gte=hire_p)
+    with_emp = up_to.filter(status__in=(RS.DRAFT, RS.CALCULATED, RS.RETURNED, RS.SUBMITTED),
+                            payslips__employee=emp, payslips__refused=False)
+    periods = sorted(set(waiting.values_list("period", flat=True)) | set(with_emp.values_list("period", flat=True)))
+    if periods:
+        periods = ", ".join(periods)
+        problems.append(f"A run for {periods} is not approved yet and includes the employee or an earlier month: approve it, "
+                        f"or recalculate it (a recalculation leaves the leaver out of the leaving month), before the final "
+                        f"settlement (re-review 6, verification 1). / مسير لفترة {periods} غير معتمد بعد ويشمل الموظف أو "
+                        "شهرًا سابقًا: اعتمده أو أعد احتسابه قبل المخالصة النهائية.")
     if problems:
         raise _problems(problems, "settlement_runs_open")
 
