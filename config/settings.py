@@ -64,7 +64,10 @@ INVOICING_ZATCA_PORT = "zatca.port.ZatcaModulePort"
 ZATCA_SECRET_STORE = os.environ.get("ZATCA_SECRET_STORE", "zatca.keystore.OpenBaoSecretStore")
 ZATCA_OPENBAO_ADDRESS = os.environ.get("ZATCA_OPENBAO_ADDRESS", "")
 ZATCA_OPENBAO_AUTH_ROLE = os.environ.get("ZATCA_OPENBAO_AUTH_ROLE", "")
-# API client (R-29). Base URLs and paths come from ZATCA's Swagger at deployment (OQ-30); empty placeholders.
+# API client (R-29, OQ-30). Empty values here mean "use the defaults in zatca/client.py" (DEFAULT_BASE_URLS,
+# DEFAULT_API_PATHS); a non-empty value overrides its default. The developer-portal sandbox URL and every path were
+# checked against ZATCA on 2026-10-19 (docs/compliance/zatca-sandbox-2026-10-19.md §2); the simulation and
+# production base URLs are ZATCA's published values, not yet called (client.BASE_URL_VERIFIED).
 ZATCA_CLIENT = "zatca.client.HttpZatcaClient"
 ZATCA_API_BASE_URLS = {"sandbox": os.environ.get("ZATCA_SANDBOX_BASE_URL", ""),
                        "simulation": os.environ.get("ZATCA_SIMULATION_BASE_URL", ""),
@@ -73,11 +76,13 @@ ZATCA_API_PATHS = {"compliance_csid": "", "compliance_check": "", "production_cs
                    "clearance": "", "reporting": ""}
 # R-29: production can be selected only where this is switched on explicitly (never in test or dev settings).
 ZATCA_PRODUCTION_ALLOWED = os.environ.get("ZATCA_PRODUCTION_ALLOWED", "0") == "1"
-# R-15 / R-37, pending a current ZATCA SDK or the sandbox (OQ-28 remainder, OQ-33): see zatca/qr.py.
+# R-15 / R-37: settled against ZATCA SDK R3.4.8 and R4.0.0 (zatca/qr.py). These three settings are retired and
+# change nothing: the QR always uses the DTG tags 7-9 layout (any other layout value is refused as misconfiguration),
+# BER lengths with no per-value cap, and the 1000-character cap constant qr.MAX_CHARS.
 ZATCA_QR_TAGS_7_9_LAYOUT = "dtg_2023_pending_sdk_confirm"
 ZATCA_QR_TLV_LENGTH_FORM = "one_byte_max_127_pending_sdk_confirm"
 ZATCA_QR_MAX_CHARS = 700
-# R-14 X509IssuerName form (RFC 2253 with ", "; [SDK-confirm]).
+# R-14 X509IssuerName form: RFC 2253 with ", " (settled by SDK R3.4.8 and R4.0.0; "bc" is for comparison only).
 ZATCA_X509_ISSUER_NAME_STYLE = "rfc2253"
 # R-10 renewal lead time (OQ-9), R-23 alert lead time, R-24 retry policy (OQ-10), R-27 optional serialising.
 ZATCA_RENEWAL_DAYS = 30
