@@ -35,6 +35,8 @@ ALLOW = {
     "core/access/services.py:visible_access_log": "the scope mechanism for access-log rows (entities_for + group parent)",
     "ledger/services.py:counterparty_choices": "choice list for admin; posting checks every line",
     "invoicing/services.py:party_problems": "pure check of a party record the caller passes (model clean, services)",
+    "invoicing/services.py:deferred_sale_of": "payroll invoicing port only: the live bai' ajel sale of a contract payroll "
+                                              "already holds and checked (R112); amounts and status, no personal data",
     "invoicing/services.py:customers": "the scope mechanism for customers (access.scope with invoicing.view, R2)",
     "invoicing/services.py:vendors": "the scope mechanism for vendors (access.scope with invoicing.view, R2)",
     "invoicing/services.py:sales_documents": "the scope mechanism for sales documents (access.scope, R2)",
