@@ -2159,7 +2159,9 @@ def _calculate(ctx):
 
 
 def _eosb_tie_out(entity, as_of):
-    sub = EosbProvisionEntry.objects.filter(entity=entity).aggregate(t=Sum("amount"))["t"] or ZERO
+    """R25: account 2500 against the EOSB sub-ledger, both as of ``as_of`` (verification 3: sub-ledger rows by their
+    date, which is the date of the entry that booked them)."""
+    sub = EosbProvisionEntry.objects.filter(entity=entity, date__lte=as_of).aggregate(t=Sum("amount"))["t"] or ZERO
     lines = JournalLine.objects.filter(entry__entity=entity, entry__status__in=("posted", "reversed"),
                                        account__code=EOSB_PROVISION, entry__date__lte=as_of) \
         .aggregate(d=Sum("debit"), c=Sum("credit"))
@@ -3561,13 +3563,14 @@ def _settlement_effects(fs, out, user):
             loan.status = EmployeeLoan.Status.SETTLED
             _save(loan)
     award, balance = fs.eosb_award, max(fs.eosb_provision_balance, ZERO)
+    on = fs.journal_entry.date  # verification 3: the entry date (the next open month when the leaving month closed)
     if award or balance:
         used = min(award, balance)
         if used:
-            _save(EosbProvisionEntry(entity=fs.entity, employee_id=fs.employee_id, date=fs.last_working_day,
+            _save(EosbProvisionEntry(entity=fs.entity, employee_id=fs.employee_id, date=on,
                                      kind=EosbProvisionEntry.Kind.UTILISATION, amount=-used))
         if balance > award:
-            _save(EosbProvisionEntry(entity=fs.entity, employee_id=fs.employee_id, date=fs.last_working_day,
+            _save(EosbProvisionEntry(entity=fs.entity, employee_id=fs.employee_id, date=on,
                                      kind=EosbProvisionEntry.Kind.RELEASE, amount=-(balance - award)))
     for inp in PayrollInput._base_manager.select_for_update().filter(pk__in=out.input_ids).order_by("pk"):
         if inp.taken_run_id is not None or inp.final_settlement_id is not None:
@@ -3636,11 +3639,14 @@ def _run_payable(run, currency):
 
 
 def _settlement_credits_2340(entity, period):
-    """Re-review 4: the lines of approved (or paid) final settlements credited to 2340, under the settlement's
-    leaving month (as a run's lines are under the run's period): both shares, a share borne by the employer and the
-    advanced (uncollected) employee share."""
-    return FinalSettlementLine.objects.filter(entity=entity, settlement__period=period,
-                                              settlement__status__in=SETTLED).filter(
+    """Re-review 4: the lines of approved (or paid) final settlements credited to 2340: both shares, a share borne by
+    the employer and the advanced (uncollected) employee share. Verification 3: they count under the month of the
+    settlement's journal entry, i.e. the leaving month, or the next open month when the leaving month was closed, so
+    the GOSI payable of a period ties out with what the ledger credited to 2340 in it."""
+    start, end = _period_bounds(period)
+    return FinalSettlementLine.objects.filter(entity=entity, settlement__status__in=SETTLED,
+                                              settlement__journal_entry__date__gte=start,
+                                              settlement__journal_entry__date__lte=end).filter(
         Q(line_type__in=(FSL.EMPLOYER_GOSI, FSL.GOSI_UNCOLLECTED))
         | Q(line_type__in=(FSL.EMPLOYEE_GOSI, FSL.GOSI_RECOVERY), account__code=GOSI_PAYABLE))
 

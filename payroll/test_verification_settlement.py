@@ -2,14 +2,18 @@
 (test_zz_rr2probe.py) ported as regression tests.
 
 Every date is fixed (the hr clock 2027-06-01, the payroll clock 2027-03-20, conftest); nothing reads the real date."""
+from datetime import date
+
 import pytest
 from django.db import connection
+from django.db.models import Sum
 
-from ledger.models import Account
+from ledger import services as ledger
+from ledger.models import Account, FiscalPeriod, JournalLine
 from payroll import services
 from payroll.conftest import D, approved, saudi, slip
-from payroll.models import FinalSettlement, PayrollError
-from payroll.test_final_settlement import leaver, lines, settle, terminate
+from payroll.models import EosbProvisionEntry, FinalSettlement, PayrollError
+from payroll.test_final_settlement import LWD, leaver, lines, opening_provision, settle, terminate
 
 
 def _approve(w, fs):
@@ -209,3 +213,50 @@ def test_v2_any_stored_line_field_changed_with_the_hash_recomputed_is_refused(w,
     with pytest.raises(PayrollError) as exc:
         _approve(w, fs)
     assert exc.value.code == "payslips_changed"
+
+
+# --- 3. closed leaving month: the tie-outs follow the entry date --------------------------------------------------
+
+def _gl_2340(entity, start, end):
+    t = JournalLine.objects.filter(entry__entity=entity, entry__status__in=("posted", "reversed"), account__code="2340",
+                                   entry__date__gte=start, entry__date__lte=end) \
+        .aggregate(d=Sum("debit"), c=Sum("credit"))
+    return (t["c"] or D("0")) - (t["d"] or D("0"))
+
+
+def test_v3_closed_leaving_month_gosi_and_eosb_tie_outs_use_the_entry_date(w):
+    n1 = leaver(w)
+    approved(w, "2027-02")
+    opening_provision(w, n1, "15500.00")
+    fs = services.prepare_final_settlement(FinalSettlement.objects.get(termination=terminate(w, n1)), user=w.p)
+    march = FiscalPeriod.objects.get(entity=w.alm, start_date=date(2027, 3, 1))
+    ledger.close_period(march, user=w.c)
+    mar_end, apr_start, apr_end = date(2027, 3, 31), date(2027, 4, 1), date(2027, 4, 30)
+    eosb_mar, eosb_apr = services._eosb_tie_out(w.alm, mar_end), services._eosb_tie_out(w.alm, apr_end)
+    gosi_mar, gosi_apr = services._gosi_booked(w.alm, "2027-03"), services._gosi_booked(w.alm, "2027-04")
+    fs = _approve(w, services.submit_final_settlement(fs, user=w.p))
+    assert fs.journal_entry.date == apr_start and fs.period == "2027-03"
+    # EOSB: the sub-ledger rows carry the entry date, so 2500 and the sub-ledger move together at every date.
+    rows = EosbProvisionEntry.objects.filter(employee=n1, kind__in=("utilisation", "release"))
+    assert rows.exists() and {r.date for r in rows} == {apr_start}
+    assert services._eosb_tie_out(w.alm, mar_end) == eosb_mar
+    assert services._eosb_tie_out(w.alm, apr_end) == eosb_apr
+    # GOSI: the settlement's 2340 credits count in April, the month the ledger credited them.
+    settled = sum(l.amount for l in services._settlement_credits_2340(w.alm, "2027-04"))
+    assert settled > 0 and settled == _gl_2340(w.alm, apr_start, apr_end)
+    assert services._gosi_booked(w.alm, "2027-03") == gosi_mar
+    assert services._gosi_booked(w.alm, "2027-04") == gosi_apr + settled
+    assert services._gosi_open(w.alm, "2027-04") == gosi_apr + settled
+    assert not services._settlement_credits_2340(w.alm, "2027-03").exists()
+
+
+def test_v3_open_leaving_month_counts_under_the_leaving_month(w):
+    n1 = leaver(w)
+    approved(w, "2027-02")
+    fs = _approve(w, settle(w, terminate(w, n1)))
+    assert fs.journal_entry.date == LWD
+    settled = sum(l.amount for l in services._settlement_credits_2340(w.alm, "2027-03"))
+    assert settled > 0 and settled == _gl_2340(w.alm, date(2027, 3, 1), date(2027, 3, 31))  # no March run
+    assert {r.date for r in EosbProvisionEntry.objects.filter(employee=n1, kind__in=("utilisation", "release"))} \
+        <= {LWD}
+    assert not services._settlement_credits_2340(w.alm, "2027-04").exists()
