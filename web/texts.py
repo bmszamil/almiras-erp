@@ -3,14 +3,14 @@
 Templates show them with ``{% t "key" %}``; Python code with :func:`text`. ``web/test_texts.py`` checks that every key
 has both halves and that templates hold no literal text outside this tag.
 
-[AR-review] Every Arabic text here awaits the Arabic reviewer (web.md OQ-24), including the Arabic form of the
-group's name.
+[AR-review] Every Arabic text here awaits the Arabic reviewer (web.md OQ-24). The group's Arabic name is written
+as in the Arabic logo (المراس).
 """
 
 TEXTS = {
     # --- frame -----------------------------------------------------------------------------------------
-    "app_name": ("Almiras ERP", "نظام الميراس"),
-    "brand_name": ("Almiras", "الميراس"),
+    "app_name": ("Almiras ERP", "نظام المراس"),
+    "brand_name": ("Almiras", "المراس"),
     "skip_to_content": ("Skip to main content", "انتقل إلى المحتوى الرئيسي"),
     "nav_label": ("Main navigation", "التنقل الرئيسي"),
     "menu": ("Menu", "القائمة"),
@@ -33,7 +33,7 @@ TEXTS = {
     "breadcrumb": ("Breadcrumb", "مسار التنقل"),
     # --- login -----------------------------------------------------------------------------------------
     "login_title": ("Sign in", "تسجيل الدخول"),
-    "login_intro": ("Sign in with your Almiras ERP account.", "سجّل الدخول بحساب نظام الميراس الخاص بك."),
+    "login_intro": ("Sign in with your Almiras ERP account.", "سجّل الدخول بحساب نظام المراس الخاص بك."),
     "username": ("Username", "اسم المستخدم"),
     "password": ("Password", "كلمة المرور"),
     "sign_in": ("Sign in", "دخول"),
