@@ -14,21 +14,27 @@ on_pg = pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL
 
 
 def test_review6_tampered_stored_lines_are_never_posted(w):
-    """Probe P6 (SQLite path): the stored lines are changed by raw SQL after submission; approval refuses."""
+    """Probe P6: the stored lines are changed by raw SQL after submission. On PostgreSQL the trigger refuses the
+    write itself; on SQLite (no triggers) approval compares the stored-rows hash and refuses."""
     s1 = saudi(w)
     run = submitted(w, "2027-03")
     line = slip(run, s1).lines.get(line_type="earning", component__code="BASIC")
+    sql = "UPDATE payroll_payslipline SET amount = 99999 WHERE id = %s"
     if connection.vendor == "postgresql":
-        pytest.skip("on PostgreSQL the trigger refuses the raw update itself (test below)")
-    with connection.cursor() as cursor:
-        cursor.execute("UPDATE payroll_payslipline SET amount = 99999 WHERE id = %s", [line.pk])
-    with pytest.raises(PayrollError) as exc:
-        services.approve_run(run, user=w.h)
-    assert exc.value.code == "payslips_changed"
-    assert PayrollRun.objects.get(pk=run.pk).status == "submitted" and PayrollRun.objects.get(pk=run.pk).journal_entry_id is None
-    run = services.calculate_run(services.return_run(run, user=w.h, reason_ar="تصحيح"), user=w.p)
-    run = services.approve_run(services.submit_run(run, user=w.p), user=w.h)
-    assert entry_lines(run)["2330"] == -slip(run, s1).net
+        with pytest.raises(DatabaseError), transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute(sql, [line.pk])
+    else:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, [line.pk])
+        with pytest.raises(PayrollError) as exc:
+            services.approve_run(run, user=w.h)
+        assert exc.value.code == "payslips_changed"
+        stored = PayrollRun.objects.get(pk=run.pk)
+        assert stored.status == "submitted" and stored.journal_entry_id is None
+        run = services.calculate_run(services.return_run(run, user=w.h, reason_ar="تصحيح"), user=w.p)
+        run = services.submit_run(run, user=w.p)
+    run = services.approve_run(run, user=w.h)
+    assert entry_lines(run)["2330"] == -slip(run, s1).net and entry_lines(run)["5100"] < D("99999")
 
 
 def test_review6_base_manager_and_bulk_writes_are_refused(w):
