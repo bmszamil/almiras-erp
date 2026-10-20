@@ -351,8 +351,22 @@ ROLE_SEED_V16 = {
                               "payroll.approve_loan_write_off"),
     "accountant": _plus(ROLE_SEED_V15, "accountant", "payroll.prepare_profit_recognition"),
 }
+# V17 (migration core.0026, payroll slice 3, payroll.md §11.7): the payroll officer and the accountant generate the
+# leave and EOSB liability reports (nothing is posted); the payroll officer records Mudad justifications; the
+# hr_officer approves them (matrix activity payroll.mudad_justification, code default hr_officer); the managing
+# partner holds the approval as fallback like every A permission (OQ-1; payroll's matrix seam refuses it for this
+# activity). No right goes to an agent or system user (R38). The parallel approval-engine build may add its own
+# seed version; the two are renumbered at merge.
+ROLE_SEED_V17 = {
+    **ROLE_SEED_V16,
+    "payroll_officer": _plus(ROLE_SEED_V16, "payroll_officer", "payroll.prepare_liability_report",
+                             "payroll.record_mudad_justification"),
+    "accountant": _plus(ROLE_SEED_V16, "accountant", "payroll.prepare_liability_report"),
+    "hr_officer": _plus(ROLE_SEED_V16, "hr_officer", "payroll.approve_mudad_justification"),
+    "managing_partner": _plus(ROLE_SEED_V16, "managing_partner", "payroll.approve_mudad_justification"),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V16
+ROLE_SEED = ROLE_SEED_V17
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
