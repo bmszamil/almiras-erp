@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     "migration",
     "tax",
     "payroll",
+    "web",
 ]
 
 # tax-returns R55: the Art. 51 annual true-up hand-off (tax.art51_port). As built, invoicing posts mixed input VAT
@@ -133,9 +134,55 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    # web.md R12 (human-only sessions), R17 (timeouts), R22 (no-store), R27 (language).
+    "web.middleware.WebMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "django.middleware.csp.ContentSecurityPolicyMiddleware",  # web.md R20
 ]
+
+# --- Web UI security (docs/specs/web.md R17, R18, R20) -------------------------------------------------------
+from django.utils.csp import CSP  # noqa: E402
+
+# R20: no inline script or style, no outside origin; fonts, images and CSS are vendored static files.
+SECURE_CSP = {
+    "default-src": [CSP.SELF],
+    "script-src": [CSP.SELF],
+    "style-src": [CSP.SELF],
+    "img-src": [CSP.SELF, "data:"],
+    "font-src": [CSP.SELF],
+    "form-action": [CSP.SELF],
+    "frame-ancestors": [CSP.NONE],
+    "base-uri": [CSP.NONE],
+    "object-src": [CSP.NONE],
+}
+X_FRAME_OPTIONS = "DENY"
+SECURE_REFERRER_POLICY = "same-origin"
+SECURE_CONTENT_TYPE_NOSNIFF = True
+# HSTS is sent on HTTPS responses only (SecurityMiddleware); one year.
+SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_HSTS_SECONDS", 365 * 24 * 3600))
+
+# R17: Secure, HttpOnly, SameSite=Lax cookies. Secure is on unless DEBUG (plain-HTTP local runs) and can be forced
+# either way with DJANGO_SECURE_COOKIES.
+_SECURE_COOKIES = os.environ.get("DJANGO_SECURE_COOKIES", "0" if DEBUG else "1") == "1"
+SESSION_COOKIE_SECURE = _SECURE_COOKIES
+CSRF_COOKIE_SECURE = _SECURE_COOKIES
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+SESSION_EXPIRE_AT_BROWSER_CLOSE = True
+# OQ-8 defaults: absolute 10 h (also the cookie age), idle 30 min, 15 min for users who need MFA (web.middleware).
+SESSION_COOKIE_AGE = 10 * 3600
+WEB_SESSION_ABSOLUTE_SECONDS = 10 * 3600
+WEB_SESSION_IDLE_SECONDS = 30 * 60
+WEB_SESSION_IDLE_MFA_SECONDS = 15 * 60
+# R18, OQ-9 defaults: 5 failed sign-ins per username + IP lock that pair for 15 minutes.
+WEB_LOGIN_MAX_FAILURES = 5
+WEB_LOGIN_LOCK_SECONDS = 15 * 60
+
+LOGIN_URL = "web:login"
+LOGIN_REDIRECT_URL = "web:home"
+CSRF_FAILURE_VIEW = "web.views.csrf_failure"
 
 ROOT_URLCONF = "config.urls"
 
@@ -149,6 +196,7 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                "web.context_processors.ui",
             ],
         },
     },

@@ -1,0 +1,9 @@
+{% load web_tags %}<form class="alm-lang-switch" method="post" action="{% url 'web:language' %}">
+  {% csrf_token %}
+  <input type="hidden" name="next" value="{{ request.get_full_path }}">
+  {% if ui.lang == "ar" %}
+  <button type="submit" name="language" value="en" class="btn btn-sm {% if on_navy %}alm-btn-on-navy{% else %}btn-outline-primary{% endif %}" lang="en" aria-label="{% t 'language' %}: {% t 'switch_to_en' %}">{% t "switch_to_en" %}</button>
+  {% else %}
+  <button type="submit" name="language" value="ar" class="btn btn-sm {% if on_navy %}alm-btn-on-navy{% else %}btn-outline-primary{% endif %}" lang="ar" aria-label="{% t 'language' %}: {% t 'switch_to_ar' %}">{% t "switch_to_ar" %}</button>
+  {% endif %}
+</form>

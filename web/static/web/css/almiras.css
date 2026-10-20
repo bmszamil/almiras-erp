@@ -1,0 +1,189 @@
+/* Almiras theme for Bootstrap 5.3 (docs/design/brand.md "Tokens for the web app"; web.md R20, R27, R35, R36).
+ *
+ * One stylesheet for both directions: CSS logical properties only (inline-start/end), so the RTL Bootstrap build and
+ * this file mirror together. Contrast rules from brand.md: orange (#DF5323) never for small text, only for large
+ * titles, graphics and the focus ring; small accent text, links and errors use orange 4 (#9B3317); muted navy 2
+ * (#5E7580) only on white. Status never by colour alone (each badge has text and a shape).
+ */
+:root {
+  --alm-navy: #0B2A3C;   --alm-sand: #FFEEE8;   --alm-orange: #DF5323;  --alm-white: #FFFFFF;
+  --alm-orange-1: #F9E4DD; --alm-orange-2: #EFA78B; --alm-orange-4: #9B3317; --alm-orange-5: #54170A;
+  --alm-navy-1: #A7B4B9;   --alm-navy-2: #5E7580;   --alm-navy-4: #081C26;   --alm-navy-5: #030F17;
+  --alm-sand-2: #FFD0BE;   --alm-sand-3: #FFC1A7;   --alm-sand-4: #FFB193;   --alm-sand-5: #BE8670;
+  --alm-text: var(--alm-navy);        --alm-text-muted: var(--alm-navy-2);
+  --alm-accent-text: var(--alm-orange-4);
+  --alm-surface: var(--alm-white);    --alm-page: var(--alm-sand);
+  --alm-radius: 20px; --alm-radius-sm: 16px; --alm-radius-input: 4px;
+  --alm-font-ar: 'HT Rakik', 'IBM Plex Sans Arabic', sans-serif;
+  --alm-font-display: 'Bricolage Grotesque', 'IBM Plex Sans Arabic', sans-serif;
+  --alm-lh-heading: 1.3; --alm-lh-body: 1.85;
+
+  /* Bootstrap themed through the tokens (brand.md last paragraph). */
+  --bs-primary: var(--alm-navy);
+  --bs-primary-rgb: 11, 42, 60;
+  --bs-body-bg: var(--alm-page);
+  --bs-body-color: var(--alm-text);
+  --bs-body-font-family: var(--alm-font-ar);
+  --bs-body-font-weight: 300;
+  --bs-body-line-height: var(--alm-lh-body);
+  --bs-emphasis-color: var(--alm-navy);
+  --bs-secondary-color: var(--alm-navy-2);
+  --bs-link-color: var(--alm-orange-4);
+  --bs-link-color-rgb: 155, 51, 23;
+  --bs-link-hover-color: var(--alm-orange-5);
+  --bs-link-hover-color-rgb: 84, 23, 10;
+  --bs-border-color: var(--alm-navy-1);
+  --bs-border-radius: var(--alm-radius-input);
+  --bs-border-radius-sm: var(--alm-radius-input);
+  --bs-focus-ring-color: rgba(223, 83, 35, 0.6);
+  --bs-heading-color: var(--alm-navy);
+}
+
+body.alm-body { background: var(--alm-page); color: var(--alm-text); }
+
+h1, h2, h3, .alm-title, .alm-card__title { font-family: var(--alm-font-ar); font-weight: 500; line-height: var(--alm-lh-heading); }
+:lang(en) h1, :lang(en) h2, :lang(en) h3, :lang(en) .alm-title, :lang(en) .alm-card__title { font-family: var(--alm-font-display); font-weight: 700; }
+label, th, .form-label, .btn, .alm-nav__link, .alm-status { font-weight: 500; }
+
+/* Visible focus everywhere (R35): orange ring, 3.4:1 or more on sand, white and navy. */
+:focus-visible { outline: 3px solid var(--alm-orange); outline-offset: 2px; }
+.form-control:focus, .form-select:focus, .btn:focus-visible { border-color: var(--alm-orange); box-shadow: 0 0 0 0.2rem rgba(223, 83, 35, 0.35); }
+
+/* Skip link (R35). */
+.alm-skip { position: absolute; inset-inline-start: 1rem; inset-block-start: -10rem; z-index: 1000; padding: .5rem 1rem;
+  background: var(--alm-white); color: var(--alm-navy); border: 2px solid var(--alm-navy); border-radius: var(--alm-radius-input); }
+.alm-skip:focus { inset-block-start: 1rem; }
+
+/* Buttons: primary is navy with white text (brand.md); orange is never a small-text button. */
+.btn-primary { --bs-btn-bg: var(--alm-navy); --bs-btn-border-color: var(--alm-navy); --bs-btn-color: var(--alm-white);
+  --bs-btn-hover-bg: var(--alm-navy-4); --bs-btn-hover-border-color: var(--alm-navy-4); --bs-btn-hover-color: var(--alm-white);
+  --bs-btn-active-bg: var(--alm-navy-5); --bs-btn-active-border-color: var(--alm-navy-5);
+  --bs-btn-disabled-bg: var(--alm-navy-2); --bs-btn-disabled-border-color: var(--alm-navy-2); }
+.btn-outline-primary { --bs-btn-color: var(--alm-navy); --bs-btn-border-color: var(--alm-navy); --bs-btn-bg: var(--alm-white);
+  --bs-btn-hover-bg: var(--alm-navy); --bs-btn-hover-color: var(--alm-white); --bs-btn-hover-border-color: var(--alm-navy);
+  --bs-btn-active-bg: var(--alm-navy-4); --bs-btn-active-color: var(--alm-white); }
+.alm-btn-on-navy { --bs-btn-color: var(--alm-sand); --bs-btn-border-color: var(--alm-sand); --bs-btn-bg: transparent;
+  --bs-btn-hover-bg: var(--alm-sand); --bs-btn-hover-color: var(--alm-navy); --bs-btn-hover-border-color: var(--alm-sand);
+  --bs-btn-active-bg: var(--alm-sand-2); --bs-btn-active-color: var(--alm-navy); }
+
+/* --- shell: navy sidebar (navigation, 55 %), sand page (30 %) ------------------------------------------------- */
+.alm-shell { display: grid; grid-template-columns: 17rem minmax(0, 1fr); min-block-size: 100vh; }
+.alm-sidebar { background: var(--alm-navy); color: var(--alm-sand); padding: 1.5rem 1.25rem; display: flex; flex-direction: column; gap: 1.5rem; }
+.alm-brand { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+/* Clear space around the logo: half the symbol height (about 19 px at 176 px width). */
+.alm-brand__link { display: inline-block; padding: 0.75rem 0; }
+.alm-logo--full { inline-size: 176px; block-size: auto; display: block; }
+.alm-logo--symbol { display: none; inline-size: 44px; block-size: auto; }
+.alm-nav-panel { display: flex; flex-direction: column; gap: 1.5rem; flex: 1; }
+.alm-switcher__label { display: block; font-size: .875rem; font-weight: 500; color: var(--alm-sand); margin-block-end: .35rem; }
+.alm-switcher__row { display: flex; gap: .5rem; }
+.alm-switcher .form-select { color: var(--alm-navy); }
+/* Inputs are white surfaces (brand.md 55/30/10/5), not the sand page colour Bootstrap would inherit. */
+.form-control, .form-select { background-color: var(--alm-white); color: var(--alm-navy); border-color: var(--alm-navy-2); }
+.alm-nav__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .15rem; }
+.alm-nav__section { margin-block-start: 1rem; padding-inline: .75rem; font-size: .8125rem; color: var(--alm-navy-1); font-weight: 500; }
+.alm-nav__link { display: block; padding: .5rem .75rem; color: var(--alm-sand); text-decoration: none; border-radius: var(--alm-radius-input);
+  border-inline-start: 4px solid transparent; line-height: 1.5; }
+.alm-nav__link:hover { background: var(--alm-navy-4); color: var(--alm-white); }
+.alm-nav__link.is-active { background: var(--alm-navy-4); color: var(--alm-white); border-inline-start-color: var(--alm-orange); }
+.alm-account { margin-block-start: auto; display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; border-block-start: 1px solid var(--alm-navy-2); padding-block-start: 1rem; }
+.alm-account__who { inline-size: 100%; margin: 0; font-size: .875rem; line-height: 1.5; }
+.alm-account__label { color: var(--alm-navy-1); }
+.alm-nav-toggle { display: none; align-items: center; gap: .5rem; background: transparent; color: var(--alm-sand);
+  border: 1px solid var(--alm-sand); border-radius: var(--alm-radius-input); padding: .35rem .75rem; font-weight: 500; }
+.alm-nav-toggle__bars { inline-size: 1rem; block-size: .7rem; border-block: 2px solid currentColor; position: relative; }
+.alm-nav-toggle__bars::after { content: ""; position: absolute; inset-inline: 0; inset-block-start: calc(50% - 1px); border-block-start: 2px solid currentColor; }
+
+.alm-main { padding: 4vmin; min-inline-size: 0; }
+.alm-main:focus { outline: none; }
+
+/* Below 992 px the sidebar becomes a top bar; the logo has less than 140 px there, so the symbol is used. */
+@media (max-width: 991.98px) {
+  .alm-shell { display: block; }
+  .alm-sidebar { padding: .75rem 1rem; gap: 1rem; }
+  .alm-logo--full { display: none; }
+  .alm-logo--symbol { display: block; }
+  .alm-brand__link { padding: .25rem 0; }
+  .alm-js .alm-nav-toggle { display: inline-flex; }
+  .alm-js .alm-nav-panel { display: none; }
+  .alm-js .alm-nav-panel.is-open { display: flex; }
+}
+
+/* --- page content ---------------------------------------------------------------------------------------- */
+.alm-page-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: .5rem 1.5rem; margin-block-end: 1rem; }
+/* Major title: orange is allowed at this size (≥ 24 px; brand.md contrast table). */
+.alm-title { font-size: clamp(1.75rem, 1.4rem + 1.2vw, 2.25rem); color: var(--alm-orange); margin: 0; }
+.alm-page-head__entity { margin: 0; font-weight: 500; }
+.alm-readonly { font-size: .9375rem; margin-block-end: 1rem; }
+.alm-card { background: var(--alm-surface); border-radius: var(--alm-radius); padding: 1.5rem; }
+.alm-card + .alm-card { margin-block-start: 1.5rem; }
+.alm-card__title { font-size: 1.25rem; color: var(--alm-navy); margin-block-end: 1rem; }
+.alm-count { font-size: .875rem; color: var(--alm-text-muted); font-family: var(--alm-font-ar); font-weight: 300; margin-inline-start: .5rem; }
+.alm-muted { color: var(--alm-text-muted); }
+.alm-pending { color: var(--alm-text-muted); font-size: .875rem; }
+.alm-muted-inline { font-size: 1rem; color: var(--alm-navy); }
+.alm-kpi { font-family: var(--alm-font-display); font-weight: 700; font-size: 2.75rem; line-height: 1.1; margin-block-end: .75rem; color: var(--alm-navy); }
+.alm-notice { background: var(--alm-white); border-inline-start: 4px solid var(--alm-navy); padding: .75rem 1rem; border-radius: var(--alm-radius-input); }
+
+.alm-filters { background: var(--alm-white); border-radius: var(--alm-radius); padding: 1rem 1.5rem 1.25rem; margin-block-end: 1.5rem; }
+.alm-filters__title { font-size: 1rem; margin-block-end: .5rem; color: var(--alm-navy); }
+.alm-filters .form-label { font-size: .875rem; margin-block-end: .25rem; }
+.alm-filters__actions { display: flex; gap: .5rem; }
+
+.alm-table { --bs-table-bg: var(--alm-white); --bs-table-color: var(--alm-navy); --bs-table-hover-bg: var(--alm-sand); --bs-table-hover-color: var(--alm-navy);
+  margin-block-end: .5rem; line-height: 1.5; font-variant-numeric: tabular-nums; }
+.alm-table thead th { border-block-end: 2px solid var(--alm-navy); font-size: .875rem; white-space: nowrap; }
+.alm-table td { vertical-align: middle; }
+.alm-table tfoot th, .alm-table tfoot td { border-block-start: 2px solid var(--alm-navy); font-weight: 500; }
+.alm-amount { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.alm-currency { font-size: .8125em; color: var(--alm-text-muted); }
+.alm-ident { white-space: nowrap; }
+.alm-code { color: var(--alm-navy); }
+
+.alm-dl { display: grid; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); gap: .75rem 1.5rem; margin: 0; }
+.alm-dl > div { min-inline-size: 0; }
+.alm-dl dt { font-size: .875rem; font-weight: 500; color: var(--alm-text-muted); }
+.alm-dl dd { margin: 0; overflow-wrap: anywhere; }
+.alm-dl--totals { grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr)); }
+.alm-dl__strong dd { font-weight: 500; font-size: 1.125rem; }
+.alm-breadcrumb { font-size: .875rem; margin-block-end: .5rem; }
+.alm-pagination .pagination { --bs-pagination-color: var(--alm-navy); --bs-pagination-active-bg: var(--alm-navy); --bs-pagination-active-border-color: var(--alm-navy);
+  --bs-pagination-hover-color: var(--alm-navy); --bs-pagination-disabled-color: var(--alm-navy-2); margin: 0; }
+
+/* Status badges (R35): text + shape; colour only adds to them. All text/background pairs ≥ 4.5:1. */
+.alm-status { display: inline-flex; align-items: center; gap: .35em; padding: .1rem .6rem; border-radius: var(--alm-radius-sm);
+  border: 1px solid var(--alm-navy); font-size: .8125rem; line-height: 1.6; white-space: nowrap; background: var(--alm-white); color: var(--alm-navy); }
+.alm-status__shape { font-size: .9em; line-height: 1; }
+.alm-status--draft, .alm-status--not_submitted { border-style: dashed; }
+.alm-status--submitted, .alm-status--pending { background: var(--alm-orange-1); color: var(--alm-orange-5); border-color: var(--alm-orange-4); }
+.alm-status--issued { background: var(--alm-sand-2); }
+.alm-status--posted, .alm-status--final, .alm-status--cleared, .alm-status--reported { background: var(--alm-navy); color: var(--alm-white); }
+.alm-status--cleared_with_warnings, .alm-status--reported_with_warnings { background: var(--alm-sand-3); }
+.alm-status--reversed, .alm-status--inactive { background: var(--alm-navy-1); }
+.alm-status--rejected { background: var(--alm-orange-4); color: var(--alm-white); border-color: var(--alm-orange-4); }
+.alm-status--masked { background: var(--alm-sand); white-space: normal; }
+
+/* Errors (R35): summary linked to fields, accent text in orange 4. */
+.alm-error-summary { border-inline-start: 4px solid var(--alm-orange-4); background: var(--alm-orange-1); padding: .75rem 1rem; margin-block-end: 1rem;
+  border-radius: var(--alm-radius-input); color: var(--alm-orange-5); }
+.alm-error-summary__title { font-weight: 500; margin-block-end: .25rem; }
+.alm-error-summary ul { margin: 0; padding-inline-start: 1.25rem; }
+.alm-error-summary a { color: var(--alm-orange-5); }
+
+/* Empty states: the Almiras symbol (brand.md: at least 24 px; full colour on light backgrounds). The supporting
+ * brand shape is not used: the file supplied is another company's logo (web/brand_assets.py). */
+.alm-empty { display: flex; flex-direction: column; align-items: center; text-align: center; gap: .75rem; padding: 2rem 1rem; }
+.alm-empty__symbol { inline-size: 48px; block-size: auto; }
+.alm-empty__text { margin: 0; max-inline-size: 32rem; }
+
+/* Sign-in and error pages: sand page, white card, full-colour logo. */
+.alm-auth { min-block-size: 100vh; display: grid; place-items: center; padding: 4vmin; position: relative; overflow: hidden; }
+.alm-auth__card { position: relative; background: var(--alm-white); border-radius: var(--alm-radius); padding: 2rem; inline-size: min(28rem, 100%); }
+.alm-auth__top { display: flex; justify-content: flex-end; margin-block-end: .5rem; }
+.alm-auth__logo { padding: 24px 0; }
+.alm-auth__logo img { inline-size: 220px; max-inline-size: 100%; block-size: auto; min-inline-size: 140px; }
+.alm-auth .alm-title { margin-block-end: .5rem; }
+.alm-error__code { font-family: var(--alm-font-display); font-weight: 700; font-size: 3rem; color: var(--alm-navy); margin: 0; }
+.alm-error__half + .alm-error__half { border-block-start: 1px solid var(--alm-navy-1); margin-block-start: 1rem; padding-block-start: 1rem; }
+.alm-error__detail { color: var(--alm-orange-4); }
+.alm-error__home { display: flex; gap: 1rem; flex-wrap: wrap; margin-block: 1.5rem 0; }

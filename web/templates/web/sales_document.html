@@ -1,0 +1,109 @@
+{% extends "web/base.html" %}{% load web_tags %}
+{% block title %}{% t "sd_detail_title" %} {{ document.number|default:document.pk }} | {{ entity.code }}{% endblock %}
+{% block content %}
+<nav aria-label="{% t 'breadcrumb' %}"><ol class="breadcrumb alm-breadcrumb">
+  <li class="breadcrumb-item"><a href="{% url 'web:sales_documents' entity.code %}">{% t "sd_list_title" %}</a></li>
+  <li class="breadcrumb-item active" aria-current="page">{% if document.number %}{{ document.number|ident }}{% else %}<bdi dir="ltr">#{{ document.pk }}</bdi>{% endif %}</li>
+</ol></nav>
+<div class="alm-page-head">
+  <h1 class="alm-title">{% half document.get_doc_type_display %} {% if document.number %}{{ document.number|ident }}{% else %}<span class="alm-muted-inline">{% t "no_number" %}</span>{% endif %}</h1>
+  <p>{% status "sd" document.status document.get_status_display %} {% status "zatca" document.zatca_status document.get_zatca_status_display %}</p>
+</div>
+<p class="alm-readonly">{% t "read_only_notice" %}</p>
+<div class="row g-4">
+  <section class="col-12 col-xl-7" aria-labelledby="alm-header">
+    <div class="alm-card h-100">
+      <h2 class="alm-card__title" id="alm-header">{% t "header" %}</h2>
+      <dl class="alm-dl">
+        <div><dt>{% t "doc_type" %}</dt><dd>{% half document.get_doc_type_display %}</dd></div>
+        <div><dt>{% t "zatca_profile" %}</dt><dd>{% half document.get_zatca_profile_display %}</dd></div>
+        <div><dt>{% t "issue_date" %}</dt><dd>{% day document.issue_date %}</dd></div>
+        {% if document.supply_date %}<div><dt>{% t "supply_date" %}</dt><dd>{% day document.supply_date %}</dd></div>{% endif %}
+        {% if document.due_date %}<div><dt>{% t "due_date" %}</dt><dd>{% day document.due_date %}</dd></div>{% endif %}
+        <div><dt>{% t "currency" %}</dt><dd><bdi dir="ltr">{{ document.currency.code }}</bdi></dd></div>
+        <div><dt>{% t "customer" %}</dt><dd>{{ document.customer.code|ident }}</dd></div>
+        {% if document.original_document %}
+        <div><dt>{% t "original_document" %}</dt><dd><a href="{% url 'web:sales_document' entity.code document.original_document.pk %}">{{ document.original_document.number|default:document.original_document.pk|ident }}</a></dd></div>
+        {% endif %}
+        {% if document.reason_ar or document.reason_en %}
+        <div><dt>{% t "reason" %}</dt><dd>{% pick document "reason" %}</dd></div>
+        {% endif %}
+        {% if document.journal_entry %}
+        <div><dt>{% t "journal_entry" %}</dt><dd><a href="{% url 'web:journal_entry' entity.code document.journal_entry.pk %}">{{ document.journal_entry.number|default:document.journal_entry.pk|ident }}</a></dd></div>
+        {% endif %}
+      </dl>
+    </div>
+  </section>
+  <section class="col-12 col-xl-5" aria-labelledby="alm-buyer">
+    <div class="alm-card h-100">
+      <h2 class="alm-card__title" id="alm-buyer">{% t "buyer" %}</h2>
+      {% if not totals_ready %}
+      <dl class="alm-dl"><div><dt>{% t "customer" %}</dt><dd>{{ document.customer.code|ident }}</dd></div></dl>
+      <p class="alm-pending">{% t "totals_at_issue_note" %}</p>
+      {% elif masked %}
+      <p class="alm-masked"><span class="alm-status alm-status--masked"><span class="alm-status__shape" aria-hidden="true">◍</span>{% t "masked_note" %}</span></p>
+      {% else %}
+      <dl class="alm-dl">
+        <div><dt>{% t "buyer_name" %}</dt><dd>{% if ui.lang == "ar" %}{{ buyer.buyer_name_ar|default:buyer.buyer_name_en }}{% else %}{{ buyer.buyer_name_en|default:buyer.buyer_name_ar }}{% endif %}</dd></div>
+        <div><dt>{% t "buyer_vat_number" %}</dt><dd>{{ buyer.buyer_vat_number|ident }}</dd></div>
+        <div><dt>{% t "buyer_address" %}</dt><dd>{% if ui.lang == "ar" %}{{ buyer.buyer_street_ar|default:buyer.buyer_street_en }} {{ buyer.buyer_building_no|ident }}, {{ buyer.buyer_district_ar|default:buyer.buyer_district_en }}, {{ buyer.buyer_city_ar|default:buyer.buyer_city_en }} {{ buyer.buyer_postal_code|ident }}{% else %}{{ buyer.buyer_building_no|ident }} {{ buyer.buyer_street_en|default:buyer.buyer_street_ar }}, {{ buyer.buyer_district_en|default:buyer.buyer_district_ar }}, {{ buyer.buyer_city_en|default:buyer.buyer_city_ar }} {{ buyer.buyer_postal_code|ident }}{% endif %} <bdi dir="ltr">{{ buyer.buyer_country }}</bdi></dd></div>
+      </dl>
+      {% endif %}
+    </div>
+  </section>
+</div>
+<section class="alm-card alm-card--table mt-4" aria-labelledby="alm-lines">
+  <h2 class="alm-card__title" id="alm-lines">{% t "lines" %}</h2>
+  <div class="table-responsive">
+    <table class="table alm-table">
+      <caption class="visually-hidden">{% t "lines" %}</caption>
+      <thead>
+        <tr>
+          <th scope="col">{% t "line_no" %}</th>
+          <th scope="col">{% t "description" %}</th>
+          <th scope="col">{% t "income_type" %}</th>
+          <th scope="col" class="text-end">{% t "quantity" %}</th>
+          <th scope="col" class="text-end">{% t "unit_price" %}</th>
+          <th scope="col" class="text-end">{% t "discount" %}</th>
+          <th scope="col">{% t "vat_category" %}</th>
+          <th scope="col" class="text-end">{% t "net_amount" %}</th>
+          <th scope="col" class="text-end">{% t "vat_amount" %}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for line in lines %}
+        <tr>
+          <td><bdi dir="ltr">{{ line.line_no }}</bdi></td>
+          <td>{% pick line "description" %}</td>
+          <td>{% pick line.income_type "name" %}</td>
+          <td class="text-end">{% amount line.quantity 0 %}</td>
+          <td class="text-end">{% money line.unit_price document.currency %}</td>
+          <td class="text-end">{% if line.line_discount %}{% money line.line_discount document.currency %}{% endif %}</td>
+          <td><bdi dir="ltr">{{ line.vat_category }}</bdi>{% if line.vat_rate %} <bdi dir="ltr">{{ line.vat_rate.rate }}%</bdi>{% endif %}</td>
+          <td class="text-end">{% money line.net_amount document.currency %}</td>
+          <td class="text-end">{% money line.vat_amount document.currency %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+<section class="alm-card mt-4" aria-labelledby="alm-totals">
+  <h2 class="alm-card__title" id="alm-totals">{% t "totals" %}</h2>
+  {% if not totals_ready %}
+  <p class="alm-pending">{% t "totals_at_issue_note" %}</p>
+  {% else %}
+  <dl class="alm-dl alm-dl--totals">
+    {% if document.document_discount %}<div><dt>{% t "discount" %}</dt><dd>{% money document.document_discount document.currency %}</dd></div>{% endif %}
+    <div><dt>{% t "net" %}</dt><dd>{% money document.total_net document.currency %}</dd></div>
+    <div><dt>{% t "vat" %}</dt><dd>{% money document.total_vat document.currency %}</dd></div>
+    <div class="alm-dl__strong"><dt>{% t "gross" %}</dt><dd>{% money document.total_gross document.currency %}</dd></div>
+    {% if document.currency.code != "SAR" %}
+    <div><dt>{% t "vat_sar" %}</dt><dd>{% money document.total_vat_sar "SAR" %}</dd></div>
+    <div><dt>{% t "gross_sar" %}</dt><dd>{% money document.total_gross_sar "SAR" %}</dd></div>
+    {% endif %}
+  </dl>
+  {% endif %}
+</section>
+<p class="mt-3"><a href="{% url 'web:sales_documents' entity.code %}">{% t "back_to_list" %}</a></p>
+{% endblock %}

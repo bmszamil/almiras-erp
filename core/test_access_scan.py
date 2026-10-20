@@ -39,6 +39,22 @@ ALLOW = {
                                                        "profile_changed (web.md R27)",
     "invoicing/services.py:party_list_name": "pure: masks an individual's name on a row the caller read through "
                                              "list_sales_documents (checked); never unmasks (web.md R24, R51)",
+    # web/services.py: UI preferences, sessions and the sign-in throttle (web.md §1); no business data.
+    "web/services.py:language_for": "pure: picks the UI language from the profile, cookie or header (R27)",
+    "web/services.py:set_language": "the signed-in person's own language through set_preferred_language (R27)",
+    "web/services.py:switcher_entities": "the entities the user may see (visible_entities, R9)",
+    "web/services.py:entity_from": "pure: picks the URL's entity among the visible ones, else 404 (R4, R10)",
+    "web/services.py:start_entity": "the user's own remembered entity, only among the visible ones (R10)",
+    "web/services.py:remember_entity": "the user's own UI preference, only for a visible entity (R10, R11)",
+    "web/services.py:is_web_user": "helper: active human users only (R12)",
+    "web/services.py:requires_mfa": "reads the user's own memberships for the session timeout (R13, OQ-8)",
+    "web/services.py:idle_timeout": "session timeout setting (OQ-8)",
+    "web/services.py:absolute_timeout": "session timeout setting (OQ-8)",
+    "web/services.py:log_login": "writes the access log (R26)",
+    "web/services.py:log_logout": "writes the access log (R26)",
+    "web/services.py:login_locked": "sign-in throttle, before any user is known (R18)",
+    "web/services.py:record_login_failure": "sign-in throttle, before any user is known (R18)",
+    "web/services.py:clear_login_failures": "sign-in throttle, after a successful sign-in (R18)",
     "ledger/services.py:counterparty_choices": "choice list for admin; posting checks every line",
     "invoicing/services.py:party_problems": "pure check of a party record the caller passes (model clean, services)",
     "invoicing/services.py:deferred_sale_of": "payroll invoicing port only: the live bai' ajel sale of a contract payroll "
