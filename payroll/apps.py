@@ -23,7 +23,7 @@ class PayrollConfig(AppConfig):
     verbose_name = "Payroll / الرواتب"
 
     def ready(self):
-        from ledger import documents
+        from ledger import documents, restricted
 
         from . import services
         from .models import (EmployeeLoan, FinalSettlement, GosiFine, LoanWriteOff, PayrollPayment, PayrollRun,
@@ -44,6 +44,10 @@ class PayrollConfig(AppConfig):
         documents.register(LoanWriteOff, post_permissions={"payroll.approve_loan_write_off"},
                            build_lines=services._write_off_lines)
         documents.register(GosiFine, post_permissions={"payroll.approve_gosi_fine"}, build_lines=services._fine_lines)
+        # Review fix 3 (invoicing R127): 1240 is restricted by invoicing; payroll's runs and final settlements post it
+        # (the bai' ajel instalments they collect, E11, E13), and so do their reversals.
+        for doc_type in ("payroll.payrollrun", "payroll.finalsettlement"):
+            restricted.allow("1240", document_type=doc_type)
         # OQ-30 (R43): payroll's remuneration WHT goes into invoicing's monthly WHT return and its 2220 tie-out.
         from invoicing import services as invoicing_services
         invoicing_services.register_wht_return_source("payroll.payrollpayment", services._wht_return_source)

@@ -80,7 +80,7 @@ def sale(w, emp, cost="30000.00", profit="3600.00", term=24, consent="SIGNED-BAJ
     c = services.approve_deferred_sale_terms(services.submit_deferred_sale_terms(c, user=w.p), user=w.mp)
     if acquire:  # R47 step 3: bought in the company's name and possessed before the sale (review 11)
         c = services.record_asset_acquisition(c, user=w.p, purchase_bill=asset_bill(w, cost),
-                                              possession_date=date(2027, 2, 16), possession_evidence_ref="DELIVERY-1")
+                                              possession_date=date(2027, 2, 16), possession_evidence_ref="DELIVERY-1", asset_type="vehicle")
     return c
 
 

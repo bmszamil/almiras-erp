@@ -2249,3 +2249,58 @@ class DeferredProfitRelease(_DeferredSaleWritten):
 
     def __str__(self):
         return f"{self.deferred_sale_id} {self.source_ref}: {self.profit_amount} ({self.status})"
+
+
+class DeferredSaleAdjustment(_DeferredSaleWritten):
+    """A payroll-approved reduction of a bai' ajel sale (compliance A8, R128): an early-settlement rebate (ibra') of
+    part of the fixed profit not yet recognised, approved in payroll by the sale approver and documented by a
+    simplified **credit note** on the sale invoice (VAT Implementing Regulations Art. 40, 54: a reduced price is
+    evidenced by a credit note). The credit note is created and issued only by
+    ``invoicing.services.create_deferred_sale_adjustment`` (never by hand) and posts on ZATCA reporting Dr 1241 /
+    Dr 2200 / Cr 1240. Payroll reduces the planned instalments by ``gross_amount`` in the same transaction; profit
+    recognition then works on the sale's profit and receivable less the active adjustments. A rejected credit note
+    is replaced by a new one (``active`` false on the old row). Whether a rebate is granted is a Sharia matter
+    (payroll OQ-33): the price itself never increases.
+    """
+
+    class Kind(models.TextChoices):
+        IBRA = "ibra", bi("Early-settlement rebate (ibra')", "إبراء عند السداد المبكر")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    deferred_sale = models.ForeignKey(DeferredSale, on_delete=models.PROTECT, related_name="adjustments",
+                                      verbose_name=bi("Bai' ajel sale", "البيع الآجل"))
+    credit_note = models.OneToOneField(SalesDocument, on_delete=models.PROTECT, related_name="deferred_sale_adjustment",
+                                       verbose_name=bi("Credit note", "الإشعار الدائن"))
+    kind = models.CharField(bi("Kind", "النوع"), max_length=10, choices=Kind.choices, default=Kind.IBRA)
+    source_ref = models.CharField(bi("Approved in (payroll)", "اعتُمد في (الرواتب)"), max_length=100)
+    net_amount = models.DecimalField(bi("Profit waived (net)", "الربح المُبرأ منه (الصافي)"), max_digits=18,
+                                     decimal_places=2)
+    vat_amount = models.DecimalField(bi("VAT credited", "الضريبة المخفضة"), max_digits=18, decimal_places=2)
+    approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                    verbose_name=bi("Approved by", "اعتمده"))
+    approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"))
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                   verbose_name=bi("Created by", "أنشأه"))
+    created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
+    active = models.BooleanField(bi("Active", "نشط"), default=True,
+                                 help_text=bi("False once ZATCA rejected the credit note and a new one replaced it",
+                                              "يصبح غير نشط إذا رفضت الهيئة الإشعار واستُبدل بآخر"))
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("bai' ajel adjustment", "تسوية بيع آجل")
+        verbose_name_plural = bi("bai' ajel adjustments", "تسويات البيع الآجل")
+        ordering = ["deferred_sale", "id"]
+        constraints = [
+            models.UniqueConstraint(fields=["deferred_sale", "source_ref"], condition=models.Q(active=True),
+                                    name="deferred_sale_adjustment_one_per_source"),
+            models.CheckConstraint(condition=models.Q(net_amount__gt=0), name="deferred_sale_adjustment_positive"),
+            models.CheckConstraint(condition=models.Q(vat_amount__gte=0), name="deferred_sale_adjustment_vat"),
+        ]
+
+    @property
+    def gross_amount(self):
+        return self.net_amount + self.vat_amount
+
+    def __str__(self):
+        return f"{self.deferred_sale_id} {self.source_ref}: {self.net_amount} + {self.vat_amount}"

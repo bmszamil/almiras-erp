@@ -27,6 +27,7 @@ from .models import (
     Customer,
     DeferredProfitRelease,
     DeferredSale,
+    DeferredSaleAdjustment,
     IncomeType,
     InvoicingSettings,
     NoteReason,
@@ -294,6 +295,14 @@ class DeferredSaleAdmin(ReadOnlyScopedAdmin):
     status_field = None
 
 
+class DeferredSaleAdjustmentAdmin(ReadOnlyScopedAdmin):
+    """R128: payroll-approved ibra' credit notes on bai' ajel sales, read-only."""
+
+    list_display = ["credit_note", "entity", "deferred_sale", "kind", "net_amount", "vat_amount", "approved_by",
+                    "active"]
+    status_field = None
+
+
 class DeferredProfitReleaseAdmin(ReadOnlyScopedAdmin):
     list_display = ["deferred_sale", "entity", "source_ref", "date", "collected_amount", "collected_to_date",
                     "profit_amount", "journal_entry", "status"]
@@ -383,6 +392,7 @@ admin.site.register(CustomerReceipt, ReceiptAdmin)
 admin.site.register(VendorPayment, VendorPaymentAdmin)
 admin.site.register(DeferredSale, DeferredSaleAdmin)
 admin.site.register(DeferredProfitRelease, DeferredProfitReleaseAdmin)
+admin.site.register(DeferredSaleAdjustment, DeferredSaleAdjustmentAdmin)
 admin.site.register(ReceivableAllocation, AllocationAdmin)
 admin.site.register(PayableAllocation, AllocationAdmin)
 admin.site.register(InvoicingSettings, SettingsAdmin)

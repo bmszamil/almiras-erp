@@ -783,6 +783,16 @@ class LoanInstallment(ServiceWritten):
 
 # --- bai' ajel (3.11; sale through invoicing R112, not built) ----------------------------------------
 
+class AssetType(models.TextChoices):
+    """Compliance A3: the kind of asset a bai' ajel contract sells (recorded with the acquisition)."""
+    VEHICLE = "vehicle", bi("Vehicle", "مركبة")
+    EQUIPMENT = "equipment", bi("Equipment or appliance", "معدات أو أجهزة")
+    ELECTRONICS = "electronics", bi("Electronics", "إلكترونيات")
+    FURNITURE = "furniture", bi("Furniture", "أثاث")
+    OTHER_MOVABLE = "other_movable", bi("Other movable goods", "منقولات أخرى")
+    REAL_ESTATE = "real_estate", bi("Real estate (refused: RETT)", "عقار (مرفوض: ضريبة التصرفات العقارية)")
+
+
 class DeferredSaleContract(Tracked, ServiceWritten):
     """Bai' ajel employee financing (R47 to R49). The sale itself is an invoicing document (invoicing R112, E28),
     reached through ``payroll.invoicing_port``. No interest, penalty, late-fee or rate field exists."""
@@ -819,6 +829,9 @@ class DeferredSaleContract(Tracked, ServiceWritten):
     # cost) and takes possession before the sale; the sale is refused otherwise.
     purchase_bill = models.ForeignKey("invoicing.PurchaseDocument", null=True, blank=True, on_delete=models.PROTECT,
                                       related_name="+", verbose_name=bi("Purchase bill", "فاتورة الشراء"))
+    # Compliance A3 (2026-10-20): what is sold, recorded with the acquisition; real estate is refused (its sale is
+    # VAT-exempt and subject to RETT, invoicing R125).
+    asset_type = models.CharField(bi("Asset type", "نوع الأصل"), max_length=20, choices=AssetType.choices, blank=True)
     possession_date = models.DateField(bi("Possession date", "تاريخ القبض"), null=True, blank=True)
     possession_evidence_ref = models.CharField(bi("Possession evidence", "مستند القبض"), max_length=200, blank=True)
     sale_date = models.DateField(bi("Sale date", "تاريخ البيع"), null=True, blank=True)
@@ -843,6 +856,43 @@ class DeferredSaleContract(Tracked, ServiceWritten):
     def receivable(self):
         """P20(h): VAT on the sale price is charged to and paid by the employee."""
         return self.sale_price + self.vat_amount
+
+
+class DeferredSaleRebate(Tracked, ServiceWritten):
+    """[Reg] Compliance A8 (invoicing R128): an early-settlement rebate (ibra') of part of a sold contract's profit not
+    yet recognised, prepared by the payroll officer and approved by the sale approver (``payroll.approve_deferred_sale``,
+    A, P; never the preparer or the employee). Approval asks invoicing for the simplified credit note through the
+    port and reduces the planned instalments by its gross (rebate + VAT), from the last one back. The price never
+    increases; whether a rebate is granted is for the Sharia board (OQ-33)."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", bi("Draft", "مسودة")
+        APPROVED = "approved", bi("Approved (credit note issued)", "معتمد (صدر الإشعار الدائن)")
+        DISCARDED = "discarded", bi("Discarded", "ملغى")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    contract = models.ForeignKey(DeferredSaleContract, on_delete=models.PROTECT, related_name="rebates",
+                                 verbose_name=bi("Contract", "العقد"))
+    amount = _money("Profit waived (net of VAT)", "الربح المُبرأ منه (قبل الضريبة)")
+    vat_amount = _money("VAT credited", "الضريبة المخفضة", default=ZERO)
+    reason_ar = models.TextField(bi("Reason (Arabic)", "السبب (بالعربية)"))
+    reason_en = models.TextField(bi("Reason (English)", "السبب (بالإنجليزية)"), blank=True)
+    request_ref = models.CharField(bi("Employee's written request", "طلب الموظف المكتوب"), max_length=200)
+    credit_note_ref = models.CharField(bi("Credit note (invoicing)", "الإشعار الدائن"), max_length=60, blank=True)
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    approved_by = _user("Approved by", "اعتمده")
+    approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("bai' ajel rebate (ibra')", "إبراء بيع آجل")
+        verbose_name_plural = bi("bai' ajel rebates (ibra')", "إبراءات البيع الآجل")
+        constraints = [models.UniqueConstraint(fields=["contract"], condition=Q(status="draft"),
+                                               name="payroll_one_open_rebate")]
+
+    @property
+    def gross_amount(self):
+        return self.amount + self.vat_amount
 
 
 class DeferredSaleInstallment(ServiceWritten):
@@ -1048,6 +1098,9 @@ class PayrollPayment(Tracked, ServiceWritten):
     wht_amount_sar = _money("WHT (SAR)", "ضريبة الاستقطاع (ريال)", default=ZERO)
     # Slice 2 (R43, OQ-30): the payment amount in SAR at the payment-date rate, the base of the WHT return row.
     wht_base_sar = _money("WHT base (SAR)", "وعاء ضريبة الاستقطاع (ريال)", default=ZERO)
+    # Compliance B2, B3: per payee at approval: the gross remuneration this payment covers (the WHT base) and its WHT,
+    # non-residents only (a person resident in KSA bears no WHT); the WHT return rows are these parts.
+    wht_parts = models.JSONField(bi("WHT per payee", "ضريبة الاستقطاع لكل مستفيد"), default=list, blank=True)
     bank_reference = models.CharField(bi("Bank reference", "المرجع البنكي"), max_length=60, blank=True)
     # C-B7: e.g. a GOSI payment above the ERP contributions, up to the recorded GOSI invoice (difference flagged).
     warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
@@ -1228,13 +1281,20 @@ class SettlementCorrection(Tracked, ServiceWritten):
     returned_reason_ar = models.TextField(bi("Return reason (Arabic)", "سبب الإعادة (بالعربية)"), blank=True)
     journal_entry = models.OneToOneField("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
                                          related_name="+", verbose_name=bi("Journal entry", "القيد"))
+    # Compliance C1: an increase of what is due to the leaver is due at once (the settlement's Art. 88 period has
+    # run): the approval day, with an alert to the payroll officers and approvers.
+    due_date = models.DateField(bi("Increase due by", "تاريخ استحقاق الزيادة"), null=True, blank=True)
 
     class Meta:
         base_manager_name = "objects"
         verbose_name = bi("final settlement correction", "تصحيح مخالصة نهائية")
         verbose_name_plural = bi("final settlement corrections", "تصحيحات المخالصات النهائية")
         constraints = [models.UniqueConstraint(fields=["entity", "number"], condition=~Q(number=""),
-                                               name="payroll_correction_number")]
+                                               name="payroll_correction_number"),
+                       # Review fix 6: one open correction per settlement, also under concurrency.
+                       models.UniqueConstraint(fields=["settlement"],
+                                               condition=Q(status__in=("draft", "submitted", "returned")),
+                                               name="payroll_one_open_correction")]
 
     def save(self, *args, **kwargs):
         if self.pk:

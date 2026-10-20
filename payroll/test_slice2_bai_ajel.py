@@ -17,7 +17,7 @@ def bai_ajel(w, emp, cost="1200.00", profit="120.00", term=12, first="2027-04", 
                                       consent_ref="SIGNED-1", final_dues_undertaking=undertaking)
     c = services.approve_deferred_sale_terms(services.submit_deferred_sale_terms(c, user=w.p), user=w.mp)
     return services.record_asset_acquisition(c, user=w.p, purchase_bill=asset_bill(w, cost),
-                                             possession_date=date(2027, 2, 16), possession_evidence_ref="DELIVERY-1")
+                                             possession_date=date(2027, 2, 16), possession_evidence_ref="DELIVERY-1", asset_type="vehicle")
 
 
 # --- with payroll's fake port --------------------------------------------------------------------------------------

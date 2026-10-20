@@ -48,7 +48,9 @@ from ledger.models import Account, FiscalPeriod, JournalLine, LedgerError
 
 from . import approvals, invoicing_port
 from .models import (
+    AssetType,
     DeferredSaleContract,
+    DeferredSaleRebate,
     DeferredSaleInstallment,
     EmployeeCostItem,
     EmployeeLoan,
@@ -2041,11 +2043,36 @@ def _remuneration_prior(ctx, slip, emp, versions, cur, rate, add, sar):
                                                  payslip__run__status__in=(RS.APPROVED, RS.PAID))
                       .filter(Q(origin_period=q) | (Q(origin_period="") & Q(payslip__run__period=q)))
                       .select_related("account", "component"))
+        # Review fix 8: a month whose contract currency (as approved now) differs from this payslip's currency, or
+        # that was paid in another currency, is never compared across currencies. Unchanged in its own currency it
+        # needs nothing; a difference (or a currency changed back-dated) is refused: the payslip cannot pay it.
+        month_cur = {v.currency_id for _, v in info.days}
+        paid_cur = {l.currency_id for l in booked if l.line_type in (LT.EARNING, LT.RETRO)
+                    and not l.source_ref.startswith("input:")}
+        if month_cur != {cur.code} or paid_cur - {cur.code}:
+            other = next(iter(month_cur)) if len(month_cur) == 1 else None
+            same = other is not None and paid_cur <= {other}
+            if same:
+                paid = {}
+                for l in booked:
+                    if l.line_type in (LT.EARNING, LT.RETRO) and not l.source_ref.startswith("input:"):
+                        paid[l.component_id] = paid.get(l.component_id, ZERO) + l.amount_txn
+                places = Currency.objects.get(code=other).minor_units
+                same = all(_round_to(exact, places) == paid.get(comp.pk, ZERO)
+                           for comp, exact in _component_earnings(info, exact=True).values())
+            if not same:
+                slip.refuse(f"The contract currency of {q} ({', '.join(sorted(month_cur))}, paid in "
+                            f"{', '.join(sorted(paid_cur)) or '-'}) differs from this payslip's {cur.code}: a retro "
+                            "difference is never computed across a currency change. Correct that month by an approved "
+                            "input in the new currency (R14, review 8).",
+                            f"عملة العقد لشهر {q} ({'، '.join(sorted(month_cur))}، ودُفع بعملة "
+                            f"{'، '.join(sorted(paid_cur)) or '-'}) تختلف عن عملة هذه القسيمة {cur.code}: لا يُحتسب فرق "
+                            "بأثر رجعي عبر تغيير العملة. صحّح ذلك الشهر بمدخل معتمد بالعملة الجديدة.")
         have = {}
         for l in booked:
             if l.line_type in (LT.EARNING, LT.RETRO) and l.currency_id == cur.code and not l.source_ref.startswith("input:"):
                 have[l.component_id] = have.get(l.component_id, ZERO) + l.amount_txn
-        for comp, exact in _component_earnings(info, exact=True).values():
+        for comp, exact in (_component_earnings(info, exact=True).values() if month_cur == {cur.code} else ()):
             delta = _round_to(exact, cur.minor_units) - have.get(comp.pk, ZERO)
             if delta > 0:
                 add(LT.RETRO, delta, comp.expense_account, f"Retro {comp.code} for {q}", f"فرق بأثر رجعي {comp.name_ar} عن {q}",
@@ -2630,7 +2657,8 @@ def approve_run(run, *, user):
         raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
     run.journal_entry = entry
     _save(run)
-    _apply_effects(run, slips, user)
+    with invoicing_port.collecting(run, user):  # review 4: invoicing recognises profit only for this collection
+        _apply_effects(run, slips, user)
     ctx.use.mark_used()
     return run
 
@@ -2874,9 +2902,10 @@ def reverse_run(run, *, user, reason, date=None, acknowledge_wps=False, wps_reas
         raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "reversal_refused") from None
     run.status, run.reversal_entry, run.reversed_by, run.reversed_at = RS.REVERSED, reversal, user, _now()
     _save(run)
-    for inst in installments:  # slice 2: the profit recognised on a collection the reversal gives back (E12)
-        if isinstance(inst, DeferredSaleInstallment) and inst.deducted_amount > 0:
-            _reverse_profit(inst.contract, _collection_ref(inst), user, on, reason.strip())
+    with invoicing_port.collecting(run, user, mode="reverse"):
+        for inst in installments:  # slice 2: the profit recognised on a collection the reversal gives back (E12)
+            if isinstance(inst, DeferredSaleInstallment) and inst.deducted_amount > 0:
+                _reverse_profit(inst.contract, _collection_ref(inst), user, on, reason.strip())
     # The run is reversed before its installments are freed: the PostgreSQL trigger lets a deducted installment go
     # back to planned only when its run is reversed (review 5).
     for inst in installments:
@@ -3145,15 +3174,29 @@ def _bill_cost(bill, entity):
 
 
 @transaction.atomic
-def record_asset_acquisition(contract, *, user, purchase_bill, possession_date, possession_evidence_ref):
+def record_asset_acquisition(contract, *, user, purchase_bill, possession_date, possession_evidence_ref,
+                             asset_type=None):
     """R47 step 3 (review 11): the company bought the asset in its own name (a posted bill of the same entity debiting
     1250 at exactly the contract cost, E9) and took possession (date and evidence). Only then may the sale be
-    approved."""
+    approved. Compliance A3: ``asset_type`` (``AssetType``) is recorded; real estate is refused (its sale is
+    VAT-exempt and subject to RETT, invoicing R125). Review 1: the bill row is locked, so it is not reversed while it
+    is recorded (invoicing refuses reversing it afterwards)."""
     c = _lock(DeferredSaleContract, contract.pk)
     _require(user, c.entity, "payroll.create_deferred_sale")
     if c.status != DeferredSaleContract.Status.TERMS_APPROVED:
         raise error("The terms must be approved before the purchase is recorded (R47).",
                     "يجب اعتماد الشروط قبل تسجيل الشراء.", code="sale_status")
+    if asset_type not in AssetType.values:
+        raise error(f"The asset type is one of {', '.join(AssetType.values)} (compliance A3).",
+                    "نوع الأصل مطلوب من القائمة المعتمدة.", code="asset_type")
+    if asset_type == AssetType.REAL_ESTATE:
+        raise error("Real estate is not sold by bai' ajel in the ERP: a real-estate sale is exempt from VAT and subject "
+                    "to the Real Estate Transaction Tax (RETT 5%), not the 15% VAT sale invoice (invoicing R125, "
+                    "OQ-77).", "لا تُباع العقارات بالبيع الآجل في النظام: بيع العقار معفى من ضريبة القيمة المضافة "
+                    "وتُفرض عليه ضريبة التصرفات العقارية (5%) لا فاتورة البيع بضريبة 15%.", code="real_estate_not_allowed")
+    if purchase_bill is not None:
+        from invoicing.models import PurchaseDocument
+        purchase_bill = PurchaseDocument.objects.select_for_update(of=("self",)).filter(pk=purchase_bill.pk).first()
     problems = []
     cost = _bill_cost(purchase_bill, c.entity)
     if cost is None:
@@ -3174,6 +3217,7 @@ def record_asset_acquisition(contract, *, user, purchase_bill, possession_date, 
     if problems:
         raise _problems(problems, "acquisition_invalid")
     c.purchase_bill, c.possession_date, c.possession_evidence_ref = purchase_bill, possession_date, possession_evidence_ref
+    c.asset_type = asset_type
     c.status, c.modified_by, c.modified_at = DeferredSaleContract.Status.ASSET_ACQUIRED, user, _now()
     try:
         with transaction.atomic():
@@ -3202,6 +3246,13 @@ def approve_deferred_sale(contract, *, user, sale_date=None):
     if c.status != DeferredSaleContract.Status.ASSET_ACQUIRED:
         raise error("The terms must be approved first (R47).", "يجب اعتماد الشروط أولًا.", code="sale_status")
     sale_date = sale_date or _today()
+    if sale_date > _today():  # compliance A6: never dated in the future (Riyadh day)
+        raise error(f"The sale date {sale_date} is after today {_today()}: a sale is never dated in the future.",
+                    f"تاريخ البيع {sale_date} بعد اليوم {_today()}: لا يؤرَّخ البيع بتاريخ مستقبلي.",
+                    code="sale_date_future")
+    if c.asset_type == AssetType.REAL_ESTATE or not c.asset_type:
+        raise error("The asset type must be recorded and is never real estate (compliance A3, invoicing R125).",
+                    "يجب تسجيل نوع الأصل ولا يكون عقارًا.", code="real_estate_not_allowed")
     if _bill_cost(c.purchase_bill, c.entity) != c.cost:
         raise error("The purchase bill is no longer posted at the contract cost (R47).",
                     "لم تعد فاتورة الشراء مرحّلة بتكلفة العقد.", code="asset_not_acquired")
@@ -3362,6 +3413,23 @@ def _settlement_input_now(fs):
     from hr.models import FinalSettlementInput
     return (FinalSettlementInput.objects.filter(termination=fs.termination, status=FinalSettlementInput.Status.DRAFT)
             .order_by("-id").first())
+
+
+def _bai_ajel_ready_for_settlement(fs):
+    """Review fix 2: before a final settlement is calculated or approved, bai' ajel sales invoicing has posted since
+    become ``sold`` (so their balance is recovered from the final dues); while a sale of the leaver still waits for
+    ZATCA reporting (``sale_invoiced``) the settlement is refused: its recovery line could not be computed."""
+    _refresh_deferred_sales(fs.entity)
+    waiting = list(DeferredSaleContract.objects.filter(employee_id=fs.employee_id,
+                                                       status=DeferredSaleContract.Status.SALE_INVOICED)
+                   .values_list("number", flat=True))
+    if waiting:
+        raise error(f"Bai' ajel sale {', '.join(waiting)} of this employee is approved but its invoice is not yet "
+                    "reported to ZATCA and posted: its balance cannot be recovered from the final dues yet. Wait for "
+                    "the reporting (or the re-approval after a rejection), then calculate the settlement again (R49).",
+                    f"البيع الآجل {'، '.join(waiting)} لهذا الموظف معتمد لكن فاتورته لم يُبلَّغ بها للهيئة ولم تُرحَّل بعد: "
+                    "لا يمكن استرداد رصيده من المستحقات النهائية الآن. انتظر الإبلاغ (أو إعادة الاعتماد بعد الرفض) ثم "
+                    "أعد احتساب المخالصة.", code="sale_not_posted")
 
 
 def _compute_settlement(fs, user, *, separate_amount, consent_ref):
@@ -3584,6 +3652,7 @@ def prepare_final_settlement(settlement, *, user, separate_settlement_amount=Non
     if fs.status not in (FSS.DRAFT, FSS.CALCULATED, FSS.RETURNED):
         raise error(f"A {fs.status} final settlement is not recalculated.", f"لا يُعاد احتساب مخالصة بحالة {fs.status}.",
                     code="settlement_status")
+    _bai_ajel_ready_for_settlement(fs)
     separate = _dec(separate_settlement_amount, "separate_settlement_amount") if separate_settlement_amount else ZERO
     if separate < 0 or not fx.has_places(separate, 2):  # re-review 10: SAR, at most 2 decimals (R5)
         raise error("The separate settlement is zero or more, in SAR with at most 2 decimals.",
@@ -3651,6 +3720,7 @@ def approve_final_settlement(settlement, *, user):
     if fs.status != FSS.SUBMITTED:
         raise error("Only a submitted final settlement is approved.", "تُعتمد المخالصة المقدّمة فقط.",
                     code="settlement_status")
+    _bai_ajel_ready_for_settlement(fs)
     out = _compute_settlement(fs, user, separate_amount=fs.separate_settlement_amount,
                               consent_ref=fs.written_consent_ref)
     if _settlement_fingerprint(fs, out) != fs.inputs_hash:
@@ -3680,7 +3750,8 @@ def approve_final_settlement(settlement, *, user):
         raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
     fs.journal_entry = entry
     _save(fs)
-    _settlement_effects(fs, out, user)
+    with invoicing_port.collecting(fs, user):  # review 4: invoicing recognises profit only for this collection
+        _settlement_effects(fs, out, user)
     return fs
 
 
@@ -3931,9 +4002,11 @@ def record_payment(entity, *, user, kind, payment_date, amount, run=None, gosi_p
     if amount <= 0 or not fx.has_places(amount, cur.minor_units):
         raise error(f"The amount is above zero with at most {cur.minor_units} decimals for {cur.code} (R5).",
                     f"المبلغ أكبر من صفر بحد أقصى {cur.minor_units} خانات عشرية للعملة {cur.code}.", code="amount_invalid")
-    remuneration = kind == PayrollPayment.Kind.NET_SALARIES and Payslip.objects.filter(
-        run=run, employment_basis=Basis.REMUNERATION).exists()
-    if remuneration and wht_category is None:
+    remuneration = (kind == PayrollPayment.Kind.NET_SALARIES and Payslip.objects.filter(
+        run=run, employment_basis=Basis.REMUNERATION).exists()) or (
+        kind == PayrollPayment.Kind.FINAL_SETTLEMENT
+        and Employee.objects.filter(pk=final_settlement.employee_id, employment_basis=Basis.REMUNERATION).exists())
+    if remuneration and wht_category is None:  # review 7: a remuneration settlement's payments too
         raise error("Remuneration payments need the WHT category (R43; category to confirm, OQ-29).",
                     "تحتاج دفعات المكافآت إلى فئة ضريبة الاستقطاع.", code="wht_category_required")
     acc = bank_account if isinstance(bank_account, Account) else _account(entity, bank_account) if bank_account \
@@ -4014,14 +4087,7 @@ def approve_payment(payment, *, user):
         p.run = run
     _payment_room(p, run)
     if p.wht_category_id:
-        rate = p.wht_category.rate
-        p.wht_amount = _round_to(Fraction(p.amount) * Fraction(rate) / 100, p.currency.minor_units)
-        fx_rate = (Decimal("1") if p.currency_id == p.entity.base_currency_id else
-                   ledger.get_rate(p.entity, p.currency_id, p.entity.base_currency_id, p.payment_date, user=user).rate)
-        p.wht_amount_sar = fx.convert(p.wht_amount, fx_rate) if p.currency_id != p.entity.base_currency_id \
-            else p.wht_amount
-        # Slice 2 (R43, OQ-30): the base of the WHT return row, in SAR at the same rate.
-        p.wht_base_sar = fx.convert(p.amount, fx_rate) if p.currency_id != p.entity.base_currency_id else p.amount
+        _compute_wht(p, user)
     p.status, p.approved_by, p.approved_at = PayrollPayment.Status.APPROVED, user, _now()
     _save(p)
     try:
@@ -4046,6 +4112,61 @@ def approve_payment(payment, *, user):
             run.status = RS.PAID
             _save(run)
     return p
+
+
+def _wht_bases(p):
+    """Compliance B2, B3 (R43): the WHT base of each payee of payment ``p`` in its currency, as Fractions: the gross
+    remuneration of their payslip (run payments) or the settlement's gross (settlement payments), in the share of
+    the open net this payment pays. Persons resident in KSA (``country_of_residence`` SA) bear no WHT: returned apart.
+    Returns ({employee: base}, [resident employees])."""
+    if p.kind == PayrollPayment.Kind.NET_SALARIES:
+        slips = list(Payslip.objects.filter(run=p.run, refused=False, currency_id=p.currency_id,
+                                            employment_basis=Basis.REMUNERATION).select_related("employee")
+                     .order_by("employee__employee_code"))
+        total = _run_payable(p.run, p.currency_id)[0]
+        share = Fraction(p.amount) / Fraction(total) if total else Fraction(0)
+        bases = {ps.employee: Fraction(ps.gross_txn) * share for ps in slips}
+    elif p.kind == PayrollPayment.Kind.FINAL_SETTLEMENT:
+        fs = p.final_settlement
+        due = _settlement_due(fs)
+        emp = Employee.objects.get(pk=fs.employee_id)
+        bases = {emp: Fraction(fs.gross) * Fraction(p.amount) / Fraction(due)} if due else {}
+    else:
+        bases = {}
+    residents = [e for e in bases if (e.country_of_residence or "").strip().upper() == "SA"]
+    return {e: v for e, v in bases.items() if e not in residents}, residents
+
+
+def _compute_wht(p, user):
+    """R43 with compliance B2 (base = gross remuneration, not the net paid) and B3 (non-residents only): WHT at the
+    category's rate on each non-resident payee's base, in the payment currency and in SAR at the payment-date rate;
+    the per-payee parts are stored for the WHT return (``wht_parts``). A resident in KSA is a warning, no WHT."""
+    rate = Fraction(p.wht_category.rate)
+    minor = p.currency.minor_units
+    foreign = p.currency_id != p.entity.base_currency_id
+    fx_rate = (ledger.get_rate(p.entity, p.currency_id, p.entity.base_currency_id, p.payment_date, user=user).rate
+               if foreign else Decimal("1"))
+    bases, residents = _wht_bases(p)
+    base_txn = {e: _round_to(b, minor) for e, b in bases.items()}
+    wht_txn = {e: _round_to(Fraction(b) * rate / 100, minor) for e, b in base_txn.items()}
+    p.wht_amount = sum(wht_txn.values(), ZERO)
+    if p.wht_amount > p.amount:
+        raise error(f"The WHT {p.wht_amount} is more than the payment {p.amount}.",
+                    f"ضريبة الاستقطاع {p.wht_amount} أكبر من الدفعة {p.amount}.", code="wht_exceeds_payment")
+    p.wht_amount_sar = fx.convert(p.wht_amount, fx_rate) if foreign else p.wht_amount
+    base_total = sum(base_txn.values(), ZERO)
+    p.wht_base_sar = fx.convert(base_total, fx_rate) if foreign else base_total
+    # SAR parts split so they add up exactly to the payment's SAR base and WHT.
+    base_sar = _split(p.wht_base_sar, base_txn) if base_txn else {}
+    wht_sar = _split(p.wht_amount_sar, wht_txn) if any(wht_txn.values()) else {e: ZERO for e in wht_txn}
+    p.wht_parts = [{"employee_id": e.pk, "employee_code": e.employee_code, "country": e.country_of_residence or "",
+                    "base_sar": str(base_sar.get(e, ZERO)), "wht_sar": str(wht_sar.get(e, ZERO))}
+                   for e in sorted(base_txn, key=lambda x: x.employee_code)]
+    for e in residents:
+        p.warnings = list(p.warnings or []) + [
+            f"{e.employee_code} is resident in Saudi Arabia: no WHT on their remuneration (WHT applies to non-residents "
+            "only; compliance B3) / " f"{e.employee_code} مقيم في المملكة: لا تُستقطع ضريبة على مكافأته (تُفرض على غير "
+            "المقيمين فقط)"]
 
 
 def _payment_lines(p):
@@ -4101,29 +4222,30 @@ def _split(total, weights):
 
 def _wht_return_source(entity, start, end):
     """OQ-30 (R43; registered with ``invoicing.register_wht_return_source``): the remuneration WHT of payroll payments
-    for invoicing's monthly WHT return, in its row shape: one row per WHT category, payee (employee code only, R36)
-    and rate. A payment of a run is split over the run's remuneration payslips in its currency by their net pay (the
-    parts add up to the payment's base and WHT exactly). A payment reversed in the month shows as a negative row."""
+    (run payments and, review 7, final-settlement payments) for invoicing's monthly WHT return, in its row shape: one
+    row per WHT category, payee (employee code only, R36) and rate, from the per-payee parts stored at approval
+    (compliance B2: base = gross remuneration; B3: non-residents only). A payment reversed in the month shows as a
+    negative row flagged ``amends_return_month`` (compliance B5): the original month's return is to be amended."""
     rows = {}
 
     def add(p, sign):
-        slips = {ps.employee: ps.net_txn for ps in Payslip.objects.filter(run=p.run, refused=False,
-                                                                          currency_id=p.currency_id,
-                                                                          employment_basis=Basis.REMUNERATION)
-                 .select_related("employee")}
-        base, wht = _split(p.wht_base_sar, slips), _split(p.wht_amount_sar, slips)
-        for emp in slips:
-            key = (p.wht_category.code, emp.employee_code, p.wht_category.rate)
+        reversal = sign < 0
+        for part in p.wht_parts or []:
+            key = (p.wht_category.code, part["employee_code"], p.wht_category.rate, reversal)
             r = rows.setdefault(key, {
                 "category": p.wht_category.code, "return_line_code": p.wht_category.return_line_code,
-                "vendor": emp.employee_code, "country": emp.country_of_residence or "", "rate": p.wht_category.rate,
+                "vendor": part["employee_code"], "country": part.get("country", ""), "rate": p.wht_category.rate,
                 "treaty_certificate": None, "treaty_country": "", "base_sar": ZERO, "wht_sar": ZERO, "gross_up": False,
                 "source": "payroll", "payee_kind": "employee"})
-            r["base_sar"] += sign * base[emp]
-            r["wht_sar"] += sign * wht[emp]
+            if reversal:
+                month = p.payment_date.strftime("%Y-%m")
+                r.update({"reversal": True, "amends_return_month": month,
+                          "note_en": f"Reversal of a payment of {month}: amend the WHT return of {month}",
+                          "note_ar": f"عكس دفعة من شهر {month}: عدّل إقرار ضريبة الاستقطاع لشهر {month}"})
+            r["base_sar"] += sign * Decimal(part["base_sar"])
+            r["wht_sar"] += sign * Decimal(part["wht_sar"])
 
-    qs = PayrollPayment.objects.filter(entity=entity, wht_category__isnull=False, run__isnull=False) \
-        .select_related("wht_category", "run")
+    qs = PayrollPayment.objects.filter(entity=entity, wht_category__isnull=False).select_related("wht_category")
     for p in qs.filter(status__in=(PayrollPayment.Status.APPROVED, PayrollPayment.Status.REVERSED),
                        payment_date__range=(start, end)):
         add(p, 1)
@@ -4412,13 +4534,16 @@ def payslip_data(payslip, *, user):
 
 
 def _payslip_wht(ps):
-    """R43: shown as information (gross, WHT, net of WHT) once the payment is approved."""
+    """R43: shown as information (gross, WHT, net of WHT) once the payment is approved; compliance B2: WHT on the
+    gross remuneration; B3: none for a person resident in KSA."""
     p = PayrollPayment.objects.filter(run=ps.run, status=PayrollPayment.Status.APPROVED, wht_category__isnull=False) \
         .select_related("wht_category").first()
     if p is None or ps.employment_basis != Basis.REMUNERATION:
         return None
-    wht = _round_to(Fraction(ps.net_txn) * Fraction(p.wht_category.rate) / 100, ps.currency.minor_units)
-    return {"rate": p.wht_category.rate, "wht": wht, "net_of_wht": ps.net_txn - wht}
+    resident = (ps.employee.country_of_residence or "").strip().upper() == "SA"
+    wht = ZERO if resident else _round_to(Fraction(ps.gross_txn) * Fraction(p.wht_category.rate) / 100,
+                                          ps.currency.minor_units)
+    return {"rate": p.wht_category.rate, "wht": wht, "net_of_wht": ps.net_txn - wht, "resident": resident}
 
 
 def render_payslip(payslip, *, user):
@@ -4472,15 +4597,24 @@ def gosi_report(entity, period, *, user):
                 r["gosi_wage"] = max(r["gosi_wage"], l.quantity)
             r[side] += l.amount
     start, end = _period_bounds(period)
+    corrections = []
     for l in SCL.objects.filter(entity=entity, correction__status=SCS.APPROVED,  # slice 2: settlement corrections
                                 correction__journal_entry__date__range=(start, end),
                                 line_type__in=("employee_gosi", "employer_gosi")) \
-            .select_related("correction__employee", "account"):
+            .select_related("correction__employee", "correction__settlement", "account").order_by("pk"):
         if l.line_type == "employee_gosi" and l.account.code != GOSI_PAYABLE:
             continue
         side = "employer" if l.line_type == "employer_gosi" else "employee"
         b_ = branches.setdefault(l.gosi_branch or "", {"branch": l.gosi_branch or "", "employee": ZERO, "employer": ZERO})
         b_[side] += l.sign * l.amount
+        # Compliance C2: counted in the month of its entry, shown with the month it corrects (the settlement's).
+        row = {"correction": l.correction.number, "origin_period": l.correction.settlement.period,
+               "branch": l.gosi_branch or "", "side": side, "amount": l.sign * l.amount,
+               "note_en": f"Correction of {l.correction.settlement.period}, counted in {period}",
+               "note_ar": f"تصحيح لشهر {l.correction.settlement.period}، يُحتسب في {period}"}
+        if detail:
+            row["employee_code"] = l.correction.employee.employee_code
+        corrections.append(row)
         if detail:
             code = l.correction.employee.employee_code
             r = rows.setdefault(code, {"employee_code": code, "gosi_wage": ZERO, "employee": ZERO, "employer": ZERO})
@@ -4496,13 +4630,16 @@ def gosi_report(entity, period, *, user):
     fines = _fines_2340(entity, period)
     return {"period": period, "rows": sorted(rows.values(), key=lambda r: r["employee_code"]),
             "branches": sorted(branches.values(), key=lambda b_: b_["branch"]), "total": total,
+            "corrections": corrections,
             "fines": fines, "total_due": total + fines,
             "due_date": ns.replace(day=due_day), "open": _gosi_open(entity, period),
-            "late_fine_en": f"Late payment: {fine['pct']}% of the due contribution per month or part (Law Art. 9(3)); a "
-                            f"delay of up to {fine['full_waiver_max_delay_days']} days may be fully waived (Regs Art. 25); "
-                            "fines are entered manually on 5930 (E14).",
-            "late_fine_ar": f"التأخير في السداد: {fine['pct']}% من الاشتراك المستحق عن كل شهر أو جزء منه؛ ويجوز الإعفاء "
-                            f"الكامل لتأخير لا يتجاوز {fine['full_waiver_max_delay_days']} أيام."}
+            "late_fine_en": f"Late payment: {fine['pct']}% of the contributions paid late per month or part (Law Art. "
+                            f"9(3)), never more than {GOSI_FINE_CAP_PCT}% of them; a delay of up to "
+                            f"{fine['full_waiver_max_delay_days']} days may be fully waived (Regs Art. 25); fines are "
+                            "entered manually on 5930 (E14).",
+            "late_fine_ar": f"التأخير في السداد: {fine['pct']}% من الاشتراكات المسددة متأخرة عن كل شهر أو جزء منه، "
+                            f"بحد أقصى {GOSI_FINE_CAP_PCT}% منها؛ ويجوز الإعفاء الكامل لتأخير لا يتجاوز "
+                            f"{fine['full_waiver_max_delay_days']} أيام."}
 
 
 def bank_transfer_list(run, *, user):
@@ -4638,6 +4775,18 @@ def send_alerts(*, today=None, entity=None):
                                   f"Art. 88){' and is late' if when[today] == 'late' else ''}.",
                                   f"المخالصة النهائية لـ {fs.employee.employee_code} مستحقة قبل {fs.due_date} (المادة 88)"
                                   f"{' وقد تأخرت' if when[today] == 'late' else ''}.", ("payroll_officer", "approver"))])
+                sent += 1
+        # Compliance C1: an increasing settlement correction still unpaid the day after its due date.
+        for c in SC.objects.filter(entity=e, status=SCS.APPROVED, due_date=today - timedelta(days=1)) \
+                .select_related("settlement", "employee"):
+            paid = PayrollPayment.objects.filter(final_settlement=c.settlement, status=PayrollPayment.Status.APPROVED) \
+                .aggregate(t=Sum("amount"))["t"] or ZERO
+            if paid < _settlement_due(c.settlement):
+                _send_alerts(e, [(PayrollAlert.Kind.FINAL_SETTLEMENT_DUE, f"fsc:{c.pk}:late",
+                                  f"Correction {c.number} of the final settlement of {c.employee.employee_code} was due "
+                                  f"on {c.due_date} and is late (Labour Law Art. 88).",
+                                  f"التصحيح {c.number} لمخالصة {c.employee.employee_code} كان مستحقًا في {c.due_date} وقد "
+                                  "تأخر (المادة 88).", ("payroll_officer", "approver"))])
                 sent += 1
         if today.day == 10:
             open_ = _gosi_open(e, prev)
@@ -4788,6 +4937,7 @@ def create_settlement_correction(settlement, *, user, reason_ar, lines, reason_e
     shares are not corrected here."""
     fs = FS.objects.select_related("entity", "employee").get(pk=settlement.pk)
     _require(user, fs.entity, "payroll.prepare_settlement_correction")
+    fs = _lock(FS, fs.pk)  # review fix 6: one open correction per settlement, checked under the settlement's lock
     if fs.status not in (FSS.APPROVED, FSS.PAID):
         raise error("Only an approved final settlement is corrected; before approval recalculate it instead.",
                     "تُصحح المخالصة المعتمدة فقط؛ وقبل الاعتماد أعد احتسابها.", code="settlement_status")
@@ -4838,7 +4988,12 @@ def create_settlement_correction(settlement, *, user, reason_ar, lines, reason_e
                     "بنود الفرق لا تقيد شيئًا (تتقابل على الحسابات نفسها).", code="correction_empty")
     c.net_change = _correction_net(rows)
     c.warnings = _correction_warnings(c, rows, fs)
-    _save(c)
+    try:
+        with transaction.atomic():
+            _save(c)
+    except IntegrityError:  # the database's partial unique constraint (payroll_one_open_correction)
+        raise error("Another correction of this settlement is open: approve or discard it first.",
+                    "يوجد تصحيح آخر مفتوح لهذه المخالصة: اعتمده أو ألغه أولًا.", code="correction_open") from None
     for r in rows:
         r.correction = c
         _save(r)
@@ -4919,6 +5074,8 @@ def approve_settlement_correction(correction, *, user):
     c.warnings = _correction_warnings(c, rows, fs)
     c.number = _next_number(c.entity, "FSC", _today().year)
     c.status, c.approved_by, c.approved_at = SCS.APPROVED, user, _now()
+    if c.net_change > 0:  # compliance C1: the Art. 88 period of the settlement has run; the increase is due now
+        c.due_date = _today()
     _save(c)
     try:
         with _marker(_posting, c):
@@ -4929,6 +5086,13 @@ def approve_settlement_correction(correction, *, user):
         raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
     c.journal_entry = entry
     _save(c)
+    if c.due_date is not None:
+        code = emp.employee_code
+        _send_alerts(c.entity, [(PayrollAlert.Kind.FINAL_SETTLEMENT_DUE, f"fsc:{c.pk}:due",
+                                 f"Correction {c.number} adds {c.net_change} to the final settlement of {code}: due "
+                                 f"today {c.due_date} (Labour Law Art. 88; the settlement's own period has run).",
+                                 f"التصحيح {c.number} يضيف {c.net_change} إلى المخالصة النهائية لـ {code}: مستحق اليوم "
+                                 f"{c.due_date} (المادة 88؛ انقضت مهلة المخالصة).", ("payroll_officer", "approver"))])
     access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=c.entity,
                         permission="payroll.approve_settlement_correction",
                         details={"action": "settlement_correction_approved", "correction": c.pk, "settlement": fs.pk,
@@ -5192,8 +5356,16 @@ def _gosi_fine_estimate(entity, period, paid_on):
         y, m = (cursor.year + (cursor.month // 12), cursor.month % 12 + 1)
         cursor = cursor.replace(year=y, month=m, day=min(due_day, calendar.monthrange(y, m)[1]))
     pct = Fraction(hr.param("SA", "gosi.late_fine_pct", end).value["pct"])
-    base = _gosi_booked(entity, period) - _fines_2340(entity, period)
-    return _round(Fraction(base) * pct / 100 * months), months
+    # Compliance D1: the base is the contributions paid late (booked for the period less what was paid by the due
+    # day), and the fine never exceeds 100% of them.
+    on_time = PayrollPayment.objects.filter(entity=entity, kind=PayrollPayment.Kind.GOSI, gosi_period=period,
+                                            status=PayrollPayment.Status.APPROVED, payment_date__lte=due) \
+        .aggregate(t=Sum("amount"))["t"] or ZERO
+    base = max(ZERO, _gosi_booked(entity, period) - _fines_2340(entity, period) - on_time)
+    return min(_round(Fraction(base) * pct / 100 * months), _round(Fraction(base) * GOSI_FINE_CAP_PCT / 100)), months
+
+
+GOSI_FINE_CAP_PCT = 100  # compliance D1: a late fine never exceeds the contributions paid late (GOSI's figure governs)
 
 
 @transaction.atomic
@@ -5211,9 +5383,15 @@ def record_gosi_fine(entity, *, user, period, amount, fine_date, gosi_invoice_re
     _account(entity, GOSI_FINES)
     estimate, months = _gosi_fine_estimate(entity, period, paid_on or fine_date)
     if estimate != amount:
-        note_en = (note_en + " " if note_en else "") + (f"ERP estimate {estimate} ({months} month(s) at 2%); GOSI's "
-                                                         "figure governs (Regs Art. 25 waivers).")
-        note_ar = (note_ar + " " if note_ar else "") + f"تقدير النظام {estimate} ({months} شهر بنسبة 2%)؛ والمعتمد رقم التأمينات."
+        waiver = hr.param("SA", "gosi.late_fine_pct", _period_bounds(period)[1]).value.get(
+            "full_waiver_max_delay_days", "10")
+        note_en = (note_en + " " if note_en else "") + (
+            f"ERP estimate {estimate} ({months} month(s) at 2% of the contributions paid late, capped at "
+            f"{GOSI_FINE_CAP_PCT}% of them); a delay of up to {waiver} days may be fully waived (Regs Art. 25); "
+            "GOSI's figure governs.")
+        note_ar = (note_ar + " " if note_ar else "") + (
+            f"تقدير النظام {estimate} ({months} شهر بنسبة 2% من الاشتراكات المسددة متأخرة، بحد أقصى {GOSI_FINE_CAP_PCT}% "
+            f"منها)؛ ويجوز الإعفاء الكامل لتأخير لا يتجاوز {waiver} أيام (المادة 25 من اللائحة)؛ والمعتمد رقم التأمينات.")
     return _save(GF(entity=entity, period=period, fine_date=fine_date, amount=amount, estimate=estimate,
                     gosi_invoice_ref=gosi_invoice_ref, note_ar=note_ar, note_en=note_en, created_by=user))
 
@@ -5318,27 +5496,67 @@ CRS = SecondmentCostReport.Status
 VAT_INPUT = "1310"
 
 
-def _source_of(entity, source_bill, source_entry):
-    """The posted source document of a cost item (R63) and the cost it booked: its journal entry's debits other
-    than recoverable input VAT (1310). Returns (entry, cost, month)."""
+PREPAYMENTS = "1320"
+
+
+def _source_problem(entity, source_bill, source_entry):
+    """Review fix 5 (R63): why ``source_bill`` / ``source_entry`` cannot back a cost item (en/ar), or None. A bill is a
+    posted, unreversed vendor bill of the entity; a journal entry is a posted entry of the entity that is neither a
+    reversal nor reversed."""
+    from ledger.models import JournalEntry
+
+    if source_bill is not None:
+        if (source_bill.entity_id != entity.pk or source_bill.doc_type != "bill" or source_bill.status != "posted"
+                or source_bill.journal_entry_id is None or source_bill.reversal_entry_id is not None):
+            return ("The source bill must be a posted, unreversed vendor bill of the same entity (R63).",
+                    "يجب أن تكون فاتورة المصدر فاتورة مورد مرحّلة غير معكوسة للكيان نفسه.")
+        entry = source_bill.journal_entry
+    else:
+        entry = source_entry
+    if (entry.entity_id != entity.pk or entry.status != "posted" or entry.reversal_of_id is not None
+            or JournalEntry.objects.filter(reversal_of_id=entry.pk).exists()):
+        return ("The source journal entry must be a posted entry of the same entity that is not a reversal and was "
+                "not reversed (R63).", "يجب أن يكون قيد المصدر قيدًا مرحّلًا للكيان نفسه ليس عكسًا ولم يُعكس.")
+    return None
+
+
+def _source_of(entity, source_bill, source_entry, *, lock=False):
+    """The posted source document of a cost item (R63) and the cost it booked: its journal entry's debits on expense
+    accounts and prepayments (1320) only, never input VAT, receivables, bank or other balance-sheet debits (review
+    fix 5). ``lock``: the bill or entry row is locked first, so two cost items on one source never both fit (and
+    the source is not reversed meanwhile). Returns (entry, cost, month)."""
+    from invoicing.models import PurchaseDocument
+    from ledger.models import JournalEntry
+
     if (source_bill is None) == (source_entry is None):
         raise error("A cost item references exactly one source document: a posted vendor bill or a posted journal "
                     "entry of the same entity (R63).", "يشير بند التكلفة إلى مستند مصدر واحد: فاتورة مورد مرحّلة أو "
                     "قيد مرحّل للكيان نفسه.", code="cost_item_source")
-    if source_bill is not None:
-        if (source_bill.entity_id != entity.pk or source_bill.doc_type != "bill" or source_bill.status != "posted"
-                or source_bill.journal_entry_id is None):
-            raise error("The source bill must be a posted vendor bill of the same entity (R63).",
-                        "يجب أن تكون فاتورة المصدر فاتورة مورد مرحّلة للكيان نفسه.", code="cost_item_source")
-        entry = source_bill.journal_entry
-    else:
-        entry = source_entry
-        if entry.entity_id != entity.pk or entry.status != "posted":
-            raise error("The source journal entry must be a posted entry of the same entity (R63).",
-                        "يجب أن يكون قيد المصدر قيدًا مرحّلًا للكيان نفسه.", code="cost_item_source")
-    cost = JournalLine.objects.filter(entry=entry).exclude(account__code=VAT_INPUT).aggregate(t=Sum("debit"))["t"] \
-        or ZERO
+    if lock and source_bill is not None:
+        source_bill = PurchaseDocument.objects.select_for_update(of=("self",)).select_related("journal_entry").get(
+            pk=source_bill.pk)
+    if lock and source_entry is not None:
+        source_entry = JournalEntry.objects.select_for_update(of=("self",)).get(pk=source_entry.pk)
+    problem = _source_problem(entity, source_bill, source_entry)
+    if problem:
+        raise error(*problem, code="cost_item_source")
+    entry = source_bill.journal_entry if source_bill is not None else source_entry
+    cost = JournalLine.objects.filter(entry=entry).filter(Q(account__type="expense") | Q(account__code=PREPAYMENTS)) \
+        .aggregate(t=Sum("debit"))["t"] or ZERO
     return entry, _round(cost), _period_of(entry.date)
+
+
+def _source_used(entity, entry, exclude=None):
+    qs = CI.objects.filter(entity=entity, status__in=(CIS.DRAFT, CIS.APPROVED)).filter(
+        Q(source_bill__journal_entry=entry) | Q(source_entry=entry))
+    if exclude is not None:
+        qs = qs.exclude(pk=exclude.pk)
+    return qs.aggregate(t=Sum("amount"))["t"] or ZERO
+
+
+def _cost_item_source_ok(item):
+    """Review fix 5: an approved cost item counts in the cost report only while its source still holds."""
+    return _source_problem(item.entity, item.source_bill, item.source_entry) is None
 
 
 @transaction.atomic
@@ -5357,12 +5575,11 @@ def create_cost_item(employee, *, user, kind, amount, description_ar, source_bil
     if amount <= 0 or not fx.has_places(amount, 2):
         raise error("The amount is above zero, in the functional currency with 2 decimals (R5).",
                     "المبلغ أكبر من صفر بالعملة الوظيفية وبخانتين عشريتين.", code="amount_invalid")
-    entry, cost, source_month = _source_of(emp.entity, source_bill, source_entry)
+    entry, cost, source_month = _source_of(emp.entity, source_bill, source_entry, lock=True)
     if month is not None and month != source_month:
         raise error(f"A cost item belongs to its source's accounting month {source_month} (R63, billing OQ-37).",
                     f"ينتمي بند التكلفة إلى شهر قيد مصدره {source_month}.", code="cost_item_month")
-    used = CI.objects.filter(entity=emp.entity, status__in=(CIS.DRAFT, CIS.APPROVED)).filter(
-        Q(source_bill__journal_entry=entry) | Q(source_entry=entry)).aggregate(t=Sum("amount"))["t"] or ZERO
+    used = _source_used(emp.entity, entry)
     if used + amount > cost:
         raise error(f"The cost items on this source ({used + amount}) would exceed the cost it booked ({cost}).",
                     f"بنود التكلفة على هذا المصدر ({used + amount}) تتجاوز التكلفة المقيدة فيه ({cost}).",
@@ -5381,6 +5598,13 @@ def approve_cost_item(item, *, user):
     i = _lock(CI, i.pk)
     if i.status != CIS.DRAFT:
         raise error("Only a draft cost item is approved.", "يُعتمد بند التكلفة المسودة فقط.", code="cost_item_status")
+    # Review fix 5: the source is checked again under its row lock (not reversed since, still enough cost).
+    entry, cost, _ = _source_of(i.entity, i.source_bill, i.source_entry, lock=True)
+    used = _source_used(i.entity, entry, exclude=i)
+    if used + i.amount > cost:
+        raise error(f"The cost items on this source ({used + i.amount}) would exceed the cost it booked ({cost}).",
+                    f"بنود التكلفة على هذا المصدر ({used + i.amount}) تتجاوز التكلفة المقيدة فيه ({cost}).",
+                    code="cost_item_exceeds_source")
     i.status, i.approved_by, i.approved_at = CIS.APPROVED, user, _now()
     return _save(i)
 
@@ -5417,8 +5641,12 @@ def _cost_lines(entity, period):
         slips = Payslip.objects.filter(employee=a.employee, run__period=period, refused=False,
                                        run__status__in=(RS.APPROVED, RS.PAID))
         sums = slips.aggregate(g=Sum("gross"), e=Sum("employer_gosi"), b=Sum("eosb_accrual"))
-        items = {}
-        for i in CI.objects.filter(employee=a.employee, month=period, status=CIS.APPROVED).order_by("pk"):
+        items, dropped = {}, []
+        for i in CI.objects.filter(employee=a.employee, month=period, status=CIS.APPROVED) \
+                .select_related("entity", "source_bill__journal_entry", "source_entry").order_by("pk"):
+            if not _cost_item_source_ok(i):  # review fix 5: its source was reversed since the approval
+                dropped.append(i.pk)
+                continue
             items[i.kind] = items.get(i.kind, ZERO) + i.amount
         items = {k: _round(Fraction(v) * share) for k, v in sorted(items.items())}
         row = SecondmentCostLine(entity=entity, assignment=a, employee_code=a.employee.employee_code,
@@ -5433,6 +5661,9 @@ def _cost_lines(entity, period):
         if not slips.exists():
             warnings.append("No approved payslip for the month: payroll costs are zero / لا توجد قسيمة معتمدة للشهر: "
                             "تكاليف الرواتب صفر")
+        if dropped:
+            warnings.append(f"Cost items {', '.join(map(str, dropped))} left out: their source document was reversed "
+                            "(R63) / بنود تكلفة مستبعدة لأن مستندها المصدر عُكس")
         if a.receiving_entity is not None and a.receiving_entity.country == "SA":
             warnings.append("Receiving entity may have to register GOSI (Regs Art. 20(3)(a), OQ-48) / قد يلزم الكيان "
                             "المستقبل التسجيل في التأمينات")
@@ -5720,15 +5951,19 @@ def _eg_caps(ctx, slip, emp):
     nafaqa = sum((l.amount for l in slip.lines if l.line_type == LT.DEDUCTION and l.basis == "nafaqa"), ZERO)
     debts = sum((l.amount for l in slip.lines if l.line_type == LT.DEDUCTION and l.basis != "nafaqa"), ZERO)
     nafaqa_cap = _round(Fraction(after) * Fraction(debt["nafaqa"]))
-    debt_cap = min(_round(Fraction(after) * Fraction(debt["debt"])), nafaqa_cap - nafaqa)
+    # Compliance E5: the 25% for other debts is on the wage after tax, insurance and the employer's own loan
+    # instalments (those have their own 10% cap).
+    loans = slip.total({LT.LOAN_INSTALLMENT})
+    debt_cap = min(_round(Fraction(max(ZERO, after - loans)) * Fraction(debt["debt"])), nafaqa_cap - nafaqa)
     if nafaqa > nafaqa_cap:
         slip.refuse(f"The maintenance (nafaqa) deduction {nafaqa} exceeds half of the wage after tax and insurance "
                     f"({nafaqa_cap}) (Art. 113).", f"استقطاع النفقة {nafaqa} يتجاوز نصف الأجر بعد الضريبة والتأمينات "
                     f"({nafaqa_cap}).")
     if debts > debt_cap:
-        slip.refuse(f"Debt deductions {debts} exceed {debt_cap}: a quarter of the wage after tax and insurance, and "
-                    "half together with a nafaqa (Art. 113).", f"استقطاعات الديون {debts} تتجاوز {debt_cap}: ربع الأجر "
-                    "بعد الضريبة والتأمينات، والنصف مع النفقة.")
+        slip.refuse(f"Debt deductions {debts} exceed {debt_cap}: a quarter of the wage after tax, insurance and the "
+                    "employer's loan instalments, and half together with a nafaqa (Art. 113).",
+                    f"استقطاعات الديون {debts} تتجاوز {debt_cap}: ربع الأجر بعد الضريبة والتأمينات وأقساط قروض صاحب "
+                    "العمل، والنصف مع النفقة.")
     if any(l.line_type == LT.LOAN_INSTALLMENT for l in slip.lines):
         loan_cap = _round(Fraction(after) * loan_pct)
         if slip.total({LT.LOAN_INSTALLMENT}) > loan_cap:
@@ -5994,3 +6229,147 @@ def _refresh_deferred_sales(entity):
             c.status, c.sale_document_ref = DeferredSaleContract.Status.SOLD, state.document_ref
             out.append(_save(c))
     return out
+
+
+# =====================================================================================================
+# Compliance A8 (invoicing R128): early-settlement rebate (ibra') of unearned bai' ajel profit
+# Compliance A1: delivery of the simplified sale invoice to the employee
+# =====================================================================================================
+
+def _rebate_ref(rebate):
+    return f"payroll.deferredsalerebate:{rebate.pk}"
+
+
+@transaction.atomic
+def prepare_deferred_sale_rebate(contract, *, user, amount, reason_ar, request_ref, reason_en=""):
+    """A8 (invoicing R128): the payroll officer (``payroll.create_deferred_sale``) records the employee's written
+    request for an early-settlement rebate (ibra') of part of a sold contract's profit not yet recognised. Posts
+    nothing; one open rebate per contract. Whether to grant it is the approver's decision (Sharia, OQ-33)."""
+    c = _lock(DeferredSaleContract, contract.pk)
+    _require(user, c.entity, "payroll.create_deferred_sale")
+    if c.status != DeferredSaleContract.Status.SOLD:
+        raise error("A rebate is for a sold contract whose invoice is posted (R128).",
+                    "يكون الإبراء لعقد مبيع رُحّلت فاتورته.", code="sale_status")
+    amount = _dec(amount, "amount")
+    if amount <= 0 or not fx.has_places(amount, 2):
+        raise error("The rebate is above zero, in SAR with at most 2 decimals (R5).",
+                    "الإبراء أكبر من صفر بالريال وبخانتين عشريتين على الأكثر.", code="amount_invalid")
+    if not (reason_ar or "").strip() or not (request_ref or "").strip():
+        raise error("The rebate needs the reason in Arabic and the employee's written request.",
+                    "يحتاج الإبراء إلى السبب بالعربية وطلب الموظف المكتوب.", code="rebate_invalid")
+    if DeferredSaleRebate.objects.filter(contract=c, status=DeferredSaleRebate.Status.DRAFT).exists():
+        raise error("Another rebate of this contract is open: approve or discard it first.",
+                    "يوجد إبراء آخر مفتوح لهذا العقد: اعتمده أو ألغه أولًا.", code="rebate_open")
+    try:
+        with transaction.atomic():
+            return _save(DeferredSaleRebate(entity=c.entity, contract=c, amount=amount, reason_ar=reason_ar,
+                                            reason_en=reason_en or "", request_ref=request_ref.strip()[:200],
+                                            created_by=user))
+    except IntegrityError:
+        raise error("Another rebate of this contract is open.", "يوجد إبراء آخر مفتوح لهذا العقد.",
+                    code="rebate_open") from None
+
+
+@transaction.atomic
+def discard_deferred_sale_rebate(rebate, *, user):
+    r = _lock(DeferredSaleRebate, rebate.pk)
+    _require(user, r.entity, "payroll.create_deferred_sale")
+    if r.status != DeferredSaleRebate.Status.DRAFT:
+        raise error("Only a draft rebate is discarded.", "يُلغى الإبراء المسودة فقط.", code="rebate_status")
+    r.status, r.modified_by, r.modified_at = DeferredSaleRebate.Status.DISCARDED, user, _now()
+    return _save(r)
+
+
+@transaction.atomic
+def approve_deferred_sale_rebate(rebate, *, user):
+    """A8 (invoicing R128): the sale approver (``payroll.approve_deferred_sale``, A, P; matrix row
+    ``payroll.deferred_sale``; never the preparer or the employee) approves the rebate: invoicing issues the
+    simplified credit note on the sale invoice (Dr 1241 / Dr 2200 / Cr 1240 on ZATCA reporting; never more than the
+    profit not yet recognised) and the planned instalments are reduced by its gross (rebate + VAT), from the last one
+    back; an instalment reduced to nothing is removed. The price never increases (R48). Approving an approved rebate
+    again is allowed only after ZATCA rejected its credit note: invoicing issues a new one."""
+    r = DeferredSaleRebate.objects.select_related("entity", "contract").get(pk=rebate.pk)
+    grant = _require(user, r.entity, "payroll.approve_deferred_sale", document=r.contract)
+    approvals.check(grant, r.entity, "payroll.deferred_sale")
+    emp = Employee.objects.get(pk=r.contract.employee_id)
+    if user.pk in {r.created_by_id, r.modified_by_id} or (emp.user_id and emp.user_id == user.pk):
+        access.deny(user, r.entity, "payroll.approve_deferred_sale", "self_approval")
+    _entity_lock(r.entity)
+    c = _lock(DeferredSaleContract, r.contract_id)
+    r = _lock(DeferredSaleRebate, r.pk)
+    port = invoicing_port.get_port()
+    if not hasattr(port, "create_bai_ajel_rebate"):
+        raise error("The rebate credit note is issued by invoicing (R128), which is not available.",
+                    "يصدر الإشعار الدائن للإبراء من الفوترة وهي غير متاحة.", code="invoicing_not_built")
+    if r.status == DeferredSaleRebate.Status.APPROVED:
+        state = port.rebate_state(c, source_ref=_rebate_ref(r))
+        if state is None or state.status != "rejected":
+            raise error("The rebate is approved and its credit note is live; it is approved again only after ZATCA "
+                        "rejects the credit note.", "الإبراء معتمد وإشعاره قائم؛ ولا يُعتمد ثانية إلا بعد رفض الهيئة "
+                        "للإشعار.", code="rebate_status")
+        result = port.create_bai_ajel_rebate(c, user=user, source_ref=_rebate_ref(r), amount=r.amount,
+                                             reason_ar=r.reason_ar, reason_en=r.reason_en)
+        r.credit_note_ref, r.modified_by, r.modified_at = result.document_ref, user, _now()
+        return _save(r)
+    if r.status != DeferredSaleRebate.Status.DRAFT:
+        raise error("Only a draft rebate is approved.", "يُعتمد الإبراء المسودة فقط.", code="rebate_status")
+    if c.status != DeferredSaleContract.Status.SOLD:
+        raise error("A rebate is for a sold contract whose invoice is posted (R128).",
+                    "يكون الإبراء لعقد مبيع رُحّلت فاتورته.", code="sale_status")
+    result = port.create_bai_ajel_rebate(c, user=user, source_ref=_rebate_ref(r), amount=r.amount,
+                                         reason_ar=r.reason_ar, reason_en=r.reason_en)
+    gross = _dec(result.net_amount, "net_amount") + _dec(result.vat_amount, "vat_amount")
+    planned = list(DeferredSaleInstallment.objects.select_for_update().filter(
+        contract=c, status=DeferredSaleInstallment.Status.PLANNED).order_by("-period", "-pk"))
+    if sum((i.amount for i in planned), ZERO) < gross:
+        raise error(f"The rebate with its VAT ({gross}) is more than the instalments still to be deducted: an ibra' "
+                    "reduces what is still owed, it never pays money out (R128).",
+                    f"الإبراء مع ضريبته ({gross}) أكبر من الأقساط المتبقية: الإبراء يخفض المتبقي ولا يُصرف نقدًا.",
+                    code="rebate_too_large")
+    rest = gross
+    for inst in planned:
+        if rest <= 0:
+            break
+        cut = min(inst.amount, rest)
+        rest -= cut
+        if cut == inst.amount:
+            inst._service_delete = True
+            inst.delete()
+        else:
+            inst.amount -= cut
+            _save(inst)
+    r.vat_amount, r.credit_note_ref = _dec(result.vat_amount, "vat_amount"), result.document_ref
+    r.status, r.approved_by, r.approved_at = DeferredSaleRebate.Status.APPROVED, user, _now()
+    _save(r)
+    access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=r.entity,
+                        permission="payroll.approve_deferred_sale",
+                        details={"action": "bai_ajel_rebate_approved", "rebate": r.pk, "contract": c.pk,
+                                 "amount": str(r.amount), "vat": str(r.vat_amount), "credit_note": r.credit_note_ref,
+                                 "message_en": "Bai' ajel rebate (ibra') approved", "message_ar": "اعتُمد إبراء بيع آجل"})
+    return r
+
+
+SALE_INVOICE_DELIVERY = {"printed": ("printed copy handed to the employee", "نسخة مطبوعة سُلّمت للموظف"),
+                         "electronic": ("electronic copy sent to the employee", "نسخة إلكترونية أُرسلت للموظف")}
+
+
+@transaction.atomic
+def record_sale_invoice_delivery(contract, *, user, channel, reference=""):
+    """Compliance A1 (invoicing R118 note): the simplified sale invoice is given to the employee **after** ZATCA
+    reporting (the contract is ``sold``: the reported invoice with its QR code is posted), printed or electronic;
+    the payroll officer (``payroll.create_deferred_sale``) records the delivery and it is logged (AccessLog). Nothing
+    is sent from the ERP to any external service."""
+    c = _lock(DeferredSaleContract, contract.pk)
+    _require(user, c.entity, "payroll.create_deferred_sale")
+    if channel not in SALE_INVOICE_DELIVERY:
+        raise error("The delivery is printed or electronic.", "يكون التسليم مطبوعًا أو إلكترونيًا.", code="channel")
+    if c.status not in (DeferredSaleContract.Status.SOLD, DeferredSaleContract.Status.SETTLED):
+        raise error("The sale invoice is given to the employee after ZATCA reported it (the contract is sold).",
+                    "تُسلَّم فاتورة البيع للموظف بعد الإبلاغ عنها للهيئة (العقد مبيع).", code="sale_not_posted")
+    en, ar = SALE_INVOICE_DELIVERY[channel]
+    return access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=c.entity,
+                               permission="payroll.create_deferred_sale",
+                               details={"action": "bai_ajel_invoice_delivered", "contract": c.pk,
+                                        "invoice": c.sale_document_ref, "channel": channel,
+                                        "reference": (reference or "")[:200], "message_en": f"Sale invoice {en}",
+                                        "message_ar": f"فاتورة البيع: {ar}"})

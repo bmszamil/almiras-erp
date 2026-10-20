@@ -98,7 +98,7 @@ def test_at26_e8_remuneration_in_usd_with_wht_at_payment(w):
     assert lines == {"2330": D("18750.00"), "1100": D("-17860.00"), "2220": D("-940.00"), "5750": D("50.00")}
     assert p.wht_amount == D("250.000") and p.wht_amount_sar == D("940.00")
     data = services.payslip_data(ps, user=w.p)
-    assert data["wht"] == {"rate": D("5.00"), "wht": D("250.00"), "net_of_wht": D("4750.000")}
+    assert data["wht"] == {"rate": D("5.00"), "wht": D("250.00"), "net_of_wht": D("4750.000"), "resident": False}
     rows = services.wht_return_rows(w.alm, date(2027, 4, 1), user=w.a)
     assert rows[0]["wht_sar"] == D("940.00")
 

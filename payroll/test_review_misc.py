@@ -32,14 +32,18 @@ def test_review11_bai_ajel_sale_refused_before_purchase_and_possession(w):
                                      (bill, date(2027, 2, 16), ""), (bill, date(2027, 2, 14), "DELIVERY-1")):
         with pytest.raises(PayrollError) as exc:
             services.record_asset_acquisition(c, user=w.p, purchase_bill=purchase, possession_date=when,
-                                              possession_evidence_ref=evidence)
+                                              possession_evidence_ref=evidence, asset_type="vehicle")
         assert exc.value.code == "acquisition_invalid"
     c = services.record_asset_acquisition(c, user=w.p, purchase_bill=bill, possession_date=date(2027, 3, 25),
-                                          possession_evidence_ref="DELIVERY-1")
+                                          possession_evidence_ref="DELIVERY-1", asset_type="vehicle")
     assert c.status == "asset_acquired"
     with pytest.raises(PayrollError) as exc:  # payroll clock 2027-03-20: before possession
         services.approve_deferred_sale(c, user=w.mp)
     assert exc.value.code == "sale_before_possession"
+    with pytest.raises(PayrollError) as exc:  # compliance A6: never dated after today
+        services.approve_deferred_sale(c, user=w.mp, sale_date=date(2027, 3, 25))
+    assert exc.value.code == "sale_date_future"
+    w.pclock.set(date(2027, 3, 25))
     c = services.approve_deferred_sale(c, user=w.mp, sale_date=date(2027, 3, 25))
     assert c.status == "sold" and c.sale_date == date(2027, 3, 25) and c.purchase_bill_id == bill.pk
 

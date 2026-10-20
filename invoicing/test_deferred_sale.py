@@ -81,7 +81,7 @@ def contract(w, emp, cost="30000.00", profit="3600.00", term=24, acquire=True, b
     c = payroll.approve_deferred_sale_terms(payroll.submit_deferred_sale_terms(c, user=w.p), user=w.mp)
     if acquire:  # R47 step 3: bought in the company's name, then possessed
         c = payroll.record_asset_acquisition(c, user=w.p, purchase_bill=bill or asset_bill(w, cost),
-                                             possession_date=date(2027, 2, 16), possession_evidence_ref="DELIVERY-1")
+                                             possession_date=date(2027, 2, 16), possession_evidence_ref="DELIVERY-1", asset_type="vehicle")
     return c
 
 
@@ -111,7 +111,8 @@ def direct(w, c, **overrides):
     """create_deferred_sale as the port calls it, with some inputs changed (refusal tests)."""
     values = dict(approver=w.mp, employee=c.employee, purchase_bill=c.purchase_bill, cost=c.cost,
                   profit_amount=c.profit_amount, possession_date=c.possession_date,
-                  possession_evidence_ref=c.possession_evidence_ref, asset_description_ar=c.asset_description_ar)
+                  possession_evidence_ref=c.possession_evidence_ref, asset_description_ar=c.asset_description_ar,
+                  asset_type=c.asset_type or "vehicle")
     values.update(overrides)
     return inv.create_deferred_sale(c, **values)
 
@@ -401,86 +402,164 @@ def test_the_bai_ajel_receivable_is_collected_by_payroll_not_by_receipts(sold):
 
 # --- profit recognised as instalments are collected (payroll E12, E13) -------------------------------------------
 
+def collection_run(w):
+    """Test data: one payroll run of ALM that the collections below are deducted by (a draft run row is enough: the
+    marker and the installment rows are what an approval leaves; payroll/test_slice2_bai_ajel_real.py runs real
+    approvals)."""
+    if not hasattr(w, "collect_run"):
+        w.collect_run = payroll.create_run(w.alm, user=w.p, period="2027-04")
+    return w.collect_run
+
+
+def next_installment(c):
+    return c.installments.filter(status="planned").order_by("period", "pk").first()
+
+
+def collect(w, c, amount, user=None, on=date(2027, 4, 30), inst=None):
+    """What payroll's run approval does for one installment: deduct it (a part leaves a remainder, R18) and, inside
+    the approval (payroll's collecting marker), report the collection to invoicing (review fix 4)."""
+    from payroll.models import DeferredSaleInstallment
+
+    user = user or w.h
+    run = collection_run(w)
+    inst = inst or next_installment(c)
+    payroll._deduct_installment(inst, D(amount), run, DeferredSaleInstallment)
+    with payroll_port.collecting(run, user):
+        result = port_module.PayrollInvoicingPort().recognise_bai_ajel_profit(
+            c, amount=D(amount), on=on, source_ref=payroll._collection_ref(inst), user=user)
+    return result, inst
+
+
 def test_profit_moves_from_1241_to_4610_as_instalments_are_collected(sold):
     w, s1, c, doc = sold
     port = port_module.PayrollInvoicingPort()
-    first = port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 4, 25), source_ref="inst:1", user=w.h)
+    first, inst = collect(w, c, "1610.00", on=date(2027, 4, 25))
     assert (first.profit_amount, first.collected_to_date) == (D("150.00"), D("1610.00")) and first.entry_ref
-    release = DeferredProfitRelease.objects.get(source_ref="inst:1")
+    ref = payroll._collection_ref(inst)
+    release = DeferredProfitRelease.objects.get(source_ref=ref)
     assert release.created_by == w.h and release.journal_entry.posted_by == w.system
     assert entry_by_account(release.journal_entry) == {"1241": D("150.00"), "4610": D("-150.00")}
-    # idempotent per collection; a changed amount for the same collection is refused
-    assert port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 4, 25), source_ref="inst:1",
-                                          user=w.h).entry_ref == first.entry_ref
-    with pytest.raises(InvoicingError) as exc:
-        port.recognise_bai_ajel_profit(c, amount=D("1000.00"), on=date(2027, 4, 25), source_ref="inst:1", user=w.h)
-    assert exc.value.code == "collection_changed" and bilingual(exc.value)
-    for n in range(2, 25):  # the rest of the term, some months late: no profit accrues for time (R48)
-        port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 12, 1), source_ref=f"inst:{n}", user=w.h)
+    with payroll_port.collecting(collection_run(w), w.h):  # idempotent per collection; a changed amount is refused
+        assert port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 4, 25), source_ref=ref,
+                                              user=w.h).entry_ref == first.entry_ref
+        with pytest.raises(InvoicingError) as exc:
+            port.recognise_bai_ajel_profit(c, amount=D("1000.00"), on=date(2027, 4, 25), source_ref=ref, user=w.h)
+    assert exc.value.code == "collection_not_from_payroll"  # 1,000.00 is not what that installment collected
+    for _ in range(2, 25):  # the rest of the term, some months late: no profit accrues for time (R48)
+        collect(w, c, "1610.00", on=date(2027, 12, 1))
     assert balance(w.alm, "1241") == D("0.00") and balance(w.alm, "4610") == D("-3600.00")
     assert balance(w.alm, "1240") == D("38640.00")  # payroll credits 1240 itself when it deducts (E11)
-    with pytest.raises(InvoicingError) as exc:
-        port.recognise_bai_ajel_profit(c, amount=D("0.01"), on=date(2027, 12, 1), source_ref="inst:25", user=w.h)
+
+
+def test_uneven_collections_round_once_and_the_last_releases_the_rest(bw, django_capture_on_commit_callbacks):
+    c = approve(bw, contract(bw, saudi(bw), term=1), django_capture_on_commit_callbacks)  # one instalment 38,640.00
+    bw.zatca.report(sale_doc(c))
+    a, inst = collect(bw, c, "1000.00", on=date(2027, 4, 25))
+    assert a.profit_amount == D("93.17")  # 3,600 x 1,000 / 38,640 = 93.167, half-up
+    b, inst = collect(bw, c, "1000.00", on=date(2027, 5, 25))  # the remainder installment payroll carried (R18)
+    assert b.profit_amount == D("93.17")  # 3,600 x 2,000 / 38,640 = 186.335 -> 186.34 to date
+    rest, _ = collect(bw, c, "36640.00", on=date(2027, 6, 30))  # the whole balance (E13): the rest is recognised
+    assert rest.profit_amount == D("3413.66") and balance(bw.alm, "1241") == D("0.00")
+    from payroll.models import DeferredSaleInstallment
+
+    extra = DeferredSaleInstallment(entity=bw.alm, contract=c, period="2028-01", amount=D("0.01"))
+    extra._service_write = True
+    extra.save()
+    with pytest.raises(InvoicingError) as exc:  # test data: more than the receivable is never recognised
+        collect(bw, c, "0.01", inst=extra)
     assert exc.value.code == "over_collected" and bilingual(exc.value)
 
 
-def test_uneven_collections_round_once_and_the_last_releases_the_rest(sold):
-    w, s1, c, doc = sold
-    port = port_module.PayrollInvoicingPort()
-    a = port.recognise_bai_ajel_profit(c, amount=D("1000.00"), on=date(2027, 4, 25), source_ref="a", user=w.h)
-    assert a.profit_amount == D("93.17")  # 3,600 x 1,000 / 38,640 = 93.167, half-up
-    b = port.recognise_bai_ajel_profit(c, amount=D("1000.00"), on=date(2027, 5, 25), source_ref="b", user=w.h)
-    assert b.profit_amount == D("93.17")  # 3,600 x 2,000 / 38,640 = 186.335 -> 186.34 to date
-    # the final settlement recovers the whole balance (E13): the rest of the profit is recognised
-    rest = port.recognise_bai_ajel_profit(c, amount=D("36640.00"), on=date(2027, 6, 30), source_ref="fs:1",
-                                          user=w.c)
-    assert rest.profit_amount == D("3413.66") and balance(w.alm, "1241") == D("0.00")
-
-
-def test_profit_waits_for_the_posted_invoice_and_for_a_collecting_approver(bw, django_capture_on_commit_callbacks):
+def test_profit_waits_for_the_posted_invoice_and_for_the_collecting_approver(bw, django_capture_on_commit_callbacks):
     c = approve(bw, contract(bw, saudi(bw)), django_capture_on_commit_callbacks)
-    port = port_module.PayrollInvoicingPort()
     with pytest.raises(InvoicingError) as exc:
-        port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 4, 25), source_ref="i1", user=bw.h)
+        collect(bw, c, "1610.00")
     assert exc.value.code == "sale_not_posted" and bilingual(exc.value)
     bw.zatca.report(sale_doc(c))
-    for user in (bw.p, make_agent("profit_bot"), bw.hs):  # no collecting approval in ALM (hs is SUB's hr_officer)
-        with pytest.raises(PermissionDenied):
-            port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 4, 25), source_ref="i1", user=user)
+    port = port_module.PayrollInvoicingPort()
+    inst = next_installment(c)
+    run = collection_run(bw)
+    from payroll.models import DeferredSaleInstallment
+
+    payroll._deduct_installment(inst, D("1610.00"), run, DeferredSaleInstallment)
+    ref = payroll._collection_ref(inst)
+    for user in (bw.p, bw.hs):  # another person than the approver whose marker is set
+        with payroll_port.collecting(run, bw.h), pytest.raises(InvoicingError) as exc:
+            port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 4, 25), source_ref=ref, user=user)
+        assert exc.value.code == "collection_not_from_payroll"
+    with payroll_port.collecting(run, bw.p), pytest.raises(PermissionDenied):  # P holds no run approval
+        port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 4, 25), source_ref=ref, user=bw.p)
+    agent = make_agent("profit_bot")
+    with payroll_port.collecting(run, agent), pytest.raises(PermissionDenied):
+        port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 4, 25), source_ref=ref, user=agent)
+    with payroll_port.collecting(run, bw.h), pytest.raises(InvoicingError) as exc:  # not an installment reference
+        port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 4, 25), source_ref="inst:1", user=bw.h)
+    assert exc.value.code == "collection_not_from_payroll"
     assert not DeferredProfitRelease.objects.exists()
     other = contract(bw, saudi(bw), acquire=False)
-    with pytest.raises(InvoicingError) as exc:
-        port.recognise_bai_ajel_profit(other, amount=D("1.00"), on=date(2027, 4, 25), source_ref="x", user=bw.h)
-    assert exc.value.code == "no_deferred_sale"
+    with payroll_port.collecting(run, bw.h), pytest.raises(InvoicingError) as exc:  # the installment is c's, not other's
+        port.recognise_bai_ajel_profit(other, amount=D("1610.00"), on=date(2027, 4, 25), source_ref=ref, user=bw.h)
+    assert exc.value.code == "collection_not_from_payroll"
+
+
+def test_review4_the_cfo_calling_profit_recognition_directly_is_refused(sold):
+    """Review fix 4: outside payroll's run or settlement approval nobody recognises profit, not even a person holding
+    every collecting right (the CFO / approver C), with a plausible installment reference and amount."""
+    w, s1, c, doc = sold
+    from payroll.models import DeferredSaleInstallment
+
+    inst = next_installment(c)
+    payroll._deduct_installment(inst, D("1610.00"), collection_run(w), DeferredSaleInstallment)
+    member(w.c, w.alm, "hr_officer")  # C now also holds payroll.approve_run
+    for call in (lambda: inv.recognise_deferred_profit(c, user=w.c, collected_amount="1610.00",
+                                                       collected_on=date(2027, 4, 25),
+                                                       source_ref=payroll._collection_ref(inst)),
+                 lambda: port_module.PayrollInvoicingPort().recognise_bai_ajel_profit(
+                     c, amount=D("1610.00"), on=date(2027, 4, 25), source_ref=payroll._collection_ref(inst),
+                     user=w.c)):
+        with pytest.raises(InvoicingError) as exc:
+            call()
+        assert exc.value.code == "collection_not_from_payroll" and bilingual(exc.value)
+    assert not DeferredProfitRelease.objects.exists() and balance(w.alm, "4610") == D("0.00")
+    from core.access.models import AccessLog
+
+    assert AccessLog.objects.filter(event="permission_denied", actor=w.c,
+                                    details__reason="collection_not_from_payroll").exists()
 
 
 def test_a_reversed_collection_reverses_its_profit_and_can_be_collected_again(sold):
     w, s1, c, doc = sold
     port = port_module.PayrollInvoicingPort()
-    port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 4, 25), source_ref="run:7", user=w.h)
-    with pytest.raises(PermissionDenied):  # the payroll officer cannot reverse runs
-        port.reverse_bai_ajel_profit(c, source_ref="run:7", user=w.p)
-    result = port.reverse_bai_ajel_profit(c, source_ref="run:7", user=w.c, reason="run reversed")
-    release = DeferredProfitRelease.objects.get(source_ref="run:7")
+    _, inst = collect(w, c, "1610.00", on=date(2027, 4, 25))
+    ref, run = payroll._collection_ref(inst), collection_run(w)
+    with pytest.raises(InvoicingError) as exc:  # outside a run reversal (review fix 4)
+        port.reverse_bai_ajel_profit(c, source_ref=ref, user=w.c)
+    assert exc.value.code == "collection_not_from_payroll"
+    with payroll_port.collecting(run, w.p, mode="reverse"), pytest.raises(PermissionDenied):
+        port.reverse_bai_ajel_profit(c, source_ref=ref, user=w.p)  # the payroll officer cannot reverse runs
+    with payroll_port.collecting(run, w.c, mode="reverse"):
+        result = port.reverse_bai_ajel_profit(c, source_ref=ref, user=w.c, reason="run reversed")
+    release = DeferredProfitRelease.objects.get(source_ref=ref)
     assert result.reversed and release.status == "reversed" and release.reversal_entry.reversal_of == release.journal_entry
     assert balance(w.alm, "4610") == D("0.00") and balance(w.alm, "1241") == D("-3600.00")
-    with pytest.raises(InvoicingError) as exc:
-        port.reverse_bai_ajel_profit(c, source_ref="run:7", user=w.c)
+    with payroll_port.collecting(run, w.c, mode="reverse"), pytest.raises(InvoicingError) as exc:
+        port.reverse_bai_ajel_profit(c, source_ref=ref, user=w.c)
     assert exc.value.code == "nothing_to_reverse"
-    again = port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 5, 25), source_ref="run:7", user=w.h)
+    with payroll_port.collecting(run, w.h):
+        again = port.recognise_bai_ajel_profit(c, amount=D("1610.00"), on=date(2027, 5, 25), source_ref=ref, user=w.h)
     assert again.profit_amount == D("150.00")
     from ledger import services as ledger
 
     with pytest.raises(PermissionDenied):  # never reversed behind invoicing's back (reverse_guard)
         g = access.require(w.c, w.alm, "payroll.reverse_run",
-                           document=DeferredProfitRelease.objects.get(source_ref="run:7", status="posted"))
-        ledger.reverse_entry(DeferredProfitRelease.objects.get(source_ref="run:7", status="posted").journal_entry, g)
+                           document=DeferredProfitRelease.objects.get(source_ref=ref, status="posted"))
+        ledger.reverse_entry(DeferredProfitRelease.objects.get(source_ref=ref, status="posted").journal_entry, g)
 
 
 def test_a_profit_entry_posts_only_through_invoicing(sold):
     w, s1, c, doc = sold
-    release = inv.recognise_deferred_profit(c, user=w.h, collected_amount="1610.00", collected_on=date(2027, 4, 25),
-                                            source_ref="only")
+    collect(w, c, "1610.00", on=date(2027, 4, 25))
+    release = DeferredProfitRelease.objects.get()
     with pytest.raises(ValidationError):
         inv._deferred_profit_lines(release)  # outside an invoicing posting
     with pytest.raises(ValidationError):
@@ -521,8 +600,8 @@ def test_pg_bai_ajel_rows_are_locked_in_the_database(sold):
     from django.db import DatabaseError, transaction
 
     w, s1, c, doc = sold
-    release = inv.recognise_deferred_profit(c, user=w.h, collected_amount="1610.00", collected_on=date(2027, 4, 25),
-                                            source_ref="pg")
+    collect(w, c, "1610.00", on=date(2027, 4, 25))
+    release = DeferredProfitRelease.objects.get()
     sale = DeferredSale.objects.get(sales_document=doc)
     for sql, params in (
         ("UPDATE invoicing_deferredsale SET cost = 1 WHERE id = %s", [sale.pk]),
@@ -535,5 +614,20 @@ def test_pg_bai_ajel_rows_are_locked_in_the_database(sold):
     ):
         with pytest.raises(DatabaseError), transaction.atomic(), connection.cursor() as cursor:
             cursor.execute(sql, params)
-    with transaction.atomic(), connection.cursor() as cursor:  # the one change allowed: a rejected invoice deactivates
+    # Review fix 9 (invoicing 0031): deactivation only once ZATCA rejected the sale invoice; this one is final.
+    with pytest.raises(DatabaseError), transaction.atomic(), connection.cursor() as cursor:
         cursor.execute("UPDATE invoicing_deferredsale SET active = false WHERE id = %s", [sale.pk])
+
+
+@pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL triggers")
+def test_pg_review9_a_sale_deactivates_only_when_its_invoice_is_rejected(bw, django_capture_on_commit_callbacks):
+    from django.db import DatabaseError, transaction
+
+    c = approve(bw, contract(bw, saudi(bw)), django_capture_on_commit_callbacks)
+    sale = DeferredSale.objects.get(source_id=c.pk, active=True)
+    with pytest.raises(DatabaseError), transaction.atomic(), connection.cursor() as cursor:  # issued, not rejected
+        cursor.execute("UPDATE invoicing_deferredsale SET active = false WHERE id = %s", [sale.pk])
+    bw.zatca.reject(sale_doc(c))
+    with transaction.atomic(), connection.cursor() as cursor:  # the one change allowed: a rejected invoice
+        cursor.execute("UPDATE invoicing_deferredsale SET active = false WHERE id = %s", [sale.pk])
+    assert DeferredSale.objects.get(pk=sale.pk).active is False

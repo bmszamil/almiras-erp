@@ -251,12 +251,12 @@ def test_rr7_p11_one_purchase_bill_backs_one_contract(w):
     a, b = saudi(w), saudi(w)
     bill = asset_bill(w, "30000.00")
     c1 = services.record_asset_acquisition(terms(w, a), user=w.p, purchase_bill=bill, possession_date=date(2027, 2, 16),
-                                           possession_evidence_ref="DELIVERY-1")
+                                           possession_evidence_ref="DELIVERY-1", asset_type="vehicle")
     assert c1.status == "asset_acquired"
     c2 = terms(w, b)
     with pytest.raises(PayrollError) as exc:
         services.record_asset_acquisition(c2, user=w.p, purchase_bill=bill, possession_date=date(2027, 2, 16),
-                                          possession_evidence_ref="DELIVERY-1")
+                                          possession_evidence_ref="DELIVERY-1", asset_type="vehicle")
     assert exc.value.code == "acquisition_invalid" and "another bai' ajel contract" in str(exc.value)
     c2 = DeferredSaleContract.objects.get(pk=c2.pk)
     c2.purchase_bill = bill

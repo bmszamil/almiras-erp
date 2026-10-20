@@ -170,3 +170,34 @@ def test_rr15_two_approvals_of_one_final_settlement_at_once_post_once(w, monkeyp
     assert sorted(results) == ["ok", "settlement_status"]
     fs = FinalSettlement.objects.get(pk=fs.pk)
     assert fs.status == "approved" and fs.number.endswith("000001") and fs.journal_entry_id
+
+
+# 2026-10-20 review fixes 5 and 6: cost items on one source, corrections of one settlement.
+
+def test_review5_two_cost_items_on_one_source_at_once_never_exceed_it(w, monkeypatch):
+    from django.apps import apps
+
+    from invoicing import reference_seed
+    from payroll.test_slice2_costs import expense_bill, seconded
+
+    reference_seed.apply_all(apps)  # the flushed database: VAT rates and income types for the source bill
+    s1, a = seconded(w)
+    bill = expense_bill(w, "1000.00")
+    calls = [(services.create_cost_item, dict(employee=s1, user=user, kind="visa", amount="600.00",
+                                              description_ar="تأشيرة", source_bill=bill)) for user in (w.p, w.p2)]
+    results = _race(monkeypatch, "_source_used", calls)
+    assert sorted(results) == ["cost_item_exceeds_source", "ok"]
+
+
+def test_review6_two_corrections_of_one_settlement_at_once_leave_one_open(w, monkeypatch):
+    from payroll.models import SettlementCorrection
+    from payroll.test_slice2_settlement import approved_settlement
+
+    n1, t, fs = approved_settlement(w)
+    calls = [(services.create_settlement_correction,
+              dict(settlement=fs, user=user, reason_ar="تصحيح", lines=[
+                  {"line_type": "leave_encashment", "direction": "increase", "amount": "10.00"}]))
+             for user in (w.p, w.p2)]
+    results = _race(monkeypatch, "_correction_problems", calls)
+    assert sorted(results) == ["correction_open", "ok"]
+    assert SettlementCorrection.objects.filter(settlement=fs, status="draft").count() == 1

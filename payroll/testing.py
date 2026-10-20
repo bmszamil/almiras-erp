@@ -17,6 +17,8 @@ class FakeInvoicingPort:
         self.status = "final"
         self.recognised = []  # (contract pk, amount, on, source_ref, user pk)
         self.reversed = []  # (contract pk, source_ref, user pk)
+        self.rebates = []  # (contract pk, source_ref, amount, user pk)
+        self.rebate_status = "issued"
 
     def create_bai_ajel_sale(self, contract, *, user):
         vat = (contract.sale_price * Decimal("0.15")).quantize(Decimal("0.01"))
@@ -32,6 +34,20 @@ class FakeInvoicingPort:
     def recognise_bai_ajel_profit(self, contract, *, amount, on, source_ref, user):
         self.recognised.append((contract.pk, amount, on, source_ref, user.pk))
         return SimpleNamespace(entry_ref="", profit_amount=Decimal("0"), collected_to_date=amount, reversed=False)
+
+    def create_bai_ajel_rebate(self, contract, *, user, source_ref, amount, reason_ar, reason_en=""):
+        """R128: a credit note of the rebate at 15% VAT; ``rebate_status`` is what ``rebate_state`` reports."""
+        vat = (Decimal(amount) * Decimal("0.15")).quantize(Decimal("0.01"))
+        self.rebates.append((contract.pk, source_ref, Decimal(amount), user.pk))
+        return SimpleNamespace(document_ref=f"TEST-CN-{contract.pk}-{len(self.rebates)}", net_amount=Decimal(amount),
+                               vat_amount=vat, status="issued")
+
+    def rebate_state(self, contract, *, source_ref):
+        mine = [r for r in self.rebates if r[1] == source_ref]
+        if not mine:
+            return None
+        return SimpleNamespace(document_ref=f"TEST-CN-{contract.pk}-{len(self.rebates)}", net_amount=mine[-1][2],
+                               vat_amount=Decimal("0"), status=self.rebate_status)
 
     def reverse_bai_ajel_profit(self, contract, *, source_ref, user, on=None, reason=""):
         self.reversed.append((contract.pk, source_ref, user.pk))

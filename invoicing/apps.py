@@ -36,6 +36,7 @@ class InvoicingConfig(AppConfig):
             PurchaseDocument, post_permissions={"invoicing.approve_bill"},
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._purchase_document_lines, validate_lines=services._check_document_rate,
+            reverse_guard=services._purchase_reverse_guard,  # R124: reversed only through reverse_document
         )
         # D26 / access R46: the person who records a customer receipt may post it; refunds keep a second person.
         documents.register(
@@ -84,3 +85,32 @@ class InvoicingConfig(AppConfig):
         )
         restricted.allow(services.PURIFICATION_BANK, document_type="invoicing.purificationtransfer",
                          predicate=services._purification_gl_allowed)
+        # Review fix 3 (R127): the bai' ajel accounts are posted only by their documents and their reversals: 1240
+        # by the sale invoice (and its payroll-approved adjustment credit note) and payroll's runs and final
+        # settlements (instalments collected, registered in payroll/apps.py); 1241 by the sale invoice, its
+        # adjustment and the profit recognitions; 4610 by the profit recognitions only. Manual journals never.
+        restricted.restrict(
+            services.EMPLOYEE_RECEIVABLE, name_en="Employee deferred-sale (bai' ajel) receivable",
+            name_ar="ذمم البيع الآجل للموظفين",
+            posted_by_en="the bai' ajel sale invoice and its payroll-approved adjustment (invoicing), payroll runs and "
+                         "final settlements collecting the instalments, and their reversals",
+            posted_by_ar="فاتورة البيع الآجل وتسويتها المعتمدة في الرواتب (الفوترة)، ومسيرات الرواتب والمخالصات "
+                         "النهائية التي تحصّل الأقساط، وعكسها",
+        )
+        restricted.restrict(
+            services.DEFERRED_PROFIT, name_en="Deferred bai' ajel profit", name_ar="أرباح البيع الآجل المؤجلة",
+            posted_by_en="the bai' ajel sale invoice, its payroll-approved adjustment and the bai' ajel profit "
+                         "recognitions (invoicing), and their reversals",
+            posted_by_ar="فاتورة البيع الآجل وتسويتها المعتمدة في الرواتب وقيود تحقق أرباح البيع الآجل (الفوترة)، وعكسها",
+        )
+        restricted.restrict(
+            services.SALE_PROFIT_INCOME, name_en="Bai' ajel profit income", name_ar="إيرادات أرباح البيع الآجل",
+            posted_by_en="the bai' ajel profit recognitions (invoicing) and their reversals",
+            posted_by_ar="قيود تحقق أرباح البيع الآجل (الفوترة) وعكسها",
+        )
+        for code in (services.EMPLOYEE_RECEIVABLE, services.DEFERRED_PROFIT):
+            restricted.allow(code, document_type="invoicing.salesdocument",
+                             predicate=services._bai_ajel_sale_entry_allowed)
+        for code in (services.DEFERRED_PROFIT, services.SALE_PROFIT_INCOME):
+            restricted.allow(code, document_type="invoicing.deferredprofitrelease",
+                             predicate=services._deferred_profit_entry_allowed)

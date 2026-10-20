@@ -1295,6 +1295,17 @@ def _local_contract_problems(contract, emp, use, jurisdiction):
     if contract.calendar_basis != EmploymentContract.CalendarBasis.GREGORIAN:
         problems.append(f"Contracts in {jurisdiction} use the Gregorian calendar. / تستخدم العقود في {jurisdiction} "
                         "التقويم الميلادي.")
+    # Compliance E6 (Egypt, National Wages Council): a monthly pay below the private-sector minimum is a warning,
+    # not a refusal (firms with fewer than 10 workers are exempt; the row is research, unverified, OQ-26).
+    minimum = param(jurisdiction, "wage.minimum.private_monthly", on, required=False)
+    if minimum is not None and contract.pk is not None:
+        total = sum((c.monthly_amount for c in contract.components.all()), Decimal("0"))
+        floor = _decimal(minimum.value["amount"], "amount")
+        if total < floor:
+            warnings.append(f"Monthly pay {total} {contract.currency_id} is below the private-sector minimum wage "
+                            f"{floor} in {jurisdiction} (from {minimum.valid_from}; firms with fewer than 10 workers "
+                            f"are exempt). / الأجر الشهري {total} أقل من الحد الأدنى للأجور في القطاع الخاص {floor} "
+                            "(المنشآت التي يقل عمالها عن 10 معفاة).")
     return problems, warnings
 
 
