@@ -137,7 +137,7 @@ label, th, .form-label, .btn, .alm-nav__link, .alm-status { font-weight: 500; }
 .alm-table tfoot th, .alm-table tfoot td { border-block-start: 2px solid var(--alm-navy); font-weight: 500; }
 .alm-amount { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .alm-currency { font-size: .8125em; color: var(--alm-text-muted); }
-.alm-ident { white-space: nowrap; }
+.alm-ident, time { white-space: nowrap; }
 .alm-code { color: var(--alm-navy); }
 
 .alm-dl { display: grid; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); gap: .75rem 1.5rem; margin: 0; }
