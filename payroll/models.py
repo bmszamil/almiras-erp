@@ -888,6 +888,10 @@ class DeferredSaleRebate(Tracked, ServiceWritten):
     credit_note_status = models.CharField(bi("Credit note status", "حالة الإشعار الدائن"), max_length=10, blank=True)
     installment_cuts = models.JSONField(bi("Instalments reduced", "الأقساط المخفضة"), default=list, blank=True)
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    # Review 2026-10-20c (finding 4): written by the approval on the locked row, checked by invoicing's call through
+    # ``invoicing_port.rebate_problems`` and cleared when the approval is done (empty otherwise).
+    approval_token = models.CharField(bi("Approval token (one-time)", "رمز الاعتماد (لمرة واحدة)"), max_length=64,
+                                      blank=True, editable=False)
     approved_by = _user("Approved by", "اعتمده")
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
 
