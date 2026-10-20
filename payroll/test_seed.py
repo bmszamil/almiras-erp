@@ -3,7 +3,7 @@ from datetime import date
 
 from core.access import catalogue
 from core.access.models import Role
-from core.access.seed import ROLE_SEED, ROLE_SEED_V12, ROLE_SEED_V13, ROLE_SEED_V14, ROLE_SEED_V16
+from core.access.seed import ROLE_SEED, ROLE_SEED_V12, ROLE_SEED_V13, ROLE_SEED_V14, ROLE_SEED_V16, ROLE_SEED_V17
 from hr.models import StatutoryParameter
 from ledger.models import Account
 from payroll import statutory_seed
@@ -31,7 +31,7 @@ def test_r68_only_sa_and_eg_are_active_and_egypt_rows_are_research(db):
 
 
 def test_v13_seed_payroll_rights(db):
-    assert ROLE_SEED is ROLE_SEED_V16
+    assert ROLE_SEED is ROLE_SEED_V17
     perms = {code: set(row[5]) for code, row in ROLE_SEED.items()}
     assert {c for c, p in perms.items() if "payroll.approve_run" in p} == {"hr_officer", "managing_partner"}
     assert {c for c, p in perms.items() if "payroll.approve_loan" in p} == {"managing_partner"}

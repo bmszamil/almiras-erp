@@ -65,11 +65,15 @@ from .models import (
     LoanInstallment,
     LoanWriteOff,
     MaternityGosiCase,
+    MudadJustification,
+    MudadJustificationExport,
     MudadSubmission,
     PayrollAlert,
     PayrollError,
     PayrollGroup,
     PayrollInput,
+    PayrollLiabilityReport,
+    PayrollLiabilityReportLine,
     PayrollPayment,
     PayrollRun,
     PayrollSequence,
@@ -2162,10 +2166,18 @@ def _calc_remuneration(ctx, emp, versions, info):
             txn = _round_to(txn, cur.minor_units)
             slip.lines.append(Line(ltype, sar(txn), account, en, ar, amount_txn=txn, **kw))
 
-        for pk, (comp, exact) in _component_earnings(info, exact=True).items():
-            add(LT.EARNING, exact, comp.expense_account, comp.name_en, comp.name_ar, component=comp,
-                quantity=Decimal(info.paid_days))
-        for inp in _employee_inputs(ctx, emp):
+        off = ctx.run.kind == PayrollRun.Kind.OFF_CYCLE
+        if off:
+            # Slice 3 (R69, R70): only what the period's approved payslips have not paid, in the contract currency.
+            _remuneration_still_due(ctx, slip, emp, info, cur, add)
+        else:
+            for pk, (comp, exact) in _component_earnings(info, exact=True).items():
+                add(LT.EARNING, exact, comp.expense_account, comp.name_en, comp.name_ar, component=comp,
+                    quantity=Decimal(info.paid_days))
+        inputs = _off_cycle_inputs(ctx, emp) if off else _employee_inputs(ctx, emp)
+        # Slice 3 fix: the inputs a remuneration payslip pays are recorded, so the next run never pays them again.
+        slip.input_ids = [i.pk for i in inputs]
+        for inp in inputs:
             if inp.kind in (IK.ONE_OFF_EARNING, IK.BONUS):
                 add(LT.ONE_OFF_EARNING if inp.kind == IK.ONE_OFF_EARNING else LT.BONUS, Fraction(inp.amount),
                     _expense(ctx, inp.component), inp.reason_en or inp.kind, inp.reason_ar, component=inp.component,
@@ -2178,6 +2190,10 @@ def _calc_remuneration(ctx, emp, versions, info):
         g = _compute_gosi(ctx, slip, emp, info, cohort=slip.cohort, nclass=nclass, basis=emp.employment_basis,
                          remuneration_sar=_round(remuneration * Fraction(rate)) if nclass == "saudi" else None)
         slip.gosi_wage, slip.gosi_wage_full = g.wage, g.wage_full
+        if off:
+            # R71: annuities only on the month's REMUNERATION in SAR not yet covered by an approved payslip of the
+            # period; the floor and cap applied to the month's GOSI wage across its payslips (R20, R68).
+            _uncovered_branches(ctx, slip, emp, g)
         for line in _gosi_lines(ctx, slip, g):
             if line.line_type == LT.EMPLOYEE_GOSI:
                 # R62: the SAR share converted into the payslip currency; the SAR amount is what the ledger books.
@@ -2269,13 +2285,12 @@ def create_run(entity, *, user, period, payroll_group=PayrollGroup.IN_COUNTRY, k
     if kind == PayrollRun.Kind.OFF_CYCLE and (not reason_ar.strip() or not employees):
         raise error("An off-cycle run needs a reason in Arabic and the named employees (R6).",
                     "يحتاج المسير خارج الدورة إلى سبب بالعربية وأسماء الموظفين.", code="off_cycle_reason")
-    if _jurisdiction_of(entity) != "SA" and (kind != PayrollRun.Kind.REGULAR
-                                              or payroll_group != PayrollGroup.IN_COUNTRY):
-        raise error("Egypt payroll runs are regular in-country runs (off-cycle runs there are not built; §10.8).",
-                    "مسيرات مصر مسيرات عادية داخل البلد (لم تُبنَ المسيرات خارج الدورة هناك).", code="off_cycle_not_built")
-    if kind == PayrollRun.Kind.OFF_CYCLE and payroll_group == PayrollGroup.OUT_OF_COUNTRY:
-        raise error("Off-cycle remuneration runs are not built yet (review 2): correct in the next regular run.",
-                    "لم تُبنَ المسيرات خارج الدورة للمكافآت بعد: صحّح في المسير العادي التالي.", code="off_cycle_not_built")
+    if _jurisdiction_of(entity) != "SA" and payroll_group != PayrollGroup.IN_COUNTRY:
+        raise error("Egypt payroll runs are in-country runs (§10.8 item 7, R73).",
+                    "مسيرات مصر مسيرات داخل البلد.", code="run_kind")
+    slice3 = _slice3_off_cycle(entity, payroll_group, kind)
+    if slice3:
+        _slice3_off_cycle_checks(entity, period, payroll_group, employees, purpose)
     s = _settings_of(entity)
     start, end = _period_bounds(period)
     if pay_date is None:
@@ -2319,6 +2334,12 @@ def _calculate(ctx):
         info = _employment(emp, ctx.period, ctx.s, versions)
         if info is None:
             continue
+        if ctx.run.kind == PayrollRun.Kind.OFF_CYCLE and ctx.jurisdiction == "EG":
+            # R74: an Egypt off-cycle run is never a final settlement (an exit found after the run was prepared).
+            problem = _eg_exit_problem(emp, versions, ctx.end)
+            if problem is not None:
+                slips.append(_refused_slip(ctx, emp, *problem))
+                continue
         term = _termination(emp)
         if term is not None and info.start <= term.last_working_day <= info.end and emp.employment_basis != Basis.REMUNERATION:
             ctx.leavers.append((emp.employee_code, term.last_working_day))
@@ -2497,6 +2518,11 @@ def calculate_run(run, *, user):
     use = hr.ParamUse()
     ctx = Ctx(run, user, _jurisdiction_gate(run.entity, use))
     ctx.use = use
+    if _slice3_off_cycle(run.entity, run.payroll_group, run.kind):
+        # Slice 3 (R69, R70): the regular run of the period is approved first; the entry date follows the open period.
+        _require_regular_approved(run.entity, run.period, run.payroll_group)
+        run.entry_date, run.entry_date_reason = _off_cycle_entry_date(run.entity, run.period)
+        _entry_date_warning(ctx)
     _refresh_deferred_sales(run.entity)  # slice 2: sales posted on ZATCA reporting since enter the run (R47)
     slips = _calculate(ctx)
     _store(ctx, slips)
@@ -2630,7 +2656,18 @@ def approve_run(run, *, user):
     use = hr.ParamUse()
     ctx = Ctx(run, user, _jurisdiction_gate(run.entity, use))
     ctx.use = use  # jurisdiction.active is verified with the rest (hr R68, R7)
+    if _slice3_off_cycle(run.entity, run.payroll_group, run.kind):
+        _require_regular_approved(run.entity, run.period, run.payroll_group)  # R69 (a reversal since refuses)
+        # R70: a period closed (or reopened) since the calculation moves the entry date: recalculate first.
+        if _off_cycle_entry_date(run.entity, run.period) != (run.entry_date, run.entry_date_reason):
+            raise error("The entry date of this off-cycle run changed since the calculation (period closed or opened): "
+                        "recalculate the run (R70, R8).", "تغيّر تاريخ قيد هذا المسير خارج الدورة بعد الاحتساب (أُقفلت "
+                        "الفترة أو فُتحت): أعد احتساب المسير.", code="recalculate")
+        _entry_date_warning(ctx)
     slips = _calculate(ctx)
+    # Slice 3 fix: the calculation's pay-date warning (Art. 90) is part of its fingerprint; without it here a run
+    # with a late pay date could never be approved ("recalculate" every time).
+    _pay_date_warning(ctx)
     if _fingerprint(slips, ctx.warnings, ctx.use.ids) != run.inputs_hash:
         raise error("A source changed after the calculation: recalculate the run and submit it again (R8).",
                     "تغيّر مصدر بعد الاحتساب: أعد احتساب المسير وقدّمه مجددًا.", code="recalculate")
@@ -4439,7 +4476,7 @@ def _wps_rows(run, bank_codes=None):
     return rows, exceptions
 
 
-def _wps_csv(run, fmt, rows, s, use, bank_codes=None):
+def _wps_csv(run, fmt, rows, s, use, bank_codes=None, columns=(), carried=None):
     out = io.StringIO()
     w = csv.writer(out, lineterminator="\r\n")
 
@@ -4462,15 +4499,17 @@ def _wps_csv(run, fmt, rows, s, use, bank_codes=None):
               "D-CATE": "", "FILE-REF": run.number, "FILE-REJCDE": "", "MOL-ESTBID": hs.mudad_establishment_no if hs else ""}
     # C-C1: the total deductions, under the field name the bank uses (settings; [CC-verify] per bank, OQ-10).
     content_fields = list(fields["content"]) + [s.wps_deductions_field or "DEDUCTIONS"]
+    extra = [c["name"] for c in columns]  # slice 3 (R81): after the Ministry fields, which stay unchanged
     write(fields["header"])
     write([header.get(f, "") for f in fields["header"]])
-    write(content_fields)
+    write(content_fields + extra)
     for r in rows:
         content = {"32B-AMT": str(r["net"]), "ACC-59": r["iban"], "NAM-57": r["name"], "BANK-57": r["bic"],
                    "DET-70": "", "MOL-BAS": str(r["basic"]), "MOL-HALI": str(r["housing"]),
                    "MOL-OEA": str(r["other"]), "MOL-ALL": str(r["basic"] + r["housing"] + r["other"]), "MOL-ID": r["id"],
                    s.wps_deductions_field or "DEDUCTIONS": str(r["deductions"])}
-        write([content.get(f, "") for f in content_fields])
+        j = (carried or {}).get(r["employee_code"])
+        write([content.get(f, "") for f in content_fields] + [_justification_cell(j, c) for c in columns])
     return out.getvalue(), None
 
 
@@ -4486,6 +4525,11 @@ def generate_wps_file(run, *, user, format_code=None):
     if run.status not in (RS.APPROVED, RS.PAID):
         raise error("A salary file is generated from an approved run (R31).", "يُنشأ ملف الرواتب من مسير معتمد.",
                     code="run_status")
+    if run.payroll_group == PayrollGroup.OUT_OF_COUNTRY or _jurisdiction_of(run.entity) != "SA":
+        # Slice 3 (R51, R72, R74): remuneration staff and Egypt payroll are outside the Saudi WPS.
+        raise error("No WPS file for this run: remuneration (out-of-country) and Egypt payroll are outside the Saudi "
+                    "Wage Protection System (R51, R72, R74).", "لا يُنشأ ملف حماية أجور لهذا المسير: المكافآت خارج "
+                    "المملكة ورواتب مصر خارج نظام حماية الأجور السعودي.", code="wps_not_applicable")
     s = _settings_of(run.entity)
     fmt = format_code or s.wps_format
     if not fmt:
@@ -4511,7 +4555,11 @@ def generate_wps_file(run, *, user, format_code=None):
                         "حدّد بنك الرواتب أولًا: يُذكر في الحقل DEST-ID.", code="salary_bank_missing")
         bank_codes = use.get("SA", "wps.bank_codes", run.entry_date)["by_iban_code"]
     rows, exceptions = _wps_rows(run, bank_codes)
-    content, _ = _wps_csv(run, fmt, rows, s, use, bank_codes)
+    columns, carried = ([], {})
+    if fmt == "mudad_placeholder":
+        # Slice 3 (R81): the salary bank's format may declare columns for the approved Mudad justifications.
+        columns, carried = _wps_justification_columns(run, s, use)
+    content, _ = _wps_csv(run, fmt, rows, s, use, bank_codes, columns=columns, carried=carried)
     f = _save(WpsFile(entity=run.entity, run=run, format_code=fmt, format_parameter=param_row, generated_by=user,
                       generated_at=_now(),
                       sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(), employee_count=len(rows),
@@ -4521,6 +4569,12 @@ def generate_wps_file(run, *, user, format_code=None):
                         details={"action": "wps_generated", "wps_file": f.pk, "sha256": f.sha256,
                                  "employee_codes": [r["employee_code"] for r in rows],
                                  "fields": ["full_name_en", "id_number", "iban", "bank_name"]})
+    included = {r["employee_code"] for r in rows}
+    for code, j in carried.items():
+        if code in included and j.status not in MudadJustification.FINAL:
+            j.wps_file = f
+            _save(j)
+    _suggest_mudad(run, user, exceptions=exceptions)  # R79: suggestions at WPS generation
     return f
 
 
@@ -4552,7 +4606,10 @@ def attach_bank_processed_file(wps_file, *, user, content):
     f.bank_processed_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
     f.bank_processed_received_at = _now()
     # Only these columns: the stored salary file is never rewritten (review 15; PostgreSQL trigger).
-    return _save(f, update_fields=["bank_processed_content", "bank_processed_sha256", "bank_processed_received_at"])
+    _save(f, update_fields=["bank_processed_content", "bank_processed_sha256", "bank_processed_received_at"])
+    # Slice 3 (R79(b)): a rejection code from the bank becomes a suggested justification.
+    _suggest_mudad(PayrollRun.objects.get(pk=f.run_id), user, returns=_bank_returns(f, content))
+    return f
 
 
 @transaction.atomic
@@ -4875,6 +4932,7 @@ def send_alerts(*, today=None, entity=None):
                                   f"التصحيح {c.number} لمخالصة {c.employee.employee_code} كان مستحقًا في {c.due_date} وقد "
                                   "تأخر (المادة 88).", ("payroll_officer", "approver"))])
                 sent += 1
+        sent += _mudad_justification_alerts(e, today)  # slice 3 (R80)
         if today.day == 10:
             open_ = _gosi_open(e, prev)
             if open_ > 0:
@@ -4886,10 +4944,11 @@ def send_alerts(*, today=None, entity=None):
                 sent += 1
         from datetime import datetime
         cutoff = timezone.make_aware(datetime(today.year - 10, today.month, min(today.day, 28)))
-        for f in WpsFile.objects.filter(entity=e, nominated_for_burn_at__isnull=True, generated_at__lt=cutoff):
-            f.nominated_for_burn_at = _now()
-            _save(f, update_fields=["nominated_for_burn_at"])
-            sent += 1
+        for model in (WpsFile, MudadJustificationExport):  # slice 3 (R81): exports are kept like WPS files
+            for f in model.objects.filter(entity=e, nominated_for_burn_at__isnull=True, generated_at__lt=cutoff):
+                f.nominated_for_burn_at = _now()
+                _save(f, update_fields=["nominated_for_burn_at"])
+                sent += 1
     return sent
 
 
@@ -5982,10 +6041,12 @@ def _eg_salary_tax(ctx, slip, emp, taxable):
         slip.refuse(f"Unknown salary tax method {method.get('method')!r}.", "طريقة ضريبة كسب العمل غير معروفة.")
     exemption = Fraction(_eg(ctx, "tax.salary.personal_exemption_annual")["amount"])
     year = ctx.period[:4]
-    prev = Payslip.objects.filter(employee=emp, run__period__startswith=f"{year}-", run__period__lt=ctx.period,
-                                  refused=False, run__status__in=(RS.APPROVED, RS.PAID))
+    # Slice 3 (R73(d)): the year to date includes the period's own approved payslips of other runs (an off-cycle run
+    # adds to its month); the run itself is never counted twice.
+    prev = Payslip.objects.filter(employee=emp, run__period__startswith=f"{year}-", run__period__lte=ctx.period,
+                                  refused=False, run__status__in=(RS.APPROVED, RS.PAID)).exclude(run=ctx.run)
     ytd = Fraction(sum((p.taxable_income for p in prev), ZERO) + taxable)
-    months = len(set(prev.values_list("run__period", flat=True))) + 1
+    months = len(set(prev.values_list("run__period", flat=True)) | {ctx.period})
     withheld = PayslipLine.objects.filter(payslip__in=prev, line_type=LT.SALARY_TAX).aggregate(t=Sum("amount"))["t"] \
         or ZERO
     annual = ytd * 12 / months
@@ -5993,9 +6054,15 @@ def _eg_salary_tax(ctx, slip, emp, taxable):
     annual_tax = _eg_annual_tax(ctx, max(annual - exemption, Fraction(0)), resident)
     due = _round(annual_tax * months / 12) - withheld
     if due < 0:
-        slip.warn(f"Salary tax withheld so far exceeds the year-to-date tax by {-due}: settled in the annual employer "
-                  "settlement, not refunded by payroll.", f"تجاوزت الضريبة المستقطعة حتى الآن الضريبة المستحقة بمبلغ "
-                  f"{-due}: تُسوى في التسوية السنوية.")
+        if ctx.run.kind == PayrollRun.Kind.OFF_CYCLE:
+            slip.warn(f"Salary tax withheld so far exceeds the year-to-date tax by {-due}: not refunded by an off-cycle "
+                      "run; the next regular run's cumulative withholding trues it up (R73(d), OQ-51).",
+                      f"تجاوزت الضريبة المستقطعة حتى الآن الضريبة المستحقة بمبلغ {-due}: لا يردها مسير خارج الدورة؛ "
+                      "ويسويها الاستقطاع التراكمي في المسير العادي التالي.")
+        else:
+            slip.warn(f"Salary tax withheld so far exceeds the year-to-date tax by {-due}: settled in the annual "
+                      "employer settlement, not refunded by payroll.", f"تجاوزت الضريبة المستقطعة حتى الآن الضريبة "
+                      f"المستحقة بمبلغ {-due}: تُسوى في التسوية السنوية.")
         due = ZERO
     return due
 
@@ -6069,8 +6136,9 @@ def _calc_eg(ctx, emp, versions, info):
     slip = Slip(employee=emp, basis=emp.employment_basis, nationality_class=_nationality_class(emp), cohort="",
                 currency=ctx.entity.base_currency, contract=v_last, paid_days=Decimal(info.paid_days),
                 iban_hash=_iban_hash(emp.iban), termination_ref=getattr(_termination(emp), "pk", None))
+    off = ctx.run.kind == PayrollRun.Kind.OFF_CYCLE
     try:
-        inputs = _employee_inputs(ctx, emp)
+        inputs = _off_cycle_inputs(ctx, emp) if off else _employee_inputs(ctx, emp)
         slip.input_ids = [i.pk for i in inputs]
         for pk, (comp, amount) in _component_earnings(info).items():
             if amount:
@@ -6083,6 +6151,10 @@ def _calc_eg(ctx, emp, versions, info):
             slip.lines.extend(_reduction_lines(LT.UNPAID_DEDUCTION,
                                                _by_component(info, unpaid, "deducted_for_unpaid_leave"),
                                                f"Unpaid leave {weight} days", f"إجازة بدون أجر {weight} يوم", weight))
+        if off:
+            # Slice 3 (R69, R70, R73): only what the period's approved payslips have not paid yet.
+            _net_against_booked(ctx, slip, emp, ctx.period, origin="", mode="current")
+            _drop_late_reductions(slip)
         for inp in inputs:
             problems = _eg_input_problems(inp)
             if problems:
@@ -6109,12 +6181,23 @@ def _calc_eg(ctx, emp, versions, info):
         acc = {k: ctx.account(v) for k, v in EG_ACCOUNTS.items()}
         ee = _round(Fraction(wage) * Fraction(si["employee"]))
         er = _round(Fraction(wage) * Fraction(si["employer"]))
-        slip.lines.append(Line(LT.SI_EMPLOYEE, ee, acc["si_payable"], f"Social insurance employee {si['employee']}",
-                               f"التأمينات الاجتماعية حصة العامل {si['employee']}", quantity=wage,
-                               rate=Decimal(si["employee"])))
-        slip.lines.append(Line(LT.SI_EMPLOYER, er, acc["si_expense"], f"Social insurance employer {si['employer']}",
-                               f"التأمينات الاجتماعية حصة صاحب العمل {si['employer']}", quantity=wage,
-                               rate=Decimal(si["employer"])))
+        booked = _eg_booked(emp, ctx.period) if off else {}
+        si_wage = wage
+        if off:
+            # R73(a): the month combined: the shares on the month's insurable wage (clamped to the year's limits) less
+            # what the period's approved payslips booked; a month already at the maximum gets none.
+            ee = max(ee - booked.get(LT.SI_EMPLOYEE, ZERO), ZERO)
+            er = max(er - booked.get(LT.SI_EMPLOYER, ZERO), ZERO)
+            si_wage = max(wage - booked.get("si_wage", ZERO), ZERO)
+            slip.gosi_wage = si_wage
+        if ee:
+            slip.lines.append(Line(LT.SI_EMPLOYEE, ee, acc["si_payable"], f"Social insurance employee {si['employee']}",
+                                   f"التأمينات الاجتماعية حصة العامل {si['employee']}", quantity=si_wage,
+                                   rate=Decimal(si["employee"])))
+        if er:
+            slip.lines.append(Line(LT.SI_EMPLOYER, er, acc["si_expense"], f"Social insurance employer {si['employer']}",
+                                   f"التأمينات الاجتماعية حصة صاحب العمل {si['employer']}", quantity=si_wage,
+                                   rate=Decimal(si["employer"])))
         # Universal Health Insurance (where the work governorate is live).
         live = _eg(ctx, "uhi.governorates_live")["governorates"]
         gov = (ctx.s.work_governorate or "").strip()
@@ -6125,10 +6208,18 @@ def _calc_eg(ctx, emp, versions, info):
             uhi = _eg(ctx, "uhi.rates")
             uee = _round(Fraction(wage) * Fraction(uhi["employee"]))
             uer = max(_round(Fraction(wage) * Fraction(uhi["employer"])), Decimal(uhi["employer_min_monthly"]))
-            slip.lines.append(Line(LT.UHI_EMPLOYEE, uee, acc["uhi_payable"], "Universal health insurance employee",
-                                   "التأمين الصحي الشامل حصة العامل", quantity=wage, rate=Decimal(uhi["employee"])))
-            slip.lines.append(Line(LT.UHI_EMPLOYER, uer, acc["uhi_expense"], "Universal health insurance employer",
-                                   "التأمين الصحي الشامل حصة صاحب العمل", quantity=wage, rate=Decimal(uhi["employer"])))
+            if off:
+                # R73(b): netted the same way; the employer minimum applies once per month, never again here.
+                uee = max(uee - booked.get(LT.UHI_EMPLOYEE, ZERO), ZERO)
+                uer = max(uer - booked.get(LT.UHI_EMPLOYER, ZERO), ZERO)
+            if uee:
+                slip.lines.append(Line(LT.UHI_EMPLOYEE, uee, acc["uhi_payable"], "Universal health insurance employee",
+                                       "التأمين الصحي الشامل حصة العامل", quantity=si_wage,
+                                       rate=Decimal(uhi["employee"])))
+            if uer:
+                slip.lines.append(Line(LT.UHI_EMPLOYER, uer, acc["uhi_expense"], "Universal health insurance employer",
+                                       "التأمين الصحي الشامل حصة صاحب العمل", quantity=si_wage,
+                                       rate=Decimal(uhi["employer"])))
             slip.warn("Family UHI contributions (non-working spouse, children) are not computed: dependants are not "
                       "recorded.", "لم تُحتسب اشتراكات التأمين الصحي للأسرة: لا توجد بيانات المعالين.")
         # Martyrs' Fund (employee-borne, withheld; who bears it is disputed, research C8).
@@ -6143,7 +6234,7 @@ def _calc_eg(ctx, emp, versions, info):
         if tax:
             slip.lines.append(Line(LT.SALARY_TAX, tax, acc["tax_payable"], "Salary tax withheld",
                                    "ضريبة كسب العمل المستقطعة", quantity=slip.taxable_income))
-        _eg_caps(ctx, slip, emp)
+        _eg_caps_combined(ctx, slip, emp) if off else _eg_caps(ctx, slip, emp)
         if _eg(ctx, "eosb.monthly_accrual").get("accrue"):
             slip.refuse("An Egypt EOSB accrual is configured but not built.", "استحقاق نهاية الخدمة لمصر غير مبني.")
         net = slip.total(PayslipLine.EARNINGS) - slip.total(PayslipLine.REDUCTIONS) - slip.total(PayslipLine.DEDUCTIONS)
@@ -6208,37 +6299,6 @@ def prepare_maternity_settlement(case, *, user):
         raise error("Nothing carried pending GOSI is left to settle for this case.",
                     "لا يتبقى أجر مُرحّل بانتظار التأمينات لهذه الحالة.", code="maternity_nothing")
     return runs
-
-
-def leave_liability_report(entity, as_of, *, user):
-    """hr OQ-6 default (slice 2): unused annual leave is not accrued in the books (2350 / 5130 are approved only if
-    leave is accrued monthly, a decision still open); this report gives the liability instead: per KSA employee, the
-    annual leave balance x the actual daily wage (counts_for_eosb components / 30, Labour Law Art. 111 basis), as of
-    ``as_of``. Totals for ``payroll.view_cost_reports``; per-employee rows (codes only) also need
-    ``payroll.view_payslip`` (logged). Nothing is posted."""
-    _require(user, entity, "payroll.view_cost_reports")
-    detail = access.has(user, entity, "payroll.view_payslip")
-    lt = hr.LeaveType.objects.filter(entity=entity, code="ANNUAL").first()
-    rows, total = [], ZERO
-    if lt is not None:
-        for emp in Employee.objects.filter(entity=entity, employment_basis=Basis.KSA_EMPLOYEE,
-                                           status=Employee.Status.ACTIVE).order_by("employee_code"):
-            terms = _terms(emp, as_of)
-            if terms is None:
-                continue
-            days = hr._balance(emp, lt)
-            daily = Fraction(_sum(terms, "counts_for_eosb")) / 30
-            value = _round(Fraction(days) * daily)
-            total += value
-            rows.append({"employee_code": emp.employee_code, "days": days, "value": value})
-    if detail:
-        access_services.log(AccessLog.Event.PERSONAL_DATA_VIEWED, actor=user, entity=entity,
-                            permission="payroll.view_payslip",
-                            details={"action": "leave_liability_report", "as_of": str(as_of)})
-    return {"entity": entity.code, "as_of": as_of, "total": total, "posted": False,
-            "rows": rows if detail else [], "employees": len(rows),
-            "note_en": "Not booked: leave accrual (2350 / 5130) waits for hr OQ-6.",
-            "note_ar": "غير مقيد: استحقاق الإجازات (2350 / 5130) بانتظار قرار OQ-6."}
 
 
 # =====================================================================================================
@@ -6529,3 +6589,1046 @@ def record_sale_invoice_delivery(contract, *, user, channel, reference=""):
                                         "invoice": c.sale_document_ref, "channel": channel,
                                         "reference": (reference or "")[:200], "message_en": f"Sale invoice {en}",
                                         "message_ar": f"فاتورة البيع: {ar}"})
+
+
+# =====================================================================================================
+# Slice 3 (§11, item 1): off-cycle runs of the out-of-country group and of Egypt (R69 to R74; E16, E17)
+# =====================================================================================================
+
+def _slice3_off_cycle(entity, group, kind):
+    """R69: an off-cycle run of the ``out_of_country`` group (remuneration staff) or of an Egypt entity's in-country
+    group. The KSA off-cycle purposes (leave advance, maternity settlement) keep their own rules (§10.5, §10.8)."""
+    return kind == PayrollRun.Kind.OFF_CYCLE and (group == PayrollGroup.OUT_OF_COUNTRY
+                                                   or _jurisdiction_of(entity) == "EG")
+
+
+def _require_regular_approved(entity, period, group):
+    """R69: refused (``regular_run_open``) until the period's regular run of the same entity and group is approved."""
+    if not PayrollRun.objects.filter(entity=entity, period=period, payroll_group=group, kind=PayrollRun.Kind.REGULAR,
+                                     status__in=(RS.APPROVED, RS.PAID)).exists():
+        raise error(f"The regular {group} run of {entity.code} for {period} is not approved yet: an off-cycle run pays "
+                    "only what that run left due, so it waits for its approval (R69).",
+                    f"لم يُعتمد المسير العادي {group} للكيان {entity.code} لفترة {period} بعد: يدفع المسير خارج الدورة "
+                    "ما تبقى بعد ذلك المسير فقط، فينتظر اعتماده.", code="regular_run_open")
+
+
+def _eg_exit_problem(emp, versions, end):
+    """R74: an employee whose contract ends in or before the period, or who has an approved termination, is never paid
+    through an Egypt off-cycle run (the Egypt final settlement is not built)."""
+    term = _termination(emp)
+    ends = None
+    in_force = [v for v in versions if v.effective_date <= end] or versions[-1:]
+    if in_force:
+        ends = hr._contract_end(in_force[-1])
+    if term is None and (ends is None or ends > end):
+        return None
+    when = term.last_working_day if term is not None else ends
+    return (f"Approved termination or contract end ({when}): an Egypt off-cycle run is never used as a final "
+            "settlement, and the Egypt final settlement is not built (R74).",
+            f"إنهاء خدمة معتمد أو انتهاء عقد ({when}): لا يُستخدم مسير مصر خارج الدورة مخالصةً نهائية، والمخالصة "
+            "النهائية لمصر غير مبنية.")
+
+
+def _slice3_off_cycle_checks(entity, period, group, employees, purpose):
+    """R69, R74 at preparation: no KSA purpose, the regular run approved, named employees of the group only, no
+    Egypt leaver."""
+    if purpose:
+        raise error("Leave advances and maternity settlements are KSA off-cycle runs (R69).",
+                    "دفعات الإجازة مقدمًا وتسويات الأمومة مسيرات خارج الدورة للمملكة فقط.", code="run_kind")
+    _require_regular_approved(entity, period, group)
+    eg = _jurisdiction_of(entity) == "EG"
+    wanted = Basis.REMUNERATION if group == PayrollGroup.OUT_OF_COUNTRY else Basis.LOCAL_ENTITY_EMPLOYEE
+    end = _period_bounds(period)[1]
+    for emp in employees:
+        if emp.entity_id != entity.pk:
+            raise error("An employee of another entity cannot be in this run (R1).",
+                        "لا يدخل موظف كيان آخر في هذا المسير.", code="entity_mismatch")
+        if emp.employment_basis != wanted:
+            raise error(f"{emp.employee_code} is not in this payroll group: an off-cycle run names employees of its own "
+                        f"group only ({wanted}) (R69).", f"{emp.employee_code} ليس من مجموعة الرواتب هذه: يحدد المسير "
+                        f"خارج الدورة موظفي مجموعته فقط ({wanted}).", code="off_cycle_group")
+        if eg:
+            problem = _eg_exit_problem(emp, _versions(emp), end)
+            if problem is not None:
+                raise error(f"{emp.employee_code}: {problem[0]}", f"{emp.employee_code}: {problem[1]}",
+                            code="eg_final_settlement_not_built")
+
+
+def _off_cycle_entry_date(entity, period):
+    """R70 (OQ-49 default): the last day of the period when that fiscal period is open, else the first day of the next
+    open period (``period_closed``). Without an open later period the last day stands and the ledger refuses."""
+    end = _period_bounds(period)[1]
+    fp = FiscalPeriod.objects.filter(entity=entity, start_date__lte=end, end_date__gte=end).first()
+    if fp is None or fp.status == FiscalPeriod.Status.OPEN:
+        return end, ""
+    later = FiscalPeriod.objects.filter(entity=entity, status=FiscalPeriod.Status.OPEN, start_date__gt=end) \
+        .order_by("start_date").first()
+    if later is None:
+        return end, ""
+    return later.start_date, "period_closed"
+
+
+def _entry_date_warning(ctx):
+    run = ctx.run
+    if run.entry_date_reason == "period_closed":
+        ctx.warnings.append(f"Period {run.period} is closed: the entry is dated {run.entry_date}, the first day of the "
+                            "next open period, at the rate of that date (R70, OQ-49) / الفترة "
+                            f"{run.period} مقفلة: يؤرَّخ القيد في {run.entry_date}، أول يوم في الفترة المفتوحة التالية، "
+                            "بسعر ذلك التاريخ")
+
+
+def _refused_slip(ctx, emp, en, ar):
+    s = Slip(employee=emp, basis=emp.employment_basis, nationality_class=_nationality_class(emp), cohort="",
+             currency=ctx.entity.base_currency)
+    s.refusal = f"{emp.employee_code}: {en} / {emp.employee_code}: {ar}"
+    return s
+
+
+def _off_cycle_inputs(ctx, emp):
+    """R69: approved inputs of the period or earlier not yet taken, not bound by the cut-off day: an input whose work
+    period is the run's period or earlier is paid now even when its approval after the cut-off put it in a later
+    run."""
+    return list(PayrollInput.objects.filter(employee=emp, status=IS.APPROVED, taken_run__isnull=True,
+                                            final_settlement__isnull=True)
+                .filter(Q(payroll_period__lte=ctx.period) | Q(period__lte=ctx.period))
+                .select_related("component", "component__expense_account").order_by("id"))
+
+
+def _remuneration_still_due(ctx, slip, emp, info, cur, add):
+    """R69, R70: the month's contract remuneration per component in the contract currency, less what the period's
+    approved payslips of this employee booked (only the difference is paid). A contract currency other than that of
+    a payslip already approved for the period is refused (naming both; §10.9 item 8)."""
+    period = ctx.period
+    approved = Payslip.objects.filter(employee=emp, run__period=period, refused=False,
+                                      run__status__in=(RS.APPROVED, RS.PAID)).exclude(run=ctx.run)
+    others = sorted(set(approved.values_list("currency_id", flat=True)) - {cur.code})
+    if others:
+        slip.refuse(f"The contract currency for {period} is {cur.code}, but a payslip already approved for the period is "
+                    f"in {', '.join(others)}: a month is never paid across two currencies; correct it by an approved "
+                    f"input in {others[0]} (R70).",
+                    f"عملة العقد لفترة {period} هي {cur.code}، لكن قسيمة معتمدة للفترة بعملة {'، '.join(others)}: لا "
+                    f"يُدفع شهر بعملتين؛ صحّحه بمدخل معتمد بعملة {others[0]}.")
+    have = {}
+    for l in (PayslipLine.objects.filter(payslip__employee=emp, payslip__refused=False,
+                                         payslip__run__status__in=(RS.APPROVED, RS.PAID),
+                                         line_type__in=(LT.EARNING, LT.RETRO))
+              .filter(Q(origin_period=period) | (Q(origin_period="") & Q(payslip__run__period=period)))
+              .exclude(source_ref__startswith="input:")):
+        have[l.component_id] = have.get(l.component_id, ZERO) + l.amount_txn
+    for comp, exact in _component_earnings(info, exact=True).values():
+        delta = _round_to(exact, cur.minor_units) - have.get(comp.pk, ZERO)
+        if delta > 0:
+            add(LT.EARNING, delta, comp.expense_account, comp.name_en, comp.name_ar, component=comp,
+                quantity=Decimal(info.paid_days))
+        elif delta < 0:
+            slip.warn(f"{comp.code} for {period}: {-delta} {cur.code} more was paid than is due now; recover only with "
+                      "the person's written consent.", f"{comp.name_ar} عن {period}: دُفع {-delta} {cur.code} أكثر من "
+                      "المستحق الآن؛ لا يُسترد إلا بموافقة كتابية.")
+
+
+def _uncovered_branches(ctx, slip, emp, g):
+    """R71: only the GOSI wage of the period not yet covered by an approved payslip (any run) is charged."""
+    booked = _booked_lines(emp, ctx.period, GOSI_TYPES)
+    branches = []
+    for branch, wage, ee, er in g.branches:
+        delta = wage - _covered_gosi_wage(emp, ctx.period, booked, branch, bool(er))
+        if delta > 0:
+            branches.append((branch, delta, ee, er))
+    g.branches = branches
+    slip.gosi_wage = max((w_ for _, w_, _, _ in branches), default=ZERO)
+
+
+def _drop_late_reductions(slip):
+    gross = slip.total(PayslipLine.EARNINGS) - slip.total(PayslipLine.REDUCTIONS)
+    if gross < 0:
+        slip.lines = [l for l in slip.lines if l.line_type not in PayslipLine.REDUCTIONS]
+        slip.warn(f"Reductions found after the month was paid ({-gross}) are not recovered by this run; recover only by "
+                  "an approved deduction with written consent.", f"تخفيضات ظهرت بعد صرف الشهر ({-gross}) لا يستردها "
+                  "هذا المسير؛ لا تُسترد إلا باستقطاع معتمد بموافقة كتابية.")
+
+
+EG_SHARE_TYPES = (LT.SI_EMPLOYEE, LT.SI_EMPLOYER, LT.UHI_EMPLOYEE, LT.UHI_EMPLOYER)
+
+
+def _eg_booked(emp, period):
+    """R73(a), (b): the social insurance and UHI shares the period's approved payslips booked, and the insurable wage
+    they covered."""
+    out = {}
+    for l in PayslipLine.objects.filter(payslip__employee=emp, payslip__refused=False, payslip__run__period=period,
+                                        payslip__run__status__in=(RS.APPROVED, RS.PAID), origin_period="",
+                                        line_type__in=EG_SHARE_TYPES):
+        out[l.line_type] = out.get(l.line_type, ZERO) + l.amount
+        if l.line_type == LT.SI_EMPLOYEE:
+            out["si_wage"] = out.get("si_wage", ZERO) + (l.quantity or ZERO)
+    return out
+
+
+def _eg_caps_combined(ctx, slip, emp):
+    """R73(e): the Egypt deduction caps on the month combined (the period's approved payslips plus this run)."""
+    booked = list(PayslipLine.objects.filter(payslip__employee=emp, payslip__refused=False,
+                                             payslip__run__period=ctx.period,
+                                             payslip__run__status__in=(RS.APPROVED, RS.PAID))
+                  .select_related("account").order_by("pk"))
+    ids = [int(l.source_ref.split(":")[1]) for l in booked if l.source_ref.startswith("input:")]
+    basis = dict(PayrollInput.objects.filter(pk__in=ids).values_list("pk", "deduction_basis"))
+    month = Slip(employee=emp, basis=slip.basis, nationality_class=slip.nationality_class, cohort="",
+                 currency=slip.currency)
+    for l in booked:
+        ref = int(l.source_ref.split(":")[1]) if l.source_ref.startswith("input:") else None
+        month.lines.append(Line(l.line_type, l.amount, l.account, l.description_en, l.description_ar,
+                                basis=basis.get(ref, "") or ""))
+    month.lines.extend(slip.lines)
+    try:
+        _eg_caps(ctx, month, emp)
+    except _Refused:
+        slip.refusal = month.refusal
+        raise
+
+
+# =====================================================================================================
+# Slice 3 (§11, item 2): leave liability and EOSB provision reports, stored, read-only, nothing posted (R75 to R78)
+# =====================================================================================================
+
+LR_ = PayrollLiabilityReport
+LRL = PayrollLiabilityReportLine
+VAL = PayrollLiabilityReportLine.Valuation
+
+LIABILITY_EXCLUSIONS = {
+    # key: (English, Arabic)
+    "remuneration_leave": ("Remuneration staff: no Saudi leave (P16)", "أصحاب المكافأة: لا إجازات وفق النظام السعودي"),
+    "remuneration_eosb": ("Remuneration staff: no end-of-service award (P16)",
+                          "أصحاب المكافأة: لا مكافأة نهاية خدمة"),
+    "settled": ("Final settlement approved: paid out there", "مخالصة نهائية معتمدة: صُرفت فيها"),
+    "not_activated": ("Jurisdiction not activated for this report", "الولاية القانونية غير مفعلة لهذا التقرير"),
+    "no_statutory_eosb": ("No statutory end-of-service award configured (eosb.monthly_accrual false)",
+                          "لا توجد مكافأة نهاية خدمة نظامية مهيأة"),
+    "left": ("Not employed on the date; the final settlement is pending", "غير موظف في التاريخ؛ المخالصة النهائية معلقة"),
+    "no_leave_type": ("No ANNUAL leave type in the entity", "لا يوجد نوع إجازة سنوية في الكيان"),
+}
+REPORT_ONLY = ("Report only: nothing is posted (no journal entry, no EOSB sub-ledger row, no leave ledger row; accounts "
+               "2350 and 5130 are not used); leave accrual is not decided (hr OQ-6).",
+               "تقرير فقط: لا يُرحَّل شيء (لا قيد يومية ولا قيد في سجل المخصص ولا في سجل الإجازات؛ لا يُستخدم الحسابان "
+               "2350 و5130)؛ واستحقاق الإجازات لم يُقرر بعد (hr OQ-6).")
+LAW_BASIS = ("Law basis: Labour Law Art. 2 (wage, month of 30 days), Art. 84 (end-of-service award), Art. 111 (cash "
+             "for untaken leave); owner decision P19(h).",
+             "الأساس النظامي: نظام العمل المادة 2 (الأجر والشهر ثلاثون يومًا) والمادة 84 (مكافأة نهاية الخدمة) والمادة "
+             "111 (البدل النقدي للإجازة غير المستخدمة)؛ قرار المالك P19(h).")
+LEAVE_BASIS = ("Untaken annual leave (KSA employees) = the leave ledger balance of the rows dated on or before the date "
+               "+ the open month pro rata (entitlement / 12 x days of the month to the date / days in the month, "
+               "computed, not written; hr R30) + approved annual leave falling after the date whose days the ledger "
+               "already deducted (hr R31). Days paid by a leave advance run stay in the liability (a salary prepayment, "
+               "OQ-52). Value = untaken days x daily wage; daily wage = the components counting for EOSB in the "
+               "contract version in force on the date / 30. No GOSI or other employer cost on top (OQ-24); "
+               "undiscounted, no interest element. Egypt: days shown, not valued until leave.encashment_basis (EG) is "
+               "set and verified (OQ-55).",
+               "الإجازة السنوية غير المستخدمة (موظفو المملكة) = رصيد سجل الإجازات للقيود المؤرخة في التاريخ أو قبله + "
+               "نسبة الشهر المفتوح (الاستحقاق / 12 × أيام الشهر حتى التاريخ / أيام الشهر، تُحتسب ولا تُقيد) + الإجازة "
+               "السنوية المعتمدة بعد التاريخ التي خُصمت أيامها من السجل. تبقى الأيام المدفوعة بمسير الإجازة مقدمًا ضمن "
+               "الالتزام (دفعة مقدمة من الأجر). القيمة = الأيام غير المستخدمة × الأجر اليومي؛ الأجر اليومي = مكونات "
+               "مكافأة نهاية الخدمة في نسخة العقد السارية في التاريخ / 30. لا تُضاف التأمينات ولا تكاليف أخرى على صاحب "
+               "العمل؛ دون خصم ولا عنصر فائدة. مصر: تُعرض الأيام دون تقييم حتى يُهيأ أساس البدل ويُتحقق منه.")
+EOSB_BASIS = ("Labour Law Art. 84 full award: half a month's wage a year for the first five years, a month a year "
+              "after, part years pro rata by days (P19(h)), on the actual wage of the contract version in force on the "
+              "date, service less suspended unpaid days (hr R62). The Art. 85 resignation fraction (0 under 2 years, "
+              "1/3 from 2, 2/3 from 5, 1 from 10 years) and the employee's EOSB sub-ledger balance are memo columns, "
+              "never a tie-out and never posted; account 2500 on the date is shown once for information. Undiscounted "
+              "vested amounts, no actuarial or discount factor (OQ-11, OQ-53).",
+              "المكافأة الكاملة وفق المادة 84: أجر نصف شهر عن كل سنة من السنوات الخمس الأولى وأجر شهر عن كل سنة بعدها، "
+              "وأجزاء السنة بنسبة الأيام، على الأجر الفعلي لنسخة العقد السارية في التاريخ، والخدمة دون أيام الإيقاف "
+              "بدون أجر. نسبة الاستقالة وفق المادة 85 ورصيد سجل المخصص للموظف عمودان للعلم، لا للمطابقة ولا للترحيل؛ "
+              "ويُعرض رصيد الحساب 2500 في التاريخ مرة واحدة للعلم. مبالغ مستحقة دون خصم ودون عامل اكتواري.")
+NO_EOSB_CONFIGURED = ("No statutory end-of-service award is configured for this entity's jurisdiction "
+                      "(eosb.monthly_accrual false): the report shows no amounts.",
+                      "لا توجد مكافأة نهاية خدمة نظامية مهيأة للولاية القانونية لهذا الكيان: لا يعرض التقرير مبالغ.")
+
+
+def _settled(emp):
+    return FinalSettlement.objects.filter(employee=emp, status__in=SETTLED).exists()
+
+
+def _excluded_line(emp, jurisdiction, key):
+    en, ar = LIABILITY_EXCLUSIONS[key]
+    return dict(employee=emp, employee_code=emp.employee_code, employment_basis=emp.employment_basis,
+                jurisdiction=jurisdiction, valuation=VAL.EXCLUDED, reason_en=en, reason_ar=ar, amount=ZERO), key
+
+
+def _report_employees(entity, as_of):
+    return list(Employee.objects.filter(entity=entity, hire_date__lte=as_of).exclude(status=Employee.Status.DRAFT)
+                .order_by("employee_code"))
+
+
+def _terms_for_report(emp, as_of):
+    term = _termination(emp)
+    day = min(as_of, term.last_working_day) if term is not None else as_of
+    return _terms(emp, day)
+
+
+def _untaken_days(emp, lt, as_of, use, jurisdiction):
+    """R76: (ledger balance of rows dated on or before ``as_of``, open-month pro rata, approved leave after
+    ``as_of`` whose days the ledger already deducted), each at 2 decimals."""
+    from hr.models import LeaveLedger
+    balance = LeaveLedger.objects.filter(employee=emp, leave_type=lt, date__lte=as_of).aggregate(t=Sum("days"))["t"] \
+        or ZERO
+    pro_rata = ZERO
+    month_start = as_of.replace(day=1)
+    month_end = _period_bounds(_period_of(as_of))[1]
+    if jurisdiction == "SA" and not hr._live_accruals(emp, lt, _period_of(as_of)).filter(date__lte=as_of).exists():
+        frac = hr._month_accrual_fraction(emp, month_start, month_end, use, jurisdiction, until=as_of)
+        pro_rata = _round(frac) if frac is not None else ZERO
+    future = ZERO
+    for req in LeaveRequest.objects.filter(employee=emp, leave_type=lt, end_date__gt=as_of,
+                                           status__in=(LeaveRequest.Status.APPROVED, LeaveRequest.Status.TAKEN)):
+        taken = -(LeaveLedger.objects.filter(employee=emp, leave_type=lt, source_type="hr.leaverequest",
+                                             source_id=req.pk, date__lte=as_of).aggregate(t=Sum("days"))["t"] or ZERO)
+        if taken <= 0:
+            continue
+        start = max(req.start_date, as_of + timedelta(days=1))
+        rule = hr._type_rule(use, jurisdiction, req)
+        dates = set(hr._counted_dates(use, jurisdiction, req, rule, start, req.end_date))
+        dates -= hr._sick_dates(emp, start, req.end_date)
+        future += min(Decimal(len(dates)), taken)
+    return balance, pro_rata, future
+
+
+def _leave_lines(entity, as_of, use, jurisdiction):
+    lt = hr.LeaveType.objects.filter(entity=entity, code="ANNUAL").first()
+    out, versions = [], set()
+    eg_basis = None
+    if jurisdiction == "EG":
+        row = hr.param("EG", "leave.encashment_basis", as_of, required=False)
+        if row is not None:
+            use._take(row)
+            value = row.value or {}
+            if row.status == StatutoryParameter.Status.VERIFIED and value.get("day_divisor") and value.get("wage_flag"):
+                eg_basis = value
+    divisor = None
+    for emp in _report_employees(entity, as_of):
+        if emp.employment_basis == Basis.REMUNERATION:
+            out.append(_excluded_line(emp, jurisdiction, "remuneration_leave"))
+            continue
+        if _settled(emp):
+            out.append(_excluded_line(emp, jurisdiction, "settled"))
+            continue
+        ksa = emp.employment_basis == Basis.KSA_EMPLOYEE and jurisdiction == "SA"
+        egypt = emp.employment_basis == Basis.LOCAL_ENTITY_EMPLOYEE and jurisdiction == "EG"
+        if not (ksa or egypt):
+            out.append(_excluded_line(emp, jurisdiction, "not_activated"))
+            continue
+        if lt is None:
+            out.append(_excluded_line(emp, jurisdiction, "no_leave_type"))
+            continue
+        terms = _terms_for_report(emp, as_of)
+        if terms is None:
+            continue  # no approved contract on the date: nothing accrued for it
+        versions.add(terms.pk)
+        balance, pro_rata, future = _untaken_days(emp, lt, as_of, use, jurisdiction)
+        untaken = balance + pro_rata + future
+        line = dict(employee=emp, employee_code=emp.employee_code, employment_basis=emp.employment_basis,
+                    jurisdiction=jurisdiction, balance_days=balance, pro_rata_days=pro_rata, future_leave_days=future,
+                    untaken_days=untaken)
+        if ksa or eg_basis is not None:
+            if ksa:
+                if divisor is None:
+                    divisor = Fraction(use.get("SA", "leave.encashment", as_of, "leave liability", "التزام الإجازات")
+                                       ["day_divisor"])
+                daily = Fraction(_sum(terms, "counts_for_eosb")) / divisor
+            else:
+                daily = Fraction(_sum(terms, eg_basis["wage_flag"])) / Fraction(eg_basis["day_divisor"])
+            line.update(valuation=VAL.VALUED, daily_wage=_round(daily), amount=_round(Fraction(untaken) * daily))
+        else:
+            line.update(valuation=VAL.NOT_VALUED, amount=ZERO,
+                        reason_en="Egypt untaken-leave valuation basis not configured and verified "
+                                  "(leave.encashment_basis, OQ-55): days shown, not valued.",
+                        reason_ar="أساس تقييم الإجازة غير المستخدمة لمصر غير مهيأ أو غير متحقق منه: تُعرض الأيام دون "
+                                  "تقييم.")
+        out.append((line, None))
+    return out, versions
+
+
+def _account_2500(entity, as_of):
+    lines = JournalLine.objects.filter(entry__entity=entity, entry__status__in=("posted", "reversed"),
+                                       account__code=EOSB_PROVISION, entry__date__lte=as_of) \
+        .aggregate(d=Sum("debit"), c=Sum("credit"))
+    return (lines["c"] or ZERO) - (lines["d"] or ZERO)
+
+
+def _eosb_lines(entity, as_of, use, jurisdiction):
+    out, versions = [], set()
+    if jurisdiction != "SA":
+        row = hr.param(jurisdiction, "eosb.monthly_accrual", as_of, required=False)
+        if row is not None:
+            use._take(row)
+    for emp in _report_employees(entity, as_of):
+        if emp.employment_basis == Basis.REMUNERATION:
+            out.append(_excluded_line(emp, jurisdiction, "remuneration_eosb"))
+            continue
+        if _settled(emp):
+            out.append(_excluded_line(emp, jurisdiction, "settled"))
+            continue
+        if emp.employment_basis != Basis.KSA_EMPLOYEE or jurisdiction != "SA":
+            out.append(_excluded_line(emp, jurisdiction, "no_statutory_eosb"))
+            continue
+        term = _termination(emp)
+        if term is not None and term.last_working_day < as_of:
+            out.append(_excluded_line(emp, jurisdiction, "left"))
+            continue
+        base = dict(employee=emp, employee_code=emp.employee_code, employment_basis=emp.employment_basis,
+                    jurisdiction=jurisdiction)
+        memo = EosbProvisionEntry.objects.filter(employee=emp, date__lte=as_of).aggregate(t=Sum("amount"))["t"] or ZERO
+        try:
+            # Art. 84 full award with the Art. 85 resignation fraction as the memo (hr R39, P19(h)); the hr rows read
+            # are recorded on the report.
+            r = hr._compute_eosb(emp, as_of, Termination.Kind.RESIGNATION, use)
+        except hr.HrError as exc:
+            if getattr(exc, "code", None) not in EOSB_SKIPPABLE:
+                raise  # as _eosb (§10.5): any other refusal stops the report
+            base.update(valuation=VAL.NOT_VALUED, reason_en=exc.text("en"), reason_ar=exc.text("ar"), amount=ZERO,
+                        subledger_balance_memo=memo)
+            out.append((base, None))
+            continue
+        terms = _terms(emp, as_of)
+        if terms is not None:
+            versions.add(terms.pk)
+        base.update(valuation=VAL.VALUED, service_start=r.service_start, service_days=r.service_days,
+                    excluded_days=r.excluded_days, wage_basis=r.wage_basis, art84_full_award=r.full_award,
+                    art85_resignation_memo=r.award, subledger_balance_memo=memo, amount=r.full_award)
+        out.append((base, None))
+    return out, versions
+
+
+def _basis_text(kind, entity, as_of, jurisdiction, excluded, parameter_ids):
+    groups_en = "; ".join(f"{LIABILITY_EXCLUSIONS[k][0]}: {n}" for k, n in sorted(excluded.items())) or "none"
+    groups_ar = "؛ ".join(f"{LIABILITY_EXCLUSIONS[k][1]}: {n}" for k, n in sorted(excluded.items())) or "لا يوجد"
+    body_en, body_ar = LEAVE_BASIS if kind == LR_.Kind.LEAVE else EOSB_BASIS
+    title_en = "Leave liability" if kind == LR_.Kind.LEAVE else "End-of-service provision (Art. 84)"
+    title_ar = "التزام الإجازات" if kind == LR_.Kind.LEAVE else "مخصص مكافأة نهاية الخدمة (المادة 84)"
+    extra_en = extra_ar = ""
+    if kind == LR_.Kind.EOSB and jurisdiction != "SA":
+        extra_en, extra_ar = (f" {NO_EOSB_CONFIGURED[0]}", f" {NO_EOSB_CONFIGURED[1]}")
+    ids = ", ".join(str(i) for i in parameter_ids) or "-"
+    en = (f"{title_en} of {entity.code} as at {as_of}. {REPORT_ONLY[0]} {LAW_BASIS[0]} {body_en}{extra_en} Excluded "
+          f"groups: {groups_en}. Parameters read: {ids}. The Arabic text prevails.")
+    ar = (f"{title_ar} للكيان {entity.code} كما في {as_of}. {REPORT_ONLY[1]} {LAW_BASIS[1]} {body_ar}{extra_ar} الفئات "
+          f"المستبعدة: {groups_ar}. المعايير المقروءة: {ids}. النص العربي هو المعتمد.")
+    return en, ar
+
+
+LIABILITY_LINE_FIELDS = ("employee_code", "employment_basis", "jurisdiction", "valuation", "reason_en", "reason_ar",
+                         "balance_days", "pro_rata_days", "future_leave_days", "untaken_days", "daily_wage",
+                         "service_start", "service_days", "excluded_days", "wage_basis", "art84_full_award",
+                         "art85_resignation_memo", "subledger_balance_memo", "amount")
+LIABILITY_HEADER_FIELDS = ("entity_id", "kind", "as_of", "currency_id", "basis_en", "basis_ar", "parameter_ids",
+                           "contract_version_ids", "excluded", "total_days", "total_amount", "account_2500_memo",
+                           "generated_by_id", "generated_at")
+
+
+def _liability_hash(report):
+    """11.3.3: the hash of the stored header and lines, read from the database."""
+    head = PayrollLiabilityReport._base_manager.filter(pk=report.pk).values(*LIABILITY_HEADER_FIELDS).get()
+    rows = list(PayrollLiabilityReportLine._base_manager.filter(report=report).order_by("pk")
+                .values("employee_id", *LIABILITY_LINE_FIELDS))
+    return hashlib.sha256(json.dumps([head, rows], default=str, sort_keys=True).encode()).hexdigest()
+
+
+@transaction.atomic
+def _liability_report(entity, as_of, user, kind):
+    _require(user, entity, "payroll.prepare_liability_report")
+    if not isinstance(as_of, date):
+        raise error("The as-at date is a date.", "تاريخ التقرير تاريخ.", code="as_of")
+    if as_of > _today():
+        raise error(f"The as-at date {as_of} is after today: a liability report is as at today or earlier (R75).",
+                    f"تاريخ التقرير {as_of} بعد اليوم: يكون تقرير الالتزامات في تاريخ اليوم أو قبله.", code="as_of_future")
+    use = hr.ParamUse()
+    jurisdiction = _jurisdiction_of(entity)
+    build = _leave_lines if kind == LR_.Kind.LEAVE else _eosb_lines
+    rows, versions = build(entity, as_of, use, jurisdiction)
+    excluded = {}
+    for _, key in rows:
+        if key:
+            excluded[key] = excluded.get(key, 0) + 1
+    lines = [r for r, _ in rows]
+    params = sorted(use.ids)
+    basis_en, basis_ar = _basis_text(kind, entity, as_of, jurisdiction, excluded, params)
+    previous = (PayrollLiabilityReport._base_manager.select_for_update()
+                .filter(entity=entity, kind=kind, as_of=as_of, status=LR_.Status.GENERATED).first())
+    if previous is not None:
+        previous.status = LR_.Status.SUPERSEDED
+        _save(previous)
+    report = _save(PayrollLiabilityReport(
+        entity=entity, kind=kind, as_of=as_of, currency=entity.base_currency, basis_en=basis_en, basis_ar=basis_ar,
+        parameter_ids=params, contract_version_ids=sorted(versions), excluded=excluded,
+        total_days=sum((l.get("untaken_days") or ZERO for l in lines if l["valuation"] != VAL.EXCLUDED), ZERO),
+        total_amount=sum((l["amount"] for l in lines if l["valuation"] == VAL.VALUED), ZERO),
+        account_2500_memo=_account_2500(entity, as_of) if kind == LR_.Kind.EOSB and jurisdiction == "SA" else None,
+        generated_by=user, generated_at=_now()))
+    for l in lines:
+        _save(PayrollLiabilityReportLine(entity=entity, report=report, **l))
+    report.sha256 = _liability_hash(report)
+    _save(report)
+    if previous is not None:
+        previous.superseded_by = report
+        _save(previous)
+    return report
+
+
+def leave_liability_report(entity, as_of, *, user):
+    """R75, R76, R78 (``payroll.prepare_liability_report``): a stored snapshot of the leave liability of one entity as
+    at ``as_of`` (today or earlier). Nothing is posted (hr OQ-6). Read it with ``liability_report_data``."""
+    return _liability_report(entity, as_of, user, LR_.Kind.LEAVE)
+
+
+def eosb_provision_report(entity, as_of, *, user):
+    """R75, R77, R78 (``payroll.prepare_liability_report``): a stored snapshot of the Art. 84 EOSB provision of one
+    entity as at ``as_of``, with the Art. 85 and sub-ledger memo columns. Nothing is posted."""
+    return _liability_report(entity, as_of, user, LR_.Kind.EOSB)
+
+
+def get_liability_report(user, pk):
+    """R75: one report through the entity scope; another entity's report is 404."""
+    return access.get_scoped_or_404(PayrollLiabilityReport.objects.all(), user, "payroll.view", pk=pk)
+
+
+def liability_report_data(report, *, user):
+    """R75: totals for ``payroll.view_cost_reports`` (or ``payroll.view_payslip``); per-employee lines only for
+    ``payroll.view_payslip`` in the report's entity, each such view logged (PDPL). The stored snapshot is shown as
+    stored, never recalculated."""
+    r = PayrollLiabilityReport.objects.select_related("entity").get(pk=report.pk)
+    detail = access.has(user, r.entity, "payroll.view_payslip")
+    _require(user, r.entity, "payroll.view_payslip" if detail else "payroll.view_cost_reports")
+    if r.sha256 and _liability_hash(r) != r.sha256:
+        raise error("This liability report no longer matches its stored hash (R75).",
+                    "لم يعد تقرير الالتزامات مطابقًا لبصمته المخزنة.", code="report_changed")
+    lines = list(r.lines.order_by("employee_code", "pk")) if detail else []
+    if detail:
+        access_services.log(AccessLog.Event.PERSONAL_DATA_VIEWED, actor=user, entity=r.entity,
+                            permission="payroll.view_payslip",
+                            details={"action": "liability_report_viewed", "report": r.pk, "kind": r.kind,
+                                     "as_of": str(r.as_of)})
+    counts = {v: r.lines.filter(valuation=v).count() for v in VAL.values}
+    return {"report": r, "entity": r.entity.code, "kind": r.kind, "as_of": r.as_of, "status": r.status,
+            "currency": r.currency_id, "basis_en": r.basis_en, "basis_ar": r.basis_ar, "total_days": r.total_days,
+            "total_amount": r.total_amount, "account_2500_memo": r.account_2500_memo, "excluded": r.excluded,
+            "counts": counts, "lines": lines, "detail": detail, "posted": False, "sha256": r.sha256,
+            "parameter_ids": r.parameter_ids}
+
+
+LIABILITY_CSV = (("employee_code", "رقم الموظف"), ("employment_basis", "أساس التوظيف"), ("valuation", "التقييم"),
+                 ("reason_ar", "السبب"), ("reason_en", "Reason"), ("balance_days", "رصيد السجل"),
+                 ("pro_rata_days", "نسبة الشهر"), ("future_leave_days", "إجازة لاحقة"), ("untaken_days", "أيام غير مستخدمة"),
+                 ("daily_wage", "الأجر اليومي"), ("service_start", "بداية الخدمة"), ("service_days", "أيام الخدمة"),
+                 ("excluded_days", "أيام مستبعدة"), ("wage_basis", "أساس الأجر"), ("art84_full_award", "المادة 84"),
+                 ("art85_resignation_memo", "المادة 85 للعلم"), ("subledger_balance_memo", "رصيد السجل للعلم"),
+                 ("amount", "المبلغ"))
+
+
+def render_liability_report(report, *, user, format_code="html"):
+    """R75: HTML (Arabic first, "the Arabic text prevails") or CSV; codes only, no names or ID numbers."""
+    data = liability_report_data(report, user=user)
+    if format_code == "html":
+        return render_to_string("payroll/liability_report.html", data)
+    if format_code != "csv":
+        raise error("Formats: html or csv.", "الصيغ: html أو csv.", code="format")
+    out = io.StringIO()
+    w = csv.writer(out, lineterminator="\r\n")
+    w.writerow([_cell(x) for x in ("النص العربي هو المعتمد / The Arabic text prevails",)])
+    w.writerow([_cell(x) for x in (data["entity"], data["kind"], data["as_of"], data["currency"], data["status"])])
+    w.writerow([_cell(data["basis_ar"])])
+    w.writerow([_cell(data["basis_en"])])
+    w.writerow([_cell(x) for x in ("الإجمالي / Total", data["total_days"], data["total_amount"],
+                                   data["account_2500_memo"] if data["account_2500_memo"] is not None else "")])
+    if data["detail"]:
+        w.writerow([f"{ar} / {en}" for en, ar in LIABILITY_CSV])
+        for l in data["lines"]:
+            w.writerow([_cell("" if getattr(l, f) is None else getattr(l, f)) for f, _ in LIABILITY_CSV])
+    return out.getvalue()
+
+
+# =====================================================================================================
+# Slice 3 (§11, item 3): Mudad justifications (R79 to R81); all Mudad codes [verify] (11.6, OQ-56)
+# =====================================================================================================
+
+MJ = MudadJustification
+MJS = MudadJustification.Status
+MJK = MudadJustification.Kind
+MJR = MudadJustification.Reason
+# 11.6: the kinds each internal reason takes. R79(c) also gives ``payroll_correction`` to a refused payslip
+# (non-payment), so it takes both.
+REASON_KINDS = {
+    MJR.UNPAID_LEAVE: {MJK.AMOUNT_DIFFERENCE, MJK.NON_PAYMENT},
+    MJR.SICK_LEAVE_REDUCED: {MJK.AMOUNT_DIFFERENCE},
+    MJR.MATERNITY_GOSI: {MJK.AMOUNT_DIFFERENCE, MJK.NON_PAYMENT},
+    MJR.JOINER_LEAVER: {MJK.PARTIAL_PAYMENT},
+    MJR.FINAL_SETTLEMENT: {MJK.NON_PAYMENT},
+    MJR.CONTRACT_SUSPENDED: {MJK.NON_PAYMENT},
+    MJR.COURT_ORDER: {MJK.AMOUNT_DIFFERENCE},
+    MJR.BANK_REJECTED: {MJK.NON_PAYMENT},
+    MJR.IBAN_EXCEPTION: {MJK.NON_PAYMENT},
+    MJR.PAID_OFF_CYCLE: {MJK.NON_PAYMENT, MJK.LATE_PAYMENT},
+    MJR.PAYROLL_CORRECTION: {MJK.AMOUNT_DIFFERENCE, MJK.NON_PAYMENT},
+    MJR.OTHER: set(MJK.values),
+}
+# R80 (PDPL, hr R11): the reason code carries "sick leave" or "maternity leave" only; a diagnosis or health detail
+# never goes into the text. A plain word check (en/ar) refuses the obvious cases; the form shows the instruction.
+HEALTH_WORDS = ("diagnos", "disease", "illness", "surgery", "operation", "cancer", "covid", "pregnan", "hospital",
+                "تشخيص", "جراح", "سرطان", "كورونا", "مستشفى", "عملية", "ورم", "حمل ")
+HEALTH_INSTRUCTION = ("Never write a diagnosis or any health detail: the reason code says sick leave or maternity leave "
+                      "only (PDPL; hr R11).", "لا تكتب تشخيصًا ولا أي تفصيل صحي: رمز السبب يذكر الإجازة المرضية أو "
+                      "إجازة الوضع فقط.")
+MUDAD_ROLES = ("hr_officer",)  # matrix activity payroll.mudad_justification, code default (R80, OQ-56)
+MUDAD_ACTIVITY = "payroll.mudad_justification"
+JUSTIFICATION_EDITS = frozenset({"kind", "reason", "description_ar", "description_en", "evidence_ref",
+                                 "mudad_notice_date", "worker_response"})
+
+
+def _label(choices, value, lang):
+    text = str(dict(choices.choices).get(value, value))
+    en, _, ar = text.partition(" / ")
+    return ar if lang == "ar" and ar else en
+
+
+def _mudad_problem(ps):
+    """R79: only ``in_country`` KSA payslips of an approved run of an SA entity get a justification; remuneration
+    and Egypt payslips never do (``mudad_not_applicable``)."""
+    run = ps.run
+    if (run.payroll_group != PayrollGroup.IN_COUNTRY or _jurisdiction_of(run.entity) != "SA"
+            or ps.employment_basis != Basis.KSA_EMPLOYEE):
+        return error("No Mudad justification for this payslip: Mudad covers KSA employees of in-country runs only; "
+                     "remuneration staff and Egypt payroll are outside it (R79).",
+                     "لا مبرر مدد لهذه القسيمة: يشمل مدد موظفي المملكة في مسيرات داخل المملكة فقط؛ وأصحاب المكافأة "
+                     "ورواتب مصر خارجه.", code="mudad_not_applicable")
+    if run.status not in (RS.APPROVED, RS.PAID):
+        return error("Justifications are recorded for approved runs (R79).", "تُسجل المبررات للمسيرات المعتمدة.",
+                     code="run_status")
+    return None
+
+
+def _health_problem(*texts):
+    low = " ".join(t or "" for t in texts).lower()
+    if any(word in low for word in HEALTH_WORDS):
+        return error(*HEALTH_INSTRUCTION, code="health_detail")
+    return None
+
+
+def _contract_wage(ps):
+    """R79(d): the contract monthly wage of the period: the fixed earning components of the version in force at the
+    period start (or on the first employed day of a joiner)."""
+    start = _period_bounds(ps.run.period)[0]
+    emp = ps.employee
+    terms = _terms(emp, max(start, emp.hire_date))
+    if terms is None:
+        return ZERO
+    return sum((c.monthly_amount for c in _components(terms) if c.component.kind == "earning"), ZERO)
+
+
+def _late_run(run):
+    """R79(e): the pay date more than a month after the previous regular run's (Art. 90; §10.5)."""
+    if run.kind != PayrollRun.Kind.REGULAR:
+        return False
+    prev = (PayrollRun.objects.filter(entity=run.entity, payroll_group=run.payroll_group, kind=PayrollRun.Kind.REGULAR,
+                                      status__in=(RS.APPROVED, RS.PAID), period__lt=run.period)
+            .order_by("-period").first())
+    if prev is None:
+        return False
+    p = prev.pay_date
+    ny, nm = (p.year + 1, 1) if p.month == 12 else (p.year, p.month + 1)
+    limit = max(p + timedelta(days=30), date(ny, nm, min(p.day, calendar.monthrange(ny, nm)[1])))
+    return run.pay_date > limit
+
+
+def _difference_reason(ps):
+    """R79(d): the reason from the payslip lines (unpaid leave, sick tier, maternity, joiner / leaver)."""
+    types = set(ps.lines.values_list("line_type", flat=True))
+    if types & {LT.MATERNITY_SUSPENDED, LT.MATERNITY_TOP_UP}:
+        return MJK.AMOUNT_DIFFERENCE, MJR.MATERNITY_GOSI
+    if LT.UNPAID_DEDUCTION in types:
+        return MJK.AMOUNT_DIFFERENCE, MJR.UNPAID_LEAVE
+    if LT.SICK_DEDUCTION in types:
+        return MJK.AMOUNT_DIFFERENCE, MJR.SICK_LEAVE_REDUCED
+    start, end = _period_bounds(ps.run.period)
+    emp = ps.employee
+    term = _termination(emp)
+    if start < emp.hire_date <= end or (term is not None and start <= term.last_working_day < end):
+        return MJK.PARTIAL_PAYMENT, MJR.JOINER_LEAVER
+    return MJK.AMOUNT_DIFFERENCE, MJR.PAYROLL_CORRECTION
+
+
+def _suggest_row(run, ps, user, kind, reason, expected, paid, evidence="", text=None):
+    if MJ.objects.filter(payslip=ps, reason=reason).exclude(status=MJS.WITHDRAWN).exists():
+        return None
+    en = text[0] if text else _label(MJR, reason, "en")
+    ar = text[1] if text else _label(MJR, reason, "ar")
+    try:
+        with transaction.atomic():
+            return _save(MJ(entity=run.entity, payslip=ps, run=run, employee_code=ps.employee.employee_code, kind=kind,
+                            reason=reason, expected_amount=expected, paid_amount=paid, description_ar=ar,
+                            description_en=en, evidence_ref=evidence or None, status=MJS.SUGGESTED,
+                            source=MJ.Source.SYSTEM, created_by=user))
+    except IntegrityError:
+        return None  # suggested meanwhile (one row per payslip and reason)
+
+
+def _suggest_mudad(run, user, *, exceptions=None, returns=None):
+    """R79: ``suggested`` rows (``source=system``) for the KSA employees of an approved in-country run of an SA entity:
+    (a) WPS exceptions, (b) bank rejections, (c) refused payslips, (d) gross below the contract wage, (e) a late pay
+    date. Idempotent: one live row per payslip and reason. Called at WPS generation and when the bank-processed file
+    is attached; never approves anything."""
+    if (run.payroll_group != PayrollGroup.IN_COUNTRY or _jurisdiction_of(run.entity) != "SA"
+            or run.status not in (RS.APPROVED, RS.PAID)):
+        return []
+    exc = {e["employee_code"]: e["reason"] for e in (exceptions or [])}
+    returns = returns or {}
+    late = _late_run(run)
+    out = []
+    for ps in Payslip.objects.filter(run=run, employment_basis=Basis.KSA_EMPLOYEE).select_related("employee", "run"):
+        code = ps.employee.employee_code
+        wage = _contract_wage(ps)
+        if ps.refused:
+            off = Payslip.objects.filter(employee=ps.employee, run__period=run.period, refused=False,
+                                         run__kind=PayrollRun.Kind.OFF_CYCLE,
+                                         run__status__in=(RS.APPROVED, RS.PAID)).exists()
+            out.append(_suggest_row(run, ps, user, MJK.NON_PAYMENT,
+                                    MJR.PAID_OFF_CYCLE if off else MJR.PAYROLL_CORRECTION, wage, ZERO))
+            continue
+        if code in exc:
+            reason = MJR.FINAL_SETTLEMENT if exc[code].startswith("Termination") else MJR.IBAN_EXCEPTION
+            out.append(_suggest_row(run, ps, user, MJK.NON_PAYMENT, reason, wage, ZERO))
+        if code in returns:
+            out.append(_suggest_row(run, ps, user, MJK.NON_PAYMENT, MJR.BANK_REJECTED, wage, ZERO,
+                                    evidence=f"RET-CDE {returns[code]}"))
+        if ps.gross < wage:
+            kind, reason = _difference_reason(ps)
+            out.append(_suggest_row(run, ps, user, kind, reason, wage, ps.gross))
+        if late:
+            out.append(_suggest_row(run, ps, user, MJK.LATE_PAYMENT, MJR.OTHER, wage, ps.gross, text=(
+                f"Salary of {run.period} paid on {run.pay_date}, more than a month after the previous pay date "
+                "(Labour Law Art. 90).", f"صُرف أجر {run.period} في {run.pay_date}، بعد أكثر من شهر من تاريخ الصرف "
+                "السابق (المادة 90).")))
+    return [j for j in out if j is not None]
+
+
+def suggest_mudad_justifications(run, *, user):
+    """R79 on demand (``payroll.record_mudad_justification``): the same suggestions as at WPS generation, from the
+    run's latest WPS file exceptions."""
+    run = PayrollRun.objects.select_related("entity").get(pk=run.pk)
+    _require(user, run.entity, "payroll.record_mudad_justification")
+    f = WpsFile.objects.filter(run=run).order_by("-generated_at", "-pk").first()
+    returns = _bank_returns(f, f.bank_processed_content) if f is not None and f.bank_processed_sha256 else None
+    with transaction.atomic():
+        return _suggest_mudad(run, user, exceptions=f.exceptions if f is not None else None, returns=returns)
+
+
+ACCEPTED_RETURN_CODES = ("", "0", "00", "000", "0000")
+
+
+def _bank_returns(f, content):
+    """R79(b): {employee code: RET-CDE} for the rows the bank rejected. The bank-processed file is read as CSV: the
+    first row naming ``RET-CDE`` is the header; employees are matched by ``MOL-ID`` (ID number) or ``employee_code``
+    within the run; an empty or all-zero code is a success **[verify: each bank's return codes, P18]**."""
+    rows = list(csv.reader(io.StringIO(content or "")))
+    header = next((i for i, r in enumerate(rows) if "RET-CDE" in [c.strip() for c in r]), None)
+    if header is None:
+        return {}
+    names = [c.strip() for c in rows[header]]
+    by_id = {}
+    for ps in Payslip.objects.filter(run_id=f.run_id).select_related("employee"):
+        emp = Employee.objects.get(pk=ps.employee_id)  # unmasked inside the service only
+        by_id[(emp.id_number or "").strip()] = emp.employee_code
+        by_id[emp.employee_code] = emp.employee_code
+    out = {}
+    for r in rows[header + 1:]:
+        cells = dict(zip(names, (c.strip().lstrip("'") for c in r)))
+        code = cells.get("RET-CDE", "")
+        who = by_id.get(cells.get("MOL-ID", "")) or by_id.get(cells.get("employee_code", ""))
+        if who and code not in ACCEPTED_RETURN_CODES:
+            out[who] = code
+    return out
+
+
+def _justification(j):
+    return MJ.objects.select_related("entity", "run", "payslip", "payslip__employee").get(pk=j.pk)
+
+
+def _justification_problems(kind, reason, description_ar, description_en):
+    problems = []
+    if kind not in MJK.values or reason not in MJR.values:
+        problems.append("Unknown justification kind or reason (11.6). / نوع المبرر أو سببه غير معروف.")
+    elif kind not in REASON_KINDS[reason]:
+        problems.append(f"Reason {reason} does not take kind {kind} (11.6). / السبب {reason} لا يقبل النوع {kind}.")
+    if not (description_ar or "").strip():
+        problems.append("The Arabic text is required (R80). / النص العربي مطلوب.")
+    if len(description_ar or "") > 500 or len(description_en or "") > 500:
+        problems.append("The text is at most 500 characters. / النص 500 حرف كحد أقصى.")
+    if _health_problem(description_ar, description_en) is not None:
+        problems.append(f"{HEALTH_INSTRUCTION[0]} / {HEALTH_INSTRUCTION[1]}")
+    return problems
+
+
+@transaction.atomic
+def record_mudad_justification(payslip, *, user, kind, reason, description_ar, description_en="", evidence_ref="",
+                               mudad_notice_date=None):
+    """R79, R80 (``payroll.record_mudad_justification``): the payroll officer records a justification by hand, as a
+    ``draft``. Expected = the contract monthly wage of the period; paid = the payslip gross (0 for non-payment)."""
+    ps = Payslip.objects.select_related("run", "run__entity", "employee").get(pk=payslip.pk)
+    _require(user, ps.entity, "payroll.record_mudad_justification")
+    problem = _mudad_problem(ps)
+    if problem is not None:
+        raise problem
+    problems = _justification_problems(kind, reason, description_ar, description_en)
+    if problems:
+        raise _problems(problems, "justification_invalid")
+    if MJ.objects.filter(payslip=ps, reason=reason).exclude(status=MJS.WITHDRAWN).exists():
+        raise error("This payslip already has a justification with this reason (11.3.2).",
+                    "لهذه القسيمة مبرر بهذا السبب مسبقًا.", code="justification_exists")
+    paid = ZERO if kind == MJK.NON_PAYMENT or ps.refused else ps.gross
+    j = MJ(entity=ps.entity, payslip=ps, run=ps.run, employee_code=ps.employee.employee_code, kind=kind, reason=reason,
+           expected_amount=_contract_wage(ps), paid_amount=paid, description_ar=description_ar,
+           description_en=description_en, evidence_ref=evidence_ref or None, status=MJS.DRAFT, source=MJ.Source.MANUAL,
+           created_by=user)
+    _set_notice(j, mudad_notice_date)
+    return _save(j)
+
+
+def _set_notice(j, notice_date):
+    if notice_date is not None:
+        j.mudad_notice_date = notice_date
+        j.due_date = notice_date + timedelta(days=10)  # R53 (WPS-G): justify within 10 days of Mudad's notice
+
+
+@transaction.atomic
+def confirm_mudad_justification(justification, *, user, **changes):
+    """R80: the payroll officer confirms (and may edit) a ``suggested`` row, or edits a ``draft``: it becomes
+    ``draft``, the officer its last modifier (so never its approver)."""
+    j = _lock(MJ, justification.pk)
+    _require(user, j.entity, "payroll.record_mudad_justification")
+    unknown = set(changes) - JUSTIFICATION_EDITS
+    if unknown:
+        raise error(f"Unknown fields: {sorted(unknown)}.", f"حقول غير معروفة: {sorted(unknown)}.", code="fields")
+    if j.status not in (MJS.SUGGESTED, MJS.DRAFT):
+        raise error("Only a suggested or draft justification is confirmed or edited (R80).",
+                    "يُؤكد أو يُعدّل المبرر المقترح أو المسودة فقط.", code="justification_status")
+    notice = changes.pop("mudad_notice_date", None)
+    for name, value in changes.items():
+        setattr(j, name, value if name != "evidence_ref" else (value or None))
+    if j.worker_response not in MJ.WorkerResponse.values:
+        raise error("Unknown worker response.", "رد العامل غير معروف.", code="justification_invalid")
+    problems = _justification_problems(j.kind, j.reason, j.description_ar, j.description_en)
+    if problems:
+        raise _problems(problems, "justification_invalid")
+    if "reason" in changes and MJ.objects.filter(payslip_id=j.payslip_id, reason=j.reason) \
+            .exclude(pk=j.pk).exclude(status=MJS.WITHDRAWN).exists():
+        raise error("This payslip already has a justification with this reason.", "لهذه القسيمة مبرر بهذا السبب مسبقًا.",
+                    code="justification_exists")
+    if j.kind == MJK.NON_PAYMENT:
+        j.paid_amount = ZERO
+    _set_notice(j, notice)
+    j.status, j.modified_by, j.modified_at = MJS.DRAFT, user, _now()
+    return _save(j)
+
+
+@transaction.atomic
+def record_mudad_notice(justification, *, user, notice_date):
+    """R80: the date of Mudad's notice for this employee and month; the justification is due 10 days after it."""
+    j = _lock(MJ, justification.pk)
+    _require(user, j.entity, "payroll.record_mudad_justification")
+    if j.status not in (MJS.SUGGESTED, MJS.DRAFT, MJS.APPROVED):
+        raise error("The notice is recorded before the justification is submitted.", "يُسجل الإشعار قبل رفع المبرر.",
+                    code="justification_status")
+    _set_notice(j, notice_date)
+    return _save(j)
+
+
+def _mudad_codes(run):
+    """R81: internal reason -> Mudad code from ``wps.mudad.justification_codes`` (SA) **[verify]**; empty when the
+    row is empty, or unverified while verified parameters are required (hr R7)."""
+    row = hr.param("SA", "wps.mudad.justification_codes", run.entry_date, required=False)
+    if row is None or (hr._required_verified() and row.status != StatutoryParameter.Status.VERIFIED):
+        return {}
+    return dict((row.value or {}).get("codes") or {})
+
+
+@transaction.atomic
+def approve_mudad_justification(justification, *, user):
+    """R80 (``payroll.approve_mudad_justification``, A; matrix activity ``payroll.mudad_justification``, code default
+    ``hr_officer``): never its creator, its last modifier or the employee. Only a ``draft`` is approved; the Mudad
+    code of its reason is filled from the parameter (empty while it is not configured)."""
+    j = _justification(justification)
+    grant = _require(user, j.entity, "payroll.approve_mudad_justification", document=j)
+    approvals.check(grant, j.entity, MUDAD_ACTIVITY, roles=MUDAD_ROLES)
+    if j.payslip.employee.user_id is not None and j.payslip.employee.user_id == user.pk:
+        access.deny(user, j.entity, "payroll.approve_mudad_justification", "self_approval")
+    j = _lock(MJ, j.pk)
+    if j.status != MJS.DRAFT:
+        raise error("Only a confirmed (draft) justification is approved; a suggestion is confirmed first (R80).",
+                    "يُعتمد المبرر المؤكد (المسودة) فقط؛ ويُؤكد المقترح أولًا.", code="justification_status")
+    problems = _justification_problems(j.kind, j.reason, j.description_ar, j.description_en)
+    if problems:
+        raise _problems(problems, "justification_invalid")
+    j.mudad_code = _mudad_codes(j.run).get(j.reason) or None
+    j.status, j.approved_by, j.approved_at = MJS.APPROVED, user, _now()
+    return _save(j)
+
+
+@transaction.atomic
+def record_justification_submission(justification, *, user, submitted_on, mudad_reference):
+    """R80 (``payroll.record_mudad_submission``; manual, R32): an approved justification uploaded to Mudad; the worker
+    may respond within 3 days (R53, WPS-G)."""
+    j = _lock(MJ, justification.pk)
+    _require(user, j.entity, "payroll.record_mudad_submission")
+    if j.status != MJS.APPROVED:
+        raise error("Only an approved justification is submitted to Mudad (R80).", "يُرفع المبرر المعتمد فقط على مدد.",
+                    code="justification_status")
+    if not (mudad_reference or "").strip() or not isinstance(submitted_on, date):
+        raise error("The submission date and the Mudad reference are required.", "تاريخ الرفع ومرجع مدد مطلوبان.",
+                    code="mudad_invalid")
+    j.status, j.submitted_on, j.mudad_reference = MJS.SUBMITTED, submitted_on, mudad_reference
+    j.worker_response_due = submitted_on + timedelta(days=3)
+    j.modified_by, j.modified_at = user, _now()
+    return _save(j)
+
+
+@transaction.atomic
+def record_justification_outcome(justification, *, user, status, worker_response=None):
+    """R80: Mudad's answer (``accepted`` or ``rejected``, manual) and the worker's response, as recorded."""
+    j = _lock(MJ, justification.pk)
+    _require(user, j.entity, "payroll.record_mudad_submission")
+    if j.status != MJS.SUBMITTED or status not in (MJS.ACCEPTED, MJS.REJECTED):
+        raise error("A submitted justification is accepted or rejected by Mudad.", "يُقبل المبرر المرفوع أو يُرفض من مدد.",
+                    code="justification_status")
+    if worker_response is not None:
+        if worker_response not in MJ.WorkerResponse.values:
+            raise error("Unknown worker response.", "رد العامل غير معروف.", code="justification_invalid")
+        j.worker_response = worker_response
+    j.status, j.modified_by, j.modified_at = status, user, _now()
+    return _save(j)
+
+
+@transaction.atomic
+def withdraw_mudad_justification(justification, *, user, reason_ar):
+    """R80: rows are never deleted; a wrong one is withdrawn with an Arabic reason (before submission)."""
+    j = _lock(MJ, justification.pk)
+    _require(user, j.entity, "payroll.record_mudad_justification")
+    if j.status not in (MJS.SUGGESTED, MJS.DRAFT, MJS.APPROVED) or not (reason_ar or "").strip():
+        raise error("A justification not yet submitted is withdrawn, with a reason in Arabic (R80).",
+                    "يُسحب المبرر غير المرفوع مع سبب بالعربية.", code="justification_status")
+    j.status, j.withdrawn_reason_ar, j.modified_by, j.modified_at = MJS.WITHDRAWN, reason_ar, user, _now()
+    return _save(j)
+
+
+EXPORTED = (MJS.APPROVED, MJS.SUBMITTED, MJS.ACCEPTED)
+EXPORT_COLUMNS = (("employee_code", "Employee code", "رقم الموظف"), ("mol_id", "MOL-ID", "رقم الهوية (MOL-ID)"),
+                  ("period", "Period", "الفترة"), ("kind", "Kind", "النوع"), ("reason", "Internal reason", "السبب الداخلي"),
+                  ("mudad_code", "Mudad code", "رمز مدد"), ("expected", "Expected", "المتوقع"), ("paid", "Paid", "المدفوع"),
+                  ("text_ar", "Arabic text", "النص العربي"), ("evidence", "Evidence reference", "مرجع الإثبات"))
+CODE_MISSING = ("Mudad code not configured (wps.mudad.justification_codes; [verify: Mudad code list])",
+                "رمز مدد غير مهيأ")
+
+
+@transaction.atomic
+def export_mudad_justifications(run, *, user, format_code="csv"):
+    """R81 (``payroll.generate_wps_file``): the bilingual list (CSV or HTML) of the run's approved justifications:
+    employee code, MOL-ID (as in the WPS file; the export is stored encrypted and logged), period, kind, internal
+    reason, Mudad code, expected, paid, Arabic text, evidence. A row whose Mudad code is not configured is exported
+    with an en/ar warning. The export is kept like a WPS file (R31)."""
+    run = PayrollRun.objects.select_related("entity").get(pk=run.pk)
+    _require(user, run.entity, "payroll.generate_wps_file")
+    if format_code not in ("csv", "html"):
+        raise error("Formats: csv or html.", "الصيغ: csv أو html.", code="format")
+    if (run.payroll_group != PayrollGroup.IN_COUNTRY or _jurisdiction_of(run.entity) != "SA"
+            or run.status not in (RS.APPROVED, RS.PAID)):
+        raise error("Mudad justifications are exported for approved in-country runs of a Saudi entity (R79, R81).",
+                    "تُصدّر مبررات مدد لمسيرات داخل المملكة المعتمدة لكيان سعودي.", code="mudad_not_applicable")
+    codes = _mudad_codes(run)
+    rows, warnings, ids = [], [], []
+    for j in MJ.objects.filter(run=run, status__in=EXPORTED).select_related("payslip").order_by("employee_code", "pk"):
+        code = codes.get(j.reason) or None
+        if code != j.mudad_code and j.status not in MJ.FINAL:
+            j.mudad_code = code
+            _save(j)
+        if not j.mudad_code:
+            warnings.append(f"{j.employee_code}: {CODE_MISSING[0]} / {j.employee_code}: {CODE_MISSING[1]}")
+        emp = Employee.objects.get(pk=j.payslip.employee_id)  # MOL-ID as in the WPS file, inside the service only
+        ids.append(j.pk)
+        rows.append({"employee_code": j.employee_code, "mol_id": emp.id_number, "period": run.period,
+                     "kind": f"{_label(MJK, j.kind, 'ar')} / {j.kind}",
+                     "reason": f"{_label(MJR, j.reason, 'ar')} / {j.reason}", "mudad_code": j.mudad_code or "",
+                     "expected": j.expected_amount, "paid": j.paid_amount, "text_ar": j.description_ar,
+                     "evidence": j.evidence_ref or ""})
+    if format_code == "csv":
+        out = io.StringIO()
+        w = csv.writer(out, lineterminator="\r\n")
+        w.writerow([_cell("النص العربي هو المعتمد / The Arabic text prevails")])
+        w.writerow([f"{ar} / {en}" for _, en, ar in EXPORT_COLUMNS])
+        for r in rows:
+            w.writerow([_cell(r[k]) for k, _, _ in EXPORT_COLUMNS])
+        for text in warnings:
+            w.writerow([_cell(text)])
+        content = out.getvalue()
+    else:
+        content = render_to_string("payroll/mudad_justifications.html", {
+            "run": run, "rows": rows, "warnings": warnings, "columns": EXPORT_COLUMNS})
+    export = _save(MudadJustificationExport(
+        entity=run.entity, run=run, format_code=format_code, generated_by=user, generated_at=_now(),
+        sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(), row_count=len(rows), justification_ids=ids,
+        warnings=warnings, content=content))
+    access_services.log(AccessLog.Event.PERSONAL_DATA_VIEWED, actor=user, entity=run.entity,
+                        permission="payroll.generate_wps_file",
+                        details={"action": "mudad_justifications_exported", "export": export.pk, "run": run.pk,
+                                 "sha256": export.sha256, "employee_codes": [r["employee_code"] for r in rows],
+                                 "fields": ["id_number"]})
+    return export
+
+
+def _wps_justification_columns(run, s, use):
+    """R81: the columns the salary bank's format declares for justifications (``wps.format.<bank>.justification_fields``
+    or the ``justification_fields`` key of ``wps.format.<bank>``); none today (P18), so the file is unchanged. Returns
+    ([{"name", "carries"}], {employee code: approved justification})."""
+    if not s.salary_bank:
+        return [], {}
+    columns = []
+    for code, key in ((f"wps.format.{s.salary_bank}.justification_fields", "columns"),
+                      (f"wps.format.{s.salary_bank}", "justification_fields")):
+        row = hr.param("SA", code, run.entry_date, required=False)
+        if row is None:
+            continue
+        value = (row.value or {}).get(key) or []
+        if value:
+            use._take(row)
+            use.check_verified()
+            columns = [c if isinstance(c, dict) else {"name": str(c), "carries": "code_and_text"} for c in value]
+            break
+    if not columns:
+        return [], {}
+    carried = {}
+    for j in MJ.objects.filter(run=run, status__in=EXPORTED).order_by("pk"):
+        carried.setdefault(j.employee_code, j)
+    return columns, carried
+
+
+def _justification_cell(j, column):
+    if j is None:
+        return ""
+    carries = column.get("carries", "code_and_text")
+    if carries == "code":
+        return j.mudad_code or ""
+    if carries == "text":
+        return j.description_ar
+    return " ".join(x for x in (j.mudad_code or "", j.description_ar) if x)
+
+
+def _mudad_justification_alerts(entity, today):
+    """R80: alerts (en/ar) to the payroll officers and hr_officers 3 days before the due date, on it and the day after,
+    while the justification is not submitted."""
+    sent = 0
+    for j in MJ.objects.filter(entity=entity, due_date__isnull=False,
+                               status__in=(MJS.SUGGESTED, MJS.DRAFT, MJS.APPROVED)).select_related("run"):
+        when = {j.due_date - timedelta(days=3): "before", j.due_date: "due", j.due_date + timedelta(days=1): "late"}
+        if today not in when:
+            continue
+        late = when[today] == "late"
+        _send_alerts(entity, [(PayrollAlert.Kind.MUDAD_JUSTIFICATION, f"mudad_j:{j.pk}:{when[today]}",
+                               f"Mudad justification for {j.employee_code} ({j.run.period}) is due by {j.due_date}"
+                               f"{' and is late' if late else ''}: submit it in Mudad (R53, R80).",
+                               f"مبرر مدد للموظف {j.employee_code} ({j.run.period}) مستحق قبل {j.due_date}"
+                               f"{' وقد تأخر' if late else ''}: ارفعه على مدد.", ("payroll_officer", "hr_officer"))])
+        sent += 1
+    return sent

@@ -47,6 +47,8 @@ ALLOW = {
     "payroll/services.py:runs": "the scope mechanism for payroll runs (access.scope with payroll.view, payroll R2)",
     "payroll/services.py:get_run": "the scope mechanism for one run (get_scoped_or_404 with payroll.view, R2)",
     "payroll/services.py:get_payslip": "the scope mechanism for one payslip (get_scoped_or_404, payroll.view_payslip)",
+    "payroll/services.py:get_liability_report": "the scope mechanism for one liability report (get_scoped_or_404 with "
+                                                "payroll.view, R75); the data needs view_cost_reports / view_payslip",
     "payroll/services.py:setup_entity": "payroll_setup_entity command only (operator setup of a new entity, R3)",
     "payroll/services.py:send_alerts": "payroll_alerts job only (R10, R22, R53; retention nomination)",
     "payroll/services.py:skip_installment": "always refuses (R27: a skip needs a new approved schedule)",
@@ -92,7 +94,9 @@ EXTRA_MODULES = ("ledger/services_setup.py", "ledger/fx.py")
 def service_modules():
     extra = [REPO / name for name in EXTRA_MODULES]
     for path in sorted(REPO.glob("*/services.py")) + sorted(REPO.glob("*/*/services.py")) + extra:
-        if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.parts):
+        # Parts below the repository only: a checkout inside a dot directory (e.g. a .claude/worktrees worktree)
+        # would otherwise skip every module and the scan would pass on nothing.
+        if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.relative_to(REPO).parts):
             continue
         yield path
 

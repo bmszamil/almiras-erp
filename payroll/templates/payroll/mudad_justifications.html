@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head><meta charset="utf-8"><title>مبررات مدد {{ run.period }} / Mudad justifications {{ run.period }}</title></head>
+<body>
+<header>
+  <h1>مبررات مدد / <span lang="en" dir="ltr">Mudad justifications</span></h1>
+  <p><strong>النص العربي هو المعتمد / <span lang="en" dir="ltr">The Arabic text prevails</span></strong></p>
+  <p>المسير / <span lang="en" dir="ltr">Run</span>: {{ run.number }} &middot; الفترة / <span lang="en" dir="ltr">Period</span>: {{ run.period }}</p>
+</header>
+<table>
+  <thead><tr>{% for key, en, ar in columns %}<th>{{ ar }} / <span lang="en" dir="ltr">{{ en }}</span></th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for r in rows %}<tr><td>{{ r.employee_code }}</td><td dir="ltr">{{ r.mol_id }}</td><td>{{ r.period }}</td><td>{{ r.kind }}</td><td>{{ r.reason }}</td><td>{{ r.mudad_code }}</td><td>{{ r.expected }}</td><td>{{ r.paid }}</td><td>{{ r.text_ar }}</td><td>{{ r.evidence }}</td></tr>{% endfor %}
+  </tbody>
+</table>
+{% if warnings %}<ul>{% for w in warnings %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}
+</body>
+</html>
