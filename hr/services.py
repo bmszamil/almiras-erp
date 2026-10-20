@@ -3092,7 +3092,7 @@ def _settlement_input(term, eosb, user, use):
     emp = term.employee
     terms = term.contract
     statutory = emp.employment_basis != Basis.REMUNERATION
-    balance, daily, encash, due_by = ZERO, ZERO, ZERO, None
+    balance, daily, encash, due_by, notice_wage = ZERO, ZERO, ZERO, None, ZERO
     if statutory:
         jurisdiction = _jurisdiction(emp)
         lt = LeaveType.objects.filter(entity=emp.entity, code="ANNUAL").first()
@@ -3103,6 +3103,8 @@ def _settlement_input(term, eosb, user, use):
         wage = _actual_wage(terms)
         daily = _round(Decimal(wage) / divisor)
         encash = _frac_round(Fraction(max(balance, ZERO)) * Fraction(wage) / divisor)
+        # Payroll re-review 9: wage x shortfall days / divisor as one fraction, rounded once (Art. 76).
+        notice_wage = _frac_round(Fraction(wage) * (term.notice_shortfall_days or 0) / divisor)
         due = use.get(jurisdiction, "final_settlement.due_days", term.last_working_day)
         due_by = term.last_working_day + timedelta(days=int(due["worker" if term.worker_initiated else "employer"]))
     loans = payroll_port.get_port().outstanding_balances(emp, term.last_working_day)
@@ -3110,6 +3112,7 @@ def _settlement_input(term, eosb, user, use):
         entity=term.entity, employee=emp, termination=term, eosb_calculation=eosb, last_working_day=term.last_working_day,
         currency_id=terms.currency_id, eosb_award=eosb.award if eosb else ZERO, leave_balance_days=max(balance, ZERO),
         daily_wage=daily, leave_encashment=encash, notice_shortfall_days=term.notice_shortfall_days,
+        notice_shortfall_wage=notice_wage,
         includes_statutory_lines=statutory, worker_initiated=term.worker_initiated, due_by=due_by,
         art77_compensation=term.art77_compensation or ZERO, outstanding_loans=_decimal(loans.loans, "loans"),
         outstanding_bai_ajel=_decimal(loans.bai_ajel, "bai_ajel"), bai_ajel_undertaking=bool(loans.bai_ajel_undertaking),

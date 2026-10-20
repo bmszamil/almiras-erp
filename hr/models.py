@@ -1447,6 +1447,10 @@ class FinalSettlementInput(models.Model):
                                            default=ZERO)
     notice_shortfall_days = models.PositiveSmallIntegerField(bi("Notice shortfall (days)", "نقص مدة الإشعار (أيام)"),
                                                              default=0)
+    # Payroll re-review 9: the wage of the shortfall days, wage x days / divisor rounded once (not a rounded daily
+    # wage times the days).
+    notice_shortfall_wage = models.DecimalField(bi("Wage of the notice shortfall", "أجر أيام نقص الإشعار"),
+                                                max_digits=18, decimal_places=2, default=ZERO)
     includes_statutory_lines = models.BooleanField(bi("End-of-service, leave and GOSI lines", "بنود المكافأة والإجازة والتأمينات"),
                                                    default=True)
     # R64 / Art. 88: who ended the contract and the statutory payment deadline (none for remuneration staff, H17).
