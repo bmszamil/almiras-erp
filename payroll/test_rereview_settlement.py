@@ -139,7 +139,9 @@ def test_rr3_header_fields_are_in_the_stored_hash(w):
 def test_rr3_pg_header_locked_once_submitted_except_the_legal_moves(w):
     n1 = leaver(w)
     opening_provision(w, n1, "15500.00")
-    fs = settle(w, terminate(w, n1))
+    t = terminate(w, n1)
+    go_live(w)
+    fs = settle(w, t)
     for sql in ("UPDATE payroll_finalsettlement SET eosb_provision_balance = 0 WHERE id = %s",
                 "UPDATE payroll_finalsettlement SET net = 1 WHERE id = %s",
                 "UPDATE payroll_finalsettlement SET settlement_input_id = NULL WHERE id = %s",

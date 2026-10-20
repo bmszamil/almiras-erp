@@ -185,7 +185,9 @@ def test_c_a11_withdrawal_discards_the_draft_and_remuneration_has_none(w):
 @pytest.mark.skipif(connection.vendor != "postgresql", reason="PostgreSQL triggers")
 def test_c_a11_pg_settlement_and_lines_locked_in_the_database(w):
     n1 = leaver(w)
-    fs = settle(w, terminate(w, n1))
+    t = terminate(w, n1)
+    go_live(w)
+    fs = settle(w, t)
     for sql in ("UPDATE payroll_finalsettlementline SET amount = 1 WHERE settlement_id = %s",
                 "DELETE FROM payroll_finalsettlementline WHERE settlement_id = %s"):
         with pytest.raises(DatabaseError), transaction.atomic(), connection.cursor() as cursor:
