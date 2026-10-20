@@ -96,3 +96,48 @@ def collection_problems(contract, *, source_ref, amount=None, user, mode="collec
     if not ok or (amount is not None and inst.deducted_amount != amount):
         return wrong, permission
     return [], permission
+
+
+# --- review 2026-10-20b, finding 1 (invoicing R128 as amended): a rebate credit note only from payroll's approval ----
+
+# (rebate pk, user pk) while ``approve_deferred_sale_rebate`` asks invoicing for the rebate's credit note. Invoicing's
+# ``create_deferred_sale_adjustment`` is refused outside it (``rebate_problems``).
+_rebating = ContextVar("payroll_rebating", default=None)
+_REBATE_REF = re.compile(r"^payroll\.deferredsalerebate:(\d+)$")
+
+
+@contextmanager
+def rebating(rebate, user):
+    """Set by ``payroll.services.approve_deferred_sale_rebate`` around its call to ``create_bai_ajel_rebate``."""
+    token = _rebating.set((rebate.pk, getattr(user, "pk", None)))
+    try:
+        yield
+    finally:
+        _rebating.reset(token)
+
+
+def rebate_problems(contract, *, source_ref, amount, approver):
+    """Why invoicing may not issue the rebate credit note ``source_ref`` of ``amount`` for ``contract`` now: [] only
+    inside the payroll approval of that very rebate (``rebating``), by its approver (four eyes: never the preparer or
+    the employee), for a rebate of that contract and entity, being approved (draft, or rejected and approved again),
+    at that amount."""
+    from hr.models import Employee
+
+    from .models import DeferredSaleRebate
+
+    refused = ["A bai' ajel rebate credit note is issued only by payroll's approval of that rebate, by its approver, "
+               "at its amount (R128). / يصدر الإشعار الدائن لإبراء البيع الآجل فقط من اعتماد الرواتب لذلك الإبراء، من "
+               "معتمده، وبمبلغه."]
+    marker = _rebating.get()
+    match = _REBATE_REF.match(str(source_ref or ""))
+    approver_pk = getattr(approver, "pk", None)
+    if marker is None or match is None or marker[1] != approver_pk or int(match.group(1)) != marker[0]:
+        return refused
+    r = DeferredSaleRebate.objects.filter(pk=marker[0], contract_id=contract.pk, entity_id=contract.entity_id).first()
+    if r is None or r.status not in (DeferredSaleRebate.Status.DRAFT, DeferredSaleRebate.Status.REJECTED) \
+            or r.amount != amount or approver_pk == r.created_by_id:
+        return refused
+    emp_user = Employee.objects.filter(pk=contract.employee_id).values_list("user_id", flat=True).first()
+    if emp_user and emp_user == approver_pk:
+        return refused
+    return []

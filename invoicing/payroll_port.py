@@ -25,8 +25,10 @@ Interface (every method runs inside the caller's transaction; refusals raise ``I
   contract at that amount; code ``collection_not_from_payroll`` otherwise.
 - ``create_bai_ajel_rebate(contract, *, user, source_ref, amount, reason_ar, reason_en="") -> RebateResult`` (R128,
   compliance A8): the simplified credit note of a payroll-approved early-settlement rebate (ibra') of unearned
-  profit; ``rebate_state(contract, *, source_ref)`` reads it back. Codes: ``sale_not_posted``, ``rebate_too_large``,
-  ``adjustment_changed``, ``no_deferred_sale``.
+  profit; ``rebate_state(contract, *, source_ref)`` reads it back (``status`` issued, final or rejected: payroll
+  restores the instalments on a rejection). Codes: ``sale_not_posted``, ``rebate_too_large``, ``adjustment_changed``,
+  ``no_deferred_sale``; ``rebate_not_from_payroll`` outside payroll's ``invoicing_port.rebating`` marker of that
+  rebate, approver and amount (second review, finding 1). The note's VAT is at the original invoice line's rate.
 
 The contract is read only through these attributes: ``pk``, ``entity_id``, ``employee``, ``purchase_bill``, ``cost``,
 ``profit_amount``, ``possession_date``, ``possession_evidence_ref``, ``asset_description_ar`` /

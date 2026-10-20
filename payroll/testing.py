@@ -36,7 +36,11 @@ class FakeInvoicingPort:
         return SimpleNamespace(entry_ref="", profit_amount=Decimal("0"), collected_to_date=amount, reversed=False)
 
     def create_bai_ajel_rebate(self, contract, *, user, source_ref, amount, reason_ar, reason_en=""):
-        """R128: a credit note of the rebate at 15% VAT; ``rebate_status`` is what ``rebate_state`` reports."""
+        """R128: a credit note of the rebate at 15% VAT; ``rebate_status`` is what ``rebate_state`` reports. Refused,
+        like the real port, outside payroll's ``rebating`` marker (review 2026-10-20b, finding 1)."""
+        if invoicing_port.rebate_problems(contract, source_ref=source_ref, amount=Decimal(amount), approver=user):
+            raise invoicing_port.error("Not from payroll's rebate approval (test port).", "ليس من اعتماد الإبراء.",
+                                       code="rebate_not_from_payroll")
         vat = (Decimal(amount) * Decimal("0.15")).quantize(Decimal("0.01"))
         self.rebates.append((contract.pk, source_ref, Decimal(amount), user.pk))
         return SimpleNamespace(document_ref=f"TEST-CN-{contract.pk}-{len(self.rebates)}", net_amount=Decimal(amount),

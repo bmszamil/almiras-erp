@@ -894,16 +894,17 @@ def _line_vat_problems(line, on):
     return problems
 
 
-def _price_line(line, on, places=2):
+def _price_line(line, on, places=2, rate=None):
     """R9 / R93: net = round(qty x price - discount); line VAT = round(net x rate) for display only; both half-up
-    to the document currency's decimals (``places``)."""
+    to the document currency's decimals (``places``). ``rate``: a fixed ``VatRate`` (a note at its original's rate,
+    R102) instead of the one in force on ``on``."""
     with localcontext() as ctx:
         ctx.prec = 60
         net = _round(line.quantity * line.unit_price - line.line_discount, places)
     if net < ZERO:
         raise error("The line discount is larger than the line amount.", "خصم البند أكبر من مبلغه.", code="line_negative")
     line.net_amount = net
-    line.vat_rate = _rate_on(line.vat_category, on)
+    line.vat_rate = rate if rate is not None else _rate_on(line.vat_category, on)
     line.vat_amount = _round(net * line.vat_rate.rate / HUNDRED, places) if line.vat_rate else ZERO
 
 
@@ -1354,7 +1355,7 @@ def _not_vat_registered(entity):
                            "entity_not_vat_registered")
 
 
-def _issue_submitted(doc, *, rate_user, approved_by, approved_at):
+def _issue_submitted(doc, *, rate_user, approved_by, approved_at, line_rates=None):
     """Issue a locked, submitted document (R57, R14, R15, R78): number, snapshots, totals and the recorded
     approval, in the caller's transaction. ``approved_by`` is the person whose approval is recorded: the CFO who
     approves it, or for an invoice auto-issued from billing the approver of the billed contract version (R60,
@@ -1384,7 +1385,7 @@ def _issue_submitted(doc, *, rate_user, approved_by, approved_at):
     fx_rate, rate_date, rate_source, rate_row = _booking_rate(entity, doc, sama_row, rate_user)
     with billing_line_writes() if doc.from_billing else nullcontext():  # the approval re-prices billing lines too
         for line in lines:
-            _price_line(line, on, _doc_places(doc))
+            _price_line(line, on, _doc_places(doc), rate=(line_rates or {}).get(line.pk))
             line._service_write = True
             line.save()
     breakdown, net, vat, vat_sar = _sales_breakdown(doc, lines, sar_rate)
@@ -4823,7 +4824,7 @@ def _check_deferred_sale(entity, *, employee, bill, cost, possession_date, posse
                     f"يكون البيع في تاريخ القبض {possession_date} أو بعده.", code="sale_before_possession")
 
 
-def _deferred_line(doc, account, amount, description_ar, description_en):
+def _deferred_line(doc, account, amount, description_ar, description_en, vat_rate=None):
     last = doc.lines.order_by("-line_no").values_list("line_no", flat=True).first() or 0
     line = SalesDocumentLine(entity=doc.entity, document=doc, line_no=last + 1)
     _sales_line_values(
@@ -4831,6 +4832,8 @@ def _deferred_line(doc, account, amount, description_ar, description_en):
         description_en=description_en[:300], vat_category=VatCategory.STANDARD, vat_exemption_reason=None,
         income_account=account, line_discount="0", unit_code="C62",
     )
+    if vat_rate is not None:  # a note at its original invoice line's rate (R102)
+        _price_line(line, doc.supply_date or doc.issue_date, _doc_places(doc), rate=vat_rate)
     line.save()
     return line
 
@@ -4973,13 +4976,27 @@ def deferred_sale_of(source):
     return _live_deferred_sale(Entity.objects.get(pk=source.entity_id), source)
 
 
-def _sale_figures(sale):
-    """(fixed profit, receivable) of a sale less its active payroll-approved adjustments (R128): an ibra' waives
-    part of the profit not yet recognised and the VAT on it, so both shrink by the credit note."""
-    adjustments = list(sale.adjustments.filter(active=True))
-    profit = sale.profit_amount - sum((a.net_amount for a in adjustments), ZERO)
-    receivable = sale.receivable - sum((a.gross_amount for a in adjustments), ZERO)
-    return Decimal(profit).quantize(CENT), Decimal(receivable).quantize(CENT)
+def _adjustment_final(adjustment):
+    """Review 2026-10-20b, finding 2: an adjustment counts only once its credit note is final (reported or cleared
+    by ZATCA and posted)."""
+    note = adjustment.credit_note
+    return note.status == Status.FINAL and note.journal_entry_id is not None
+
+
+def _sale_figures(sale, *, prudent=False):
+    """(fixed profit, receivable) of a sale less its payroll-approved adjustments (R128): an ibra' waives part of the
+    profit not yet recognised and the VAT on it, so both shrink by the credit note.
+
+    Review 2026-10-20b (finding 2): only adjustments whose credit note is **final** count; a pending one (issued,
+    awaiting ZATCA) changes nothing and a rejected one never counts. ``prudent=True`` (profit recognition and the
+    rebate ceiling only) also deducts pending ones, so no profit a pending rebate may waive is ever recognised; a
+    rejected one never."""
+    profit, receivable = Decimal(sale.profit_amount), Decimal(sale.receivable)
+    for a in sale.adjustments.select_related("credit_note").filter(active=True):
+        if _adjustment_final(a) or (prudent and a.credit_note.status == Status.ISSUED):
+            profit -= a.net_amount
+            receivable -= a.gross_amount
+    return profit.quantize(CENT), receivable.quantize(CENT)
 
 
 def create_deferred_sale_adjustment(source, *, approver, source_ref, amount, reason_ar, reason_en=""):
@@ -5006,6 +5023,13 @@ def create_deferred_sale_adjustment(source, *, approver, source_ref, amount, rea
     if not ref or not (reason_ar or "").strip():
         raise error("The rebate needs its payroll reference and the reason in Arabic.",
                     "يحتاج الإبراء إلى مرجعه في الرواتب والسبب بالعربية.", code="adjustment_required")
+    from payroll import invoicing_port as payroll_port  # review 2026-10-20b, finding 1: only payroll's approval
+
+    problems = payroll_port.rebate_problems(source, source_ref=ref, amount=amount, approver=approver)
+    if problems:
+        access_services.log_denial(actor=approver, entity=entity, permission="payroll.approve_deferred_sale",
+                                   details={"reason": "rebate_not_from_payroll", "source_ref": ref})
+        raise _problems_error(problems, "rebate_not_from_payroll")
     with transaction.atomic():
         sale = _live_deferred_sale(entity, source, lock=True)
         if sale is None:
@@ -5028,7 +5052,7 @@ def create_deferred_sale_adjustment(source, *, approver, source_ref, amount, rea
             live.save(update_fields=["active"])
         recognised = Decimal(sale.releases.filter(status=DeferredProfitRelease.Status.POSTED)
                              .aggregate(t=Sum("profit_amount"))["t"] or ZERO).quantize(CENT)
-        unearned = _sale_figures(sale)[0] - recognised
+        unearned = _sale_figures(sale, prudent=True)[0] - recognised  # finding 2: less rebates still pending
         if amount > unearned:
             raise error(f"The rebate {amount} is more than the profit not yet recognised ({unearned}); an ibra' waives "
                         "only unearned profit, never the cost (R128).", f"الإبراء {amount} أكبر من الربح غير المحقق "
@@ -5046,9 +5070,16 @@ def create_deferred_sale_adjustment(source, *, approver, source_ref, amount, rea
         )
         _refresh_tax_point(note)
         note.save()
+        # Finding 5 (R102): the note's VAT is at the rate of the original invoice's profit line, not today's.
+        original = (invoice.lines.select_related("vat_rate").filter(income_account__code=DEFERRED_PROFIT)
+                    .order_by("line_no").first())
+        if original is None or original.vat_rate is None:
+            raise error(f"The sale invoice {invoice.number} has no profit line with a VAT rate (R118).",
+                        f"ليس لفاتورة البيع {invoice.number} بند ربح بنسبة ضريبة.", code="document_invalid")
         token = _deferred_sale_writes.set(True)
         try:
-            _deferred_line(note, DEFERRED_PROFIT, amount, "إبراء من ربح البيع الآجل", "Bai' ajel profit rebate (ibra')")
+            line = _deferred_line(note, DEFERRED_PROFIT, amount, "إبراء من ربح البيع الآجل",
+                                  "Bai' ajel profit rebate (ibra')", vat_rate=original.vat_rate)
             note = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity", "customer").get(
                 pk=note.pk)
             lines = list(note.lines.select_related("vat_rate", "vat_exemption_reason", "income_account", "income_type"))
@@ -5064,7 +5095,8 @@ def create_deferred_sale_adjustment(source, *, approver, source_ref, amount, rea
             _bump(note)
             note._service_write = True
             note.save()
-            _issue_submitted(note, rate_user=system, approved_by=approver, approved_at=approved_at)
+            _issue_submitted(note, rate_user=system, approved_by=approver, approved_at=approved_at,
+                             line_rates={line.pk: original.vat_rate})
         finally:
             _deferred_sale_writes.reset(token)
         if Decimal(note.total_vat) != adjustment.vat_amount:
@@ -5093,8 +5125,10 @@ def _deferred_sale_adjustment_of(source, source_ref):
 def _profit_figures(sale, collected_after, profit_before):
     """Profit to recognise when ``collected_after`` of the receivable is collected: the fixed profit times the
     collected share, rounded half-up once; all of it once everything is collected. Never time-based (R48). With an
-    adjustment (R128) the profit and receivable less the adjustments; never negative."""
-    profit, receivable = _sale_figures(sale)
+    adjustment (R128) the profit and receivable less the adjustments, a pending one included (prudence, finding 2:
+    never recognise profit a pending rebate may waive; once its note is rejected the full figures catch up);
+    never negative."""
+    profit, receivable = _sale_figures(sale, prudent=True)
     if collected_after >= receivable:
         to_date = profit
     else:

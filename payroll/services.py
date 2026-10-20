@@ -3971,11 +3971,16 @@ def _bank_account(entity, account):
 
 @transaction.atomic
 def record_payment(entity, *, user, kind, payment_date, amount, run=None, gosi_period="", bank_account=None,
-                   currency=None, wht_category=None, bank_reference="", final_settlement=None):
+                   currency=None, wht_category=None, bank_reference="", final_settlement=None, payslips=None):
     """R29: the payroll officer records a payment after the bank release (``payroll.record_payment``). Net salaries
     of a run (per currency) or the GOSI contributions of a period. Remuneration staff in a foreign currency: WHT is
     considered on every payment (R43): a WHT category is required (rate from invoicing's global table). The entity's
-    payroll lock and the run row are taken before the open amount is read (review 1)."""
+    payroll lock and the run row are taken before the open amount is read (review 1).
+
+    ``payslips`` (review 2026-10-20b, finding 3): the payslips of the run a salary payment pays (default: all of the
+    run in the currency, pro rata to what is open on each). A payment of less than the run's open net in a currency
+    with remuneration payslips names them, so each payee's WHT base is their own gross in the share of their own net
+    paid (``payees_required``)."""
     _require(user, entity, "payroll.record_payment")
     amount = _dec(amount, "amount")
     s = _settings_of(entity)
@@ -4012,9 +4017,20 @@ def record_payment(entity, *, user, kind, payment_date, amount, run=None, gosi_p
     acc = bank_account if isinstance(bank_account, Account) else _account(entity, bank_account) if bank_account \
         else s.salary_bank_account
     _bank_account(entity, acc)
+    ids = []
+    if payslips:
+        if kind != PayrollPayment.Kind.NET_SALARIES:
+            raise error("Only a salary payment of a run names payslips.", "تحدد دفعة رواتب المسير فقط القسائم.",
+                        code="payslips_invalid")
+        ids = sorted({getattr(ps, "pk", ps) for ps in payslips})
+        found = set(Payslip.objects.filter(pk__in=ids, run=run, refused=False, currency_id=cur.code)
+                    .values_list("pk", flat=True))
+        if found != set(ids):
+            raise error("Every payslip named is a paid payslip of this run in the payment currency (R29).",
+                        "كل قسيمة محددة قسيمة مدفوعة من هذا المسير بعملة الدفعة.", code="payslips_invalid")
     payment = PayrollPayment(entity=entity, kind=kind, run=run, gosi_period=gosi_period, payment_date=payment_date,
                              bank_account=acc, currency=cur, amount=amount, wht_category=wht_category,
-                             bank_reference=bank_reference, created_by=user,
+                             bank_reference=bank_reference, created_by=user, payslip_ids=ids,
                              final_settlement=final_settlement if kind == PayrollPayment.Kind.FINAL_SETTLEMENT else None)
     _payment_room(payment, run)
     return _save(payment)
@@ -4040,6 +4056,17 @@ def _payment_room(p, run):
         if p.amount > total - paid:
             raise error(f"The payment exceeds the open net pay {total - paid} of the run (R29).",
                         f"الدفعة تتجاوز صافي الرواتب المتبقي {total - paid} للمسير.", code="overpayment")
+        slips, paid_on, _ = _payslip_paid(run, p.currency_id, exclude=p.pk)
+        if p.payslip_ids:
+            named = sum((Fraction(slips[i].net_txn) - paid_on[i] for i in p.payslip_ids if i in slips), Fraction(0))
+            if Fraction(p.amount) > named:
+                raise error(f"The payment exceeds the open net {_round_to(named, p.currency.minor_units)} of the "
+                            "payslips it names (R29).", "الدفعة تتجاوز صافي القسائم المحددة المتبقي.",
+                            code="overpayment")
+        elif p.amount < total - paid and any(ps.employment_basis == Basis.REMUNERATION for ps in slips.values()):
+            raise error("A part payment of a run with remuneration payees names the payslips it pays, so each payee's "
+                        "WHT base is their own (R43).", "تحدد الدفعة الجزئية لمسير فيه مكافآت القسائم التي تدفعها، ليكون "
+                        "وعاء الاستقطاع لكل مستفيد خاصًا به.", code="payees_required")
     else:
         open_ = _gosi_open(p.entity, p.gosi_period)
         recon = (GosiReconciliation.objects.filter(entity=p.entity, period=p.gosi_period).order_by("-pk").first())
@@ -4086,6 +4113,8 @@ def approve_payment(payment, *, user):
     if run is not None:
         p.run = run
     _payment_room(p, run)
+    if p.kind == PayrollPayment.Kind.NET_SALARIES:
+        p.payslip_parts = _payslip_allocation(p)
     if p.wht_category_id:
         _compute_wht(p, user)
     p.status, p.approved_by, p.approved_at = PayrollPayment.Status.APPROVED, user, _now()
@@ -4114,18 +4143,65 @@ def approve_payment(payment, *, user):
     return p
 
 
+def _payslip_paid(run, currency, exclude=None):
+    """Finding 3: ({payslip pk: payslip}, {payslip pk: paid so far as Fraction}, {payslip pks covered}) of the run's
+    paid payslips in ``currency``, from the approved salary payments' per-payslip parts; a payment approved before
+    ``payroll.0018`` (no parts) counts pro rata to every payslip's net."""
+    slips = {ps.pk: ps for ps in Payslip.objects.filter(run=run, refused=False, currency_id=currency)
+             .select_related("employee")}
+    paid, covered = {pk: Fraction(0) for pk in slips}, set()
+    total = sum((Fraction(ps.net_txn) for ps in slips.values()), Fraction(0))
+    for pay in PayrollPayment.objects.filter(run=run, kind=PayrollPayment.Kind.NET_SALARIES, currency_id=currency,
+                                             status=PayrollPayment.Status.APPROVED).exclude(pk=exclude):
+        if pay.payslip_parts:
+            for part in pay.payslip_parts:
+                if part["payslip_id"] in paid:
+                    paid[part["payslip_id"]] += Fraction(Decimal(part["amount"]))
+                    covered.add(part["payslip_id"])
+        elif total:
+            for pk, ps in slips.items():
+                paid[pk] += Fraction(pay.amount) * Fraction(ps.net_txn) / total
+                covered.add(pk)
+    return slips, paid, covered
+
+
+def _payslip_allocation(p):
+    """Finding 3: what salary payment ``p`` pays on each payslip it covers (the payslips it names, or all of the run
+    in its currency): each one's open net when it pays them all in full, otherwise pro rata to what is open on each,
+    rounded to the currency's decimals so the parts add up to the payment. A payslip with no net pay (all deducted)
+    is covered, at 0, by the first payment that covers it. Returns [{"payslip_id", "amount"}]."""
+    slips, paid, covered = _payslip_paid(p.run, p.currency_id, exclude=p.pk)
+    targets = [pk for pk in sorted(slips) if not p.payslip_ids or pk in p.payslip_ids]
+    open_ = {pk: max(Fraction(slips[pk].net_txn) - paid[pk], Fraction(0)) for pk in targets}
+    whole = sum(open_.values(), Fraction(0))
+    unit = Decimal(1).scaleb(-p.currency.minor_units)
+    exact = {pk: Fraction(p.amount) * v / whole if whole else Fraction(0) for pk, v in open_.items()}
+    amounts = {}
+    for pk, v in exact.items():
+        with localcontext() as ctx:
+            ctx.prec = 60
+            amounts[pk] = (Decimal(v.numerator) / Decimal(v.denominator)).quantize(unit, rounding="ROUND_FLOOR")
+    rest = int((p.amount - sum(amounts.values(), ZERO)) / unit)  # largest remainder: the parts add up exactly
+    for pk in sorted(exact, key=lambda k: (Fraction(amounts[k]) - exact[k], k))[:max(rest, 0)]:
+        amounts[pk] += unit
+    return [{"payslip_id": pk, "amount": str(amounts[pk])} for pk in targets
+            if amounts[pk] > 0 or (slips[pk].net_txn == 0 and pk not in covered)]
+
+
 def _wht_bases(p):
     """Compliance B2, B3 (R43): the WHT base of each payee of payment ``p`` in its currency, as Fractions: the gross
     remuneration of their payslip (run payments) or the settlement's gross (settlement payments), in the share of
-    the open net this payment pays. Persons resident in KSA (``country_of_residence`` SA) bear no WHT: returned apart.
-    Returns ({employee: base}, [resident employees])."""
+    their own open net this payment pays. Finding 3 (review 2026-10-20b): per payee, from the payment's per-payslip
+    parts (``_payslip_allocation``), never pro rata to the whole run, so a payment to some payees never carries the
+    WHT of others or of non-remuneration staff. Persons resident in KSA (``country_of_residence`` SA) bear no WHT:
+    returned apart. Returns ({employee: base}, [resident employees])."""
     if p.kind == PayrollPayment.Kind.NET_SALARIES:
-        slips = list(Payslip.objects.filter(run=p.run, refused=False, currency_id=p.currency_id,
+        parts = {part["payslip_id"]: Decimal(part["amount"]) for part in (p.payslip_parts or [])}
+        slips = list(Payslip.objects.filter(pk__in=parts, run=p.run, refused=False, currency_id=p.currency_id,
                                             employment_basis=Basis.REMUNERATION).select_related("employee")
                      .order_by("employee__employee_code"))
-        total = _run_payable(p.run, p.currency_id)[0]
-        share = Fraction(p.amount) / Fraction(total) if total else Fraction(0)
-        bases = {ps.employee: Fraction(ps.gross_txn) * share for ps in slips}
+        bases = {ps.employee: (Fraction(ps.gross_txn) * Fraction(parts[ps.pk]) / Fraction(ps.net_txn)
+                               if ps.net_txn else Fraction(ps.gross_txn)) for ps in slips}
     elif p.kind == PayrollPayment.Kind.FINAL_SETTLEMENT:
         fs = p.final_settlement
         due = _settlement_due(fs)
@@ -4246,6 +4322,17 @@ def _wht_return_source(entity, start, end):
             r["wht_sar"] += sign * Decimal(part["wht_sar"])
 
     qs = PayrollPayment.objects.filter(entity=entity, wht_category__isnull=False).select_related("wht_category")
+    # Finding 4 (review 2026-10-20b): a WHT payment without its per-payee parts (approved before payroll.0017 and
+    # not backfilled by payroll.0018) would drop out of the return: the return is refused until it has them.
+    missing = [p for p in qs.filter(status__in=(PayrollPayment.Status.APPROVED, PayrollPayment.Status.REVERSED))
+               .filter(Q(payment_date__range=(start, end)) | Q(reversal_entry__date__range=(start, end)))
+               if not p.wht_parts and (p.wht_amount_sar or p.wht_base_sar)]
+    if missing:
+        refs = ", ".join(str(p.pk) for p in missing)
+        raise error(f"Payroll WHT payments {refs} have no per-payee WHT parts; the WHT return is refused until they "
+                    "are recorded (migration payroll.0018 backfills them) (R43).",
+                    f"دفعات الرواتب {refs} ليس لها توزيع ضريبة الاستقطاع لكل مستفيد؛ يُرفض الإقرار حتى تُسجّل.",
+                    code="wht_parts_missing")
     for p in qs.filter(status__in=(PayrollPayment.Status.APPROVED, PayrollPayment.Status.REVERSED),
                        payment_date__range=(start, end)):
         add(p, 1)
@@ -6228,6 +6315,7 @@ def _refresh_deferred_sales(entity):
         if state is not None and state.posted:
             c.status, c.sale_document_ref = DeferredSaleContract.Status.SOLD, state.document_ref
             out.append(_save(c))
+    _refresh_rebates(entity)  # review 2026-10-20b, finding 2: rebate credit notes reported or rejected since
     return out
 
 
@@ -6257,7 +6345,8 @@ def prepare_deferred_sale_rebate(contract, *, user, amount, reason_ar, request_r
     if not (reason_ar or "").strip() or not (request_ref or "").strip():
         raise error("The rebate needs the reason in Arabic and the employee's written request.",
                     "يحتاج الإبراء إلى السبب بالعربية وطلب الموظف المكتوب.", code="rebate_invalid")
-    if DeferredSaleRebate.objects.filter(contract=c, status=DeferredSaleRebate.Status.DRAFT).exists():
+    if DeferredSaleRebate.objects.filter(contract=c, status__in=(DeferredSaleRebate.Status.DRAFT,
+                                                                 DeferredSaleRebate.Status.REJECTED)).exists():
         raise error("Another rebate of this contract is open: approve or discard it first.",
                     "يوجد إبراء آخر مفتوح لهذا العقد: اعتمده أو ألغه أولًا.", code="rebate_open")
     try:
@@ -6274,8 +6363,9 @@ def prepare_deferred_sale_rebate(contract, *, user, amount, reason_ar, request_r
 def discard_deferred_sale_rebate(rebate, *, user):
     r = _lock(DeferredSaleRebate, rebate.pk)
     _require(user, r.entity, "payroll.create_deferred_sale")
-    if r.status != DeferredSaleRebate.Status.DRAFT:
-        raise error("Only a draft rebate is discarded.", "يُلغى الإبراء المسودة فقط.", code="rebate_status")
+    if r.status not in (DeferredSaleRebate.Status.DRAFT, DeferredSaleRebate.Status.REJECTED):
+        raise error("Only a draft rebate, or one whose credit note was rejected, is discarded.",
+                    "يُلغى الإبراء المسودة، أو الذي رُفض إشعاره، فقط.", code="rebate_status")
     r.status, r.modified_by, r.modified_at = DeferredSaleRebate.Status.DISCARDED, user, _now()
     return _save(r)
 
@@ -6286,8 +6376,12 @@ def approve_deferred_sale_rebate(rebate, *, user):
     ``payroll.deferred_sale``; never the preparer or the employee) approves the rebate: invoicing issues the
     simplified credit note on the sale invoice (Dr 1241 / Dr 2200 / Cr 1240 on ZATCA reporting; never more than the
     profit not yet recognised) and the planned instalments are reduced by its gross (rebate + VAT), from the last one
-    back; an instalment reduced to nothing is removed. The price never increases (R48). Approving an approved rebate
-    again is allowed only after ZATCA rejected its credit note: invoicing issues a new one."""
+    back; an instalment reduced to nothing is removed. The price never increases (R48).
+
+    Review 2026-10-20b: invoicing accepts the call only inside :func:`invoicing_port.rebating` for this rebate and
+    this approver (finding 1). A rebate whose credit note ZATCA rejected is ``rejected`` (its instalments restored,
+    payroll and the approver alerted, :func:`_refresh_rebates`); it is approved again like a draft (a new credit
+    note, the instalments reduced again) or discarded (finding 2)."""
     r = DeferredSaleRebate.objects.select_related("entity", "contract").get(pk=rebate.pk)
     grant = _require(user, r.entity, "payroll.approve_deferred_sale", document=r.contract)
     approvals.check(grant, r.entity, "payroll.deferred_sale")
@@ -6302,22 +6396,21 @@ def approve_deferred_sale_rebate(rebate, *, user):
         raise error("The rebate credit note is issued by invoicing (R128), which is not available.",
                     "يصدر الإشعار الدائن للإبراء من الفوترة وهي غير متاحة.", code="invoicing_not_built")
     if r.status == DeferredSaleRebate.Status.APPROVED:
-        state = port.rebate_state(c, source_ref=_rebate_ref(r))
-        if state is None or state.status != "rejected":
+        _refresh_rebates(r.entity, only=r)  # a rejection not read yet: restore the instalments first
+        r = _lock(DeferredSaleRebate, r.pk)
+        if r.status == DeferredSaleRebate.Status.APPROVED:
             raise error("The rebate is approved and its credit note is live; it is approved again only after ZATCA "
                         "rejects the credit note.", "الإبراء معتمد وإشعاره قائم؛ ولا يُعتمد ثانية إلا بعد رفض الهيئة "
                         "للإشعار.", code="rebate_status")
-        result = port.create_bai_ajel_rebate(c, user=user, source_ref=_rebate_ref(r), amount=r.amount,
-                                             reason_ar=r.reason_ar, reason_en=r.reason_en)
-        r.credit_note_ref, r.modified_by, r.modified_at = result.document_ref, user, _now()
-        return _save(r)
-    if r.status != DeferredSaleRebate.Status.DRAFT:
-        raise error("Only a draft rebate is approved.", "يُعتمد الإبراء المسودة فقط.", code="rebate_status")
+    if r.status not in (DeferredSaleRebate.Status.DRAFT, DeferredSaleRebate.Status.REJECTED):
+        raise error("Only a draft rebate, or one whose credit note ZATCA rejected, is approved.",
+                    "يُعتمد الإبراء المسودة، أو الذي رفضت الهيئة إشعاره، فقط.", code="rebate_status")
     if c.status != DeferredSaleContract.Status.SOLD:
         raise error("A rebate is for a sold contract whose invoice is posted (R128).",
                     "يكون الإبراء لعقد مبيع رُحّلت فاتورته.", code="sale_status")
-    result = port.create_bai_ajel_rebate(c, user=user, source_ref=_rebate_ref(r), amount=r.amount,
-                                         reason_ar=r.reason_ar, reason_en=r.reason_en)
+    with invoicing_port.rebating(r, user):
+        result = port.create_bai_ajel_rebate(c, user=user, source_ref=_rebate_ref(r), amount=r.amount,
+                                             reason_ar=r.reason_ar, reason_en=r.reason_en)
     gross = _dec(result.net_amount, "net_amount") + _dec(result.vat_amount, "vat_amount")
     planned = list(DeferredSaleInstallment.objects.select_for_update().filter(
         contract=c, status=DeferredSaleInstallment.Status.PLANNED).order_by("-period", "-pk"))
@@ -6326,12 +6419,13 @@ def approve_deferred_sale_rebate(rebate, *, user):
                     "reduces what is still owed, it never pays money out (R128).",
                     f"الإبراء مع ضريبته ({gross}) أكبر من الأقساط المتبقية: الإبراء يخفض المتبقي ولا يُصرف نقدًا.",
                     code="rebate_too_large")
-    rest = gross
+    rest, cuts = gross, []
     for inst in planned:
         if rest <= 0:
             break
         cut = min(inst.amount, rest)
         rest -= cut
+        cuts.append({"period": inst.period, "amount": str(cut)})
         if cut == inst.amount:
             inst._service_delete = True
             inst.delete()
@@ -6339,6 +6433,7 @@ def approve_deferred_sale_rebate(rebate, *, user):
             inst.amount -= cut
             _save(inst)
     r.vat_amount, r.credit_note_ref = _dec(result.vat_amount, "vat_amount"), result.document_ref
+    r.credit_note_status, r.installment_cuts = str(getattr(result, "status", "") or "")[:10], cuts
     r.status, r.approved_by, r.approved_at = DeferredSaleRebate.Status.APPROVED, user, _now()
     _save(r)
     access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=r.entity,
@@ -6347,6 +6442,67 @@ def approve_deferred_sale_rebate(rebate, *, user):
                                  "amount": str(r.amount), "vat": str(r.vat_amount), "credit_note": r.credit_note_ref,
                                  "message_en": "Bai' ajel rebate (ibra') approved", "message_ar": "اعتُمد إبراء بيع آجل"})
     return r
+
+
+def _restore_rebate_cuts(r, c):
+    """Finding 2: give back the planned instalments a rebate's approval reduced (its credit note was rejected, so
+    nothing was waived): each cut goes back to the planned instalment of its period, or a planned instalment of that
+    period is recreated; a period already collected gets the amount in the period after the contract's last one."""
+    cuts = r.installment_cuts or [{"period": "", "amount": str(r.gross_amount)}]  # rows approved before 0018
+    for cut in sorted(cuts, key=lambda x: x["period"] or ""):
+        amount = Decimal(cut["amount"])
+        insts = DeferredSaleInstallment.objects.select_for_update().filter(contract=c)
+        inst = insts.filter(period=cut["period"], status=DeferredSaleInstallment.Status.PLANNED).order_by("pk").first() \
+            if cut["period"] else None
+        if inst is not None:
+            inst.amount += amount
+            _save(inst)
+            continue
+        done = insts.exclude(status=DeferredSaleInstallment.Status.PLANNED).order_by("-period") \
+            .values_list("period", flat=True).first()
+        last = insts.order_by("-period").values_list("period", flat=True).first() or c.first_period
+        period = cut["period"] if cut["period"] and (done is None or cut["period"] > done) else _next_period(last)
+        _save(DeferredSaleInstallment(entity=c.entity, contract=c, period=period, amount=amount))
+
+
+def _refresh_rebates(entity, only=None):
+    """Finding 2 (invoicing R128 as amended): read the credit note of every approved rebate not known final through
+    the port. Final: recorded. Rejected by ZATCA: nothing was waived, so the instalments are restored, the rebate
+    becomes ``rejected`` (approved again or discarded) and the payroll officers and the rebate's approver are
+    alerted. Called with the bai' ajel sale refresh (run calculation, final settlement, the daily alerts job) and by
+    the rebate approval. Returns the rebates found rejected."""
+    port = invoicing_port.get_port()
+    if not hasattr(port, "rebate_state"):
+        return []
+    qs = DeferredSaleRebate.objects.select_for_update().filter(entity=entity, status=DeferredSaleRebate.Status.APPROVED) \
+        .exclude(credit_note_status="final")
+    if only is not None:
+        qs = qs.filter(pk=only.pk)
+    out = []
+    for r in qs.order_by("pk"):
+        c = _lock(DeferredSaleContract, r.contract_id)
+        state = port.rebate_state(c, source_ref=_rebate_ref(r))
+        status = getattr(state, "status", "") if state is not None else ""
+        if status == "final":
+            r.credit_note_status = "final"
+            _save(r)
+        elif status == "rejected":
+            _restore_rebate_cuts(r, c)
+            r.status, r.credit_note_status = DeferredSaleRebate.Status.REJECTED, "rejected"
+            _save(r)
+            en = (f"ZATCA rejected credit note {r.credit_note_ref} of the bai' ajel rebate of contract {c.number}: "
+                  f"nothing was waived and the instalments were restored ({r.gross_amount}); approve the rebate "
+                  "again (a new credit note) or discard it (R128).")
+            ar = (f"رفضت الهيئة الإشعار الدائن {r.credit_note_ref} لإبراء عقد البيع الآجل {c.number}: لم يُبرأ من "
+                  f"شيء وأُعيدت الأقساط ({r.gross_amount})؛ اعتمد الإبراء مجددًا (إشعار جديد) أو ألغه.")
+            key = f"rebate:{r.pk}:{r.credit_note_ref}:rejected"[:120]
+            _send_alerts(entity, [(PayrollAlert.Kind.BAI_AJEL_REBATE, key, en, ar, ("payroll_officer",))])
+            if r.approved_by_id:
+                PayrollAlert.objects.get_or_create(entity=entity, recipient_id=r.approved_by_id,
+                                                   kind=PayrollAlert.Kind.BAI_AJEL_REBATE, key=key,
+                                                   defaults=dict(text_en=en, text_ar=ar))
+            out.append(r)
+    return out
 
 
 SALE_INVOICE_DELIVERY = {"printed": ("printed copy handed to the employee", "نسخة مطبوعة سُلّمت للموظف"),

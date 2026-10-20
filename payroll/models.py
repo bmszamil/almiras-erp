@@ -868,6 +868,10 @@ class DeferredSaleRebate(Tracked, ServiceWritten):
     class Status(models.TextChoices):
         DRAFT = "draft", bi("Draft", "مسودة")
         APPROVED = "approved", bi("Approved (credit note issued)", "معتمد (صدر الإشعار الدائن)")
+        # Review 2026-10-20b (finding 2): ZATCA rejected the credit note; the instalments were restored. Approved
+        # again (a new credit note, four eyes again) or discarded.
+        REJECTED = "rejected", bi("Credit note rejected: approve again or discard",
+                                  "رُفض الإشعار الدائن: يُعتمد مجددًا أو يُلغى")
         DISCARDED = "discarded", bi("Discarded", "ملغى")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
@@ -879,6 +883,10 @@ class DeferredSaleRebate(Tracked, ServiceWritten):
     reason_en = models.TextField(bi("Reason (English)", "السبب (بالإنجليزية)"), blank=True)
     request_ref = models.CharField(bi("Employee's written request", "طلب الموظف المكتوب"), max_length=200)
     credit_note_ref = models.CharField(bi("Credit note (invoicing)", "الإشعار الدائن"), max_length=60, blank=True)
+    # Review 2026-10-20b (finding 2): the credit note's state as last read through the port (issued, final,
+    # rejected) and the planned instalments the approval reduced ([{"period", "amount"}]), restored on a rejection.
+    credit_note_status = models.CharField(bi("Credit note status", "حالة الإشعار الدائن"), max_length=10, blank=True)
+    installment_cuts = models.JSONField(bi("Instalments reduced", "الأقساط المخفضة"), default=list, blank=True)
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     approved_by = _user("Approved by", "اعتمده")
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
@@ -887,7 +895,7 @@ class DeferredSaleRebate(Tracked, ServiceWritten):
         base_manager_name = "objects"
         verbose_name = bi("bai' ajel rebate (ibra')", "إبراء بيع آجل")
         verbose_name_plural = bi("bai' ajel rebates (ibra')", "إبراءات البيع الآجل")
-        constraints = [models.UniqueConstraint(fields=["contract"], condition=Q(status="draft"),
+        constraints = [models.UniqueConstraint(fields=["contract"], condition=Q(status__in=("draft", "rejected")),
                                                name="payroll_one_open_rebate")]
 
     @property
@@ -1101,6 +1109,11 @@ class PayrollPayment(Tracked, ServiceWritten):
     # Compliance B2, B3: per payee at approval: the gross remuneration this payment covers (the WHT base) and its WHT,
     # non-residents only (a person resident in KSA bears no WHT); the WHT return rows are these parts.
     wht_parts = models.JSONField(bi("WHT per payee", "ضريبة الاستقطاع لكل مستفيد"), default=list, blank=True)
+    # Review 2026-10-20b (finding 3): the payslips a run payment pays (named at recording; empty = every payslip of
+    # the run in the currency) and, at approval, what it paid on each ([{"payslip_id", "amount"}]). The WHT base of a
+    # remuneration payee is their gross in the share of their own net this payment paid.
+    payslip_ids = models.JSONField(bi("Payslips paid", "القسائم المدفوعة"), default=list, blank=True)
+    payslip_parts = models.JSONField(bi("Paid per payslip", "المدفوع لكل قسيمة"), default=list, blank=True)
     bank_reference = models.CharField(bi("Bank reference", "المرجع البنكي"), max_length=60, blank=True)
     # C-B7: e.g. a GOSI payment above the ERP contributions, up to the recorded GOSI invoice (difference flagged).
     warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
@@ -1224,6 +1237,8 @@ class PayrollAlert(models.Model):
                                                           "موعد المخالصة النهائية (المادة 88)")
         MATERNITY_DECIDED = "maternity_decided", bi("Maternity case decided: carried days to settle",
                                                     "قرار حالة الأمومة: أيام مرحّلة للتسوية")
+        BAI_AJEL_REBATE = "bai_ajel_rebate", bi("Bai' ajel rebate credit note rejected",
+                                                "رُفض الإشعار الدائن لإبراء بيع آجل")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="payroll_alerts",
