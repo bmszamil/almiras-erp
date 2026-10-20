@@ -111,6 +111,7 @@ def test_r90_only_the_posting_services_name_the_helper():
         path.relative_to(REPO).as_posix() for path in REPO.glob("*/**/*.py")
         if "_settlement_for_document" in path.read_text(encoding="utf-8")
         and not path.name.startswith("test_") and "migrations" not in path.parts
+        and not any(part.startswith(".") for part in path.relative_to(REPO).parts)
     )
     assert users == ["banking/services.py", "invoicing/services.py", "ledger/services.py"]
 
