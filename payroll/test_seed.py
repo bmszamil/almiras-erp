@@ -3,7 +3,7 @@ from datetime import date
 
 from core.access import catalogue
 from core.access.models import Role
-from core.access.seed import ROLE_SEED, ROLE_SEED_V12, ROLE_SEED_V13
+from core.access.seed import ROLE_SEED, ROLE_SEED_V12, ROLE_SEED_V13, ROLE_SEED_V14
 from hr.models import StatutoryParameter
 from ledger.models import Account
 from payroll import statutory_seed
@@ -31,7 +31,7 @@ def test_r68_only_sa_and_eg_are_active_and_egypt_rows_are_research(db):
 
 
 def test_v13_seed_payroll_rights(db):
-    assert ROLE_SEED is ROLE_SEED_V13
+    assert ROLE_SEED is ROLE_SEED_V14
     perms = {code: set(row[5]) for code, row in ROLE_SEED.items()}
     assert {c for c, p in perms.items() if "payroll.approve_run" in p} == {"hr_officer", "managing_partner"}
     assert {c for c, p in perms.items() if "payroll.approve_loan" in p} == {"managing_partner"}
@@ -41,6 +41,18 @@ def test_v13_seed_payroll_rights(db):
     assert not [c for c, p in catalogue.CATALOGUE.items() if c.startswith("payroll.") and p.agent_ok]  # R38
     assert "payroll.reverse_run" in catalogue.REVERSE_PERMISSIONS
     assert Role.objects.get(code="department_head").scope == "entity"
+
+
+def test_v14_seed_final_settlement_rights(db):
+    """C-A11: the payroll officer prepares final settlements; the approver approves (= posts) them, the MP as
+    fallback; the preparer never holds the approval."""
+    perms = {code: set(row[5]) for code, row in ROLE_SEED_V14.items()}
+    assert {c for c, p in perms.items() if "payroll.prepare_final_settlement" in p} == {"payroll_officer"}
+    assert {c for c, p in perms.items() if "payroll.approve_final_settlement" in p} == {"approver", "managing_partner"}
+    flags = catalogue.get("payroll.approve_final_settlement").flags
+    assert catalogue.APPROVAL in flags and catalogue.POSTS in flags
+    assert set(Role.objects.get(code="approver").permission_rows.values_list("codename", flat=True)) >= {
+        "payroll.approve_final_settlement"}
 
 
 def test_approved_payroll_accounts_in_new_charts(db):

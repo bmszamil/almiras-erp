@@ -287,6 +287,9 @@ class PayrollInput(Tracked, ServiceWritten):
     # inputs of its period or earlier that no approved run has taken yet.
     taken_run = models.ForeignKey("PayrollRun", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
                                   verbose_name=bi("Taken by run", "أخذه المسير"))
+    final_settlement = models.ForeignKey("FinalSettlement", null=True, blank=True, on_delete=models.PROTECT,
+                                         related_name="+", verbose_name=bi("Taken by final settlement",
+                                                                           "أخذته المخالصة النهائية"))
 
     class Meta:
         base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
@@ -803,6 +806,8 @@ class DeferredSaleInstallment(ServiceWritten):
     class Status(models.TextChoices):
         PLANNED = "planned", bi("Planned", "مخطط")
         DEDUCTED = "deducted", bi("Deducted", "مستقطع")
+        SETTLED_IN_FINAL = "settled_in_final", bi("Settled in the final settlement", "سُدد في المخالصة النهائية")
+        OUTSTANDING_AFTER_EXIT = "outstanding_after_exit", bi("Outstanding after exit", "قائم بعد انتهاء الخدمة")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     contract = models.ForeignKey(DeferredSaleContract, on_delete=models.PROTECT, related_name="installments",
@@ -810,7 +815,7 @@ class DeferredSaleInstallment(ServiceWritten):
     period = models.CharField(bi("Period", "الفترة"), max_length=7)
     amount = _money("Amount", "المبلغ")
     deducted_amount = _money("Deducted", "المستقطع", default=ZERO)
-    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.PLANNED)
+    status = models.CharField(bi("Status", "الحالة"), max_length=24, choices=Status.choices, default=Status.PLANNED)
     run = models.ForeignKey(PayrollRun, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
                             verbose_name=bi("Run", "المسير"))
     carried_from = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
@@ -823,6 +828,142 @@ class DeferredSaleInstallment(ServiceWritten):
         ordering = ["contract", "period", "id"]
 
 
+# --- final settlement (3.8; R28, R34, R49; E5; compliance C-A11, review 14) ---------------------------------
+
+class FinalSettlement(Tracked, ServiceWritten):
+    """[Reg] The leaver's final settlement (R34, E5): salary to the last working day net of what the runs paid, leave
+    encashment, the EOSB award (hr snapshot), notice pay, a separate settlement (mutual agreement), GOSI of the leaving
+    month on days of service (Regs Art. 20(2)), loan and bai' ajel recovery from the final dues without the monthly
+    caps (P17), due within 7 days, or 14 when the worker ended the contract (Labour Law Art. 88). Drafted by hr's
+    termination approval (hr R38) through ``payroll.hr_port``."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", bi("Draft", "مسودة")
+        CALCULATED = "calculated", bi("Calculated", "محتسبة")
+        SUBMITTED = "submitted", bi("Submitted", "مقدّمة")
+        RETURNED = "returned", bi("Returned", "معادة")
+        APPROVED = "approved", bi("Approved and posted", "معتمدة ومرحّلة")
+        PAID = "paid", bi("Paid", "مدفوعة")
+        DISCARDED = "discarded", bi("Discarded (termination withdrawn)", "ملغاة (سُحب إنهاء الخدمة)")
+
+    TRANSITIONS = frozenset({
+        ("draft", "calculated"), ("calculated", "calculated"), ("calculated", "submitted"), ("submitted", "returned"),
+        ("returned", "calculated"), ("submitted", "approved"), ("approved", "paid"), ("draft", "draft"),
+        ("calculated", "draft"), ("returned", "draft"), ("draft", "discarded"), ("calculated", "discarded"),
+        ("returned", "discarded"), ("submitted", "discarded"),
+    })
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    employee = models.ForeignKey("hr.Employee", on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Employee", "الموظف"))
+    termination = models.OneToOneField("hr.Termination", on_delete=models.PROTECT, related_name="payroll_settlement",
+                                       verbose_name=bi("Termination", "إنهاء الخدمة"))
+    settlement_input = models.ForeignKey("hr.FinalSettlementInput", on_delete=models.PROTECT, related_name="+",
+                                         verbose_name=bi("HR settlement input", "مدخلات المخالصة من الموارد البشرية"))
+    eosb_calculation = models.ForeignKey("hr.EosbCalculation", null=True, blank=True, on_delete=models.PROTECT,
+                                         related_name="+", verbose_name=bi("EOSB calculation", "حساب المكافأة"))
+    number = models.CharField(bi("Number", "الرقم"), max_length=40, blank=True)
+    kind = models.CharField(bi("Termination kind", "نوع الإنهاء"), max_length=30)
+    last_working_day = models.DateField(bi("Last working day", "آخر يوم عمل"))
+    period = models.CharField(bi("Leaving month", "شهر الترك"), max_length=7)
+    worker_initiated = models.BooleanField(bi("Ended by the worker", "أنهاه العامل"), default=False)
+    due_date = models.DateField(bi("Due by (Art. 88)", "موعد السداد (المادة 88)"), null=True, blank=True)
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    gross = _money("Gross", "الإجمالي", default=ZERO)
+    total_deductions = _money("Deductions", "الاستقطاعات", default=ZERO)
+    net = _money("Net", "الصافي", default=ZERO)
+    eosb_award = _money("EOSB award", "مكافأة نهاية الخدمة", default=ZERO)
+    eosb_provision_balance = _money("EOSB provision balance used", "رصيد مخصص المكافأة المستخدم", default=ZERO)
+    separate_settlement_amount = _money("Separate settlement (mutual agreement)", "تسوية منفصلة (اتفاق الطرفين)",
+                                        default=ZERO)
+    written_consent_ref = models.CharField(bi("Written consent to the separate settlement", "الموافقة الكتابية على التسوية"),
+                                           max_length=200, blank=True)
+    input_ids = models.JSONField(bi("Inputs taken", "المدخلات المأخوذة"), default=list, blank=True)
+    warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
+    notes = models.JSONField(bi("Notes", "ملاحظات"), default=list, blank=True)
+    calc_version = models.PositiveIntegerField(bi("Calculation version", "نسخة الاحتساب"), default=0)
+    inputs_hash = models.CharField(bi("Calculation fingerprint", "بصمة الاحتساب"), max_length=64, blank=True)
+    stored_hash = models.CharField(bi("Stored lines hash", "بصمة البنود المخزنة"), max_length=64, blank=True)
+    calculated_by = _user("Calculated by", "احتسبها")
+    calculated_at = models.DateTimeField(bi("Calculated at", "تاريخ الاحتساب"), null=True, blank=True)
+    submitted_by = _user("Submitted by", "قدّمها")
+    submitted_at = models.DateTimeField(bi("Submitted at", "تاريخ التقديم"), null=True, blank=True)
+    approved_by = _user("Approved by", "اعتمدها")
+    approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+    returned_reason_ar = models.TextField(bi("Return reason (Arabic)", "سبب الإعادة (بالعربية)"), blank=True)
+    journal_entry = models.OneToOneField("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                         related_name="+", verbose_name=bi("Journal entry", "القيد"))
+
+    class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
+        verbose_name = bi("final settlement", "مخالصة نهائية")
+        verbose_name_plural = bi("final settlements", "المخالصات النهائية")
+        constraints = [models.UniqueConstraint(fields=["entity", "number"], condition=~Q(number=""),
+                                               name="payroll_settlement_number")]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self)._base_manager.filter(pk=self.pk).values_list("status", flat=True).first()
+            if stored is not None and stored != self.status and (stored, self.status) not in self.TRANSITIONS:
+                raise error(f"A final settlement does not move from {stored} to {self.status}.",
+                            f"لا تنتقل المخالصة النهائية من {stored} إلى {self.status}.", code="settlement_status")
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.number or f"{self.employee.employee_code} final settlement ({self.status})"
+
+
+class FinalSettlementLine(ServiceWritten):
+    class LineType(models.TextChoices):
+        SALARY_TO_LAST_DAY = "salary_to_last_day", bi("Salary to the last working day", "الأجر حتى آخر يوم عمل")
+        RETRO = "retro", bi("Earlier months (retro)", "أشهر سابقة (بأثر رجعي)")
+        SALARY_REDUCTION = "salary_reduction", bi("Unpaid, sick or maternity reduction", "تخفيض بدون أجر أو مرضي أو أمومة")
+        LEAVE_ENCASHMENT = "leave_encashment", bi("Leave encashment (Art. 111)", "بدل الإجازة (المادة 111)")
+        EOSB = "eosb", bi("End-of-service award", "مكافأة نهاية الخدمة")
+        NOTICE_PAY = "notice_pay", bi("Notice pay (Art. 76)", "بدل الإشعار (المادة 76)")
+        SEPARATE_SETTLEMENT = "separate_settlement", bi("Separate settlement (mutual agreement)", "تسوية منفصلة (اتفاق الطرفين)")
+        OTHER_EARNING = "other_earning", bi("Other earning", "استحقاق آخر")
+        LOAN_RECOVERY = "loan_recovery", bi("Interest-free loan recovered", "استرداد القرض الحسن")
+        DEFERRED_SALE_RECOVERY = "deferred_sale_recovery", bi("Bai' ajel balance recovered", "استرداد رصيد البيع الآجل")
+        GOSI_RECOVERY = "gosi_recovery", bi("GOSI share recovered", "استرداد حصة التأمينات")
+        EMPLOYEE_GOSI = "employee_gosi", bi("Employee GOSI", "حصة الموظف في التأمينات")
+        OTHER_DEDUCTION = "other_deduction", bi("Other deduction", "استقطاع آخر")
+        EMPLOYER_GOSI = "employer_gosi", bi("Employer GOSI", "حصة صاحب العمل في التأمينات")
+        GOSI_UNCOLLECTED = "gosi_uncollected", bi("Employee GOSI share advanced by the employer",
+                                                  "حصة الموظف في التأمينات المدفوعة عنه مقدمًا")
+
+    EARNINGS = frozenset({"salary_to_last_day", "retro", "leave_encashment", "eosb", "notice_pay",
+                          "separate_settlement", "other_earning"})
+    REDUCTIONS = frozenset({"salary_reduction"})
+    DEDUCTIONS = frozenset({"loan_recovery", "deferred_sale_recovery", "gosi_recovery", "employee_gosi",
+                            "other_deduction"})
+    EMPLOYER = frozenset({"employer_gosi", "gosi_uncollected"})
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    settlement = models.ForeignKey(FinalSettlement, on_delete=models.PROTECT, related_name="lines",
+                                   verbose_name=bi("Final settlement", "المخالصة النهائية"))
+    line_type = models.CharField(bi("Line type", "نوع البند"), max_length=24, choices=LineType.choices)
+    component = models.ForeignKey("hr.SalaryComponent", null=True, blank=True, on_delete=models.PROTECT,
+                                  related_name="+", verbose_name=bi("Component", "المكوّن"))
+    gosi_branch = models.CharField(bi("GOSI branch", "فرع التأمينات"), max_length=24, blank=True)
+    quantity = models.DecimalField(bi("Quantity", "الكمية"), max_digits=10, decimal_places=2, null=True, blank=True)
+    rate = models.DecimalField(bi("Rate", "المعدل"), max_digits=12, decimal_places=4, null=True, blank=True)
+    amount = _money("Amount", "المبلغ")
+    account = models.ForeignKey("ledger.Account", on_delete=models.PROTECT, related_name="+",
+                                verbose_name=bi("Account", "الحساب"))
+    description_en = models.CharField(bi("Description (English)", "الوصف (بالإنجليزية)"), max_length=300)
+    description_ar = models.CharField(bi("Description (Arabic)", "الوصف (بالعربية)"), max_length=300)
+    source_ref = models.CharField(bi("Source", "المصدر"), max_length=80, blank=True)
+    origin_period = models.CharField(bi("Period of origin", "فترة المنشأ"), max_length=7, blank=True)
+
+    class Meta:
+        base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
+        verbose_name = bi("final settlement line", "بند المخالصة النهائية")
+        verbose_name_plural = bi("final settlement lines", "بنود المخالصات النهائية")
+        ordering = ["settlement", "id"]
+        constraints = [models.CheckConstraint(condition=Q(amount__gte=0), name="payroll_settlement_line_positive")]
+
+
 # --- payments (3.7) --------------------------------------------------------------------------------
 
 class PayrollPayment(Tracked, ServiceWritten):
@@ -831,6 +972,7 @@ class PayrollPayment(Tracked, ServiceWritten):
     class Kind(models.TextChoices):
         NET_SALARIES = "net_salaries", bi("Net salaries", "صافي الرواتب")
         GOSI = "gosi", bi("GOSI contributions", "اشتراكات التأمينات")
+        FINAL_SETTLEMENT = "final_settlement", bi("Final settlement", "المخالصة النهائية")
 
     class Status(models.TextChoices):
         DRAFT = "draft", bi("Draft", "مسودة")
@@ -838,10 +980,13 @@ class PayrollPayment(Tracked, ServiceWritten):
         APPROVED = "approved", bi("Approved and posted", "معتمد ومرحّل")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
-    kind = models.CharField(bi("Kind", "النوع"), max_length=14, choices=Kind.choices)
+    kind = models.CharField(bi("Kind", "النوع"), max_length=20, choices=Kind.choices)
     run = models.ForeignKey(PayrollRun, null=True, blank=True, on_delete=models.PROTECT, related_name="payments",
                             verbose_name=bi("Run", "المسير"))
     gosi_period = models.CharField(bi("GOSI period", "فترة التأمينات"), max_length=7, blank=True)
+    final_settlement = models.ForeignKey("FinalSettlement", null=True, blank=True, on_delete=models.PROTECT,
+                                         related_name="payments", verbose_name=bi("Final settlement",
+                                                                                  "المخالصة النهائية"))
     payment_date = models.DateField(bi("Payment date", "تاريخ الدفع"))
     bank_account = models.ForeignKey("ledger.Account", on_delete=models.PROTECT, related_name="+",
                                      verbose_name=bi("Bank account", "الحساب البنكي"))
@@ -965,6 +1110,8 @@ class PayrollAlert(models.Model):
         GOSI_PAYMENT = "gosi_payment", bi("GOSI payment due", "موعد سداد التأمينات")
         RETENTION = "retention", bi("Retention review", "مراجعة الحفظ")
         LEAVE_ADVANCE = "leave_advance", bi("Annual leave pay due in advance", "أجر إجازة سنوية مستحق مقدمًا")
+        FINAL_SETTLEMENT_DUE = "final_settlement_due", bi("Final settlement due (Art. 88)",
+                                                          "موعد المخالصة النهائية (المادة 88)")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="payroll_alerts",

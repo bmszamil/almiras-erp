@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from types import SimpleNamespace
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
 
@@ -50,6 +51,8 @@ from .models import (
     DeferredSaleInstallment,
     EmployeeLoan,
     EosbProvisionEntry,
+    FinalSettlement,
+    FinalSettlementLine,
     GosiAbroadPeriod,
     GosiCatchUpNotice,
     GosiReconciliation,
@@ -1338,7 +1341,8 @@ def _employee_inputs(ctx, emp, *, every_period=False):
     """Review 9: approved inputs not yet taken by an approved run (or a final settlement) whose paid-in period is the
     run's period or earlier: an input approved after its period's run was approved goes to the next run. A final
     settlement takes every approved input not yet taken."""
-    qs = PayrollInput.objects.filter(employee=emp, status=IS.APPROVED, taken_run__isnull=True)
+    qs = PayrollInput.objects.filter(employee=emp, status=IS.APPROVED, taken_run__isnull=True,
+                                     final_settlement__isnull=True)
     if not every_period:
         qs = qs.filter(payroll_period__lte=ctx.period)
     return list(qs.select_related("component", "component__expense_account").order_by("id"))
@@ -1819,6 +1823,11 @@ def _gosi_for_period(ctx, slip, emp, info, nclass):
             delta = wage - _covered_gosi_wage(emp, ctx.period, booked, branch, bool(er))
             if delta > 0:
                 branches.append((branch, delta, ee, er))
+            elif delta < 0:  # e.g. a full month booked for a leaver: GOSI collects the leaving month on days (R66)
+                slip.warn(f"GOSI {branch} was booked for {ctx.period} on {-delta} more wage than is due now: correct it "
+                          "with GOSI and the GOSI reconciliation (R23).",
+                          f"قُيدت اشتراكات {branch} عن {ctx.period} على أجر يزيد {-delta} على المستحق الآن: يُصحح مع "
+                          "التأمينات وفي مطابقة التأمينات.")
         g.branches = branches
         slip.gosi_wage = max((w_ for _, w_, _, _ in branches), default=ZERO)
     slip.lines.extend(_gosi_lines(ctx, slip, g))
@@ -2933,6 +2942,477 @@ def approve_deferred_sale(contract, *, user, sale_date=None):
 
 
 # =====================================================================================================
+# Final settlement (3.8; R28, R34, R49; E5; compliance C-A11, review 14)
+# =====================================================================================================
+
+FS = FinalSettlement
+FSL = FinalSettlementLine.LineType
+FSS = FinalSettlement.Status
+SLIP_TO_FS = {
+    LT.EARNING: FSL.SALARY_TO_LAST_DAY, LT.RETRO: FSL.RETRO, LT.MATERNITY_TOP_UP: FSL.OTHER_EARNING,
+    LT.OVERTIME: FSL.OTHER_EARNING, LT.ONE_OFF_EARNING: FSL.OTHER_EARNING, LT.BONUS: FSL.OTHER_EARNING,
+    LT.MATERNITY_SUPPORT: FSL.OTHER_EARNING, LT.UNPAID_DEDUCTION: FSL.SALARY_REDUCTION,
+    LT.SICK_DEDUCTION: FSL.SALARY_REDUCTION, LT.MATERNITY_SUSPENDED: FSL.SALARY_REDUCTION,
+    LT.DEDUCTION: FSL.OTHER_DEDUCTION, LT.EMPLOYEE_GOSI: FSL.EMPLOYEE_GOSI, LT.EMPLOYER_GOSI: FSL.EMPLOYER_GOSI,
+    LT.GOSI_CATCH_UP: FSL.GOSI_RECOVERY, LT.GOSI_UNCOLLECTED: FSL.GOSI_UNCOLLECTED,
+}
+
+
+def _settlement_draft(settlement_input, user):
+    """hr R38 hand-off (``payroll.hr_port``): the final settlement draft of a KSA employee's approved termination,
+    inside hr's approval transaction (no right of its own: hr checked ``hr.approve_termination``). A recalculated
+    EOSB (hr R40) points the open draft at the new input. Remuneration staff have no statutory settlement (H17): their
+    last month is paid by the run."""
+    si = settlement_input
+    if not si.includes_statutory_lines or PayrollSettings.objects.filter(entity=si.entity).first() is None:
+        return None
+    t = si.termination
+    fs = FS._base_manager.select_for_update().filter(termination=t).first()
+    if fs is not None and fs.status not in (FSS.DRAFT, FSS.CALCULATED, FSS.RETURNED):
+        raise error("The final settlement is already submitted or approved (R40).",
+                    "المخالصة النهائية مقدّمة أو معتمدة.", code="settlement_status")
+    if fs is None:
+        # The draft originates from the HR termination record: its drafter is the creator, so the termination's
+        # approver (often the CFO, hr OQ-3) may still approve the settlement (access R35).
+        fs = FS(entity=si.entity, employee=si.employee, termination=t, created_by=t.created_by)
+    else:
+        _clear_settlement_lines(fs)
+        fs.modified_by, fs.modified_at = user, _now()
+    fs.settlement_input, fs.eosb_calculation, fs.kind = si, si.eosb_calculation, t.kind
+    fs.last_working_day, fs.period = si.last_working_day, _period_of(si.last_working_day)
+    fs.worker_initiated, fs.due_date, fs.status = si.worker_initiated, si.due_by, FSS.DRAFT
+    fs.inputs_hash = fs.stored_hash = ""
+    return _save(fs)
+
+
+def _discard_settlement(termination, user):
+    """hr R41 hand-off: a withdrawn termination discards the open settlement."""
+    fs = FS._base_manager.select_for_update().filter(termination=termination).first()
+    if fs is None or fs.status == FSS.DISCARDED:
+        return None
+    if fs.status not in (FSS.DRAFT, FSS.CALCULATED, FSS.RETURNED, FSS.SUBMITTED):
+        raise error("An approved final settlement is never discarded (R41).", "لا تُلغى المخالصة النهائية المعتمدة.",
+                    code="settlement_status")
+    fs.status, fs.modified_by, fs.modified_at = FSS.DISCARDED, user, _now()
+    _save(fs)
+    _clear_settlement_lines(fs)  # after the status: the PostgreSQL trigger keeps a submitted settlement's lines
+    return fs
+
+
+def _clear_settlement_lines(fs):
+    for line in FinalSettlementLine.objects.filter(settlement=fs):
+        line._service_delete = True
+        line.delete()
+
+
+def _settlement_approved(termination):
+    """hr R40, R41: True once the final settlement of ``termination`` is approved (or paid)."""
+    return FS.objects.filter(termination=termination, status__in=(FSS.APPROVED, FSS.PAID)).exists()
+
+
+@dataclass
+class SLine:
+    line_type: str
+    amount: Decimal
+    account: object
+    desc_en: str
+    desc_ar: str
+    component: object = None
+    branch: str = ""
+    quantity: Decimal = None
+    rate: Decimal = None
+    source_ref: str = ""
+    origin_period: str = ""
+
+
+@dataclass
+class Settlement:
+    lines: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+    input_ids: list = field(default_factory=list)
+    notices: list = field(default_factory=list)
+    loan_effects: list = field(default_factory=list)  # [(installment pk, amount)]
+    sale_effects: list = field(default_factory=list)
+    sale_outstanding: list = field(default_factory=list)  # installment pks left after exit
+    eosb_award: Decimal = ZERO
+    provision: Decimal = ZERO
+    eosb_calc_id: int = None
+
+    def total(self, kinds):
+        return sum((l.amount for l in self.lines if l.line_type in kinds), ZERO)
+
+    def warn(self, en, ar):
+        text = f"{en} / {ar}"
+        if text not in self.warnings:
+            self.warnings.append(text)
+
+
+def _settlement_ctx(fs, user, s):
+    run = SimpleNamespace(entity=fs.entity, period=fs.period, kind="final_settlement", purpose="",
+                          payroll_group=PayrollGroup.IN_COUNTRY, entry_date=fs.last_working_day)
+    return Ctx(run, user, s)
+
+
+def _latest_eosb(fs):
+    from hr.models import EosbCalculation
+    return (EosbCalculation.objects.filter(termination=fs.termination, superseded_by__isnull=True, voided=False)
+            .order_by("-id").first())
+
+
+def _settlement_input_now(fs):
+    from hr.models import FinalSettlementInput
+    return (FinalSettlementInput.objects.filter(termination=fs.termination, status=FinalSettlementInput.Status.DRAFT)
+            .order_by("-id").first())
+
+
+def _compute_settlement(fs, user, *, separate_amount, consent_ref):
+    """C-A11 (R28, R34, R49, E5): every line of the final settlement, in memory (deterministic)."""
+    s = _jurisdiction_gate(fs.entity, hr.ParamUse())
+    ctx = _settlement_ctx(fs, user, s)
+    emp = Employee.objects.get(pk=fs.employee_id)
+    si = _settlement_input_now(fs)
+    out = Settlement()
+    if si is None:
+        raise error("HR has no current settlement input for this termination.",
+                    "لا توجد مدخلات مخالصة حالية من الموارد البشرية لهذا الإنهاء.", code="settlement_input")
+    versions = _versions(emp)
+    info = _employment(emp, fs.period, s, versions)
+    # 1. Salary to the last working day, earlier months, GOSI of the leaving month on days of service (Regs Art.
+    #    20(2)), every approved input not yet taken; net of what the runs paid (final mode of _calc_ksa).
+    if info is not None:
+        slip = _calc_ksa(ctx, emp, versions, info, mode="final")
+        if slip.refusal:
+            raise error(slip.refusal.split(" / ")[0], slip.refusal.split(" / ")[-1], code="settlement_refused")
+        out.warnings.extend(slip.warnings)
+        out.notes.extend(slip.notes)
+        out.input_ids = list(slip.input_ids)
+        out.notices = list(slip.notices)
+        for l in slip.lines:
+            if l.line_type not in SLIP_TO_FS:
+                continue
+            ltype = SLIP_TO_FS[l.line_type]
+            if l.line_type == LT.RETRO and not l.origin_period:  # a release in the leaving month itself
+                ltype = FSL.SALARY_TO_LAST_DAY
+            out.lines.append(SLine(ltype, l.amount, l.account, l.desc_en, l.desc_ar, component=l.component,
+                                   branch=l.branch, quantity=l.quantity, rate=l.rate, source_ref=l.source_ref,
+                                   origin_period=l.origin_period))
+    salaries = ctx.account(SALARIES)
+    # 2. Leave encashment (Art. 111: balance x actual daily wage / 30, from hr).
+    if si.leave_encashment > 0:
+        out.lines.append(SLine(FSL.LEAVE_ENCASHMENT, si.leave_encashment, salaries,
+                               f"Leave encashment {si.leave_balance_days} days (Art. 111)",
+                               f"بدل الإجازة {si.leave_balance_days} يوم (المادة 111)", quantity=si.leave_balance_days,
+                               rate=si.daily_wage))
+    # 3. Notice pay when the employer gave short notice (Art. 76); a worker's short notice is not deducted (Art. 92).
+    if si.notice_shortfall_days:
+        if not si.worker_initiated:
+            amount = _round(Fraction(si.daily_wage) * si.notice_shortfall_days)
+            out.lines.append(SLine(FSL.NOTICE_PAY, amount, salaries,
+                                   f"Notice pay {si.notice_shortfall_days} days (Art. 76)",
+                                   f"بدل الإشعار {si.notice_shortfall_days} يوم (المادة 76)",
+                                   quantity=Decimal(si.notice_shortfall_days), rate=si.daily_wage))
+        else:
+            out.warn(f"The worker gave {si.notice_shortfall_days} days' short notice: not deducted without written "
+                     "consent or a judgment (Art. 92).", f"قصّر العامل في الإشعار {si.notice_shortfall_days} يومًا: لا "
+                     "يُستقطع دون موافقة كتابية أو حكم (المادة 92).")
+    if si.art77_compensation > 0:
+        out.lines.append(SLine(FSL.OTHER_EARNING, si.art77_compensation, salaries, "Compensation (Art. 77)",
+                               "التعويض (المادة 77)"))
+    # 4. EOSB: the hr snapshot award (R39, R40); charged to the employee's provision first (E5).
+    eosb = _latest_eosb(fs)
+    if eosb is not None and eosb.award > 0:
+        out.eosb_award, out.eosb_calc_id = eosb.award, eosb.pk
+        out.lines.append(SLine(FSL.EOSB, eosb.award, ctx.account(EOSB_PROVISION),
+                               f"End-of-service award ({eosb.fraction_text} of {eosb.full_award})",
+                               f"مكافأة نهاية الخدمة ({eosb.fraction_text} من {eosb.full_award})"))
+    elif eosb is not None:
+        out.eosb_calc_id = eosb.pk
+    out.provision = EosbProvisionEntry.objects.filter(employee=emp).aggregate(t=Sum("amount"))["t"] or ZERO
+    # 5. Separate settlement above the statutory award (mutual agreement, P19(i); Art. 8): never part of the EOSB.
+    if separate_amount:
+        if fs.kind != Termination.Kind.MUTUAL_AGREEMENT or not (consent_ref or "").strip():
+            raise error("A separate settlement is for a mutual agreement, with the worker's written consent (R34, "
+                        "P19(i)).", "التسوية المنفصلة لاتفاق الطرفين مع موافقة العامل الكتابية.", code="separate_settlement")
+        out.lines.append(SLine(FSL.SEPARATE_SETTLEMENT, separate_amount, salaries,
+                               f"Separate settlement (mutual agreement, consent {consent_ref})",
+                               f"تسوية منفصلة (اتفاق الطرفين، الموافقة {consent_ref})", source_ref=consent_ref[:80]))
+    # 6. Recoveries from the final dues, without the monthly 10% / 50% caps (P17, R28, R49).
+    earnings = out.total(FinalSettlementLine.EARNINGS) - out.total(FinalSettlementLine.REDUCTIONS)
+    fixed = out.total(FinalSettlementLine.DEDUCTIONS)
+    overpaid = [l for l in out.lines if l.source_ref.startswith("overpaid:")]
+    if earnings - fixed < 0 and overpaid:  # salary paid beyond the last day: recovered only up to the dues
+        excess = fixed - earnings
+        for l in overpaid:
+            cut = min(l.amount, excess)
+            l.amount -= cut
+            excess -= cut
+            out.warn(f"{cut} of the salary paid beyond the last working day is not covered by the final dues: recover "
+                     "it separately.", f"{cut} من الأجر المدفوع بعد آخر يوم عمل لا تغطيه المستحقات النهائية: يُسترد "
+                     "بشكل منفصل.")
+        out.lines = [l for l in out.lines if l.amount > 0]
+        fixed = out.total(FinalSettlementLine.DEDUCTIONS)
+    room = earnings - fixed
+    if room < 0:
+        raise error(f"The deductions ({fixed}) exceed the final dues ({earnings}).",
+                    f"الاستقطاعات ({fixed}) تتجاوز المستحقات النهائية ({earnings}).", code="settlement_negative")
+    eosb_part = out.eosb_award
+    allowed = bool(getattr(django_settings, "PAYROLL_EOSB_DEDUCTION_ALLOWED", True))
+    room_non_eosb = max(ZERO, room - eosb_part)
+    loan_room = room if allowed else room_non_eosb
+    for loan in EmployeeLoan.objects.filter(employee=emp, status=EmployeeLoan.Status.ACTIVE).order_by("pk"):
+        outstanding = _loan_outstanding_of(loan)
+        take = min(outstanding, loan_room)
+        if take > 0:
+            out.lines.append(SLine(FSL.LOAN_RECOVERY, take, ctx.account(LOANS),
+                                   f"{INTEREST_FREE[0]} {loan.number} recovered from the final dues",
+                                   f"{INTEREST_FREE[1]} {loan.number} مسترد من المستحقات النهائية",
+                                   source_ref=f"loan:{loan.pk}"))
+            rest = take
+            for inst in loan.installments.filter(status=LoanInstallment.Status.PLANNED).order_by("period", "pk"):
+                part = min(inst.amount, rest)
+                out.loan_effects.append((inst.pk, part))
+                rest -= part
+            loan_room -= take
+            room -= take
+        if outstanding > take:
+            out.warn(f"Loan {loan.number}: {outstanding - take} not covered by the final dues"
+                     f"{'' if allowed else ' other than the EOSB (PAYROLL_EOSB_DEDUCTION_ALLOWED off)'}; a write-off "
+                     "needs a decision and account (OQ-7), refused until then.",
+                     f"القرض {loan.number}: {outstanding - take} لا تغطيه المستحقات النهائية؛ يحتاج الشطب إلى قرار "
+                     "وحساب ولا يُقبل حتى ذلك.")
+    for c in DeferredSaleContract.objects.filter(employee=emp, status=DeferredSaleContract.Status.SOLD).order_by("pk"):
+        planned = list(c.installments.filter(status=DeferredSaleInstallment.Status.PLANNED).order_by("period", "pk"))
+        outstanding = sum((i.amount for i in planned), ZERO)
+        sale_room = room if (allowed and c.final_dues_undertaking) else min(room, max(ZERO, room - eosb_part))
+        take = min(outstanding, sale_room)
+        rest = take
+        for inst in planned:
+            part = min(inst.amount, rest)
+            if part > 0:
+                out.sale_effects.append((inst.pk, part))
+            if part < inst.amount:
+                out.sale_outstanding.append(inst.pk)
+            rest -= part
+        if take > 0:
+            out.lines.append(SLine(FSL.DEFERRED_SALE_RECOVERY, take, ctx.account(BAI_AJEL),
+                                   f"Bai' ajel {c.number} balance recovered from the final dues (no increase)",
+                                   f"رصيد البيع الآجل {c.number} مسترد من المستحقات النهائية (دون زيادة)",
+                                   source_ref=f"sale:{c.pk}"))
+            room -= take
+        if outstanding > take:
+            out.warn(f"Bai' ajel {c.number}: {outstanding - take} stays on 1240 as outstanding after exit"
+                     f"{'' if c.final_dues_undertaking else ' (no final-dues undertaking: EOSB not used)'} (R49).",
+                     f"البيع الآجل {c.number}: يبقى {outstanding - take} على الحساب 1240 قائمًا بعد انتهاء الخدمة.")
+    return out
+
+
+def _settlement_fingerprint(fs, out):
+    def line(l):
+        return [l.line_type, str(l.amount), l.account.code, l.component.pk if l.component else None, l.branch,
+                str(l.quantity), str(l.rate), l.source_ref, l.origin_period]
+    data = [fs.settlement_input_id, out.eosb_calc_id, str(out.eosb_award), str(out.provision), [line(l) for l in out.lines],
+            sorted(out.loan_effects), sorted(out.sale_effects), sorted(out.sale_outstanding), sorted(out.input_ids),
+            sorted(out.notices)]
+    return hashlib.sha256(json.dumps(data, default=str).encode()).hexdigest()
+
+
+def _settlement_stored_hash(fs):
+    names = [f.attname for f in FinalSettlementLine._meta.concrete_fields]
+    rows = [[str(r[n]) for n in names] for r in FinalSettlementLine._base_manager.filter(settlement=fs)
+            .order_by("pk").values(*names)]
+    return hashlib.sha256(json.dumps(rows, default=str).encode()).hexdigest()
+
+
+@transaction.atomic
+def prepare_final_settlement(settlement, *, user, separate_settlement_amount=None, written_consent_ref=""):
+    """C-A11 (R34, E5): calculate the final settlement (``payroll.prepare_final_settlement``): salary to the last
+    working day net of what the runs paid, earlier months re-examined, leave encashment, EOSB award, notice pay, a
+    separate settlement for a mutual agreement (with the written consent), GOSI of the leaving month on days of
+    service, and loan and bai' ajel recovery from the final dues without the monthly caps (P17). Replaces the lines."""
+    fs = _lock(FS, settlement.pk)
+    _require(user, fs.entity, "payroll.prepare_final_settlement")
+    if fs.status not in (FSS.DRAFT, FSS.CALCULATED, FSS.RETURNED):
+        raise error(f"A {fs.status} final settlement is not recalculated.", f"لا يُعاد احتساب مخالصة بحالة {fs.status}.",
+                    code="settlement_status")
+    separate = _dec(separate_settlement_amount, "separate_settlement_amount") if separate_settlement_amount else ZERO
+    if separate < 0:
+        raise error("The separate settlement is zero or more.", "التسوية المنفصلة صفر أو أكثر.", code="separate_settlement")
+    out = _compute_settlement(fs, user, separate_amount=separate, consent_ref=written_consent_ref)
+    _clear_settlement_lines(fs)
+    for l in out.lines:
+        _save(FinalSettlementLine(entity=fs.entity, settlement=fs, line_type=l.line_type, component=l.component,
+                                  gosi_branch=l.branch, quantity=l.quantity, rate=l.rate, amount=l.amount,
+                                  account=l.account, description_en=l.desc_en[:300], description_ar=l.desc_ar[:300],
+                                  source_ref=l.source_ref[:80], origin_period=l.origin_period))
+    fs.gross = out.total(FinalSettlementLine.EARNINGS) - out.total(FinalSettlementLine.REDUCTIONS)
+    fs.total_deductions = out.total(FinalSettlementLine.DEDUCTIONS)
+    fs.net = fs.gross - fs.total_deductions
+    fs.eosb_award, fs.eosb_provision_balance = out.eosb_award, out.provision
+    fs.separate_settlement_amount, fs.written_consent_ref = separate, written_consent_ref or ""
+    fs.settlement_input = _settlement_input_now(fs)
+    fs.eosb_calculation_id = out.eosb_calc_id
+    fs.input_ids, fs.warnings, fs.notes = sorted(out.input_ids), out.warnings, out.notes
+    fs.status, fs.calc_version = FSS.CALCULATED, fs.calc_version + 1
+    fs.inputs_hash = _settlement_fingerprint(fs, out)
+    fs.stored_hash = _settlement_stored_hash(fs)
+    fs.calculated_by, fs.calculated_at, fs.modified_by, fs.modified_at = user, _now(), user, _now()
+    return _save(fs)
+
+
+@transaction.atomic
+def submit_final_settlement(settlement, *, user):
+    fs = _lock(FS, settlement.pk)
+    _require(user, fs.entity, "payroll.prepare_final_settlement")
+    if fs.status != FSS.CALCULATED:
+        raise error("Only a calculated final settlement is submitted.", "تُقدّم المخالصة المحتسبة فقط.",
+                    code="settlement_status")
+    fs.status, fs.submitted_by, fs.submitted_at = FSS.SUBMITTED, user, _now()
+    return _save(fs)
+
+
+@transaction.atomic
+def return_final_settlement(settlement, *, user, reason_ar):
+    fs = _lock(FS, settlement.pk)
+    grant = _require(user, fs.entity, "payroll.approve_final_settlement", document=fs)
+    approvals.check(grant, fs.entity, "payroll.final_settlement")
+    if fs.status != FSS.SUBMITTED or not (reason_ar or "").strip():
+        raise error("Only a submitted final settlement is returned, with a reason in Arabic.",
+                    "تُعاد المخالصة المقدّمة فقط مع سبب بالعربية.", code="settlement_status")
+    fs.status, fs.returned_reason_ar = FSS.RETURNED, reason_ar
+    return _save(fs)
+
+
+@transaction.atomic
+def approve_final_settlement(settlement, *, user):
+    """C-A11 (R34, E5): the approver (``payroll.approve_final_settlement``, A: never its preparer or submitter)
+    approves; the settlement is recomputed (refused "recalculate" if a source changed) and its stored lines checked;
+    approval posts E5 through the registry: earnings Dr, EOSB Dr 2500 for the employee's provision balance with the
+    shortfall Dr 5120 or the excess released Cr 5120, GOSI Cr 2340, recoveries Cr 1230 / 1240, net Cr 2330."""
+    fs = FS.objects.select_related("entity").get(pk=settlement.pk)
+    grant = _require(user, fs.entity, "payroll.approve_final_settlement", document=fs)
+    approvals.check(grant, fs.entity, "payroll.final_settlement")
+    if user.pk in {fs.calculated_by_id, fs.submitted_by_id}:
+        access.deny(user, fs.entity, "payroll.approve_final_settlement", "self_approval")
+    emp = Employee.objects.get(pk=fs.employee_id)
+    if emp.user_id is not None and emp.user_id == user.pk:
+        access.deny(user, fs.entity, "payroll.approve_final_settlement", "self_approval")
+    _entity_lock(fs.entity)
+    fs = _lock(FS, fs.pk)
+    if fs.status != FSS.SUBMITTED:
+        raise error("Only a submitted final settlement is approved.", "تُعتمد المخالصة المقدّمة فقط.",
+                    code="settlement_status")
+    out = _compute_settlement(fs, user, separate_amount=fs.separate_settlement_amount,
+                              consent_ref=fs.written_consent_ref)
+    if _settlement_fingerprint(fs, out) != fs.inputs_hash:
+        raise error("A source changed after the calculation: recalculate the final settlement (R8).",
+                    "تغيّر مصدر بعد الاحتساب: أعد احتساب المخالصة النهائية.", code="recalculate")
+    if _settlement_stored_hash(fs) != fs.stored_hash:
+        raise error("The stored lines of this final settlement changed after the calculation: recalculate it.",
+                    "تغيّرت بنود هذه المخالصة المخزنة بعد الاحتساب: أعد احتسابها.", code="payslips_changed")
+    fs.number = _next_number(fs.entity, "FS", fs.last_working_day.year)
+    fs.status, fs.approved_by, fs.approved_at = FSS.APPROVED, user, _now()
+    _save(fs)
+    try:
+        with _marker(_posting, fs):
+            entry = ledger.create_entry(fs.entity, fs.last_working_day,
+                                        f"Final settlement {fs.number} / مخالصة نهائية {fs.number}", None, user=user,
+                                        reference=fs.number, post=True, grant=grant, document=fs)
+    except LedgerError as exc:
+        raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
+    fs.journal_entry = entry
+    _save(fs)
+    _settlement_effects(fs, out, user)
+    return fs
+
+
+def _settlement_effects(fs, out, user):
+    """Installments settled in the final settlement (or outstanding after exit), loans settled, EOSB sub-ledger
+    utilisation and release (E5), inputs taken, GOSI catch-up notices (R58)."""
+    for pk, amount in out.loan_effects:
+        inst = _lock(LoanInstallment, pk)
+        inst.status, inst.deducted_amount = LoanInstallment.Status.SETTLED_IN_FINAL, amount
+        _save(inst)
+    for pk, amount in out.sale_effects:
+        inst = _lock(DeferredSaleInstallment, pk)
+        if amount < inst.amount:  # the unrecovered part stays as a planned remainder after exit
+            _save(DeferredSaleInstallment(entity=inst.entity, contract=inst.contract, period=inst.period,
+                                          amount=inst.amount - amount, carried_from=inst,
+                                          status=DeferredSaleInstallment.Status.OUTSTANDING_AFTER_EXIT))
+            inst.amount = amount
+        inst.status, inst.deducted_amount = DeferredSaleInstallment.Status.SETTLED_IN_FINAL, amount
+        _save(inst)
+    taken = {pk for pk, _ in out.sale_effects}
+    for pk in out.sale_outstanding:
+        if pk in taken:
+            continue
+        inst = _lock(DeferredSaleInstallment, pk)
+        inst.status = DeferredSaleInstallment.Status.OUTSTANDING_AFTER_EXIT
+        _save(inst)
+    for loan in EmployeeLoan.objects.filter(employee_id=fs.employee_id, status=EmployeeLoan.Status.ACTIVE):
+        if _loan_outstanding_of(loan) == 0:
+            loan.status = EmployeeLoan.Status.SETTLED
+            _save(loan)
+    award, balance = fs.eosb_award, max(fs.eosb_provision_balance, ZERO)
+    if award or balance:
+        used = min(award, balance)
+        if used:
+            _save(EosbProvisionEntry(entity=fs.entity, employee_id=fs.employee_id, date=fs.last_working_day,
+                                     kind=EosbProvisionEntry.Kind.UTILISATION, amount=-used))
+        if balance > award:
+            _save(EosbProvisionEntry(entity=fs.entity, employee_id=fs.employee_id, date=fs.last_working_day,
+                                     kind=EosbProvisionEntry.Kind.RELEASE, amount=-(balance - award)))
+    for inp in PayrollInput._base_manager.select_for_update().filter(pk__in=out.input_ids).order_by("pk"):
+        if inp.taken_run_id is not None or inp.final_settlement_id is not None:
+            raise error("An input of this settlement was taken meanwhile: recalculate.",
+                        "أُخذ مدخل من هذه المخالصة في الأثناء: أعد الاحتساب.", code="recalculate")
+        inp.final_settlement = fs
+        _save(inp)
+
+
+def _settlement_lines(fs):
+    """Registered ``build_lines`` for FinalSettlement (§5 E5; R36: per account, no names or pay in descriptions)."""
+    _require_posting(fs)
+    label = f"{fs.number}"
+    sums = {}
+
+    def add(acc, amount):
+        sums.setdefault(acc.pk, [acc, ZERO])[1] += amount
+
+    for l in fs.lines.select_related("account"):
+        t = l.line_type
+        if t == FSL.EOSB:
+            balance = max(fs.eosb_provision_balance, ZERO)
+            add(_account(fs.entity, EOSB_PROVISION), balance)
+            add(_account(fs.entity, EOSB_EXPENSE), l.amount - balance)  # shortfall Dr 5120, excess released Cr 5120
+        elif t in FinalSettlementLine.EARNINGS:
+            add(l.account, l.amount)
+        elif t in FinalSettlementLine.REDUCTIONS or t in FinalSettlementLine.DEDUCTIONS:
+            add(l.account, -l.amount)
+        elif t in FinalSettlementLine.EMPLOYER:
+            add(l.account, l.amount)
+            add(_account(fs.entity, GOSI_PAYABLE), -l.amount)
+    if fs.eosb_award == 0 and fs.eosb_provision_balance > 0:  # no award (e.g. Art. 80): the provision is released
+        add(_account(fs.entity, EOSB_PROVISION), fs.eosb_provision_balance)
+        add(_account(fs.entity, EOSB_EXPENSE), -fs.eosb_provision_balance)
+    add(_account(fs.entity, SALARIES_PAYABLE), -fs.net)
+    out = []
+    for acc, amount in sums.values():
+        if amount > 0:
+            out.append({"account": acc, "debit": amount, "description": label})
+        elif amount < 0:
+            out.append({"account": acc, "credit": -amount, "description": label})
+    return out
+
+
+def _pending_settlements(entity, start_date, end_date):
+    """Registered ``pending_documents``: submitted final settlements dated in the range block close_period."""
+    return [f"final settlement {fs.employee.employee_code} (submitted)" for fs in
+            FS.objects.filter(entity=entity, status=FSS.SUBMITTED, last_working_day__range=(start_date, end_date))
+            .select_related("employee")]
+
+
+# =====================================================================================================
 # Payments (R29, R43; §5 E2, E3, E8b)
 # =====================================================================================================
 
@@ -2972,7 +3452,7 @@ def _bank_account(entity, account):
 
 @transaction.atomic
 def record_payment(entity, *, user, kind, payment_date, amount, run=None, gosi_period="", bank_account=None,
-                   currency=None, wht_category=None, bank_reference=""):
+                   currency=None, wht_category=None, bank_reference="", final_settlement=None):
     """R29: the payroll officer records a payment after the bank release (``payroll.record_payment``). Net salaries
     of a run (per currency) or the GOSI contributions of a period. Remuneration staff in a foreign currency: WHT is
     considered on every payment (R43): a WHT category is required (rate from invoicing's global table). The entity's
@@ -2991,6 +3471,12 @@ def record_payment(entity, *, user, kind, payment_date, amount, run=None, gosi_p
         _check_period(gosi_period)
         currency = entity.base_currency_id
         run = None
+    elif kind == PayrollPayment.Kind.FINAL_SETTLEMENT:
+        if final_settlement is None or final_settlement.entity_id != entity.pk:
+            raise error("A final settlement payment names a settlement of the entity (R30).",
+                        "تحدد دفعة المخالصة مخالصة للكيان.", code="payment_run")
+        final_settlement = _lock(FinalSettlement, final_settlement.pk)
+        currency, run = entity.base_currency_id, None
     else:
         raise error("Unknown payment kind.", "نوع دفعة غير معروف.", code="payment_kind")
     cur = Currency.objects.get(code=getattr(currency, "code", currency))
@@ -3007,14 +3493,25 @@ def record_payment(entity, *, user, kind, payment_date, amount, run=None, gosi_p
     _bank_account(entity, acc)
     payment = PayrollPayment(entity=entity, kind=kind, run=run, gosi_period=gosi_period, payment_date=payment_date,
                              bank_account=acc, currency=cur, amount=amount, wht_category=wht_category,
-                             bank_reference=bank_reference, created_by=user)
+                             bank_reference=bank_reference, created_by=user,
+                             final_settlement=final_settlement if kind == PayrollPayment.Kind.FINAL_SETTLEMENT else None)
     _payment_room(payment, run)
     return _save(payment)
 
 
 def _payment_room(p, run):
     """R29: a payment never exceeds what is open. ``run`` is the locked run row (review 1)."""
-    if p.kind == PayrollPayment.Kind.NET_SALARIES:
+    if p.kind == PayrollPayment.Kind.FINAL_SETTLEMENT:
+        fs = p.final_settlement
+        if fs.status not in (FSS.APPROVED, FSS.PAID):
+            raise error("Only an approved final settlement is paid.", "تُدفع المخالصة المعتمدة فقط.",
+                        code="settlement_status")
+        paid = PayrollPayment.objects.filter(final_settlement=fs, status=PayrollPayment.Status.APPROVED) \
+            .aggregate(t=Sum("amount"))["t"] or ZERO
+        if p.amount > fs.net - paid:
+            raise error(f"The payment exceeds the open net {fs.net - paid} of the final settlement (R29).",
+                        f"الدفعة تتجاوز صافي المخالصة المتبقي {fs.net - paid}.", code="overpayment")
+    elif p.kind == PayrollPayment.Kind.NET_SALARIES:
         if run.status not in (RS.APPROVED, RS.PAID):
             raise error("Only an approved run is paid.", "يُدفع المسير المعتمد فقط.", code="run_status")
         total, paid = _run_payable(run, p.currency_id)
@@ -3058,7 +3555,10 @@ def approve_payment(payment, *, user):
     # approvals (or an approval and a run reversal) never both see the same open amount.
     _entity_lock(p.entity)
     run = _lock(PayrollRun, p.run_id) if p.run_id else None
+    fs = _lock(FinalSettlement, p.final_settlement_id) if p.final_settlement_id else None
     p = _lock(PayrollPayment, p.pk)
+    if fs is not None:
+        p.final_settlement = fs
     if p.status != PayrollPayment.Status.SUBMITTED:
         raise error("Only a submitted payment is approved.", "تُعتمد الدفعة المقدمة فقط.", code="payment_status")
     if run is not None:
@@ -3076,12 +3576,19 @@ def approve_payment(payment, *, user):
     try:
         with _marker(_posting, p):
             entry = ledger.create_entry(p.entity, p.payment_date, f"Payroll payment {p.get_kind_display()} / دفعة رواتب",
-                                        None, user=user, reference=(p.run.number if p.run else p.gosi_period),
+                                        None, user=user, reference=(p.run.number if p.run else p.final_settlement.number
+                                                                    if p.final_settlement_id else p.gosi_period),
                                         post=True, grant=grant, document=p)
     except LedgerError as exc:
         raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
     p.journal_entry = entry
     _save(p)
+    if fs is not None:
+        paid = PayrollPayment.objects.filter(final_settlement=fs, status=PayrollPayment.Status.APPROVED) \
+            .aggregate(t=Sum("amount"))["t"] or ZERO
+        if paid >= fs.net and fs.status == FSS.APPROVED:
+            fs.status = FSS.PAID
+            _save(fs)
     if run is not None:
         currencies = set(Payslip.objects.filter(run=run, refused=False).values_list("currency_id", flat=True))
         if all(_run_payable(run, c)[0] <= _run_payable(run, c)[1] for c in currencies) and run.status == RS.APPROVED:
@@ -3095,7 +3602,8 @@ def _payment_lines(p):
     remuneration payment: Dr 2330 settling the run's line at its carrying rate, Cr bank at the payment-date rate, Cr
     2220 WHT in SAR, the realised FX difference on 4700 / 5750."""
     _require_posting(p)
-    label = f"{p.run.number if p.run else 'GOSI ' + p.gosi_period} payment"
+    label = (f"{p.run.number} payment" if p.run else f"{p.final_settlement.number} payment" if p.final_settlement_id
+             else f"GOSI {p.gosi_period} payment")
     if p.kind == PayrollPayment.Kind.GOSI:
         return [{"account": _account(p.entity, GOSI_PAYABLE), "debit": p.amount, "description": label},
                 {"account": p.bank_account, "credit": p.amount, "description": label}]
@@ -3594,6 +4102,18 @@ def send_alerts(*, today=None, entity=None):
                                   "in advance (Labour Law Art. 109; prepare_leave_advance).",
                                   f"تبدأ الإجازة السنوية لـ {req.employee.employee_code} في {req.start_date}: اصرف أجر "
                                   "الإجازة مقدمًا (المادة 109).", ("payroll_officer",))])
+                sent += 1
+        # C-A11 (Art. 88): final settlements due within 7 days, or 14 when the worker ended the contract; alerts 3
+        # days before, on the due day and the day after while unpaid.
+        for fs in FS.objects.filter(entity=e, due_date__isnull=False).exclude(status__in=(FSS.PAID, FSS.DISCARDED)) \
+                .select_related("employee"):
+            when = {fs.due_date - timedelta(days=3): "before", fs.due_date: "due", fs.due_date + timedelta(days=1): "late"}
+            if today in when:
+                _send_alerts(e, [(PayrollAlert.Kind.FINAL_SETTLEMENT_DUE, f"fs:{fs.pk}:{when[today]}",
+                                  f"Final settlement of {fs.employee.employee_code} is due by {fs.due_date} (Labour Law "
+                                  f"Art. 88){' and is late' if when[today] == 'late' else ''}.",
+                                  f"المخالصة النهائية لـ {fs.employee.employee_code} مستحقة قبل {fs.due_date} (المادة 88)"
+                                  f"{' وقد تأخرت' if when[today] == 'late' else ''}.", ("payroll_officer", "approver"))])
                 sent += 1
         if today.day == 10:
             open_ = _gosi_open(e, prev)

@@ -311,8 +311,17 @@ ROLE_SEED_V13 = {
         ("payroll.approve_overtime",),
     ),
 }
+# V14 (migration core.0023, payroll review 2026-10-19, compliance C-A11): final settlements. The payroll officer
+# prepares them; the approver (CFO) approves (= posts) them (payroll OQ-36 default); the managing partner holds the
+# approval as fallback like every A permission (OQ-1).
+ROLE_SEED_V14 = {
+    **ROLE_SEED_V13,
+    "payroll_officer": _plus(ROLE_SEED_V13, "payroll_officer", "payroll.prepare_final_settlement"),
+    "approver": _plus(ROLE_SEED_V13, "approver", "payroll.approve_final_settlement"),
+    "managing_partner": _plus(ROLE_SEED_V13, "managing_partner", "payroll.approve_final_settlement"),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V13
+ROLE_SEED = ROLE_SEED_V14
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {

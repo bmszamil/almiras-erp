@@ -9,6 +9,7 @@ class PayrollConfig(AppConfig):
       keeps ``close_period`` from closing a period with a submitted run (R12).
     - ``PayrollPayment``: ``payroll.approve_payment`` (E2, E3, E8b).
     - ``EmployeeLoan``: ``payroll.approve_loan`` (E4, interest-free).
+    - ``FinalSettlement``: ``payroll.approve_final_settlement`` (E5); ``pending_documents`` for submitted ones.
 
     Every type builds its own lines from stored data, only inside a ``payroll.services`` posting.
     """
@@ -20,7 +21,7 @@ class PayrollConfig(AppConfig):
         from ledger import documents
 
         from . import services
-        from .models import EmployeeLoan, PayrollPayment, PayrollRun
+        from .models import EmployeeLoan, FinalSettlement, PayrollPayment, PayrollRun
 
         documents.register(PayrollRun, post_permissions={"payroll.approve_run"},
                            reverse_permissions={"payroll.reverse_run"}, build_lines=services._run_lines,
@@ -29,3 +30,5 @@ class PayrollConfig(AppConfig):
                            build_lines=services._payment_lines)
         documents.register(EmployeeLoan, post_permissions={"payroll.approve_loan"},
                            build_lines=services._loan_disbursement_lines)
+        documents.register(FinalSettlement, post_permissions={"payroll.approve_final_settlement"},
+                           build_lines=services._settlement_lines, pending_documents=services._pending_settlements)

@@ -237,6 +237,11 @@ _PERMS = [
     _p("payroll.record_payment", "Record payroll payments", "تسجيل مدفوعات الرواتب"),
     _p("payroll.approve_payment", "Approve and post payroll payments", "اعتماد مدفوعات الرواتب وترحيلها", APPROVAL,
        POSTS),
+    # Final settlements (payroll R34, E5; compliance C-A11): prepared by the payroll officer, approved (= posted) by the
+    # approver (OQ-36), never by the preparer.
+    _p("payroll.prepare_final_settlement", "Prepare final settlements", "إعداد المخالصات النهائية"),
+    _p("payroll.approve_final_settlement", "Approve and post final settlements", "اعتماد المخالصات النهائية وترحيلها",
+       APPROVAL, POSTS),
     _p("payroll.generate_wps_file", "Generate salary (WPS) files", "إنشاء ملفات الرواتب (حماية الأجور)"),
     _p("payroll.record_mudad_submission", "Record Mudad submissions", "تسجيل الرفع على منصة مدد"),
     # banking (banking.md §7). Agents may view (masked), suggest matches and draft bank transactions only (R43).

@@ -9,8 +9,8 @@ Until the approval engine and matrix exist, the seed rows of payroll.md §7 / OQ
   the head of the employee's department (role ``department_head``); see ``payroll.services._overtime_route``.
 - ``payroll.loan``, ``payroll.deferred_sale_terms``, ``payroll.deferred_sale``: ``managing_partner`` (P12; the
   ``ceo`` seed row of other entities waits for the ``ceo`` role, access A28).
-- ``payroll.payment``, ``payroll.reversal``, ``payroll.maternity_clearance``: ``approver``, ``managing_partner``
-  as fallback (OQ-36).
+- ``payroll.payment``, ``payroll.reversal``, ``payroll.maternity_clearance``, ``payroll.final_settlement``:
+  ``approver``, ``managing_partner`` as fallback (OQ-36).
 
 Top-authority self-approval (access R58) needs the matrix's ``top_authority_role``; until then nobody self-approves
 in payroll (the access layer refuses the creator, submitter and last modifier of every A document).
@@ -30,6 +30,7 @@ SEED_ROWS = {
     "payroll.reversal": ("approver", "managing_partner"),
     "payroll.maternity_clearance": ("approver", "managing_partner"),
     "payroll.input": ("payroll_officer", "managing_partner"),
+    "payroll.final_settlement": ("approver", "managing_partner"),
 }
 
 LABELS = {
@@ -41,6 +42,7 @@ LABELS = {
     "payroll.reversal": ("run reversals", "عكس المسيرات"),
     "payroll.maternity_clearance": ("maternity legal clearances", "الإذن القانوني لأجر الأمومة"),
     "payroll.input": ("payroll inputs", "مدخلات الرواتب"),
+    "payroll.final_settlement": ("final settlements", "المخالصات النهائية"),
 }
 
 
