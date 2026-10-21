@@ -1135,7 +1135,7 @@ def test_rv93_n5_migration_0031_converts_only_live_delegations_within_the_limits
     dead = HM.objects.create(user_id=g.ba.pk, entity_id=g.sub.pk, role_id=approver.pk,
                              valid_from=now - timedelta(days=5), valid_to=now + timedelta(days=20), granted_by_id=cf2.pk,
                              granted_at=now - timedelta(days=5), reason="cover", delegated_from_id=src2.pk)
-    HM.objects.filter(pk=src2.pk).update(revoked_at=now - timedelta(days=1), revoked_by_id=g.ce.pk, revoke_reason="left")
+    HM.objects.filter(pk=src2.pk).update(revoked_at=timezone.now(), revoked_by_id=g.ce.pk, revoke_reason="left")
     importlib.import_module("core.migrations.0031_convert_legacy_delegations").convert(apps, None)
     d = ApprovalDelegation.objects.get(delegate=g.ac)
     assert d.delegator == g.cf and d.valid_from >= now and (d.valid_to - d.valid_from) <= timedelta(days=90)
