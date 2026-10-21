@@ -275,7 +275,9 @@ def test_review6_leaver_without_settlement_is_valued_due_and_settled_counts_from
     services.approve_final_settlement(settle(w, t), user=w.c)
     before = services.eosb_provision_report(w.alm, date(2027, 3, 10), user=w.a)  # still employed on that date
     assert line(before, n1).valuation == "valued" and line(before, n1).reason_en == ""
-    after = services.eosb_provision_report(w.alm, date(2027, 3, 31), user=w.a)
+    on_day = services.eosb_provision_report(w.alm, date(2027, 3, 31), user=w.a)  # approved after that date
+    assert line(on_day, n1).valuation == "valued" and "settlement pending" in line(on_day, n1).reason_en
+    after = services.eosb_provision_report(w.alm, date(2027, 4, 5), user=w.a)  # approved on 2027-04-05
     assert line(after, n1).valuation == "excluded" and "Final settlement approved" in line(after, n1).reason_en
 
 
@@ -284,14 +286,29 @@ def test_c4_regular_bonuses_and_in_kind_housing_join_the_eosb_and_leave_wage(w):
     s4 = saudi(w, id_number="1000000994", components={"BASIC": "8000.00", "TRANSPORT": "500.00"},
                contract_kwargs={"housing_in_kind": True})
     w.pclock.set(datetime(2027, 2, 20, 12, 0))
-    inp = services.create_input(s1, user=w.p, kind="bonus", period="2027-02", amount="1200.00", reason_ar="مكافأة")
+    inp = services.create_input(s1, user=w.p, kind="bonus", period="2027-02", amount="1200.00", reason_ar="مكافأة",
+                                eosb_regular=True)
     services.approve_input(inp, user=w.p2)
+    once = services.create_input(s1, user=w.p, kind="bonus", period="2027-02", amount="999.00",
+                                 reason_ar="مكافأة لمرة واحدة", reference="ONCE")  # not regular: never counts
+    services.approve_input(once, user=w.p2)
     feb = approved(w, "2027-02")
     assert feb.payslips.get(employee=s1).lines.filter(line_type="bonus").exists()
     w.pclock.set(datetime(2027, 4, 5, 12, 0))
     report = services.eosb_provision_report(w.alm, date(2027, 3, 31), user=w.a)
-    assert line(report, s1).wage_basis == D("13600.00")  # 13,500.00 + 1,200.00 / 12
+    # Verification 3: the regular bonus over the months employed in the window (January and February: 2).
+    assert line(report, s1).wage_basis == D("14100.00")  # 13,500.00 + 1,200.00 / 2
+    # Verification 1: eosb.in_kind_housing is unverified: in-kind housing counts 0, with the warning.
+    assert line(report, s4).wage_basis == D("8500.00") and "eosb.in_kind_housing" in line(report, s4).reason_en
+    housing = hr.param("SA", "eosb.in_kind_housing", date(2027, 3, 31))
+    assert housing.pk not in report.parameter_ids
+    from core.access.testing import make_user, member
+    verifier = make_user("housing-verifier")
+    member(verifier, w.alm, "managing_partner")
+    hr.verify_statutory_parameter(housing, user=verifier)
+    report = services.eosb_provision_report(w.alm, date(2027, 3, 31), user=w.a)
     assert line(report, s4).wage_basis == D("10500.00")  # 8,500.00 + in-kind housing 8,000.00 x 3 / 12
+    assert housing.pk in report.parameter_ids
     ledger_row(s1, "10.00", date(2027, 3, 31))
     leave = services.leave_liability_report(w.alm, date(2027, 3, 31), user=w.a)
-    assert line(leave, s1).daily_wage == D("453.33")  # 13,600.00 / 30
+    assert line(leave, s1).daily_wage == D("470.00")  # 14,100.00 / 30

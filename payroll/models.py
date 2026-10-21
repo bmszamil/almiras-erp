@@ -291,6 +291,10 @@ class PayrollInput(Tracked, ServiceWritten):
                                    blank=True)
     legal_clearance_ref = models.CharField(bi("Written legal clearance", "الإذن القانوني المكتوب"), max_length=200,
                                            blank=True)
+    # Slice 3 verification 3 (Labour Law Art. 2): a bonus or commission that is regular, contractual or customary
+    # joins the end-of-service wage (12-month average); default not.
+    eosb_regular = models.BooleanField(bi("Regular, contractual or customary (Art. 2)", "منتظمة أو تعاقدية أو عرفية "
+                                          "(المادة 2)"), default=False)
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     approved_by = _user("Approved by", "اعتمده")
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)

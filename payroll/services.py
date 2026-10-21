@@ -606,7 +606,7 @@ def _input_problems(inp, use):
 
 INPUT_FIELDS = frozenset({"kind", "period", "reference", "quantity", "amount", "component", "reason_en", "reason_ar",
                           "overtime_date", "art106_exceptional", "art106_case", "worker_consent_ref", "deduction_basis",
-                          "consent_ref", "legal_clearance_ref"})
+                          "consent_ref", "legal_clearance_ref", "eosb_regular"})
 
 
 @transaction.atomic
@@ -1842,9 +1842,15 @@ def _eosb(ctx, slip, emp, info):
                   "لم يُحتسب مخصص نهاية الخدمة: المخالصة النهائية معتمدة.")
         return
     try:
-        # Slice 3, compliance C4: the provision uses the same wage as the award (Art. 2 regular additions).
+        # Slice 3, compliance C4: the provision uses the same wage as the award (Art. 2 regular additions); the
+        # rows the additions used are this run's too (verification 1, R7), their warnings go on the payslip.
+        extra = _eosb_additional(emp, as_of)
+        for row in extra.rows:
+            ctx.use._take(row)
+        for text in extra.warnings:
+            slip.warn(*text.split(" / ", 1)) if " / " in text else slip.warn(text, text)
         result = hr.calculate_eosb(emp, as_of, Termination.Kind.EMPLOYER_TERMINATION, user=ctx.user,
-                                   additional_wage=_eosb_additional(emp, as_of))
+                                   additional_wage=extra)
     except hr.HrError as exc:
         # Review 16: only the refusals that mean "no provision for this person" become a warning; a missing or
         # unverified parameter, a permission refusal or a bug stops the calculation.
@@ -2197,7 +2203,7 @@ def _calc_remuneration(ctx, emp, versions, info):
         slip.gosi_wage, slip.gosi_wage_full = g.wage, g.wage_full
         # R71 (review 2, compliance C5): GOSI only while the month's REMUNERATION is still due in the contract
         # currency, and only on branches no approved payslip of the period booked (never on an FX difference).
-        _uncovered_branches(ctx, slip, emp, g, remuneration_due)
+        _uncovered_branches(ctx, slip, emp, info, g, remuneration_due, remuneration)
         for line in _gosi_lines(ctx, slip, g):
             if line.line_type == LT.EMPLOYEE_GOSI:
                 # R62: the SAR share converted into the payslip currency; the SAR amount is what the ledger books.
@@ -7360,15 +7366,33 @@ def _remuneration_still_due(ctx, slip, emp, info, cur, add):
     return due
 
 
-def _uncovered_branches(ctx, slip, emp, g, remuneration_due):
-    """R71 (slice 3 review 2, compliance C5): a remuneration payslip charges GOSI only when the month's REMUNERATION is
-    still due (measured in the contract currency, so a different rate never creates a GOSI wage) and only on the
-    branches no approved payslip (or settlement) of the period booked."""
-    booked = {l.gosi_branch for l in _booked_lines(emp, ctx.period, GOSI_TYPES) if l.gosi_branch}
-    covered = Payslip.objects.filter(employee=emp, run__period=ctx.period, refused=False, gosi_wage__gt=0,
-                                     run__status__in=(RS.APPROVED, RS.PAID)).exclude(run=ctx.run).exists()
-    g.branches = [] if not remuneration_due or covered else [b for b in g.branches if b[0] not in booked]
-    slip.gosi_wage = g.wage if g.branches else ZERO
+def _uncovered_branches(ctx, slip, emp, info, g, remuneration_due, remuneration):
+    """R71 (slice 3 review 2, compliance C5, verification 4): a remuneration payslip charges GOSI only while the
+    month's REMUNERATION is still due in the contract currency. When an approved payslip of the period exists, the
+    month's GOSI wage is re-measured at that first payslip's rate (contract currency to SAR as booked), so a
+    different rate never creates a GOSI wage, and only the part not yet covered is charged (a back-dated raise); a
+    month with nothing booked is charged in full at this run's rate."""
+    if not remuneration_due:
+        g.branches = []
+        slip.gosi_wage = ZERO
+        return
+    first = (Payslip.objects.filter(employee=emp, run__period=ctx.period, refused=False,
+                                    run__status__in=(RS.APPROVED, RS.PAID)).exclude(run=ctx.run)
+             .order_by("run__approved_at", "pk").first())
+    if first is None:
+        return
+    sub = Slip(employee=emp, basis=slip.basis, nationality_class=slip.nationality_class, cohort=slip.cohort,
+               currency=slip.currency)
+    g2 = _compute_gosi(ctx, sub, emp, info, cohort=slip.cohort, nclass=slip.nationality_class, basis=slip.basis,
+                       remuneration_sar=_round(remuneration * Fraction(first.fx_rate)))
+    booked = _booked_lines(emp, ctx.period, GOSI_TYPES)
+    branches = []
+    for branch, wage, ee, er in g2.branches:
+        delta = wage - _covered_gosi_wage(emp, ctx.period, booked, branch, bool(er))
+        if delta > 0:
+            branches.append((branch, delta, ee, er))
+    g.branches = branches
+    slip.gosi_wage = max((w_ for _, w_, _, _ in branches), default=ZERO)
 
 
 def _drop_late_reductions(slip):
@@ -7477,8 +7501,11 @@ NO_EOSB_CONFIGURED = ("No statutory end-of-service award is configured for this 
 
 
 def _settled(emp, as_of):
-    """Review 6: an approved (or paid) final settlement whose last working day is on or before ``as_of``."""
-    return FinalSettlement.objects.filter(employee=emp, status__in=SETTLED, last_working_day__lte=as_of).exists()
+    """Review 6, verification 7: an approved (or paid) final settlement whose last working day and approval are both
+    on or before ``as_of``."""
+    return any(timezone.localtime(fs.approved_at).date() <= as_of
+               for fs in FinalSettlement.objects.filter(employee=emp, status__in=SETTLED, last_working_day__lte=as_of,
+                                                        approved_at__isnull=False))
 
 
 def _eosb_additional(emp, on):
@@ -7574,6 +7601,11 @@ def _leave_lines(entity, as_of, use, jurisdiction):
                     divisor = Fraction(use.get("SA", "leave.encashment", as_of, "leave liability", "التزام الإجازات")
                                        ["day_divisor"])
                 extra = _eosb_additional(emp, as_of)  # C4: the same wage as the EOSB (Art. 2, 111)
+                for row in extra.rows:  # verification 1 (R7): recorded on the report
+                    use._take(row)
+                if extra.warnings:
+                    line.update(reason_en=" ".join(t.split(" / ", 1)[0] for t in extra.warnings),
+                                reason_ar=" ".join(t.split(" / ", 1)[-1] for t in extra.warnings))
                 daily = (Fraction(_sum(terms, "counts_for_eosb")) + Fraction(extra.amount)) / divisor
             else:
                 daily = Fraction(_sum(terms, eg_basis["wage_flag"])) / Fraction(eg_basis["day_divisor"])
@@ -7612,7 +7644,8 @@ def _eosb_lines(entity, as_of, use, jurisdiction):
             out.append(_excluded_line(emp, jurisdiction, "no_statutory_eosb"))
             continue
         term = _termination(emp)
-        left = term is not None and term.last_working_day < as_of
+        # Verification 7: a last working day on the as-at date is a leaver's too (valued with its kind's fraction).
+        left = term is not None and term.last_working_day <= as_of
         base = dict(employee=emp, employee_code=emp.employee_code, employment_basis=emp.employment_basis,
                     jurisdiction=jurisdiction)
         memo = EosbProvisionEntry.objects.filter(employee=emp, date__lte=as_of).aggregate(t=Sum("amount"))["t"] or ZERO
@@ -7621,8 +7654,8 @@ def _eosb_lines(entity, as_of, use, jurisdiction):
             # Art. 84 full award with the Art. 85 resignation fraction as the memo (hr R39, P19(h)); the hr rows read
             # are recorded on the report. Review 6: a leaver without an approved settlement is valued at the last
             # working day with the fraction of the actual termination kind: due, settlement pending.
-            r = hr._compute_eosb(emp, on, term.kind if left else Termination.Kind.RESIGNATION, use,
-                                 _eosb_additional(emp, on))
+            extra = _eosb_additional(emp, on)
+            r = hr._compute_eosb(emp, on, term.kind if left else Termination.Kind.RESIGNATION, use, extra)
         except hr.HrError as exc:
             if getattr(exc, "code", None) not in EOSB_SKIPPABLE:
                 raise  # as _eosb (§10.5): any other refusal stops the report
@@ -7637,11 +7670,13 @@ def _eosb_lines(entity, as_of, use, jurisdiction):
                     excluded_days=r.excluded_days, wage_basis=r.wage_basis, art84_full_award=r.full_award,
                     art85_resignation_memo=None if left else r.award, subledger_balance_memo=memo,
                     amount=r.award if left else r.full_award)
+        reasons = [(t.split(" / ", 1)[0], t.split(" / ", 1)[-1]) for t in extra.warnings]
         if left:
-            base.update(reason_en=f"Due, settlement pending: left on {on} ({term.kind}); award at that kind's "
-                                  "fraction (Art. 84 to 87).",
-                        reason_ar=f"مستحقة والمخالصة معلقة: ترك العمل في {on} ({term.kind})؛ المكافأة بنسبة نوع "
-                                  "الإنهاء.")
+            reasons.insert(0, (f"Due, settlement pending: left on {on} ({term.kind}); award at that kind's fraction "
+                               "(Art. 84 to 87).", f"مستحقة والمخالصة معلقة: ترك العمل في {on} ({term.kind})؛ المكافأة "
+                               "بنسبة نوع الإنهاء."))
+        if reasons:
+            base.update(reason_en=" ".join(en for en, _ in reasons), reason_ar=" ".join(ar for _, ar in reasons))
         out.append((base, None))
     return out, versions
 
@@ -7864,9 +7899,23 @@ def _health_words(on=None):
     return tuple(words) if words else HEALTH_WORDS
 
 
+ARABIC_PREFIXES = "(?:وال|بال|فال|كال|لل|ال|و|ب|ف|ل|ك)?"
+
+
+def _health_pattern(word):
+    """Verification 6: whole words only. An English entry is a word start (``diagnos`` matches "diagnosis", never
+    inside another word); an Arabic entry is the whole word, after an optional clitic prefix (و، ب، ال ...), so
+    "طبي" matches "الطبي" but never "تطبيق" or "طبيعي"."""
+    import re
+    w = re.escape(word.strip().lower())
+    if word.isascii():
+        return re.compile(rf"(?<![^\W\d_]){w}[a-z]*(?![^\W\d_])")
+    return re.compile(rf"(?<![^\W\d_]){ARABIC_PREFIXES}{w}(?![^\W\d_])")
+
+
 def _health_problem(*texts):
     low = " ".join(t or "" for t in texts).lower()
-    if any(word.lower() in low for word in _health_words()):
+    if any(_health_pattern(word).search(low) for word in _health_words() if word.strip()):
         return error(*HEALTH_INSTRUCTION, code="health_detail")
     return None
 

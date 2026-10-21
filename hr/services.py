@@ -3113,7 +3113,12 @@ def _compute_eosb(employee, as_of, kind, use, additional_wage=ZERO):
     years = _years_between(start, as_of + timedelta(days=1 - excluded), terms.calendar_basis, year_days)
     components = {c.component.code: c.monthly_amount for c in terms.components.select_related("component")
                   if c.component.counts_for_eosb}
-    # R39: payroll's regular additions (payroll_port.AdditionalWage), or a plain amount from a preview caller.
+    # R39: payroll's regular additions (payroll_port.AdditionalWage), or a plain amount from a preview caller. The
+    # parameter rows they used are read through this ParamUse (R7); their warnings go with the calculation.
+    for row in getattr(additional_wage, "rows", None) or ():
+        use._take(row)
+    for text in getattr(additional_wage, "warnings", None) or ():
+        use.warn(text)
     extra_parts = dict(getattr(additional_wage, "parts", None) or {})
     extra = _decimal(getattr(additional_wage, "amount", additional_wage), "additional_wage")
     wage = sum(components.values(), ZERO) + extra
@@ -3177,7 +3182,12 @@ def _settlement_input(term, eosb, user, use):
         # balance at the last working day.
         balance = _balance(emp, lt) if lt else ZERO
         divisor = int(use.get(jurisdiction, "leave.encashment", term.last_working_day)["day_divisor"])
-        wage = _actual_wage(terms)
+        # Payroll slice 3 (verification 2; R34, payroll R76): leave encashment and notice pay use the same wage as the
+        # EOSB award: the components counting for EOSB plus payroll's Art. 2 regular additions.
+        extra = payroll_port.get_port().eosb_additional_wage(emp, term.last_working_day)
+        for row in getattr(extra, "rows", None) or ():
+            use._take(row)
+        wage = _actual_wage(terms) + _decimal(getattr(extra, "amount", ZERO), "additional_wage")
         daily = _round(Decimal(wage) / divisor)
         encash = _frac_round(Fraction(max(balance, ZERO)) * Fraction(wage) / divisor)
         # Payroll re-review 9: wage x shortfall days / divisor as one fraction, rounded once (Art. 76).
