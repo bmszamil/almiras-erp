@@ -11,6 +11,7 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import secrets
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -50,6 +51,7 @@ from ledger.models import Account, FiscalPeriod, JournalLine, LedgerError
 from . import approvals, invoicing_port
 from .models import (
     AssetType,
+    DeferredSaleClosure,
     DeferredSaleContract,
     DeferredSaleRebate,
     DeferredSaleInstallment,
@@ -117,6 +119,8 @@ SHARIA_NO_CHARGE = ("Loans and bai' ajel are interest-free and never carry a fee
                     "القروض والبيع الآجل بدون فوائد ولا تُضاف إليها رسوم أو زيادة ربح أو غرامة أو رسوم تأخير، في كل "
                     "الكيانات.")
 INTEREST_FREE = ("Interest-free loan (qard hasan)", "قرض حسن بدون فوائد")
+
+logger = logging.getLogger(__name__)
 
 
 def _today():
@@ -4195,45 +4199,85 @@ def _wht_bases(p):
     their own open net this payment pays. Finding 3 (review 2026-10-20b): per payee, from the payment's per-payslip
     parts (``_payslip_allocation``), never pro rata to the whole run, so a payment to some payees never carries the
     WHT of others or of non-remuneration staff. Persons resident in KSA (``country_of_residence`` SA) bear no WHT:
-    returned apart. Returns ({employee: base}, [resident employees])."""
+    returned apart.
+
+    Review 4 (2026-10-21, item 1): each payee also gets their own part of this payment (the cap of the WHT withheld
+    for them, :func:`_compute_wht`). A payslip with no net pay (all deducted) is covered at 0 by the first payment
+    that covers it: its base is the whole gross, its part 0. Returns ({employee: base}, {employee: part},
+    [resident employees])."""
+    caps = {}
     if p.kind == PayrollPayment.Kind.NET_SALARIES:
         parts = {part["payslip_id"]: Decimal(part["amount"]) for part in (p.payslip_parts or [])}
         slips = list(Payslip.objects.filter(pk__in=parts, run=p.run, refused=False, currency_id=p.currency_id,
                                             employment_basis=Basis.REMUNERATION).select_related("employee")
                      .order_by("employee__employee_code"))
-        # Review 2026-10-20c, item 7: a payslip with no net pay (all deducted) is covered at 0 and pays nothing, so
-        # no WHT is withheld for it from this payment (it would come out of the other payees' money): a warning.
-        unpaid = [ps for ps in slips if not ps.net_txn]
-        bases = {ps.employee: Fraction(ps.gross_txn) * Fraction(parts[ps.pk]) / Fraction(ps.net_txn)
-                 for ps in slips if ps.net_txn}
-        p.warnings = list(p.warnings or []) + [
-            f"{ps.employee.employee_code} has no net pay on {p.run.number}: the WHT on their gross {ps.gross_txn} "
-            "is not withheld by this payment; record it with the tax adviser (R43) / "
-            f"لا صافي أجر لـ {ps.employee.employee_code} في {p.run.number}: لا تُستقطع ضريبة إجماليه {ps.gross_txn} من "
-            "هذه الدفعة؛ تُسجَّل مع المستشار الضريبي" for ps in unpaid]
+        bases = {}
+        for ps in slips:
+            share = Fraction(parts[ps.pk]) / Fraction(ps.net_txn) if ps.net_txn else Fraction(1)
+            bases[ps.employee] = Fraction(ps.gross_txn) * share
+            caps[ps.employee] = parts[ps.pk]
     elif p.kind == PayrollPayment.Kind.FINAL_SETTLEMENT:
         fs = p.final_settlement
         due = _settlement_due(fs)
         emp = Employee.objects.get(pk=fs.employee_id)
         bases = {emp: Fraction(fs.gross) * Fraction(p.amount) / Fraction(due)} if due else {}
+        caps = {emp: p.amount} if due else {}
     else:
         bases = {}
     residents = [e for e in bases if (e.country_of_residence or "").strip().upper() == "SA"]
-    return {e: v for e, v in bases.items() if e not in residents}, residents
+    return ({e: v for e, v in bases.items() if e not in residents}, {e: v for e, v in caps.items() if e not in residents},
+            residents)
+
+
+def _wht_not_withheld_text(p, e, base, due, withheld):
+    """The en/ar warning of a payee whose WHT due on this payment is more than their own part of it (review 4)."""
+    ref = p.run.number if p.run_id else p.final_settlement.number if p.final_settlement_id else ""
+    short = due - withheld
+    if not withheld:
+        head_en = f"{e.employee_code} has no net pay on {ref}: "
+        head_ar = f"لا صافي أجر لـ {e.employee_code} في {ref}: "
+    else:
+        head_en = f"{e.employee_code}'s part of this payment on {ref} is {withheld}: "
+        head_ar = f"حصة {e.employee_code} من هذه الدفعة في {ref} هي {withheld}: "
+    return (f"{head_en}the WHT {due} on their gross {base} is more than their own part of this payment, so only "
+            f"{withheld} is withheld and {short} is not (never from the other payees' money); it is listed for review "
+            "in the WHT return; record it with the tax adviser (R43, OQ-29) / "
+            f"{head_ar}ضريبة الاستقطاع {due} على إجماليه {base} أكبر من حصته في هذه الدفعة، فلا يُستقطع إلا {withheld} "
+            f"ولا يُستقطع {short} (ولا يؤخذ أبدًا من أموال المستفيدين الآخرين)؛ يظهر للمراجعة في إقرار ضريبة "
+            "الاستقطاع؛ يُسجَّل مع المستشار الضريبي")
 
 
 def _compute_wht(p, user):
     """R43 with compliance B2 (base = gross remuneration, not the net paid) and B3 (non-residents only): WHT at the
     category's rate on each non-resident payee's base, in the payment currency and in SAR at the payment-date rate;
-    the per-payee parts are stored for the WHT return (``wht_parts``). A resident in KSA is a warning, no WHT."""
+    the per-payee parts are stored for the WHT return (``wht_parts``). A resident in KSA is a warning, no WHT.
+
+    Review 4 (2026-10-21, items 1 and 6): the WHT withheld for a payee never exceeds their own part of the payment,
+    whatever their net (0, 0.01 or more), so it is never funded by the other payees. Where the WHT due on their base
+    is more, the withheld part keeps the matching share of the base in ``wht_parts`` (base x withheld / due) and the
+    rest (base and WHT not withheld) goes to ``wht_uncovered``: an en/ar warning on the payment and a
+    ``review_required`` row of the WHT return for the tax adviser (OQ-29)."""
     rate = Fraction(p.wht_category.rate)
     minor = p.currency.minor_units
     foreign = p.currency_id != p.entity.base_currency_id
     fx_rate = (ledger.get_rate(p.entity, p.currency_id, p.entity.base_currency_id, p.payment_date, user=user).rate
                if foreign else Decimal("1"))
-    bases, residents = _wht_bases(p)
-    base_txn = {e: _round_to(b, minor) for e, b in bases.items()}
-    wht_txn = {e: _round_to(Fraction(b) * rate / 100, minor) for e, b in base_txn.items()}
+    bases, caps, residents = _wht_bases(p)
+    full_base = {e: _round_to(b, minor) for e, b in bases.items()}
+    due_txn = {e: _round_to(Fraction(b) * rate / 100, minor) for e, b in full_base.items()}
+    wht_txn = {e: min(due_txn[e], caps[e]) for e in full_base}
+    base_txn, short = {}, {}
+    for e in sorted(full_base, key=lambda x: x.employee_code):
+        if wht_txn[e] < due_txn[e]:
+            covered = _round_to(Fraction(full_base[e]) * Fraction(wht_txn[e]) / Fraction(due_txn[e]), minor)
+            short[e] = (full_base[e] - covered, due_txn[e] - wht_txn[e])
+            p.warnings = list(p.warnings or []) + [_wht_not_withheld_text(p, e, full_base[e], due_txn[e], wht_txn[e])]
+            if not wht_txn[e]:
+                continue  # nothing withheld for them: no live WHT part, only the review row
+            base_txn[e] = covered
+        else:
+            base_txn[e] = full_base[e]
+    wht_txn = {e: wht_txn[e] for e in base_txn}
     p.wht_amount = sum(wht_txn.values(), ZERO)
     if p.wht_amount > p.amount:
         raise error(f"The WHT {p.wht_amount} is more than the payment {p.amount}.",
@@ -4247,6 +4291,11 @@ def _compute_wht(p, user):
     p.wht_parts = [{"employee_id": e.pk, "employee_code": e.employee_code, "country": e.country_of_residence or "",
                     "base_sar": str(base_sar.get(e, ZERO)), "wht_sar": str(wht_sar.get(e, ZERO))}
                    for e in sorted(base_txn, key=lambda x: x.employee_code)]
+    sar = (lambda v: fx.convert(v, fx_rate)) if foreign else (lambda v: _round(v))
+    p.wht_uncovered = [{"employee_id": e.pk, "employee_code": e.employee_code, "country": e.country_of_residence or "",
+                        "currency": p.currency_id, "base_txn": str(b), "wht_txn": str(t), "base_sar": str(sar(b)),
+                        "wht_not_withheld_sar": str(sar(t))}
+                       for e, (b, t) in sorted(short.items(), key=lambda x: x[0].employee_code)]
     for e in residents:
         p.warnings = list(p.warnings or []) + [
             f"{e.employee_code} is resident in Saudi Arabia: no WHT on their remuneration (WHT applies to non-residents "
@@ -4310,7 +4359,9 @@ def _wht_return_source(entity, start, end):
     (run payments and, review 7, final-settlement payments) for invoicing's monthly WHT return, in its row shape: one
     row per WHT category, payee (employee code only, R36) and rate, from the per-payee parts stored at approval
     (compliance B2: base = gross remuneration; B3: non-residents only). A payment reversed in the month shows as a
-    negative row flagged ``amends_return_month`` (compliance B5): the original month's return is to be amended."""
+    negative row flagged ``amends_return_month`` (compliance B5): the original month's return is to be amended.
+    Review 4: the WHT a payment could not withhold from a payee's own part (``wht_uncovered``) is a separate
+    ``review_required`` row with ``wht_sar`` 0 (:func:`_not_withheld_review`)."""
     rows = {}
 
     def add(p, sign):
@@ -4332,6 +4383,21 @@ def _wht_return_source(entity, start, end):
                           "note_ar": f"عكس دفعة من شهر {month}: عدّل إقرار ضريبة الاستقطاع لشهر {month}"})
             r["base_sar"] += sign * Decimal(part["base_sar"])
             r["wht_sar"] += sign * Decimal(part["wht_sar"])
+        for part in p.wht_uncovered or []:
+            key = (p.wht_category.code, part["employee_code"], p.wht_category.rate, reversal, "not_withheld")
+            r = rows.setdefault(key, {
+                "category": p.wht_category.code, "return_line_code": p.wht_category.return_line_code,
+                "vendor": part["employee_code"], "country": part.get("country", ""), "rate": p.wht_category.rate,
+                "treaty_certificate": None, "treaty_country": "", "base_sar": ZERO, "wht_sar": ZERO,
+                "wht_not_withheld_sar": ZERO, "gross_up": False, "source": "payroll", "payee_kind": "employee"})
+            _not_withheld_review(r, p)
+            if reversal:
+                month = p.payment_date.strftime("%Y-%m")
+                r.update({"reversal": True, "amends_return_month": month,
+                          "note_en": f"Reversal of a payment of {month}: amend the WHT return of {month}",
+                          "note_ar": f"عكس دفعة من شهر {month}: عدّل إقرار ضريبة الاستقطاع لشهر {month}"})
+            r["base_sar"] += sign * Decimal(part["base_sar"])
+            r["wht_not_withheld_sar"] += sign * Decimal(part["wht_not_withheld_sar"])
 
     qs = PayrollPayment.objects.filter(entity=entity, wht_category__isnull=False).select_related("wht_category")
     # Finding 4 (review 2026-10-20b): a WHT payment without its per-payee parts (approved before payroll.0017 and
@@ -4385,6 +4451,27 @@ def _backfilled_review(row, p, part):
         en += "; " + "; ".join(text[k][0] for k in reasons) + ": correct the booked WHT (amend or refund) first"
         ar += "؛ " + "؛ ".join(text[k][1] for k in reasons) + ": صحّح الضريبة المقيدة (تعديل أو رد) أولًا"
     row.update({"backfilled": True, "review_required": True, "review_en": f"{en} (R43).", "review_ar": f"{ar}."})
+
+
+def _not_withheld_review(row, p):
+    """Review 4 (2026-10-21, items 1 and 6): a payee whose WHT due on a payment was more than their own part of it
+    (no net pay, or a net below the WHT): the base and the WHT not withheld (``wht_not_withheld_sar``) form a row of
+    their own with ``wht_sar`` 0 (nothing was booked on 2220, so the return still ties), flagged
+    ``review_required`` (reason ``wht_not_withheld``) for the tax adviser, who decides who bears it (OQ-29)."""
+    reasons = row.setdefault("review_reasons", [])
+    if "wht_not_withheld" not in reasons:
+        reasons.append("wht_not_withheld")
+    payments = row.setdefault("not_withheld_payments", [])
+    if p.pk not in payments:
+        payments.append(p.pk)
+    refs = ", ".join(str(pk) for pk in payments)
+    row.update({"not_withheld": True, "review_required": True,
+                "review_en": f"WHT due on this payee's gross was more than their own part of payment(s) {refs} and "
+                             "was not withheld (never from the other payees): the tax adviser decides who bears it "
+                             "before filing (R43, OQ-29).",
+                "review_ar": f"ضريبة الاستقطاع المستحقة على إجمالي هذا المستفيد أكبر من حصته في الدفعة (الدفعات) {refs} "
+                             "ولم تُستقطع (ولا تؤخذ من المستفيدين الآخرين): يقرر المستشار الضريبي من يتحملها قبل تقديم "
+                             "الإقرار."})
 
 
 def wht_return_rows(entity, month, *, user):
@@ -4854,91 +4941,119 @@ def send_alerts(*, today=None, entity=None):
     today = today or _today()
     entities = Entity.objects.filter(pk=entity.pk) if entity is not None else Entity.objects.filter(
         payroll_settings__enabled=True)
+    sent, failures = 0, []
+    for e in entities.order_by("code"):
+        if _jurisdiction_of(e) != "SA":  # WPS, Mudad and GOSI are Saudi (Egypt research §2.4, §2.5)
+            continue
+        # Review 4 (2026-10-21, item 2): one entity failing never stops the others, and within an entity the bai'
+        # ajel refresh (its own transaction: it locks rows, and a rebate's restore, status and alerts commit
+        # together, review 2026-10-20c finding 2) commits apart from the Mudad / GOSI / settlement alerts (a second
+        # transaction). A failure is logged and the job goes on; it ends with ``AlertsFailed`` naming them.
+        for step, fn in (("bai_ajel_refresh", lambda: len(_refresh_deferred_sales(e))),
+                         ("alerts", lambda: _entity_alerts(e, today))):
+            try:
+                with transaction.atomic():
+                    sent += fn()
+            except Exception as exc:  # noqa: BLE001 - logged, reported at the end; the other entities go on
+                logger.exception("payroll_alerts: %s failed for %s", step, e.code)
+                failures.append((e.code, step, f"{type(exc).__name__}: {exc}"[:300]))
+    if failures:
+        raise AlertsFailed(sent, failures)
+    return sent
+
+
+class AlertsFailed(PayrollError):
+    """Review 4 (item 2): the daily alerts job finished with some entities (or steps) failed; the others were sent
+    and committed. ``sent`` is what was sent, ``failures`` [(entity code, step, error)]."""
+
+    def __init__(self, sent, failures):
+        names = ", ".join(f"{code} ({step})" for code, step, _ in failures)
+        super().__init__(f"Payroll alerts failed for {names}; the other entities were processed. / تعذر إرسال تنبيهات "
+                         f"الرواتب للكيانات {names}؛ وعولجت الكيانات الأخرى.", code="alerts_failed")
+        self.sent, self.failures = sent, list(failures)
+
+
+def _entity_alerts(e, today):
+    """The Mudad, GOSI, leave-advance and final-settlement alerts and the WPS burn nominations of one entity on
+    ``today`` (``send_alerts``). Returns how many were sent."""
     sent = 0
-    for e in entities:
-        # Review 2026-10-20c, finding 2: one transaction per entity; the bai' ajel refresh locks rows (select_for_update
-        # needs a transaction on PostgreSQL) and a rebate's restore, status and alerts commit together.
-        with transaction.atomic():
-            roles = ("payroll_officer", "hr_officer")
-            if _jurisdiction_of(e) != "SA":  # WPS, Mudad and GOSI are Saudi (Egypt research §2.4, §2.5)
-                continue
-            sent += len(_refresh_deferred_sales(e))  # slice 2: bai' ajel sales posted on ZATCA reporting (R47)
-            prev = _period_of(today.replace(day=1) - timedelta(days=1))
-            # C-C5: Mudad counts from the pay date: alerts 7, 10 and 15 days after it while no submission is recorded.
-            for offset in MUDAD_ALERT_DAYS:
-                for run in PayrollRun.objects.filter(entity=e, pay_date=today - timedelta(days=offset),
-                                                     payroll_group=PayrollGroup.IN_COUNTRY,
-                                                     status__in=(RS.APPROVED, RS.PAID)):
-                    if not MudadSubmission.objects.filter(run=run).exists():
-                        _send_alerts(e, [(PayrollAlert.Kind.MUDAD_DEADLINE, f"mudad:{run.pk}:{offset}",
-                                          f"Upload the bank-processed salary file of {run.period} to Mudad: {offset} days since "
-                                          f"the pay date {run.pay_date} (R53, C-C5).",
-                                          f"ارفع ملف الرواتب المعالج من البنك لفترة {run.period} على مدد: مضى {offset} أيام على "
-                                          f"تاريخ الصرف {run.pay_date}.", roles)])
-                        sent += 1
-            last = calendar.monthrange(today.year, today.month)[1]
-            if today.day in (25, last):
-                for emp in Employee.objects.filter(entity=e, employment_basis=Basis.KSA_EMPLOYEE,
-                                                   status=Employee.Status.ACTIVE):
-                    if not (emp.gosi_number or "").strip():
-                        _send_alerts(e, [(PayrollAlert.Kind.GOSI_REGISTRATION, f"gosi_reg:{emp.pk}:{_period_of(today)}:{today.day}",
-                                          f"Register {emp.employee_code} at GOSI by {today.replace(day=last)} (Regs Art. 6).",
-                                          f"سجّل {emp.employee_code} في التأمينات قبل {today.replace(day=last)}.", roles)])
-                        sent += 1
-            # C-A10: an approved annual leave starting within 14 days before its period's pay date, not yet advanced.
-            for req in LeaveRequest.objects.filter(entity=e, leave_type__code="ANNUAL", status=LeaveRequest.Status.APPROVED,
-                                                   employee__employment_basis=Basis.KSA_EMPLOYEE,
-                                                   start_date__gt=today, start_date__lte=today + timedelta(days=14)) \
-                    .select_related("employee"):
-                s_ = PayrollSettings.objects.filter(entity=e).first()
-                due = [p for p in _leave_advance_periods(req, s_)
-                       if not PayrollRun.objects.filter(leave_request=req, period=p).exclude(status=RS.REVERSED).exists()]
-                if due:
-                    _send_alerts(e, [(PayrollAlert.Kind.LEAVE_ADVANCE, f"leave_advance:{req.pk}",
-                                      f"Annual leave of {req.employee.employee_code} starts {req.start_date}: pay the leave wage "
-                                      "in advance (Labour Law Art. 109; prepare_leave_advance).",
-                                      f"تبدأ الإجازة السنوية لـ {req.employee.employee_code} في {req.start_date}: اصرف أجر "
-                                      "الإجازة مقدمًا (المادة 109).", ("payroll_officer",))])
-                    sent += 1
-            # C-A11 (Art. 88): final settlements due within 7 days, or 14 when the worker ended the contract; alerts 3
-            # days before, on the due day and the day after while unpaid.
-            for fs in FS.objects.filter(entity=e, due_date__isnull=False).exclude(status__in=(FSS.PAID, FSS.DISCARDED)) \
-                    .select_related("employee"):
-                when = {fs.due_date - timedelta(days=3): "before", fs.due_date: "due", fs.due_date + timedelta(days=1): "late"}
-                if today in when:
-                    _send_alerts(e, [(PayrollAlert.Kind.FINAL_SETTLEMENT_DUE, f"fs:{fs.pk}:{when[today]}",
-                                      f"Final settlement of {fs.employee.employee_code} is due by {fs.due_date} (Labour Law "
-                                      f"Art. 88){' and is late' if when[today] == 'late' else ''}.",
-                                      f"المخالصة النهائية لـ {fs.employee.employee_code} مستحقة قبل {fs.due_date} (المادة 88)"
-                                      f"{' وقد تأخرت' if when[today] == 'late' else ''}.", ("payroll_officer", "approver"))])
-                    sent += 1
-            # Compliance C1: an increasing settlement correction still unpaid the day after its due date.
-            for c in SC.objects.filter(entity=e, status=SCS.APPROVED, due_date=today - timedelta(days=1)) \
-                    .select_related("settlement", "employee"):
-                paid = PayrollPayment.objects.filter(final_settlement=c.settlement, status=PayrollPayment.Status.APPROVED) \
-                    .aggregate(t=Sum("amount"))["t"] or ZERO
-                if paid < _settlement_due(c.settlement):
-                    _send_alerts(e, [(PayrollAlert.Kind.FINAL_SETTLEMENT_DUE, f"fsc:{c.pk}:late",
-                                      f"Correction {c.number} of the final settlement of {c.employee.employee_code} was due "
-                                      f"on {c.due_date} and is late (Labour Law Art. 88).",
-                                      f"التصحيح {c.number} لمخالصة {c.employee.employee_code} كان مستحقًا في {c.due_date} وقد "
-                                      "تأخر (المادة 88).", ("payroll_officer", "approver"))])
-                    sent += 1
-            if today.day == 10:
-                open_ = _gosi_open(e, prev)
-                if open_ > 0:
-                    _send_alerts(e, [(PayrollAlert.Kind.GOSI_PAYMENT, f"gosi_pay:{prev}",
-                                      f"GOSI contributions of {prev} ({open_}) are due by the 15th (Regs Art. 24(1)); late "
-                                      "payment: 2% a month (Law Art. 9(3)).",
-                                      f"اشتراكات التأمينات لفترة {prev} ({open_}) مستحقة قبل اليوم 15؛ غرامة التأخير 2% شهريًا.",
-                                      ("payroll_officer", "approver"))])
-                    sent += 1
-            from datetime import datetime
-            cutoff = timezone.make_aware(datetime(today.year - 10, today.month, min(today.day, 28)))
-            for f in WpsFile.objects.filter(entity=e, nominated_for_burn_at__isnull=True, generated_at__lt=cutoff):
-                f.nominated_for_burn_at = _now()
-                _save(f, update_fields=["nominated_for_burn_at"])
+    roles = ("payroll_officer", "hr_officer")
+    prev = _period_of(today.replace(day=1) - timedelta(days=1))
+    # C-C5: Mudad counts from the pay date: alerts 7, 10 and 15 days after it while no submission is recorded.
+    for offset in MUDAD_ALERT_DAYS:
+        for run in PayrollRun.objects.filter(entity=e, pay_date=today - timedelta(days=offset),
+                                             payroll_group=PayrollGroup.IN_COUNTRY,
+                                             status__in=(RS.APPROVED, RS.PAID)):
+            if not MudadSubmission.objects.filter(run=run).exists():
+                _send_alerts(e, [(PayrollAlert.Kind.MUDAD_DEADLINE, f"mudad:{run.pk}:{offset}",
+                                  f"Upload the bank-processed salary file of {run.period} to Mudad: {offset} days since "
+                                  f"the pay date {run.pay_date} (R53, C-C5).",
+                                  f"ارفع ملف الرواتب المعالج من البنك لفترة {run.period} على مدد: مضى {offset} أيام على "
+                                  f"تاريخ الصرف {run.pay_date}.", roles)])
                 sent += 1
+    last = calendar.monthrange(today.year, today.month)[1]
+    if today.day in (25, last):
+        for emp in Employee.objects.filter(entity=e, employment_basis=Basis.KSA_EMPLOYEE,
+                                           status=Employee.Status.ACTIVE):
+            if not (emp.gosi_number or "").strip():
+                _send_alerts(e, [(PayrollAlert.Kind.GOSI_REGISTRATION, f"gosi_reg:{emp.pk}:{_period_of(today)}:{today.day}",
+                                  f"Register {emp.employee_code} at GOSI by {today.replace(day=last)} (Regs Art. 6).",
+                                  f"سجّل {emp.employee_code} في التأمينات قبل {today.replace(day=last)}.", roles)])
+                sent += 1
+    # C-A10: an approved annual leave starting within 14 days before its period's pay date, not yet advanced.
+    for req in LeaveRequest.objects.filter(entity=e, leave_type__code="ANNUAL", status=LeaveRequest.Status.APPROVED,
+                                           employee__employment_basis=Basis.KSA_EMPLOYEE,
+                                           start_date__gt=today, start_date__lte=today + timedelta(days=14)) \
+            .select_related("employee"):
+        s_ = PayrollSettings.objects.filter(entity=e).first()
+        due = [p for p in _leave_advance_periods(req, s_)
+               if not PayrollRun.objects.filter(leave_request=req, period=p).exclude(status=RS.REVERSED).exists()]
+        if due:
+            _send_alerts(e, [(PayrollAlert.Kind.LEAVE_ADVANCE, f"leave_advance:{req.pk}",
+                              f"Annual leave of {req.employee.employee_code} starts {req.start_date}: pay the leave wage "
+                              "in advance (Labour Law Art. 109; prepare_leave_advance).",
+                              f"تبدأ الإجازة السنوية لـ {req.employee.employee_code} في {req.start_date}: اصرف أجر "
+                              "الإجازة مقدمًا (المادة 109).", ("payroll_officer",))])
+            sent += 1
+    # C-A11 (Art. 88): final settlements due within 7 days, or 14 when the worker ended the contract; alerts 3
+    # days before, on the due day and the day after while unpaid.
+    for fs in FS.objects.filter(entity=e, due_date__isnull=False).exclude(status__in=(FSS.PAID, FSS.DISCARDED)) \
+            .select_related("employee"):
+        when = {fs.due_date - timedelta(days=3): "before", fs.due_date: "due", fs.due_date + timedelta(days=1): "late"}
+        if today in when:
+            _send_alerts(e, [(PayrollAlert.Kind.FINAL_SETTLEMENT_DUE, f"fs:{fs.pk}:{when[today]}",
+                              f"Final settlement of {fs.employee.employee_code} is due by {fs.due_date} (Labour Law "
+                              f"Art. 88){' and is late' if when[today] == 'late' else ''}.",
+                              f"المخالصة النهائية لـ {fs.employee.employee_code} مستحقة قبل {fs.due_date} (المادة 88)"
+                              f"{' وقد تأخرت' if when[today] == 'late' else ''}.", ("payroll_officer", "approver"))])
+            sent += 1
+    # Compliance C1: an increasing settlement correction still unpaid the day after its due date.
+    for c in SC.objects.filter(entity=e, status=SCS.APPROVED, due_date=today - timedelta(days=1)) \
+            .select_related("settlement", "employee"):
+        paid = PayrollPayment.objects.filter(final_settlement=c.settlement, status=PayrollPayment.Status.APPROVED) \
+            .aggregate(t=Sum("amount"))["t"] or ZERO
+        if paid < _settlement_due(c.settlement):
+            _send_alerts(e, [(PayrollAlert.Kind.FINAL_SETTLEMENT_DUE, f"fsc:{c.pk}:late",
+                              f"Correction {c.number} of the final settlement of {c.employee.employee_code} was due "
+                              f"on {c.due_date} and is late (Labour Law Art. 88).",
+                              f"التصحيح {c.number} لمخالصة {c.employee.employee_code} كان مستحقًا في {c.due_date} وقد "
+                              "تأخر (المادة 88).", ("payroll_officer", "approver"))])
+            sent += 1
+    if today.day == 10:
+        open_ = _gosi_open(e, prev)
+        if open_ > 0:
+            _send_alerts(e, [(PayrollAlert.Kind.GOSI_PAYMENT, f"gosi_pay:{prev}",
+                              f"GOSI contributions of {prev} ({open_}) are due by the 15th (Regs Art. 24(1)); late "
+                              "payment: 2% a month (Law Art. 9(3)).",
+                              f"اشتراكات التأمينات لفترة {prev} ({open_}) مستحقة قبل اليوم 15؛ غرامة التأخير 2% شهريًا.",
+                              ("payroll_officer", "approver"))])
+            sent += 1
+    from datetime import datetime
+    cutoff = timezone.make_aware(datetime(today.year - 10, today.month, min(today.day, 28)))
+    for f in WpsFile.objects.filter(entity=e, nominated_for_burn_at__isnull=True, generated_at__lt=cutoff):
+        f.nominated_for_burn_at = _now()
+        _save(f, update_fields=["nominated_for_burn_at"])
+        sent += 1
     return sent
 
 
@@ -5460,6 +5575,263 @@ def _write_off_lines(w):
     label = f"{w.number} (interest-free / قرض حسن)"
     return [{"account": w.expense_account, "debit": w.amount, "description": label},
             {"account": _account(w.entity, LOANS), "credit": w.amount, "description": label}]
+
+
+# =====================================================================================================
+# Review 4 (2026-10-21, item 5; OQ-33 / OQ-34 defaults): a bai' ajel balance left after exit, written off or recovered
+# =====================================================================================================
+
+DEFERRED_PROFIT = "1241"
+DSC = DeferredSaleClosure
+DSCS = DeferredSaleClosure.Status
+DSI = DeferredSaleInstallment.Status
+
+
+def _sale_after_exit(c):
+    """(outstanding-after-exit installments oldest first, their total, whether a planned one is left)."""
+    rows = list(DeferredSaleInstallment.objects.filter(contract=c, status=DSI.OUTSTANDING_AFTER_EXIT)
+                .order_by("period", "pk"))
+    planned = DeferredSaleInstallment.objects.filter(contract=c, status=DSI.PLANNED).exists()
+    return rows, _round(sum((i.amount for i in rows), ZERO)), planned
+
+
+def _closure_problems(c, kind, amount):
+    """Why the contract's after-exit balance may not be closed (``kind``) for ``amount`` now; [] when it may."""
+    if c.status != DeferredSaleContract.Status.SOLD:
+        return error("Only a sold contract's balance outstanding after exit is written off or recovered.",
+                     "يُشطب أو يُسترد الرصيد القائم بعد انتهاء الخدمة لعقد مبيع فقط.", code="sale_status")
+    if not _left_with_settlement(c):
+        return error("The balance is written off or recovered only after the employee's final settlement is approved: "
+                     "the final dues are used first (R49, P17).", "لا يُشطب الرصيد ولا يُسترد إلا بعد اعتماد المخالصة "
+                     "النهائية للموظف: تُستخدم المستحقات النهائية أولًا.", code="closure_before_settlement")
+    rebates = DeferredSaleRebate.objects.filter(contract=c)
+    if rebates.filter(status__in=(DeferredSaleRebate.Status.DRAFT, DeferredSaleRebate.Status.REJECTED)).exists():
+        return error("A rebate of this contract is open: discard it first (no instalment is left for it to reduce).",
+                     "يوجد إبراء مفتوح لهذا العقد: ألغه أولًا (لا يبقى قسط يخفضه).", code="rebate_open")
+    if rebates.filter(status=DeferredSaleRebate.Status.APPROVED).exclude(credit_note_status="final").exists():
+        return error("A rebate credit note of this contract is waiting for ZATCA: its reporting changes 1240, so the "
+                     "balance is closed once the note is final or rejected (R128).", "إشعار دائن لإبراء هذا العقد "
+                     "بانتظار الهيئة: يغيّر الإبلاغ عنه الحساب 1240، فيُقفل الرصيد بعد اعتماد الإشعار أو رفضه.",
+                     code="rebate_pending")
+    _, total, planned = _sale_after_exit(c)
+    if planned or total <= 0:
+        return error("Only a balance outstanding after exit is closed (nothing planned may remain).",
+                     "يُقفل الرصيد القائم بعد انتهاء الخدمة فقط (دون أقساط مخططة متبقية).", code="closure_amount")
+    if kind == DSC.Kind.WRITE_OFF and amount != total:
+        return error(f"A write-off is of the whole balance outstanding after exit ({total}).",
+                     f"يكون الشطب بكامل الرصيد القائم بعد انتهاء الخدمة ({total}).", code="closure_amount")
+    if kind == DSC.Kind.RECOVERY and not ZERO < amount <= total:
+        return error(f"A recovery is above zero and at most the balance outstanding after exit ({total}).",
+                     f"يكون الاسترداد أكبر من صفر وبحد أقصى الرصيد القائم بعد انتهاء الخدمة ({total}).",
+                     code="closure_amount")
+    return None
+
+
+def _unearned_profit(c, amount):
+    """The profit not yet recognised on the contract (on 1241), from invoicing through the port; written off with the
+    whole balance it is debited back to 1241 (never income), the rest of the balance is the loss."""
+    port = invoicing_port.get_port()
+    read = getattr(port, "unearned_bai_ajel_profit", None)
+    if read is None:
+        raise error("The unearned profit is read from invoicing (R128), which is not available.",
+                    "يُقرأ الربح غير المحقق من الفوترة وهي غير متاحة.", code="invoicing_not_built")
+    unearned = _dec(read(c), "unearned profit")
+    if unearned < 0 or unearned > amount:
+        raise error(f"The profit not yet recognised ({unearned}) does not fit the balance written off ({amount}).",
+                    f"الربح غير المحقق ({unearned}) لا يتسق مع الرصيد المشطوب ({amount}).", code="closure_profit")
+    return _round(unearned)
+
+
+@transaction.atomic
+def prepare_deferred_sale_closure(contract, *, user, kind, reason_ar, reason_en="", amount=None,
+                                  expense_account=None, bank_account=None, received_on=None, bank_reference=""):
+    """Review 4 (item 5; OQ-33 / OQ-34 team defaults): after the employee's final settlement is approved, the payroll
+    officer (``payroll.prepare_loan_write_off``) drafts the closure of a bai' ajel balance left outstanding after
+    exit: a ``write_off`` of the whole balance (expense account: the settings' write-off account, default 5100, as
+    loans) or a ``recovery`` the former employee paid into ``bank_account`` on ``received_on`` (up to the balance).
+    Refused while a rebate is open or its credit note is pending. Nothing posts until approval."""
+    c = _lock(DeferredSaleContract, contract.pk)
+    _require(user, c.entity, "payroll.prepare_loan_write_off")
+    if kind not in DSC.Kind.values:
+        raise error("A closure is a write-off or a recovery.", "يكون الإقفال شطبًا أو استردادًا.", code="closure_kind")
+    if not (reason_ar or "").strip():
+        raise error("The reason in Arabic is required.", "السبب بالعربية مطلوب.", code="reason_required")
+    _, total, _ = _sale_after_exit(c)
+    fields = {}
+    if kind == DSC.Kind.WRITE_OFF:
+        amount = total
+        fields["expense_account"] = _write_off_account(c.entity, expense_account)
+    else:
+        amount = _dec(amount, "amount")
+        if not fx.has_places(amount, 2):
+            raise error("The amount is in SAR with at most 2 decimals (R5).", "المبلغ بالريال وبخانتين عشريتين على الأكثر.",
+                        code="amount_invalid")
+        if bank_account is None or received_on is None:
+            raise error("A recovery names the bank account it was received in and the date.",
+                        "يحدد الاسترداد الحساب البنكي الذي استُلم فيه وتاريخه.", code="recovery_invalid")
+        if received_on > _today():
+            raise error("The recovery date is not in the future.", "لا يكون تاريخ الاسترداد في المستقبل.",
+                        code="recovery_invalid")
+        fields.update(bank_account=_bank_account(c.entity, bank_account), received_on=received_on,
+                      bank_reference=(bank_reference or "").strip()[:60])
+    problem = _closure_problems(c, kind, amount)
+    if problem is not None:
+        raise problem
+    if kind == DSC.Kind.WRITE_OFF:
+        fields["profit_share"] = _unearned_profit(c, amount)
+    try:
+        with transaction.atomic():
+            return _save(DSC(entity=c.entity, contract=c, employee_id=c.employee_id, kind=kind, amount=amount,
+                             reason_ar=reason_ar, reason_en=reason_en or "", created_by=user, **fields))
+    except IntegrityError:
+        raise error("A closure of this contract's balance is already open.", "يوجد إقفال مفتوح لرصيد هذا العقد.",
+                    code="closure_exists") from None
+
+
+@transaction.atomic
+def submit_deferred_sale_closure(closure, *, user):
+    w = _lock(DSC, closure.pk)
+    _require(user, w.entity, "payroll.prepare_loan_write_off")
+    if w.status != DSCS.DRAFT:
+        raise error("Only a draft closure is submitted.", "يُقدّم الإقفال المسودة فقط.", code="closure_status")
+    w.status, w.submitted_by, w.submitted_at, w.modified_by, w.modified_at = DSCS.SUBMITTED, user, _now(), user, _now()
+    return _save(w)
+
+
+@transaction.atomic
+def reject_deferred_sale_closure(closure, *, user, reason_ar):
+    w = _lock(DSC, closure.pk)
+    grant = _require(user, w.entity, "payroll.approve_loan_write_off", document=w)
+    approvals.check(grant, w.entity, "payroll.loan_write_off")
+    if w.status not in (DSCS.DRAFT, DSCS.SUBMITTED) or not (reason_ar or "").strip():
+        raise error("An open closure is rejected with a reason in Arabic.", "يُرفض الإقفال المفتوح مع سبب بالعربية.",
+                    code="closure_status")
+    w.status, w.rejected_reason_ar = DSCS.REJECTED, reason_ar
+    return _save(w)
+
+
+@transaction.atomic
+def approve_deferred_sale_closure(closure, *, user):
+    """Review 4 (item 5): the write-off approver (``payroll.approve_loan_write_off``, matrix row
+    ``payroll.loan_write_off``; never the preparer, submitter, last modifier or the employee) approves; the balance
+    is checked again under the entity and contract locks. Posts through the ledger registry only:
+
+    - write-off (dated the approval day): Dr 1241 the profit not yet recognised (read from invoicing again), Dr the
+      write-off account the rest, Cr 1240; the installments become ``written_off``.
+    - recovery (dated ``received_on``): Dr bank / Cr 1240; the installments it covers, oldest first, become
+      ``recovered_after_exit`` (a part-covered one leaves its remainder outstanding after exit) and invoicing
+      recognises the profit share of each through the port inside ``invoicing_port.collecting`` (E13; the
+      collection completing the receivable releases the rest).
+
+    The contract becomes ``settled`` when nothing is left. Logged (AccessLog)."""
+    w = DSC.objects.select_related("entity", "contract").get(pk=closure.pk)
+    grant = _require(user, w.entity, "payroll.approve_loan_write_off", document=w)
+    approvals.check(grant, w.entity, "payroll.loan_write_off")
+    emp = Employee.objects.get(pk=w.employee_id)
+    if user.pk in {w.created_by_id, w.submitted_by_id, w.modified_by_id} or (emp.user_id and emp.user_id == user.pk):
+        access.deny(user, w.entity, "payroll.approve_loan_write_off", "self_approval")
+    _entity_lock(w.entity)
+    c = _lock(DeferredSaleContract, w.contract_id)
+    w = _lock(DSC, w.pk)
+    if w.status != DSCS.SUBMITTED:
+        raise error("Only a submitted closure is approved.", "يُعتمد الإقفال المقدّم فقط.", code="closure_status")
+    for pk in DeferredSaleRebate.objects.filter(contract=c, status=DeferredSaleRebate.Status.APPROVED) \
+            .exclude(credit_note_status="final").values_list("pk", flat=True):
+        _refresh_rebates(w.entity, only=SimpleNamespace(pk=pk))  # a note reported or rejected since
+    problem = _closure_problems(c, w.kind, w.amount)
+    if problem is not None:
+        if problem.code == "closure_amount":
+            raise error("The balance outstanding after exit changed: reject this closure and prepare a new one.",
+                        "تغيّر الرصيد القائم بعد انتهاء الخدمة: ارفض هذا الإقفال وأعدّ إقفالًا جديدًا.",
+                        code="closure_amount")
+        raise problem
+    rows, _, _ = _sale_after_exit(c)
+    if w.kind == DSC.Kind.WRITE_OFF:
+        _write_off_account(w.entity, w.expense_account)
+        w.profit_share = _unearned_profit(c, w.amount)
+        on = _today()
+    else:
+        _bank_account(w.entity, w.bank_account)
+        on = w.received_on
+    parts, rest = [], w.amount
+    for inst in rows:
+        if rest <= 0:
+            break
+        part = min(inst.amount, rest)
+        rest -= part
+        parts.append({"installment_id": inst.pk, "amount": str(part)})
+    w.installment_parts = parts
+    w.number = _next_number(w.entity, "BWO" if w.kind == DSC.Kind.WRITE_OFF else "BRC", _today().year)
+    w.status, w.approved_by, w.approved_at = DSCS.APPROVED, user, _now()
+    _save(w)
+    label = "Bai' ajel write-off / شطب بيع آجل" if w.kind == DSC.Kind.WRITE_OFF else \
+        "Bai' ajel recovery / استرداد بيع آجل"
+    try:
+        with _marker(_posting, w):
+            entry = ledger.create_entry(w.entity, on, f"{label} {w.number}", None, user=user, reference=w.number,
+                                        post=True, grant=grant, document=w)
+    except LedgerError as exc:
+        raise PayrollError(exc.messages, code=getattr(exc, "code", None) or "posting_refused") from None
+    w.journal_entry = entry
+    _save(w)
+    closed = []
+    for part in parts:
+        inst = _lock(DeferredSaleInstallment, part["installment_id"])
+        amount = Decimal(part["amount"])
+        if w.kind == DSC.Kind.WRITE_OFF:
+            inst.status = DSI.WRITTEN_OFF
+            _save(inst)
+            continue
+        if amount < inst.amount:  # the unrecovered part stays outstanding after exit
+            _save(DeferredSaleInstallment(entity=inst.entity, contract=c, period=inst.period,
+                                          amount=inst.amount - amount, carried_from=inst,
+                                          status=DSI.OUTSTANDING_AFTER_EXIT))
+            inst.amount = amount
+        inst.status, inst.deducted_amount = DSI.RECOVERED_AFTER_EXIT, amount
+        _save(inst)
+        closed.append(inst)
+    if closed:
+        with invoicing_port.collecting(w, user):
+            for inst in closed:
+                _recognise_profit(c, inst.deducted_amount, entry.date, _collection_ref(inst), user)
+    if not DeferredSaleInstallment.objects.filter(contract=c, status__in=(DSI.PLANNED,
+                                                                          DSI.OUTSTANDING_AFTER_EXIT)).exists():
+        c.status, c.modified_by, c.modified_at = DeferredSaleContract.Status.SETTLED, user, _now()
+        _save(c)
+    access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=w.entity,
+                        permission="payroll.approve_loan_write_off",
+                        details={"action": f"bai_ajel_{w.kind}", "closure": w.pk, "contract": c.pk,
+                                 "employee_code": emp.employee_code, "amount": str(w.amount),
+                                 "profit_share": str(w.profit_share),
+                                 "message_en": "Bai' ajel balance after exit written off" if w.kind == DSC.Kind.WRITE_OFF
+                                 else "Bai' ajel balance after exit recovered",
+                                 "message_ar": "شُطب رصيد بيع آجل بعد انتهاء الخدمة" if w.kind == DSC.Kind.WRITE_OFF
+                                 else "استُرد رصيد بيع آجل بعد انتهاء الخدمة"})
+    return w
+
+
+def _closure_lines(w):
+    """Registered ``build_lines`` for DeferredSaleClosure. Write-off: Dr 1241 (unearned profit) / Dr write-off account
+    (the rest) / Cr 1240. Recovery: Dr bank / Cr 1240. No fee or penalty ever (R26, R48)."""
+    _require_posting(w)
+    receivable = _account(w.entity, BAI_AJEL)
+    label = f"{w.number} {w.contract.number}".strip()
+    if w.kind == DSC.Kind.RECOVERY:
+        return [{"account": w.bank_account, "debit": w.amount, "description": label},
+                {"account": receivable, "credit": w.amount, "description": label}]
+    lines = []
+    if w.profit_share:
+        lines.append({"account": _account(w.entity, DEFERRED_PROFIT), "debit": w.profit_share,
+                      "description": f"{label} (unearned profit / ربح غير محقق)"})
+    if w.amount - w.profit_share:
+        lines.append({"account": w.expense_account, "debit": w.amount - w.profit_share, "description": label})
+    lines.append({"account": receivable, "credit": w.amount, "description": label})
+    return lines
+
+
+def _closure_entry_allowed(entry):
+    """``ledger.restricted`` allowance for 1241 (invoicing R127): only a bai' ajel write-off's own entry of the entity."""
+    return DSC.objects.filter(pk=entry.document_id, entity_id=entry.entity_id, kind=DSC.Kind.WRITE_OFF).exists()
 
 
 # =====================================================================================================
@@ -6554,13 +6926,21 @@ def _refresh_rebates(entity, only=None):
     port = invoicing_port.get_port()
     if not hasattr(port, "rebate_state"):
         return []
-    qs = DeferredSaleRebate.objects.select_for_update().filter(entity=entity, status=DeferredSaleRebate.Status.APPROVED) \
+    qs = DeferredSaleRebate.objects.filter(entity=entity, status=DeferredSaleRebate.Status.APPROVED) \
         .exclude(credit_note_status="final")
     if only is not None:
         qs = qs.filter(pk=only.pk)
     out = []
-    for r in qs.order_by("pk"):
-        c = _lock(DeferredSaleContract, r.contract_id)
+    # Review 4 (2026-10-21, item 3): the same lock order as the rebate approval (contract, then rebate): the
+    # candidates are read without a lock, then each contract is locked before its rebate, which is read again under
+    # the lock (another approval may have changed it meanwhile). Locking the rebates first would deadlock with an
+    # approval that holds the contract and waits for the rebate (PostgreSQL).
+    for rebate_pk, contract_pk in qs.order_by("contract_id", "pk").values_list("pk", "contract_id"):
+        c = _lock(DeferredSaleContract, contract_pk)
+        r = DeferredSaleRebate.objects.select_for_update(of=("self",)).filter(
+            pk=rebate_pk, status=DeferredSaleRebate.Status.APPROVED).exclude(credit_note_status="final").first()
+        if r is None:
+            continue
         state = port.rebate_state(c, source_ref=_rebate_ref(r))
         status = getattr(state, "status", "") if state is not None else ""
         if status == "final":

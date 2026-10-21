@@ -913,6 +913,10 @@ class DeferredSaleInstallment(ServiceWritten):
         DEDUCTED = "deducted", bi("Deducted", "مستقطع")
         SETTLED_IN_FINAL = "settled_in_final", bi("Settled in the final settlement", "سُدد في المخالصة النهائية")
         OUTSTANDING_AFTER_EXIT = "outstanding_after_exit", bi("Outstanding after exit", "قائم بعد انتهاء الخدمة")
+        # Review 4 (2026-10-21, item 5): the outstanding-after-exit part closed by an approved DeferredSaleClosure.
+        WRITTEN_OFF = "written_off", bi("Written off", "مشطوب")
+        RECOVERED_AFTER_EXIT = "recovered_after_exit", bi("Recovered from the former employee",
+                                                          "مُسترد من الموظف السابق")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     contract = models.ForeignKey(DeferredSaleContract, on_delete=models.PROTECT, related_name="installments",
@@ -931,6 +935,81 @@ class DeferredSaleInstallment(ServiceWritten):
         verbose_name = bi("bai' ajel installment", "قسط بيع آجل")
         verbose_name_plural = bi("bai' ajel installments", "أقساط البيع الآجل")
         ordering = ["contract", "period", "id"]
+
+
+class DeferredSaleClosure(Tracked, ServiceWritten):
+    """[Reg] Review 4 (2026-10-21, item 5; OQ-33 / OQ-34 defaults): closes the part of a bai' ajel contract that the
+    final dues did not cover (installments ``outstanding_after_exit``, on 1240), after the employee's final
+    settlement is approved. Two kinds, both prepared by the payroll officer and approved with four eyes under the
+    loan write-off right and matrix row (``payroll.approve_loan_write_off``, ``payroll.loan_write_off``):
+
+    - ``write_off``: the whole balance; Dr 1241 for the profit not yet recognised on it (the unearned share is
+      never income), Dr the write-off expense account (default 5100, as loans) for the rest, Cr 1240.
+    - ``recovery``: the former employee paid (part of) it into the bank: Dr bank / Cr 1240; the profit share of
+      what was recovered is recognised by invoicing through the port (1241 -> 4610, E13 on collection).
+
+    No fee, penalty or increase ever (R26, R48)."""
+
+    class Kind(models.TextChoices):
+        WRITE_OFF = "write_off", bi("Write-off", "شطب")
+        RECOVERY = "recovery", bi("Recovered from the former employee", "استرداد من الموظف السابق")
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", bi("Draft", "مسودة")
+        SUBMITTED = "submitted", bi("Submitted", "مقدّم")
+        APPROVED = "approved", bi("Approved and posted", "معتمد ومرحّل")
+        REJECTED = "rejected", bi("Rejected", "مرفوض")
+
+    TRANSITIONS = frozenset({("draft", "submitted"), ("submitted", "approved"), ("submitted", "rejected"),
+                             ("draft", "rejected")})
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    contract = models.ForeignKey(DeferredSaleContract, on_delete=models.PROTECT, related_name="closures",
+                                 verbose_name=bi("Contract", "العقد"))
+    employee = models.ForeignKey("hr.Employee", on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Employee", "الموظف"))
+    kind = models.CharField(bi("Kind", "النوع"), max_length=10, choices=Kind.choices)
+    number = models.CharField(bi("Number", "الرقم"), max_length=40, blank=True)
+    amount = _money("Balance closed (1240)", "الرصيد المقفل (1240)")
+    # Write-off: the profit not yet recognised on the balance, debited to 1241 (read from invoicing at approval).
+    profit_share = _money("Unearned profit reversed (1241)", "الربح غير المحقق المعكوس (1241)", default=ZERO)
+    expense_account = models.ForeignKey("ledger.Account", null=True, blank=True, on_delete=models.PROTECT,
+                                        related_name="+", verbose_name=bi("Write-off account", "حساب الشطب"))
+    bank_account = models.ForeignKey("ledger.Account", null=True, blank=True, on_delete=models.PROTECT,
+                                     related_name="+", verbose_name=bi("Bank account", "الحساب البنكي"))
+    received_on = models.DateField(bi("Received on", "تاريخ الاستلام"), null=True, blank=True)
+    bank_reference = models.CharField(bi("Bank reference", "المرجع البنكي"), max_length=60, blank=True)
+    reason_en = models.TextField(bi("Reason (English)", "السبب (بالإنجليزية)"), blank=True)
+    reason_ar = models.TextField(bi("Reason (Arabic)", "السبب (بالعربية)"))
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
+    # At approval: the outstanding-after-exit installments closed and how much of each ([{"installment_id", "amount"}]).
+    installment_parts = models.JSONField(bi("Instalments closed", "الأقساط المقفلة"), default=list, blank=True)
+    submitted_by = _user("Submitted by", "قدّمه")
+    submitted_at = models.DateTimeField(bi("Submitted at", "تاريخ التقديم"), null=True, blank=True)
+    approved_by = _user("Approved by", "اعتمده")
+    approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
+    rejected_reason_ar = models.TextField(bi("Rejection reason (Arabic)", "سبب الرفض (بالعربية)"), blank=True)
+    journal_entry = models.OneToOneField("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                         related_name="+", verbose_name=bi("Journal entry", "القيد"))
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("bai' ajel balance after exit (write-off or recovery)",
+                          "رصيد بيع آجل بعد انتهاء الخدمة (شطب أو استرداد)")
+        verbose_name_plural = bi("bai' ajel balances after exit", "أرصدة البيع الآجل بعد انتهاء الخدمة")
+        constraints = [models.CheckConstraint(condition=Q(amount__gt=0), name="payroll_sale_closure_positive"),
+                       models.CheckConstraint(condition=Q(profit_share__gte=0) & Q(profit_share__lte=models.F("amount")),
+                                              name="payroll_sale_closure_profit_share"),
+                       models.UniqueConstraint(fields=["contract"], condition=Q(status__in=("draft", "submitted")),
+                                               name="payroll_one_open_sale_closure")]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            stored = type(self)._base_manager.filter(pk=self.pk).values_list("status", flat=True).first()
+            if stored is not None and stored != self.status and (stored, self.status) not in self.TRANSITIONS:
+                raise error(f"A bai' ajel balance closure does not move from {stored} to {self.status}.",
+                            f"لا ينتقل إقفال رصيد البيع الآجل من {stored} إلى {self.status}.", code="closure_status")
+        super().save(*args, **kwargs)
 
 
 # --- final settlement (3.8; R28, R34, R49; E5; compliance C-A11, review 14) ---------------------------------
@@ -1113,6 +1192,10 @@ class PayrollPayment(Tracked, ServiceWritten):
     # Compliance B2, B3: per payee at approval: the gross remuneration this payment covers (the WHT base) and its WHT,
     # non-residents only (a person resident in KSA bears no WHT); the WHT return rows are these parts.
     wht_parts = models.JSONField(bi("WHT per payee", "ضريبة الاستقطاع لكل مستفيد"), default=list, blank=True)
+    # Review 4 (2026-10-21): per payee, the base and WHT not withheld because the WHT due was more than their own part
+    # of this payment (never taken from the other payees); a review row of the WHT return (OQ-29).
+    wht_uncovered = models.JSONField(bi("WHT not withheld per payee", "ضريبة الاستقطاع غير المستقطعة لكل مستفيد"),
+                                     default=list, blank=True)
     # Review 2026-10-20b (finding 3): the payslips a run payment pays (named at recording; empty = every payslip of
     # the run in the currency) and, at approval, what it paid on each ([{"payslip_id", "amount"}]). The WHT base of a
     # remuneration payee is their gross in the share of their own net this payment paid.
