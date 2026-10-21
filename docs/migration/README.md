@@ -31,7 +31,9 @@ Steps for each entity (`E` = entity code, users are named people with rights in 
    `migration_load --entity E --user <accountant> --workbook exports/wb.xlsx` (dry run) and the same with `--apply`.
    This drafts one opening entry dated the cut-over date, balanced against 3900. Nothing is posted.
 5. **Second person posts.** `migration_post --entity E --user <approver> --kind opening` (dry run), then `--apply`.
-   The preparer cannot post their own drafts.
+   The preparer cannot post their own drafts. The opening entry posts only when the open receivables and payables
+   loaded into invoicing equal its balances on 1200, 1210, 2100 and 2110 (spec R22); until that loader is built
+   (R23), an opening entry with balances on those accounts stays a draft.
 6. **Tie-out sign-off.** `migration_tieout --entity E --user <approver> --workbook exports/wb.xlsx --as-of <cut-over>
    --posted-only --report exports/tieout.csv` must show zero differences to the halala. The accountant and the CFO /
    CEO sign the Checklist's sign-off block. Nothing goes to a real environment without this sign-off.
@@ -63,7 +65,8 @@ into their modules is built with each module (spec OQ-12).
 4. **تحميل المسودات.** `migration_validate` ثم `migration_load` بتجربة أولًا ثم مع `--apply`. يُنشأ قيد افتتاحي واحد
    كمسودة بتاريخ التحويل ويتوازن مع الحساب 3900. لا يُرحَّل شيء.
 5. **الترحيل بواسطة شخص آخر.** `migration_post ... --kind opening` بتجربة أولًا ثم مع `--apply`. لا يرحّل المُعد
-   مسوداته.
+   مسوداته. لا يُرحَّل القيد الافتتاحي إلا إذا ساوت الذمم المدينة والدائنة المفتوحة المحمّلة في الفوترة أرصدته على
+   الحسابات 1200 و1210 و2100 و2110 (القاعدة R22)؛ وإلى أن تُبنى أداة تحميلها (R23) يبقى القيد مسودة.
 6. **توقيع المطابقة.** يجب أن يُظهر `migration_tieout ... --posted-only` صفر فروق حتى الهللة. يوقع المحاسب والمدير
    المالي أو الرئيس التنفيذي في قسم الاعتماد في قائمة التحقق. لا يُنقل شيء إلى بيئة حقيقية دون هذا التوقيع.
 

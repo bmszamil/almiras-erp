@@ -31,7 +31,7 @@ def files(tmp_path):
     return {k: str(v) for k, v in paths.items()}
 
 
-def test_at15_full_command_flow_dry_run_by_default(w, files):
+def test_at15_full_command_flow_dry_run_by_default(w, files, loaded):
     base = ["--entity", "ALM"]
     assert "dry run" in cmd("migration_map", *base, "--user", "mig.a", "--import", files["map"])
     assert not AccountMap.objects.exists()

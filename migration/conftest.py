@@ -27,11 +27,12 @@ CHART = {
     "5101": ("رواتب وأجور", "5100"),
     "5201": ("مصروف إيجار", "5200"),
 }
-# code -> (name, opening signed, movement debit, movement credit): ties out with JOURNAL below.
+# code -> (name, opening signed, movement debit, movement credit): ties out with JOURNAL below. The replayed journal
+# never touches a control account (1201 -> 1200, 2101 -> 2100; R8 as amended by M7): they carry opening balances only.
 BALANCES = {
-    "1101": ("الصندوق الرئيسي", "10000.00", "0", "3000.00"),
-    "1102": ("بنك تجريبي", "50000.00", "11500.00", "8000.00"),
-    "1201": ("عملاء تجريبيون", "20000.00", "11500.00", "11500.00"),
+    "1101": ("الصندوق الرئيسي", "10000.00", "500.00", "3000.00"),
+    "1102": ("بنك تجريبي", "50000.00", "11500.00", "8500.00"),
+    "1201": ("عملاء تجريبيون", "20000.00", "0", "0"),
     "2101": ("موردون تجريبيون", "-15000.00", "0", "0"),
     "2201": ("ضريبة القيمة المضافة المستحقة", "-5000.00", "0", "1500.00"),
     "2501": ("رأس المال", "-60000.00", "0", "0"),
@@ -44,14 +45,14 @@ BALANCES = {
 def journal_rows():
     L = t.line
     return [
-        L(26000001, date(2026, 1, 15), "1201", "عملاء تجريبيون", debit="11500.00", description="مستخلص رقم 1",
+        L(26000001, date(2026, 1, 15), "1102", "بنك تجريبي", debit="11500.00", description="مستخلص رقم 1 محصل",
           source="مستخلص عميل", source_no=501, serial=1),
         L(26000001, date(2026, 1, 15), "4101", "إيرادات إيجار", credit="10000.00", description="مستخلص رقم 1",
           source="مستخلص عميل", source_no=501, serial=2),
         L(26000001, date(2026, 1, 15), "2201", "ضريبة القيمة المضافة المستحقة", credit="1500.00",
           description="ضريبة مستخلص 1", source="مستخلص عميل", source_no=501, serial=3),
-        L(26000002, date(2026, 1, 20), "1102", "بنك تجريبي", debit="11500.00", description="تحصيل", serial=1),
-        L(26000002, date(2026, 1, 20), "1201", "عملاء تجريبيون", credit="11500.00", description="تحصيل", serial=2),
+        L(26000002, date(2026, 1, 20), "1101", "الصندوق الرئيسي", debit="500.00", description="سحب نقدي", serial=1),
+        L(26000002, date(2026, 1, 20), "1102", "بنك تجريبي", credit="500.00", description="سحب نقدي", serial=2),
         L(26000003, date(2026, 2, 1), "5101", "رواتب وأجور", debit="8000.00", description="رواتب يناير",
           cost_centre="الإدارة", serial=1),
         L(26000003, date(2026, 2, 1), "1102", "بنك تجريبي", credit="8000.00", description="رواتب يناير", serial=2),
@@ -94,6 +95,31 @@ def w(db):
 
 def map_rows(chart=None):
     return [{"legacy_code": c, "legacy_name": n, "erp_code": erp} for c, (n, erp) in (chart or CHART).items()]
+
+
+# The TB's control-account balances (the same at the cut-over and the year end: no replayed movement on them).
+OPEN_ITEMS = {("1200", ""): D("20000.00"), ("2100", ""): D("-15000.00")}
+
+
+@pytest.fixture
+def open_items():
+    """Stands in for the invoicing open-item loader (R23, OQ-12; not built): ``open_items["ALM"] = {(control code,
+    counterparty code or ""): signed SAR}`` is what the R22 posting gate sees as loaded for that entity."""
+    loaded = {}
+
+    def source(entity):
+        return loaded.get(entity.code, {})
+
+    services.register_open_items_source(source)
+    yield loaded
+    services.unregister_open_items_source(source)
+
+
+@pytest.fixture
+def loaded(open_items):
+    """ALM's open items loaded and equal to its control accounts (R22 passes)."""
+    open_items["ALM"] = dict(OPEN_ITEMS)
+    return open_items
 
 
 @pytest.fixture
