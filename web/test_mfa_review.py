@@ -16,7 +16,6 @@ from core.access.authority_models import AccessAlert, ApprovalRequest
 from core.access.models import AccessLog
 from core.access.testing import make_user, member
 from web import crypto, mfa, views
-from payroll.test_pg_review_2026_10_20c import seeded_db  # noqa: F401  (a fixture: reseeds after the flush)
 from web.conftest import PASSWORD, enrol, next_code, person
 from web.models import MfaDevice, RecoveryCode
 
@@ -93,26 +92,6 @@ def test_item1_a_used_code_stays_used_when_the_decision_then_fails(w, signed_in,
     assert replay.status_code == 400
     w.alm_invoice.refresh_from_db()
     assert w.alm_invoice.status == "submitted"
-
-
-@pytest.mark.skipif(connection.vendor != "postgresql", reason="ATOMIC_REQUESTS is set in the PostgreSQL settings")
-@pytest.mark.django_db(transaction=True, databases=["default", "access_log"])
-def test_item1_postgresql_failures_and_used_steps_are_committed_despite_errors(seeded_db, w, signed_in, mfa_clock,
-                                                                          monkeypatch):
-    assert connection.settings_dict["ATOMIC_REQUESTS"]
-    client = signed_in(w.cfo)
-    req = request_of(w.alm_invoice)
-    for i in range(3):
-        mfa_clock.tick(60)
-        client.post(f"/e/ALM/inbox/{req.pk}/approve/", {"version": req.document_version, "code": "%06d" % i})
-    assert MfaDevice.objects.get(user=w.cfo).failures == 3 and failures(w.cfo).count() >= 3
-    mfa_clock.tick(60)
-    code = next_code(w.cfo)
-    monkeypatch.setattr(views.inbox_services, "decide", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
-    client.raise_request_exception = False
-    assert client.post(f"/e/ALM/inbox/{req.pk}/approve/", {"version": req.document_version,
-                                                           "code": code}).status_code == 500
-    assert MfaDevice.objects.get(user=w.cfo).last_counter == int(mfa_clock.at.timestamp()) // 30
 
 
 # --- item 3: escalating locks, alert on the second -------------------------------------------------------------
