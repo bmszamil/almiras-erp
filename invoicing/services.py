@@ -5328,6 +5328,67 @@ def recognise_deferred_profit(source, *, user, collected_amount, collected_on, s
     return release
 
 
+def catch_up_deferred_profit(source, *, source_ref, on, approver):
+    """Payroll review 5 (2026-10-21, item 3; payroll OQ-33): when ZATCA rejects the credit note of a bai' ajel
+    rebate, nothing was waived, so the profit held back while it was pending (prudence, :func:`_profit_figures`) is
+    recognised at once on what is already collected: Dr 1241 / Cr 4610 for ``profit x collected to date /
+    receivable`` (full figures) less what was recognised, dated ``on``, by the deferred-sale system user through the
+    ledger registry (a recognition with no new collection, ``collected_amount`` 0). Then the profit not yet recognised
+    is exactly the profit on what is still outstanding, whatever happens to the balance next (collection, recovery or
+    write-off after exit).
+
+    Accepted only inside payroll's marker for that rejected rebate (``payroll.invoicing_port.catching_up``;
+    ``source_ref`` = ``payroll.deferredsalerebate:<pk>:catch_up:<credit note>``); otherwise
+    ``collection_not_from_payroll``. ``approver`` (the rebate's payroll approver, recorded as ``created_by``) is
+    never the poster. Idempotent per reference; returns None when nothing was held back."""
+    from payroll import invoicing_port as payroll_port
+
+    entity = Entity.objects.get(pk=source.entity_id)
+    system = access.system_user(DEFERRED_SALE_SYSTEM)
+    ref = str(source_ref or "").strip()[:100]
+    if not isinstance(on, date_type):
+        raise error("The catch-up needs its date.", "يحتاج التحقق اللاحق إلى تاريخه.", code="collection_required")
+    problems = payroll_port.catch_up_problems(source, source_ref=ref, approver=approver)
+    if problems:
+        access_services.log_denial(actor=system, entity=entity, permission="invoicing.post_deferred_profit",
+                                   details={"reason": "collection_not_from_payroll", "source_ref": ref})
+        raise _problems_error(problems, "collection_not_from_payroll")
+    with transaction.atomic():
+        sale = _live_deferred_sale(entity, source, lock=True)
+        if sale is None:
+            return None
+        posted = DeferredProfitRelease.objects.filter(deferred_sale=sale, status=DeferredProfitRelease.Status.POSTED)
+        existing = posted.filter(source_ref=ref).first()
+        if existing is not None:
+            return existing
+        doc = sale.sales_document
+        if doc.status != Status.FINAL or doc.journal_entry_id is None:
+            return None
+        collected = Decimal(posted.aggregate(t=Sum("collected_amount"))["t"] or ZERO).quantize(CENT)
+        profit_before = Decimal(posted.aggregate(t=Sum("profit_amount"))["t"] or ZERO).quantize(CENT)
+        if collected <= ZERO:
+            return None
+        amount = _profit_figures(sale, collected, profit_before)
+        if amount <= ZERO:
+            return None
+        release = DeferredProfitRelease(
+            entity=entity, deferred_sale=sale, source_ref=ref, date=on, collected_amount=ZERO,
+            collected_to_date=collected, profit_amount=amount, created_by=approver,
+        )
+        release._service_write = True
+        release.save()
+        grant = access.require(system, entity, "invoicing.post_deferred_profit", document=release)
+        with _posting_as(system):
+            entry = ledger.create_entry(
+                entity, on, f"Bai' ajel profit catch-up {doc.number} / تحقق لاحق لأرباح البيع الآجل {doc.number}", None,
+                user=system, reference=doc.number, post=True, grant=grant, document=release,
+            )
+        release.journal_entry = entry
+        release._service_write = True
+        release.save(update_fields=["journal_entry"])
+    return release
+
+
 def reverse_deferred_profit(source, *, user, source_ref, date=None, reason=""):
     """Reverse the profit recognised for collection ``source_ref`` (a reversed payroll run gives its instalment
     back): the reversal of its own entry, through ``ledger.reverse_entry`` with the person's ``payroll.reverse_run``

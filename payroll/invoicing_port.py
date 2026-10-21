@@ -178,3 +178,45 @@ def rebate_problems(contract, *, source_ref, amount, approver):
     except PermissionDenied:
         return refused
     return []
+
+
+# --- review 5 (2026-10-21, item 3; OQ-33): the profit held back while a rebate note was pending, caught up ----------
+
+# (rebate pk, contract pk, source ref) while ``payroll.services._refresh_rebates`` handles a rebate whose credit note
+# ZATCA rejected. Invoicing's ``catch_up_deferred_profit`` is refused outside it (``catch_up_problems``).
+_catching_up = ContextVar("payroll_catching_up", default=None)
+_CATCH_UP_REF = re.compile(r"^payroll\.deferredsalerebate:(\d+):catch_up:(.*)$")
+
+
+def catch_up_ref(rebate):
+    return f"payroll.deferredsalerebate:{rebate.pk}:catch_up:{rebate.credit_note_ref or ''}"[:100]
+
+
+@contextmanager
+def catching_up(rebate):
+    token = _catching_up.set((rebate.pk, rebate.contract_id, catch_up_ref(rebate)))
+    try:
+        yield
+    finally:
+        _catching_up.reset(token)
+
+
+def catch_up_problems(contract, *, source_ref, approver=None):
+    """Why invoicing may not catch up the bai' ajel profit held back for ``contract`` now: [] only inside payroll's
+    handling of that very rebate (``catching_up``), of that contract and entity, whose credit note ZATCA rejected;
+    ``approver`` is that rebate's approver."""
+    from .models import DeferredSaleRebate
+
+    refused = ["Held-back bai' ajel profit is caught up only by payroll when ZATCA rejects that rebate's credit note "
+               "(R128, OQ-33). / لا يتحقق ربح البيع الآجل المؤجل لاحقًا إلا من الرواتب عند رفض الهيئة للإشعار الدائن "
+               "لذلك الإبراء."]
+    marker = _catching_up.get()
+    match = _CATCH_UP_REF.match(str(source_ref or ""))
+    if marker is None or match is None or marker[2] != source_ref or int(match.group(1)) != marker[0] \
+            or marker[1] != contract.pk:
+        return refused
+    ok = DeferredSaleRebate.objects.filter(pk=marker[0], contract_id=contract.pk, entity_id=contract.entity_id,
+                                           status=DeferredSaleRebate.Status.REJECTED,
+                                           credit_note_status="rejected",
+                                           approved_by_id=getattr(approver, "pk", -1)).exists()
+    return [] if ok else refused

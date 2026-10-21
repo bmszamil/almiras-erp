@@ -19,6 +19,7 @@ class FakeInvoicingPort:
         self.reversed = []  # (contract pk, source_ref, user pk)
         self.rebates = []  # (contract pk, source_ref, amount, user pk)
         self.rebate_status = "issued"
+        self.caught_up = []  # review 5 (item 3): (contract pk, source_ref, on)
         self.unearned = None  # review 4: what unearned_bai_ajel_profit reports (None: pro rata, see there)
 
     def create_bai_ajel_sale(self, contract, *, user):
@@ -65,6 +66,14 @@ class FakeInvoicingPort:
         rows = DeferredSaleInstallment.objects.filter(contract=contract, status="outstanding_after_exit")
         balance = sum((i.amount for i in rows), Decimal("0"))
         return (contract.profit_amount * balance / contract.receivable).quantize(Decimal("0.01"))
+
+    def catch_up_bai_ajel_profit(self, contract, *, source_ref, on, approver):
+        """Review 5 (item 3): refused, like the real port, outside payroll's ``catching_up`` marker."""
+        if invoicing_port.catch_up_problems(contract, source_ref=source_ref, approver=approver):
+            raise invoicing_port.error("Not from payroll's rebate rejection (test port).", "ليس من رفض الإبراء.",
+                                       code="collection_not_from_payroll")
+        self.caught_up.append((contract.pk, source_ref, on))
+        return None
 
     def reverse_bai_ajel_profit(self, contract, *, source_ref, user, on=None, reason=""):
         self.reversed.append((contract.pk, source_ref, user.pk))

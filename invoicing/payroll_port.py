@@ -134,6 +134,12 @@ class PayrollInvoicingPort:
         recognised = sum((r.profit_amount for r in sale.releases.filter(status="posted")), Decimal("0.00"))
         return services._sale_figures(sale)[0] - recognised
 
+    def catch_up_bai_ajel_profit(self, contract, *, source_ref, on, approver):
+        """Payroll review 5 (item 3; OQ-33): the profit held back while a rejected rebate note was pending,
+        recognised on what was already collected. Returns RecognitionResult or None."""
+        release = services.catch_up_deferred_profit(contract, source_ref=source_ref, on=on, approver=approver)
+        return None if release is None else _result(release)
+
     def reverse_bai_ajel_profit(self, contract, *, source_ref, user, on=None, reason=""):
         return _result(services.reverse_deferred_profit(contract, user=user, source_ref=source_ref, date=on,
                                                         reason=reason))

@@ -45,6 +45,7 @@ from hr.models import (
     Termination,
 )
 from ledger import fx
+from ledger import restricted
 from ledger import services as ledger
 from ledger.models import Account, FiscalPeriod, JournalLine, LedgerError
 
@@ -4011,11 +4012,36 @@ def _gosi_open(entity, period):
     return _gosi_booked(entity, period) - _gosi_paid(entity, period)
 
 
+CASH_AND_BANK, PETTY_CASH = "1100", "1110"
+# Review 5 (2026-10-21, item 1): never a bank or cash account, whatever the chart says of them.
+NOT_BANK_OR_CASH = frozenset({"1240", "1241", "1250"})
+
+
+def _is_bank_or_cash(account):
+    """The chart has no bank/cash flag: a bank account is 1100 or a sub-account of 1100 (banking R5, the GL account
+    of every banking ``BankAccount``; tax's settlement rule), a cash account 1110 (petty cash) or a sub-account of it."""
+    if account.code in (CASH_AND_BANK, PETTY_CASH):
+        return True
+    parent = Account.objects.filter(pk=account.parent_id).values_list("code", flat=True).first() \
+        if account.parent_id else None
+    return parent in (CASH_AND_BANK, PETTY_CASH)
+
+
 def _bank_account(entity, account):
-    """Review 17: a payment leaves from a postable asset account of the paying entity."""
-    if account.entity_id != entity.pk or account.type != "asset" or not account.is_postable:
+    """Review 17: a payment leaves from (and a recovery is received in) a postable asset account of the entity.
+    Review 5 (2026-10-21, item 1): that account is a bank or cash account (:func:`_is_bank_or_cash`), active, never a
+    restricted account (``ledger.restricted``: 1140 purification, 1240 / 1241 bai' ajel, ...) and never 1240, 1241
+    or 1250 (a recovery into the receivable itself or the sale assets would recognise profit with no cash)."""
+    if account is None or account.entity_id != entity.pk or account.type != "asset" or not account.is_postable:
         raise error("The bank account is a postable asset account of the entity (R30).",
                     "الحساب البنكي حساب أصول قابل للترحيل من حسابات الكيان.", code="bank_account_invalid")
+    if (account.code in NOT_BANK_OR_CASH or restricted.get(account.code) is not None or not account.is_active
+            or not _is_bank_or_cash(account)):
+        raise error(f"Account {account.code} is not a bank or cash account of the entity: choose 1100, 1110 or a bank "
+                    "or cash sub-account of them (never a restricted account, 1240, 1241 or 1250).",
+                    f"الحساب {account.code} ليس حسابًا بنكيًا أو نقديًا للكيان: اختر 1100 أو 1110 أو حسابًا فرعيًا "
+                    "بنكيًا أو نقديًا منهما (وليس حسابًا مقيدًا ولا 1240 ولا 1241 ولا 1250).",
+                    code="bank_account_invalid")
     return account
 
 
@@ -4327,6 +4353,14 @@ def _compute_wht(p, user):
     if p.wht_amount > p.amount:
         raise error(f"The WHT {p.wht_amount} is more than the payment {p.amount}.",
                     f"ضريبة الاستقطاع {p.wht_amount} أكبر من الدفعة {p.amount}.", code="wht_exceeds_payment")
+    if p.wht_amount and p.wht_amount == p.amount:
+        # Review 5 (2026-10-21, item 2): the WHT capped at the payees' own parts takes the whole payment: nothing
+        # leaves the bank; the entry is Dr 2330 / Cr 2220 only and the payment is recorded as fully withheld.
+        p.warnings = list(p.warnings or []) + [
+            f"The whole payment {p.amount} {p.currency_id} is withheld tax (WHT payable 2220): nothing is paid from "
+            "the bank, so no bank line is posted; the payment is recorded as fully withheld (R43) / "
+            f"الدفعة كاملة {p.amount} {p.currency_id} ضريبة استقطاع (ضريبة الاستقطاع المستحقة 2220): لا يُدفع شيء من "
+            "البنك فلا يُرحَّل بند بنكي؛ وتُسجَّل الدفعة مستقطعة بالكامل"]
     p.wht_amount_sar = fx.convert(p.wht_amount, fx_rate) if foreign else p.wht_amount
     base_total = sum(base_txn.values(), ZERO)
     p.wht_base_sar = fx.convert(base_total, fx_rate) if foreign else base_total
@@ -4360,8 +4394,9 @@ def _payment_lines(p):
                 {"account": p.bank_account, "credit": p.amount, "description": label}]
     payable = _account(p.entity, SALARIES_PAYABLE)
     if p.currency_id == p.entity.base_currency_id:
-        lines = [{"account": payable, "debit": p.amount, "description": label},
-                 {"account": p.bank_account, "credit": p.amount - p.wht_amount, "description": label}]
+        lines = [{"account": payable, "debit": p.amount, "description": label}]
+        if p.amount - p.wht_amount:  # review 5 (item 2): fully withheld, no bank line (Dr 2330 / Cr 2220)
+            lines.append({"account": p.bank_account, "credit": p.amount - p.wht_amount, "description": label})
         if p.wht_amount:
             lines.append({"account": _account(p.entity, WHT_PAYABLE), "credit": p.wht_amount, "description": label})
         return lines
@@ -4376,8 +4411,10 @@ def _payment_lines(p):
     bank_txn = p.amount - p.wht_amount
     bank_sar = fx.convert(bank_txn, rate)
     lines = [{"account": payable, "currency": p.currency_id, "txn_debit": p.amount, "settles_line": item,
-              "description": label},
-             {"account": p.bank_account, "currency": p.currency_id, "txn_credit": bank_txn, "description": label}]
+              "description": label}]
+    if bank_txn:  # review 5 (item 2): fully withheld, no bank line (Dr 2330 / Cr 2220 and any realised FX)
+        lines.append({"account": p.bank_account, "currency": p.currency_id, "txn_credit": bank_txn,
+                      "description": label})
     if p.wht_amount_sar:
         lines.append({"account": _account(p.entity, WHT_PAYABLE), "credit": p.wht_amount_sar, "description": label})
     diff = carrying - bank_sar - p.wht_amount_sar
@@ -5691,6 +5728,63 @@ def _closure_problems(c, kind, amount):
     return None
 
 
+def _closure_vat_share(c, amount):
+    """Review 5 (2026-10-21, item 5): the VAT included in ``amount`` of the contract's balance: every instalment
+    carries the VAT of the sale pro rata (receivable = sale price + VAT, P20(h)), less the rebates whose credit note
+    is final (their VAT was credited). Written off, it stays on 2200 (declared output VAT)."""
+    vat, receivable = Fraction(c.vat_amount), Fraction(c.receivable)
+    for r in DeferredSaleRebate.objects.filter(contract=c, status=DeferredSaleRebate.Status.APPROVED,
+                                               credit_note_status="final"):
+        vat -= Fraction(r.vat_amount)
+        receivable -= Fraction(r.gross_amount)
+    if receivable <= 0 or vat <= 0:
+        return ZERO
+    return min(_round(Fraction(amount) * vat / receivable), amount)
+
+
+def _closure_vat_warning(w):
+    return (f"The balance written off ({w.amount}) includes {w.vat_share} of VAT already declared as output VAT; it "
+            "stays on 2200 (VAT output). Whether bad-debt relief may reduce it is for the tax adviser (invoicing "
+            "OQ-78); this write-off is listed for them / "
+            f"يتضمن الرصيد المشطوب ({w.amount}) مبلغ {w.vat_share} ضريبة قيمة مضافة سبق الإقرار بها ضريبةَ مخرجات؛ "
+            "ويبقى في الحساب 2200 (ضريبة المخرجات). وتحديد إمكانية تخفيضها بإعفاء الديون المعدومة يعود إلى المستشار "
+            "الضريبي؛ ويُدرج هذا الشطب في قائمته")
+
+
+def bai_ajel_write_off_vat_list(entity, *, user, start=None, end=None):
+    """Review 5 (2026-10-21, item 5; invoicing OQ-78): the approved bai' ajel write-offs after exit with VAT in the
+    balance written off (``vat_share``, still on 2200), for the tax adviser to consider bad-debt relief. Needs
+    ``payroll.view``; no personal data beyond the employee code. Optional ``start`` / ``end`` on the entry date."""
+    _require(user, entity, "payroll.view")
+    qs = DSC.objects.filter(entity=entity, kind=DSC.Kind.WRITE_OFF, status=DSCS.APPROVED, vat_share__gt=0) \
+        .select_related("contract", "journal_entry", "employee").order_by("journal_entry__date", "pk")
+    if start is not None:
+        qs = qs.filter(journal_entry__date__gte=start)
+    if end is not None:
+        qs = qs.filter(journal_entry__date__lte=end)
+    return [{"closure": w.number, "contract": w.contract.number, "sale_document_ref": w.contract.sale_document_ref,
+             "employee_code": w.employee.employee_code, "date": w.journal_entry.date, "amount": w.amount,
+             "vat_share": w.vat_share, "note_en": "VAT in a written-off bai' ajel balance, still on 2200: bad-debt "
+             "relief to be decided by the tax adviser (invoicing OQ-78)", "note_ar": "ضريبة قيمة مضافة في رصيد بيع "
+             "آجل مشطوب، باقية في 2200: يقرر المستشار الضريبي إعفاء الديون المعدومة"} for w in qs]
+
+
+def _recovery_date_check(c, received_on):
+    """Review 5 (2026-10-21, item 4): a recovery after exit is received on or after the sale date and on or after the
+    approval date of the employee's final settlement (the balance is only outstanding after exit from then on)."""
+    if c.sale_date and received_on < c.sale_date:
+        raise error(f"The recovery date {received_on} is before the sale date {c.sale_date}.",
+                    f"تاريخ الاسترداد {received_on} قبل تاريخ البيع {c.sale_date}.", code="recovery_date")
+    approved = FinalSettlement.objects.filter(employee_id=c.employee_id, status__in=SETTLED) \
+        .exclude(approved_at=None).order_by("approved_at").values_list("approved_at", flat=True).first()
+    if approved is not None and received_on < timezone.localdate(approved):
+        on = timezone.localdate(approved)
+        raise error(f"The recovery date {received_on} is before the final settlement's approval on {on}: what was "
+                    "received before it is collected by the final settlement, not as a recovery after exit.",
+                    f"تاريخ الاسترداد {received_on} قبل اعتماد المخالصة النهائية في {on}: ما استُلم قبلها يُحصَّل "
+                    "في المخالصة النهائية لا استردادًا بعد انتهاء الخدمة.", code="recovery_date")
+
+
 def _unearned_profit(c, amount):
     """The profit not yet recognised on the contract (on 1241), from invoicing through the port; written off with the
     whole balance it is debited back to 1241 (never income), the rest of the balance is the loss."""
@@ -5736,6 +5830,7 @@ def prepare_deferred_sale_closure(contract, *, user, kind, reason_ar, reason_en=
         if received_on > _today():
             raise error("The recovery date is not in the future.", "لا يكون تاريخ الاسترداد في المستقبل.",
                         code="recovery_invalid")
+        _recovery_date_check(c, received_on)
         fields.update(bank_account=_bank_account(c.entity, bank_account), received_on=received_on,
                       bank_reference=(bank_reference or "").strip()[:60])
     problem = _closure_problems(c, kind, amount)
@@ -5743,6 +5838,9 @@ def prepare_deferred_sale_closure(contract, *, user, kind, reason_ar, reason_en=
         raise problem
     if kind == DSC.Kind.WRITE_OFF:
         fields["profit_share"] = _unearned_profit(c, amount)
+        fields["vat_share"] = _closure_vat_share(c, amount)
+        if fields["vat_share"]:
+            fields["warnings"] = [_closure_vat_warning(SimpleNamespace(amount=amount, vat_share=fields["vat_share"]))]
     try:
         with transaction.atomic():
             return _save(DSC(entity=c.entity, contract=c, employee_id=c.employee_id, kind=kind, amount=amount,
@@ -5774,8 +5872,33 @@ def reject_deferred_sale_closure(closure, *, user, reason_ar):
     return _save(w)
 
 
-@transaction.atomic
 def approve_deferred_sale_closure(closure, *, user):
+    """Review 5 (2026-10-21, item 6): the credit notes of the contract's rebates still pending are read first, in
+    their own committed step (:func:`_refresh_rebates`), before the approval transaction. A note ZATCA rejected
+    meanwhile restores its instalments outside the approval, so it is not rolled back with the refused approval and
+    the user is not stuck: the approval is refused with ``rebate_rejected_retry`` (en/ar: discard the rebate, then
+    reject this closure and prepare a new one for the new balance). Then :func:`_approve_deferred_sale_closure`."""
+    w = DSC.objects.select_related("entity").get(pk=closure.pk)
+    _require(user, w.entity, "payroll.approve_loan_write_off", document=w)
+    found = []
+    with transaction.atomic():
+        for pk in DeferredSaleRebate.objects.filter(contract_id=w.contract_id,
+                                                    status=DeferredSaleRebate.Status.APPROVED) \
+                .exclude(credit_note_status="final").values_list("pk", flat=True):
+            found += _refresh_rebates(w.entity, only=SimpleNamespace(pk=pk))  # a note reported or rejected since
+    if found:
+        refs = ", ".join(r.credit_note_ref or str(r.pk) for r in found)
+        raise error(f"ZATCA rejected the rebate credit note {refs} of this contract since this closure was prepared: "
+                    "nothing was waived and the amount is outstanding after exit again (recorded). Discard the rebate, "
+                    "then reject this closure and prepare a new one for the new balance.",
+                    f"رفضت الهيئة الإشعار الدائن للإبراء {refs} لهذا العقد بعد إعداد هذا الإقفال: لم يُبرأ من شيء وعاد "
+                    "المبلغ قائمًا بعد انتهاء الخدمة (سُجّل ذلك). ألغِ الإبراء ثم ارفض هذا الإقفال وأعدّ إقفالًا جديدًا "
+                    "بالرصيد الجديد.", code="rebate_rejected_retry")
+    return _approve_deferred_sale_closure(closure, user=user)
+
+
+@transaction.atomic
+def _approve_deferred_sale_closure(closure, *, user):
     """Review 4 (item 5): the write-off approver (``payroll.approve_loan_write_off``, matrix row
     ``payroll.loan_write_off``; never the preparer, submitter, last modifier or the employee) approves; the balance
     is checked again under the entity and contract locks. Posts through the ledger registry only:
@@ -5799,9 +5922,6 @@ def approve_deferred_sale_closure(closure, *, user):
     w = _lock(DSC, w.pk)
     if w.status != DSCS.SUBMITTED:
         raise error("Only a submitted closure is approved.", "يُعتمد الإقفال المقدّم فقط.", code="closure_status")
-    for pk in DeferredSaleRebate.objects.filter(contract=c, status=DeferredSaleRebate.Status.APPROVED) \
-            .exclude(credit_note_status="final").values_list("pk", flat=True):
-        _refresh_rebates(w.entity, only=SimpleNamespace(pk=pk))  # a note reported or rejected since
     problem = _closure_problems(c, w.kind, w.amount)
     if problem is not None:
         if problem.code == "closure_amount":
@@ -5813,9 +5933,12 @@ def approve_deferred_sale_closure(closure, *, user):
     if w.kind == DSC.Kind.WRITE_OFF:
         _write_off_account(w.entity, w.expense_account)
         w.profit_share = _unearned_profit(c, w.amount)
+        w.vat_share = _closure_vat_share(c, w.amount)
+        w.warnings = [_closure_vat_warning(w)] if w.vat_share else []
         on = _today()
     else:
         _bank_account(w.entity, w.bank_account)
+        _recovery_date_check(c, w.received_on)
         on = w.received_on
     parts, rest = [], w.amount
     for inst in rows:
@@ -5866,7 +5989,7 @@ def approve_deferred_sale_closure(closure, *, user):
                         permission="payroll.approve_loan_write_off",
                         details={"action": f"bai_ajel_{w.kind}", "closure": w.pk, "contract": c.pk,
                                  "employee_code": emp.employee_code, "amount": str(w.amount),
-                                 "profit_share": str(w.profit_share),
+                                 "profit_share": str(w.profit_share), "vat_share": str(w.vat_share),
                                  "message_en": "Bai' ajel balance after exit written off" if w.kind == DSC.Kind.WRITE_OFF
                                  else "Bai' ajel balance after exit recovered",
                                  "message_ar": "شُطب رصيد بيع آجل بعد انتهاء الخدمة" if w.kind == DSC.Kind.WRITE_OFF
@@ -5881,6 +6004,10 @@ def _closure_lines(w):
     receivable = _account(w.entity, BAI_AJEL)
     label = f"{w.number} {w.contract.number}".strip()
     if w.kind == DSC.Kind.RECOVERY:
+        if w.bank_account_id == receivable.pk or w.bank_account.code in NOT_BANK_OR_CASH:
+            raise error("A recovery never debits the bai' ajel receivable (1240) or 1241 / 1250.",
+                        "لا يُقيَّد الاسترداد على ذمم البيع الآجل (1240) ولا على 1241 أو 1250.",
+                        code="bank_account_invalid")
         return [{"account": w.bank_account, "debit": w.amount, "description": label},
                 {"account": receivable, "credit": w.amount, "description": label}]
     lines = []
@@ -7025,6 +7152,7 @@ def _refresh_rebates(entity, only=None):
                 after_exit = _restore_rebate_cuts(r, c)
                 r.status, r.credit_note_status = DeferredSaleRebate.Status.REJECTED, "rejected"
                 _save(r)
+                _catch_up_profit(port, r, c)
                 en, ar = _rebate_rejected_text(r, c, after_exit)
                 key = f"rebate:{r.pk}:{r.credit_note_ref}:rejected"[:120]
                 _send_alerts(entity, [(PayrollAlert.Kind.BAI_AJEL_REBATE, key, en, ar, ("payroll_officer",))])
@@ -7034,6 +7162,18 @@ def _refresh_rebates(entity, only=None):
                                                        defaults=dict(text_en=en, text_ar=ar))
             out.append(r)
     return out
+
+
+def _catch_up_profit(port, r, c):
+    """Review 5 (2026-10-21, item 3; OQ-33): nothing was waived, so invoicing recognises at once the profit it held
+    back while the note was pending (on what is already collected), through the port inside payroll's marker for
+    this rejected rebate; it posts through the ledger only. The profit not yet recognised is then the profit on
+    what is still outstanding, so a write-off after exit no longer depends on whether a recovery came first."""
+    catch_up = getattr(port, "catch_up_bai_ajel_profit", None)
+    if catch_up is None or r.approved_by_id is None:
+        return None
+    with invoicing_port.catching_up(r):
+        return catch_up(c, source_ref=invoicing_port.catch_up_ref(r), on=_today(), approver=r.approved_by)
 
 
 def _rebate_rejected_text(r, c, after_exit):

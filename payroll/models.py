@@ -980,6 +980,11 @@ class DeferredSaleClosure(Tracked, ServiceWritten):
     amount = _money("Balance closed (1240)", "الرصيد المقفل (1240)")
     # Write-off: the profit not yet recognised on the balance, debited to 1241 (read from invoicing at approval).
     profit_share = _money("Unearned profit reversed (1241)", "الربح غير المحقق المعكوس (1241)", default=ZERO)
+    # Review 5 (2026-10-21, item 5): write-off: the VAT included in the balance written off (it stays on 2200, output
+    # VAT already declared); listed for the tax adviser (bad-debt relief, invoicing OQ-78). 0 for a recovery.
+    vat_share = _money("VAT in the balance written off (stays on 2200)", "ضريبة القيمة المضافة في الرصيد المشطوب (تبقى في 2200)",
+                       default=ZERO)
+    warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
     expense_account = models.ForeignKey("ledger.Account", null=True, blank=True, on_delete=models.PROTECT,
                                         related_name="+", verbose_name=bi("Write-off account", "حساب الشطب"))
     bank_account = models.ForeignKey("ledger.Account", null=True, blank=True, on_delete=models.PROTECT,
@@ -1007,6 +1012,8 @@ class DeferredSaleClosure(Tracked, ServiceWritten):
         constraints = [models.CheckConstraint(condition=Q(amount__gt=0), name="payroll_sale_closure_positive"),
                        models.CheckConstraint(condition=Q(profit_share__gte=0) & Q(profit_share__lte=models.F("amount")),
                                               name="payroll_sale_closure_profit_share"),
+                       models.CheckConstraint(condition=Q(vat_share__gte=0) & Q(vat_share__lte=models.F("amount")),
+                                              name="payroll_sale_closure_vat_share"),
                        models.UniqueConstraint(fields=["contract"], condition=Q(status__in=("draft", "submitted")),
                                                name="payroll_one_open_sale_closure")]
 

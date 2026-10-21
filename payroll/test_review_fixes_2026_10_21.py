@@ -257,7 +257,7 @@ def _write_off(w, c, **kw):
     return services.submit_deferred_sale_closure(x, user=w.p)
 
 
-def _recovery(w, c, amount, on=date(2027, 3, 18)):
+def _recovery(w, c, amount, on=date(2027, 3, 20)):  # review 5 item 4: not before the settlement's approval
     x = services.prepare_deferred_sale_closure(c, user=w.p, kind="recovery", amount=amount, reason_ar="سداد الموظف",
                                                bank_account=services._account(w.alm, "1100"), received_on=on,
                                                bank_reference="TRF-1")
@@ -408,7 +408,7 @@ def test_item5_recovery_refusals(w):
     with pytest.raises(PayrollError) as exc:
         services.prepare_deferred_sale_closure(c, user=w.p, kind="recovery", amount="10.00", reason_ar="سداد",
                                                bank_account=services._account(w.alm, "5100"),
-                                               received_on=date(2027, 3, 18))
+                                               received_on=date(2027, 3, 20))
     assert exc.value.code == "bank_account_invalid"
 
 
