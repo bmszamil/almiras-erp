@@ -351,8 +351,17 @@ ROLE_SEED_V16 = {
                               "payroll.approve_loan_write_off"),
     "accountant": _plus(ROLE_SEED_V15, "accountant", "payroll.prepare_profit_recognition"),
 }
+# V17 (migration core.0026, zatca.md §7 as amended 2026-10-21, D-19): ``zatca.view_key_events`` (secret-version
+# retirement events and pending retirements) for the ZATCA admin and the viewer / auditor (read-only); not the
+# accountant, not agents. Retiring itself has no permission: only the ZATCA system user does it, after commit and
+# in the retirement job (zatca R-57 to R-60).
+ROLE_SEED_V17 = {
+    **ROLE_SEED_V16,
+    "zatca_admin": _plus(ROLE_SEED_V16, "zatca_admin", "zatca.view_key_events"),
+    "viewer": _plus(ROLE_SEED_V16, "viewer", "zatca.view_key_events"),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V16
+ROLE_SEED = ROLE_SEED_V17
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {

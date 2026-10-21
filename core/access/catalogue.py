@@ -178,6 +178,8 @@ _PERMS = [
     _p("zatca.export_archive", "Export the ZATCA archive", "تصدير أرشيف الفواتير الإلكترونية"),
     _p("zatca.close_late_notice", "Close late-submission notices", "إغلاق إشعارات التأخر في الإرسال"),
     _p("zatca.grant_key_delegation", "Grant ZATCA key custody", "تفويض حفظ مفاتيح الهيئة", GROUP_ONLY, SEGREGATED),
+    # zatca §7 as amended 2026-10-21 (D-19): secret-version retirement events and pending retirements.
+    _p("zatca.view_key_events", "View ZATCA key retirement events", "عرض أحداث إيقاف إصدارات مفاتيح الهيئة"),
     # ledger
     _p("ledger.create_entry", "Create draft journal entries", "إنشاء مسودات القيود اليومية", AGENT_OK),
     _p("ledger.post_entry", "Post manual journal entries", "ترحيل القيود اليومية اليدوية", APPROVAL, POSTS),

@@ -230,6 +230,7 @@ Flags: **A** = approval (creator ≠ approver, R14); **S!** = segregation that c
 | `zatca.export_archive` | | zatca_admin, accountant, viewer (OQ-7) |
 | `zatca.close_late_notice` | | zatca_admin |
 | `zatca.grant_key_delegation` | G, S! | managing_partner. *Amended 2026-10-17 (A20):* delegates custody of a per-entity master key (zatca R-50); the `unseal` scope is withdrawn |
+| `zatca.view_key_events` | | zatca_admin, viewer (read-only). *Added 2026-10-21 (zatca §7 as amended by D-19, as built; seed V17, migration core.0026):* view secret-version retirement events and pending retirements. Not the accountant, not **Ag**. Retiring itself needs no permission: only the ZATCA system user does it |
 | `ledger.create_entry` (draft) | Ag | accountant, agent (table rates only, ledger-fx) |
 | `ledger.post_entry` (manual journals) | A, P | approver; accountant pending OQ-5 |
 | `ledger.reverse_entry` (manual journals) | P | accountant (OQ-5) |
