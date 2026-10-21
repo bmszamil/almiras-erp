@@ -351,7 +351,7 @@ ROLE_SEED_V16 = {
                               "payroll.approve_loan_write_off"),
     "accountant": _plus(ROLE_SEED_V15, "accountant", "payroll.prepare_profit_recognition"),
 }
-# V17 (migration core.0026, payroll slice 3, payroll.md §11.7): the payroll officer and the accountant generate the
+# V17 (migration core.0027, payroll slice 3, payroll.md §11.7): the payroll officer and the accountant generate the
 # leave and EOSB liability reports (nothing is posted); the payroll officer records Mudad justifications; the
 # hr_officer approves them (matrix activity payroll.mudad_justification, code default hr_officer); the managing
 # partner holds the approval as fallback like every A permission (OQ-1; payroll's matrix seam refuses it for this

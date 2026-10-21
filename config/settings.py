@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     "migration",
     "tax",
     "payroll",
+    "web",
 ]
 
 # tax-returns R55: the Art. 51 annual true-up hand-off (tax.art51_port). As built, invoicing posts mixed input VAT
@@ -64,7 +65,10 @@ INVOICING_ZATCA_PORT = "zatca.port.ZatcaModulePort"
 ZATCA_SECRET_STORE = os.environ.get("ZATCA_SECRET_STORE", "zatca.keystore.OpenBaoSecretStore")
 ZATCA_OPENBAO_ADDRESS = os.environ.get("ZATCA_OPENBAO_ADDRESS", "")
 ZATCA_OPENBAO_AUTH_ROLE = os.environ.get("ZATCA_OPENBAO_AUTH_ROLE", "")
-# API client (R-29). Base URLs and paths come from ZATCA's Swagger at deployment (OQ-30); empty placeholders.
+# API client (R-29, OQ-30). Empty values here mean "use the defaults in zatca/client.py" (DEFAULT_BASE_URLS,
+# DEFAULT_API_PATHS); a non-empty value overrides its default. The developer-portal sandbox URL and every path were
+# checked against ZATCA on 2026-10-19 (docs/compliance/zatca-sandbox-2026-10-19.md §2); the simulation and
+# production base URLs are ZATCA's published values, not yet called (client.BASE_URL_VERIFIED).
 ZATCA_CLIENT = "zatca.client.HttpZatcaClient"
 ZATCA_API_BASE_URLS = {"sandbox": os.environ.get("ZATCA_SANDBOX_BASE_URL", ""),
                        "simulation": os.environ.get("ZATCA_SIMULATION_BASE_URL", ""),
@@ -73,11 +77,13 @@ ZATCA_API_PATHS = {"compliance_csid": "", "compliance_check": "", "production_cs
                    "clearance": "", "reporting": ""}
 # R-29: production can be selected only where this is switched on explicitly (never in test or dev settings).
 ZATCA_PRODUCTION_ALLOWED = os.environ.get("ZATCA_PRODUCTION_ALLOWED", "0") == "1"
-# R-15 / R-37, pending a current ZATCA SDK or the sandbox (OQ-28 remainder, OQ-33): see zatca/qr.py.
+# R-15 / R-37: settled against ZATCA SDK R3.4.8 and R4.0.0 (zatca/qr.py). These three settings are retired and
+# change nothing: the QR always uses the DTG tags 7-9 layout (any other layout value is refused as misconfiguration),
+# BER lengths with no per-value cap, and the 1000-character cap constant qr.MAX_CHARS.
 ZATCA_QR_TAGS_7_9_LAYOUT = "dtg_2023_pending_sdk_confirm"
 ZATCA_QR_TLV_LENGTH_FORM = "one_byte_max_127_pending_sdk_confirm"
 ZATCA_QR_MAX_CHARS = 700
-# R-14 X509IssuerName form (RFC 2253 with ", "; [SDK-confirm]).
+# R-14 X509IssuerName form: RFC 2253 with ", " (settled by SDK R3.4.8 and R4.0.0; "bc" is for comparison only).
 ZATCA_X509_ISSUER_NAME_STYLE = "rfc2253"
 # R-10 renewal lead time (OQ-9), R-23 alert lead time, R-24 retry policy (OQ-10), R-27 optional serialising.
 ZATCA_RENEWAL_DAYS = 30
@@ -133,9 +139,63 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    # web.md R12 (human-only sessions), R17 (timeouts), R22 (no-store), R27 (language).
+    "web.middleware.WebMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "django.middleware.csp.ContentSecurityPolicyMiddleware",  # web.md R20
 ]
+
+# --- Web UI security (docs/specs/web.md R17, R18, R20) -------------------------------------------------------
+from django.utils.csp import CSP  # noqa: E402
+
+# R20: no inline script or style, no outside origin; fonts, images and CSS are vendored static files.
+SECURE_CSP = {
+    "default-src": [CSP.SELF],
+    "script-src": [CSP.SELF],
+    "style-src": [CSP.SELF],
+    "img-src": [CSP.SELF, "data:"],
+    "font-src": [CSP.SELF],
+    "form-action": [CSP.SELF],
+    "frame-ancestors": [CSP.NONE],
+    "base-uri": [CSP.NONE],
+    "object-src": [CSP.NONE],
+}
+X_FRAME_OPTIONS = "DENY"
+SECURE_REFERRER_POLICY = "same-origin"
+SECURE_CONTENT_TYPE_NOSNIFF = True
+# HSTS is sent on HTTPS responses only (SecurityMiddleware); one year.
+SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_HSTS_SECONDS", 365 * 24 * 3600))
+
+# R17: Secure, HttpOnly, SameSite=Lax cookies. Secure is on unless DEBUG (plain-HTTP local runs) and can be forced
+# either way with DJANGO_SECURE_COOKIES.
+_SECURE_COOKIES = os.environ.get("DJANGO_SECURE_COOKIES", "0" if DEBUG else "1") == "1"
+SESSION_COOKIE_SECURE = _SECURE_COOKIES
+CSRF_COOKIE_SECURE = _SECURE_COOKIES
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+SESSION_EXPIRE_AT_BROWSER_CLOSE = True
+# OQ-8 defaults: absolute 10 h (also the cookie age), idle 30 min, 15 min for users who need MFA (web.middleware).
+SESSION_COOKIE_AGE = 10 * 3600
+WEB_SESSION_ABSOLUTE_SECONDS = 10 * 3600
+WEB_SESSION_IDLE_SECONDS = 30 * 60
+WEB_SESSION_IDLE_MFA_SECONDS = 15 * 60
+# R18, OQ-9 defaults: 5 failed sign-ins per username + IP lock that pair for 15 minutes; 20 per username from all
+# addresses lock the username for 15 minutes (bounds guessing spread over many addresses; web.md "As built").
+WEB_LOGIN_MAX_FAILURES = 5
+WEB_LOGIN_MAX_USER_FAILURES = 20
+WEB_LOGIN_LOCK_SECONDS = 15 * 60
+# OQ-27: the request header holding the client address. None = REMOTE_ADDR. Set below behind the TLS proxy, which
+# writes X-Real-IP itself (deploy/proxy/Caddyfile). X-Forwarded-For is never trusted.
+WEB_CLIENT_IP_HEADER = None
+# MFA (web.md R13 to R16) is not built yet. The deploy check (manage.py check --deploy, web.E001) fails while DEBUG
+# is off unless this is switched on explicitly: password-only sign-in is a go-live blocker.
+WEB_ALLOW_PASSWORD_ONLY_LOGIN = os.environ.get("DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN", "0") == "1"
+
+LOGIN_URL = "web:login"
+LOGIN_REDIRECT_URL = "web:home"
+CSRF_FAILURE_VIEW = "web.views.csrf_failure"
 
 ROOT_URLCONF = "config.urls"
 
@@ -149,6 +209,7 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                "web.context_processors.ui",
             ],
         },
     },
@@ -264,6 +325,7 @@ if os.environ.get("DJANGO_BEHIND_TLS_PROXY", "0") == "1":
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+    WEB_CLIENT_IP_HEADER = "HTTP_X_REAL_IP"  # written by the proxy (header_up X-Real-IP {remote_host}), OQ-27
 
 
 # Email

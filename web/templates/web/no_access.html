@@ -1,0 +1,6 @@
+{% extends "web/base.html" %}{% load web_tags %}
+{% block title %}{% t "no_access_title" %}{% endblock %}
+{% block content %}
+<h1 class="alm-title">{% t "no_access_title" %}</h1>
+{% include "web/_empty.html" with message_key="no_access_body" %}
+{% endblock %}

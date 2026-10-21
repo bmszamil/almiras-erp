@@ -1,5 +1,6 @@
 # Checks and tests on every push and pull request (CLAUDE.md: python -m pytest -q must pass before any merge).
 # Two jobs: PostgreSQL 16 (the real database; runs the PostgreSQL-only trigger and locking tests) and SQLite.
+# Tests run in parallel (pytest-xdist, -n auto); REQUIRE_POSTGRES still counts skips from every worker.
 # Throwaway databases only: no real data or credentials. Actions are pinned by commit SHA (tag in the comment).
 name: tests
 
@@ -45,7 +46,8 @@ jobs:
       - run: python manage.py makemigrations --check --dry-run
       - run: DJANGO_SETTINGS_MODULE=config.settings_test python manage.py makemigrations --check --dry-run
       - run: python manage.py check
-      - run: python -m pytest -q -rs
+      # pytest-xdist: one worker per CPU, each with its own test database (pytest-django adds _gw<N>).
+      - run: python -m pytest -q -rs -n auto
 
   sqlite:
     runs-on: ubuntu-latest
@@ -59,4 +61,5 @@ jobs:
       - run: python manage.py makemigrations --check --dry-run
       - run: DJANGO_SETTINGS_MODULE=config.settings_test python manage.py makemigrations --check --dry-run
       - run: python manage.py check
-      - run: python -m pytest -q -rs
+      # pytest-xdist: one worker per CPU, each with its own test database (pytest-django adds _gw<N>).
+      - run: python -m pytest -q -rs -n auto

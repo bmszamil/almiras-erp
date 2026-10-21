@@ -100,29 +100,43 @@ def collection_problems(contract, *, source_ref, amount=None, user, mode="collec
 
 # --- review 2026-10-20b, finding 1 (invoicing R128 as amended): a rebate credit note only from payroll's approval ----
 
-# (rebate pk, user pk) while ``approve_deferred_sale_rebate`` asks invoicing for the rebate's credit note. Invoicing's
-# ``create_deferred_sale_adjustment`` is refused outside it (``rebate_problems``).
+# (rebate pk, user pk, token, grant) while ``approve_deferred_sale_rebate`` asks invoicing for the rebate's credit
+# note. Invoicing's ``create_deferred_sale_adjustment`` is refused outside it (``rebate_problems``). Review
+# 2026-10-20c, finding 4: the marker alone is not proof (any code can build an object with a ``pk``): it carries a
+# one-time token that the approval writes on the locked rebate row in its own transaction (and clears when done), and
+# the approver's grant, checked again here with the authority matrix and four eyes.
 _rebating = ContextVar("payroll_rebating", default=None)
 _REBATE_REF = re.compile(r"^payroll\.deferredsalerebate:(\d+)$")
 
 
 @contextmanager
-def rebating(rebate, user):
-    """Set by ``payroll.services.approve_deferred_sale_rebate`` around its call to ``create_bai_ajel_rebate``."""
-    token = _rebating.set((rebate.pk, getattr(user, "pk", None)))
+def rebating(rebate, user, *, token, grant):
+    """Set by ``payroll.services.approve_deferred_sale_rebate`` around its call to ``create_bai_ajel_rebate``, with
+    the token it stored on the locked rebate row and the grant of the approver's ``payroll.approve_deferred_sale``."""
+    marker = _rebating.set((rebate.pk, getattr(user, "pk", None), str(token or ""), grant))
     try:
         yield
     finally:
-        _rebating.reset(token)
+        _rebating.reset(marker)
 
 
 def rebate_problems(contract, *, source_ref, amount, approver):
     """Why invoicing may not issue the rebate credit note ``source_ref`` of ``amount`` for ``contract`` now: [] only
-    inside the payroll approval of that very rebate (``rebating``), by its approver (four eyes: never the preparer or
-    the employee), for a rebate of that contract and entity, being approved (draft, or rejected and approved again),
-    at that amount."""
+    inside the payroll approval of that very rebate (``rebating``), by its approver, for a rebate of that contract and
+    entity, being approved (draft, or rejected and approved again), at that amount. Review 2026-10-20c, finding 4:
+    the rebate row is read again (the approval holds its lock) and must carry the marker's one-time token (written by the approval in
+    this transaction); the approver's grant must be the one logged for this contract, still valid and unused, and
+    eligible under the entity's authority matrix (``payroll.deferred_sale``); four eyes as the approval: never the
+    preparer, the last modifier or the employee."""
+    import hmac
+
+    from django.core.exceptions import PermissionDenied
+
+    from core import access
+    from core.models import Entity
     from hr.models import Employee
 
+    from . import approvals
     from .models import DeferredSaleRebate
 
     refused = ["A bai' ajel rebate credit note is issued only by payroll's approval of that rebate, by its approver, "
@@ -131,13 +145,25 @@ def rebate_problems(contract, *, source_ref, amount, approver):
     marker = _rebating.get()
     match = _REBATE_REF.match(str(source_ref or ""))
     approver_pk = getattr(approver, "pk", None)
-    if marker is None or match is None or marker[1] != approver_pk or int(match.group(1)) != marker[0]:
+    if marker is None or match is None or marker[1] != approver_pk or int(match.group(1)) != marker[0] \
+            or len(marker[2]) < 32:
         return refused
-    r = DeferredSaleRebate.objects.filter(pk=marker[0], contract_id=contract.pk, entity_id=contract.entity_id).first()
+    r = DeferredSaleRebate.objects.filter(pk=marker[0], contract_id=contract.pk,
+                                          entity_id=contract.entity_id).first()  # read again (the approval locks it)
     if r is None or r.status not in (DeferredSaleRebate.Status.DRAFT, DeferredSaleRebate.Status.REJECTED) \
-            or r.amount != amount or approver_pk == r.created_by_id:
+            or r.amount != amount or approver_pk in {r.created_by_id, r.modified_by_id} \
+            or not hmac.compare_digest(r.approval_token or "", marker[2]):
         return refused
     emp_user = Employee.objects.filter(pk=contract.employee_id).values_list("user_id", flat=True).first()
     if emp_user and emp_user == approver_pk:
+        return refused
+    grant = marker[3]
+    entity = Entity.objects.get(pk=contract.entity_id)
+    try:
+        if getattr(getattr(grant, "user", None), "pk", None) != approver_pk:
+            return refused
+        access.verify_grant(grant, entity, ("payroll.approve_deferred_sale",), document=contract, use=False)
+        approvals.check(grant, entity, "payroll.deferred_sale")
+    except PermissionDenied:
         return refused
     return []

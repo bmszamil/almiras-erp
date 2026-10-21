@@ -10,9 +10,9 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("core", "0025_seed_access_v16_payroll_slice2"),
+        ("core", "0026_alter_accesslog_event"),
         ("hr", "0021_contract_pay_rate_basis"),
-        ("payroll", "0018_review_fixes_rebate_wht"),
+        ("payroll", "0019_review_fixes_rebate_token"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

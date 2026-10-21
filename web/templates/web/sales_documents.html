@@ -1,0 +1,49 @@
+{% extends "web/base.html" %}{% load web_tags %}
+{% block title %}{% t "sd_list_title" %} | {{ entity.code }}{% endblock %}
+{% block content %}
+<div class="alm-page-head">
+  <h1 class="alm-title">{% t "sd_list_title" %}</h1>
+  <p class="alm-page-head__entity">{% pick entity "name" %} <span class="alm-code">{{ entity.code|ident }}</span></p>
+</div>
+<p class="alm-readonly">{% t "read_only_notice" %}</p>
+{% include "web/_filters.html" %}
+<section class="alm-card alm-card--table" aria-labelledby="alm-results">
+  <h2 class="alm-card__title" id="alm-results">{% t "results" %} <span class="alm-count">{% t "rows_found" count=paginator.count %}</span></h2>
+  {% if page.object_list %}
+  <div class="table-responsive">
+    <table class="table table-hover alm-table">
+      <caption class="visually-hidden">{% t "sd_list_title" %}</caption>
+      <thead>
+        <tr>
+          <th scope="col">{% t "number" %}</th>
+          <th scope="col">{% t "doc_type" %}</th>
+          <th scope="col">{% t "issue_date" %}</th>
+          <th scope="col">{% t "customer" %}</th>
+          <th scope="col">{% t "status" %}</th>
+          <th scope="col">{% t "zatca_status" %}</th>
+          <th scope="col" class="text-end">{% t "gross" %}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for doc in page.object_list %}
+        <tr>
+          <td><a href="{% url 'web:sales_document' entity.code doc.pk %}">{% if doc.number %}{{ doc.number|ident }}{% else %}{% t "no_number" %} <bdi dir="ltr">#{{ doc.pk }}</bdi>{% endif %}</a></td>
+          <td>{% half doc.get_doc_type_display %}</td>
+          <td>{% day doc.issue_date %}</td>
+          <td>{{ doc.customer.code|ident }} <span dir="auto">{{ doc.customer_display }}</span></td>
+          <td>{% status "sd" doc.status doc.get_status_display %}</td>
+          <td>{% status "zatca" doc.zatca_status doc.get_zatca_status_display %}</td>
+          <td class="text-end">{% if doc.totals_ready %}{% money doc.total_gross doc.currency %}{% else %}<span class="alm-pending">{% t "totals_at_issue" %}</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% include "web/_pagination.html" %}
+  {% elif filtered %}
+  {% include "web/_empty.html" with message_key="empty_filtered" %}
+  {% else %}
+  {% include "web/_empty.html" with message_key="empty_sales" %}
+  {% endif %}
+</section>
+{% endblock %}

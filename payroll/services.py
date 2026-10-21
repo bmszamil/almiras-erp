@@ -11,6 +11,7 @@ import csv
 import hashlib
 import io
 import json
+import secrets
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -4237,8 +4238,16 @@ def _wht_bases(p):
         slips = list(Payslip.objects.filter(pk__in=parts, run=p.run, refused=False, currency_id=p.currency_id,
                                             employment_basis=Basis.REMUNERATION).select_related("employee")
                      .order_by("employee__employee_code"))
-        bases = {ps.employee: (Fraction(ps.gross_txn) * Fraction(parts[ps.pk]) / Fraction(ps.net_txn)
-                               if ps.net_txn else Fraction(ps.gross_txn)) for ps in slips}
+        # Review 2026-10-20c, item 7: a payslip with no net pay (all deducted) is covered at 0 and pays nothing, so
+        # no WHT is withheld for it from this payment (it would come out of the other payees' money): a warning.
+        unpaid = [ps for ps in slips if not ps.net_txn]
+        bases = {ps.employee: Fraction(ps.gross_txn) * Fraction(parts[ps.pk]) / Fraction(ps.net_txn)
+                 for ps in slips if ps.net_txn}
+        p.warnings = list(p.warnings or []) + [
+            f"{ps.employee.employee_code} has no net pay on {p.run.number}: the WHT on their gross {ps.gross_txn} "
+            "is not withheld by this payment; record it with the tax adviser (R43) / "
+            f"لا صافي أجر لـ {ps.employee.employee_code} في {p.run.number}: لا تُستقطع ضريبة إجماليه {ps.gross_txn} من "
+            "هذه الدفعة؛ تُسجَّل مع المستشار الضريبي" for ps in unpaid]
     elif p.kind == PayrollPayment.Kind.FINAL_SETTLEMENT:
         fs = p.final_settlement
         due = _settlement_due(fs)
@@ -4344,12 +4353,15 @@ def _wht_return_source(entity, start, end):
     def add(p, sign):
         reversal = sign < 0
         for part in p.wht_parts or []:
-            key = (p.wht_category.code, part["employee_code"], p.wht_category.rate, reversal)
+            backfilled = bool(part.get("backfilled"))
+            key = (p.wht_category.code, part["employee_code"], p.wht_category.rate, reversal, backfilled)
             r = rows.setdefault(key, {
                 "category": p.wht_category.code, "return_line_code": p.wht_category.return_line_code,
                 "vendor": part["employee_code"], "country": part.get("country", ""), "rate": p.wht_category.rate,
                 "treaty_certificate": None, "treaty_country": "", "base_sar": ZERO, "wht_sar": ZERO, "gross_up": False,
                 "source": "payroll", "payee_kind": "employee"})
+            if backfilled:
+                _backfilled_review(r, p, part)
             if reversal:
                 month = p.payment_date.strftime("%Y-%m")
                 r.update({"reversal": True, "amends_return_month": month,
@@ -4376,6 +4388,40 @@ def _wht_return_source(entity, start, end):
     for p in qs.filter(status=PayrollPayment.Status.REVERSED, reversal_entry__date__range=(start, end)):
         add(p, -1)
     return list(rows.values())
+
+
+def _backfilled_review(row, p, part):
+    """Review 2026-10-20c, finding 6: a payee part rebuilt by payroll.0018 from what was booked (split by net pay)
+    may name the wrong payee: before the per-payee base, WHT was booked on the whole net paid, residents in KSA and
+    non-remuneration staff included. Such rows stay in the return apart from the others (they tie to 2220 as
+    booked) and are flagged for review (``review_required``, ``review_en`` / ``review_ar``), naming the reason when
+    the payee is recorded as resident in KSA or is not paid as remuneration staff."""
+    reasons = row.setdefault("review_reasons", [])
+    if (part.get("country") or "").strip().upper() == "SA" and "resident" not in reasons:
+        reasons.append("resident")
+    if p.kind == PayrollPayment.Kind.NET_SALARIES and p.run_id:
+        bases = set(Payslip.objects.filter(run_id=p.run_id, employee_id=part.get("employee_id"), refused=False)
+                    .values_list("employment_basis", flat=True))
+    else:
+        bases = set(Employee.objects.filter(pk=part.get("employee_id")).values_list("employment_basis", flat=True))
+    if Basis.REMUNERATION not in bases and "not_remuneration" not in reasons:
+        reasons.append("not_remuneration")
+    payments = row.setdefault("backfilled_payments", [])
+    if p.pk not in payments:
+        payments.append(p.pk)
+    refs = ", ".join(str(pk) for pk in payments)
+    en = (f"Rebuilt by migration payroll.0018 from the WHT booked on payment(s) {refs} (split by net pay): check "
+          "the payee and the amounts before filing")
+    ar = (f"أُعيد بناؤه في الترحيل payroll.0018 من الضريبة المقيدة على الدفعة (الدفعات) {refs} (موزعة حسب صافي الأجر): "
+          "تحقق من المستفيد والمبالغ قبل تقديم الإقرار")
+    text = {"resident": ("the payee is recorded as resident in Saudi Arabia (WHT applies to non-residents only, B3)",
+                         "المستفيد مسجل مقيمًا في المملكة (تُفرض الضريبة على غير المقيمين فقط)"),
+            "not_remuneration": ("the payee is not paid as remuneration staff (no WHT on salaries, B2)",
+                                 "المستفيد ليس من موظفي المكافآت (لا ضريبة استقطاع على الرواتب)")}
+    if reasons:
+        en += "; " + "; ".join(text[k][0] for k in reasons) + ": correct the booked WHT (amend or refund) first"
+        ar += "؛ " + "؛ ".join(text[k][1] for k in reasons) + ": صحّح الضريبة المقيدة (تعديل أو رد) أولًا"
+    row.update({"backfilled": True, "review_required": True, "review_en": f"{en} (R43).", "review_ar": f"{ar}."})
 
 
 def wht_return_rows(entity, month, *, user):
@@ -4867,88 +4913,91 @@ def send_alerts(*, today=None, entity=None):
         payroll_settings__enabled=True)
     sent = 0
     for e in entities:
-        roles = ("payroll_officer", "hr_officer")
-        if _jurisdiction_of(e) != "SA":  # WPS, Mudad and GOSI are Saudi (Egypt research §2.4, §2.5)
-            continue
-        sent += len(_refresh_deferred_sales(e))  # slice 2: bai' ajel sales posted on ZATCA reporting (R47)
-        prev = _period_of(today.replace(day=1) - timedelta(days=1))
-        # C-C5: Mudad counts from the pay date: alerts 7, 10 and 15 days after it while no submission is recorded.
-        for offset in MUDAD_ALERT_DAYS:
-            for run in PayrollRun.objects.filter(entity=e, pay_date=today - timedelta(days=offset),
-                                                 payroll_group=PayrollGroup.IN_COUNTRY,
-                                                 status__in=(RS.APPROVED, RS.PAID)):
-                if not MudadSubmission.objects.filter(run=run).exists():
-                    _send_alerts(e, [(PayrollAlert.Kind.MUDAD_DEADLINE, f"mudad:{run.pk}:{offset}",
-                                      f"Upload the bank-processed salary file of {run.period} to Mudad: {offset} days since "
-                                      f"the pay date {run.pay_date} (R53, C-C5).",
-                                      f"ارفع ملف الرواتب المعالج من البنك لفترة {run.period} على مدد: مضى {offset} أيام على "
-                                      f"تاريخ الصرف {run.pay_date}.", roles)])
+        # Review 2026-10-20c, finding 2: one transaction per entity; the bai' ajel refresh locks rows (select_for_update
+        # needs a transaction on PostgreSQL) and a rebate's restore, status and alerts commit together.
+        with transaction.atomic():
+            roles = ("payroll_officer", "hr_officer")
+            if _jurisdiction_of(e) != "SA":  # WPS, Mudad and GOSI are Saudi (Egypt research §2.4, §2.5)
+                continue
+            sent += len(_refresh_deferred_sales(e))  # slice 2: bai' ajel sales posted on ZATCA reporting (R47)
+            prev = _period_of(today.replace(day=1) - timedelta(days=1))
+            # C-C5: Mudad counts from the pay date: alerts 7, 10 and 15 days after it while no submission is recorded.
+            for offset in MUDAD_ALERT_DAYS:
+                for run in PayrollRun.objects.filter(entity=e, pay_date=today - timedelta(days=offset),
+                                                     payroll_group=PayrollGroup.IN_COUNTRY,
+                                                     status__in=(RS.APPROVED, RS.PAID)):
+                    if not MudadSubmission.objects.filter(run=run).exists():
+                        _send_alerts(e, [(PayrollAlert.Kind.MUDAD_DEADLINE, f"mudad:{run.pk}:{offset}",
+                                          f"Upload the bank-processed salary file of {run.period} to Mudad: {offset} days since "
+                                          f"the pay date {run.pay_date} (R53, C-C5).",
+                                          f"ارفع ملف الرواتب المعالج من البنك لفترة {run.period} على مدد: مضى {offset} أيام على "
+                                          f"تاريخ الصرف {run.pay_date}.", roles)])
+                        sent += 1
+            last = calendar.monthrange(today.year, today.month)[1]
+            if today.day in (25, last):
+                for emp in Employee.objects.filter(entity=e, employment_basis=Basis.KSA_EMPLOYEE,
+                                                   status=Employee.Status.ACTIVE):
+                    if not (emp.gosi_number or "").strip():
+                        _send_alerts(e, [(PayrollAlert.Kind.GOSI_REGISTRATION, f"gosi_reg:{emp.pk}:{_period_of(today)}:{today.day}",
+                                          f"Register {emp.employee_code} at GOSI by {today.replace(day=last)} (Regs Art. 6).",
+                                          f"سجّل {emp.employee_code} في التأمينات قبل {today.replace(day=last)}.", roles)])
+                        sent += 1
+            # C-A10: an approved annual leave starting within 14 days before its period's pay date, not yet advanced.
+            for req in LeaveRequest.objects.filter(entity=e, leave_type__code="ANNUAL", status=LeaveRequest.Status.APPROVED,
+                                                   employee__employment_basis=Basis.KSA_EMPLOYEE,
+                                                   start_date__gt=today, start_date__lte=today + timedelta(days=14)) \
+                    .select_related("employee"):
+                s_ = PayrollSettings.objects.filter(entity=e).first()
+                due = [p for p in _leave_advance_periods(req, s_)
+                       if not PayrollRun.objects.filter(leave_request=req, period=p).exclude(status=RS.REVERSED).exists()]
+                if due:
+                    _send_alerts(e, [(PayrollAlert.Kind.LEAVE_ADVANCE, f"leave_advance:{req.pk}",
+                                      f"Annual leave of {req.employee.employee_code} starts {req.start_date}: pay the leave wage "
+                                      "in advance (Labour Law Art. 109; prepare_leave_advance).",
+                                      f"تبدأ الإجازة السنوية لـ {req.employee.employee_code} في {req.start_date}: اصرف أجر "
+                                      "الإجازة مقدمًا (المادة 109).", ("payroll_officer",))])
                     sent += 1
-        last = calendar.monthrange(today.year, today.month)[1]
-        if today.day in (25, last):
-            for emp in Employee.objects.filter(entity=e, employment_basis=Basis.KSA_EMPLOYEE,
-                                               status=Employee.Status.ACTIVE):
-                if not (emp.gosi_number or "").strip():
-                    _send_alerts(e, [(PayrollAlert.Kind.GOSI_REGISTRATION, f"gosi_reg:{emp.pk}:{_period_of(today)}:{today.day}",
-                                      f"Register {emp.employee_code} at GOSI by {today.replace(day=last)} (Regs Art. 6).",
-                                      f"سجّل {emp.employee_code} في التأمينات قبل {today.replace(day=last)}.", roles)])
+            # C-A11 (Art. 88): final settlements due within 7 days, or 14 when the worker ended the contract; alerts 3
+            # days before, on the due day and the day after while unpaid.
+            for fs in FS.objects.filter(entity=e, due_date__isnull=False).exclude(status__in=(FSS.PAID, FSS.DISCARDED)) \
+                    .select_related("employee"):
+                when = {fs.due_date - timedelta(days=3): "before", fs.due_date: "due", fs.due_date + timedelta(days=1): "late"}
+                if today in when:
+                    _send_alerts(e, [(PayrollAlert.Kind.FINAL_SETTLEMENT_DUE, f"fs:{fs.pk}:{when[today]}",
+                                      f"Final settlement of {fs.employee.employee_code} is due by {fs.due_date} (Labour Law "
+                                      f"Art. 88){' and is late' if when[today] == 'late' else ''}.",
+                                      f"المخالصة النهائية لـ {fs.employee.employee_code} مستحقة قبل {fs.due_date} (المادة 88)"
+                                      f"{' وقد تأخرت' if when[today] == 'late' else ''}.", ("payroll_officer", "approver"))])
                     sent += 1
-        # C-A10: an approved annual leave starting within 14 days before its period's pay date, not yet advanced.
-        for req in LeaveRequest.objects.filter(entity=e, leave_type__code="ANNUAL", status=LeaveRequest.Status.APPROVED,
-                                               employee__employment_basis=Basis.KSA_EMPLOYEE,
-                                               start_date__gt=today, start_date__lte=today + timedelta(days=14)) \
-                .select_related("employee"):
-            s_ = PayrollSettings.objects.filter(entity=e).first()
-            due = [p for p in _leave_advance_periods(req, s_)
-                   if not PayrollRun.objects.filter(leave_request=req, period=p).exclude(status=RS.REVERSED).exists()]
-            if due:
-                _send_alerts(e, [(PayrollAlert.Kind.LEAVE_ADVANCE, f"leave_advance:{req.pk}",
-                                  f"Annual leave of {req.employee.employee_code} starts {req.start_date}: pay the leave wage "
-                                  "in advance (Labour Law Art. 109; prepare_leave_advance).",
-                                  f"تبدأ الإجازة السنوية لـ {req.employee.employee_code} في {req.start_date}: اصرف أجر "
-                                  "الإجازة مقدمًا (المادة 109).", ("payroll_officer",))])
-                sent += 1
-        # C-A11 (Art. 88): final settlements due within 7 days, or 14 when the worker ended the contract; alerts 3
-        # days before, on the due day and the day after while unpaid.
-        for fs in FS.objects.filter(entity=e, due_date__isnull=False).exclude(status__in=(FSS.PAID, FSS.DISCARDED)) \
-                .select_related("employee"):
-            when = {fs.due_date - timedelta(days=3): "before", fs.due_date: "due", fs.due_date + timedelta(days=1): "late"}
-            if today in when:
-                _send_alerts(e, [(PayrollAlert.Kind.FINAL_SETTLEMENT_DUE, f"fs:{fs.pk}:{when[today]}",
-                                  f"Final settlement of {fs.employee.employee_code} is due by {fs.due_date} (Labour Law "
-                                  f"Art. 88){' and is late' if when[today] == 'late' else ''}.",
-                                  f"المخالصة النهائية لـ {fs.employee.employee_code} مستحقة قبل {fs.due_date} (المادة 88)"
-                                  f"{' وقد تأخرت' if when[today] == 'late' else ''}.", ("payroll_officer", "approver"))])
-                sent += 1
-        # Compliance C1: an increasing settlement correction still unpaid the day after its due date.
-        for c in SC.objects.filter(entity=e, status=SCS.APPROVED, due_date=today - timedelta(days=1)) \
-                .select_related("settlement", "employee"):
-            paid = PayrollPayment.objects.filter(final_settlement=c.settlement, status=PayrollPayment.Status.APPROVED) \
-                .aggregate(t=Sum("amount"))["t"] or ZERO
-            if paid < _settlement_due(c.settlement):
-                _send_alerts(e, [(PayrollAlert.Kind.FINAL_SETTLEMENT_DUE, f"fsc:{c.pk}:late",
-                                  f"Correction {c.number} of the final settlement of {c.employee.employee_code} was due "
-                                  f"on {c.due_date} and is late (Labour Law Art. 88).",
-                                  f"التصحيح {c.number} لمخالصة {c.employee.employee_code} كان مستحقًا في {c.due_date} وقد "
-                                  "تأخر (المادة 88).", ("payroll_officer", "approver"))])
-                sent += 1
-        sent += _mudad_justification_alerts(e, today)  # slice 3 (R80)
-        if today.day == 10:
-            open_ = _gosi_open(e, prev)
-            if open_ > 0:
-                _send_alerts(e, [(PayrollAlert.Kind.GOSI_PAYMENT, f"gosi_pay:{prev}",
-                                  f"GOSI contributions of {prev} ({open_}) are due by the 15th (Regs Art. 24(1)); late "
-                                  "payment: 2% a month (Law Art. 9(3)).",
-                                  f"اشتراكات التأمينات لفترة {prev} ({open_}) مستحقة قبل اليوم 15؛ غرامة التأخير 2% شهريًا.",
-                                  ("payroll_officer", "approver"))])
-                sent += 1
-        from datetime import datetime
-        cutoff = timezone.make_aware(datetime(today.year - 10, today.month, min(today.day, 28)))
-        for model in (WpsFile, MudadJustificationExport):  # slice 3 (R81): exports are kept like WPS files
-            for f in model.objects.filter(entity=e, nominated_for_burn_at__isnull=True, generated_at__lt=cutoff):
-                f.nominated_for_burn_at = _now()
-                _save(f, update_fields=["nominated_for_burn_at"])
-                sent += 1
+            # Compliance C1: an increasing settlement correction still unpaid the day after its due date.
+            for c in SC.objects.filter(entity=e, status=SCS.APPROVED, due_date=today - timedelta(days=1)) \
+                    .select_related("settlement", "employee"):
+                paid = PayrollPayment.objects.filter(final_settlement=c.settlement, status=PayrollPayment.Status.APPROVED) \
+                    .aggregate(t=Sum("amount"))["t"] or ZERO
+                if paid < _settlement_due(c.settlement):
+                    _send_alerts(e, [(PayrollAlert.Kind.FINAL_SETTLEMENT_DUE, f"fsc:{c.pk}:late",
+                                      f"Correction {c.number} of the final settlement of {c.employee.employee_code} was due "
+                                      f"on {c.due_date} and is late (Labour Law Art. 88).",
+                                      f"التصحيح {c.number} لمخالصة {c.employee.employee_code} كان مستحقًا في {c.due_date} وقد "
+                                      "تأخر (المادة 88).", ("payroll_officer", "approver"))])
+                    sent += 1
+            sent += _mudad_justification_alerts(e, today)  # slice 3 (R80)
+            if today.day == 10:
+                open_ = _gosi_open(e, prev)
+                if open_ > 0:
+                    _send_alerts(e, [(PayrollAlert.Kind.GOSI_PAYMENT, f"gosi_pay:{prev}",
+                                      f"GOSI contributions of {prev} ({open_}) are due by the 15th (Regs Art. 24(1)); late "
+                                      "payment: 2% a month (Law Art. 9(3)).",
+                                      f"اشتراكات التأمينات لفترة {prev} ({open_}) مستحقة قبل اليوم 15؛ غرامة التأخير 2% شهريًا.",
+                                      ("payroll_officer", "approver"))])
+                    sent += 1
+            from datetime import datetime
+            cutoff = timezone.make_aware(datetime(today.year - 10, today.month, min(today.day, 28)))
+            for model in (WpsFile, MudadJustificationExport):  # slice 3 (R81): exports are kept like WPS files
+                for f in model.objects.filter(entity=e, nominated_for_burn_at__isnull=True, generated_at__lt=cutoff):
+                    f.nominated_for_burn_at = _now()
+                    _save(f, update_fields=["nominated_for_burn_at"])
+                    sent += 1
     return sent
 
 
@@ -6363,6 +6412,7 @@ def _reissue_rejected_sale(c, user):
     return _save(c)
 
 
+@transaction.atomic  # review 2026-10-20c, finding 2: it locks rows (select_for_update), whoever calls it
 def _refresh_deferred_sales(entity):
     """R47 as amended (slice 2): contracts whose sale invoice was posted on ZATCA reporting since become ``sold`` (their
     installments then enter the runs). Called before every run calculation and by the daily alerts job; reads
@@ -6468,7 +6518,15 @@ def approve_deferred_sale_rebate(rebate, *, user):
     if c.status != DeferredSaleContract.Status.SOLD:
         raise error("A rebate is for a sold contract whose invoice is posted (R128).",
                     "يكون الإبراء لعقد مبيع رُحّلت فاتورته.", code="sale_status")
-    with invoicing_port.rebating(r, user):
+    if _left_with_settlement(c):  # review 2026-10-20c, finding 1: no instalment is left to reduce
+        raise error("The employee's final settlement is approved: what is still owed is outstanding after exit on "
+                    "1240 and no instalment is left for an ibra' to reduce; discard the rebate (R49, R128).",
+                    "المخالصة النهائية للموظف معتمدة: المتبقي قائم بعد انتهاء الخدمة في الحساب 1240 ولا يبقى قسط "
+                    "يخفضه الإبراء؛ ألغِ الإبراء.", code="rebate_after_exit")
+    # Review 2026-10-20c, finding 4: a one-time token on the locked row binds invoicing's call to this approval.
+    r.approval_token = secrets.token_hex(32)
+    _save(r, update_fields=["approval_token"])
+    with invoicing_port.rebating(r, user, token=r.approval_token, grant=grant):
         result = port.create_bai_ajel_rebate(c, user=user, source_ref=_rebate_ref(r), amount=r.amount,
                                              reason_ar=r.reason_ar, reason_en=r.reason_en)
     gross = _dec(result.net_amount, "net_amount") + _dec(result.vat_amount, "vat_amount")
@@ -6495,6 +6553,7 @@ def approve_deferred_sale_rebate(rebate, *, user):
     r.vat_amount, r.credit_note_ref = _dec(result.vat_amount, "vat_amount"), result.document_ref
     r.credit_note_status, r.installment_cuts = str(getattr(result, "status", "") or "")[:10], cuts
     r.status, r.approved_by, r.approved_at = DeferredSaleRebate.Status.APPROVED, user, _now()
+    r.approval_token = ""  # used once
     _save(r)
     access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=r.entity,
                         permission="payroll.approve_deferred_sale",
@@ -6504,14 +6563,33 @@ def approve_deferred_sale_rebate(rebate, *, user):
     return r
 
 
+def _left_with_settlement(c):
+    """Review 2026-10-20c, finding 1: the contract's employee has an approved (or paid) final settlement, so no run
+    deducts an instalment again; what is still owed stays on 1240 as ``outstanding_after_exit`` (R49, AT-32)."""
+    return FinalSettlement.objects.filter(employee_id=c.employee_id, status__in=SETTLED).exists()
+
+
 def _restore_rebate_cuts(r, c):
     """Finding 2: give back the planned instalments a rebate's approval reduced (its credit note was rejected, so
     nothing was waived): each cut goes back to the planned instalment of its period, or a planned instalment of that
-    period is recreated; a period already collected gets the amount in the period after the contract's last one."""
+    period is recreated; a period already collected gets the amount in the period after the contract's last one.
+
+    Review 2026-10-20c, finding 1: once the employee's final settlement is approved no run collects a planned
+    instalment again, so each cut comes back as an ``outstanding_after_exit`` instalment (carried from the
+    instalment of its period, or the contract's last one), on 1240 like any balance the final dues did not cover
+    (R49, AT-32). Returns True when restored after exit."""
     cuts = r.installment_cuts or [{"period": "", "amount": str(r.gross_amount)}]  # rows approved before 0018
+    after_exit = _left_with_settlement(c)
     for cut in sorted(cuts, key=lambda x: x["period"] or ""):
         amount = Decimal(cut["amount"])
         insts = DeferredSaleInstallment.objects.select_for_update().filter(contract=c)
+        if after_exit:
+            source = (insts.filter(period=cut["period"]).order_by("-pk").first() if cut["period"] else None) \
+                or insts.order_by("-period", "-pk").first()
+            _save(DeferredSaleInstallment(entity=c.entity, contract=c, period=cut["period"] or source.period,
+                                          amount=amount, carried_from=source,
+                                          status=DeferredSaleInstallment.Status.OUTSTANDING_AFTER_EXIT))
+            continue
         inst = insts.filter(period=cut["period"], status=DeferredSaleInstallment.Status.PLANNED).order_by("pk").first() \
             if cut["period"] else None
         if inst is not None:
@@ -6523,8 +6601,10 @@ def _restore_rebate_cuts(r, c):
         last = insts.order_by("-period").values_list("period", flat=True).first() or c.first_period
         period = cut["period"] if cut["period"] and (done is None or cut["period"] > done) else _next_period(last)
         _save(DeferredSaleInstallment(entity=c.entity, contract=c, period=period, amount=amount))
+    return after_exit
 
 
+@transaction.atomic
 def _refresh_rebates(entity, only=None):
     """Finding 2 (invoicing R128 as amended): read the credit note of every approved rebate not known final through
     the port. Final: recorded. Rejected by ZATCA: nothing was waived, so the instalments are restored, the rebate
@@ -6547,22 +6627,39 @@ def _refresh_rebates(entity, only=None):
             r.credit_note_status = "final"
             _save(r)
         elif status == "rejected":
-            _restore_rebate_cuts(r, c)
-            r.status, r.credit_note_status = DeferredSaleRebate.Status.REJECTED, "rejected"
-            _save(r)
-            en = (f"ZATCA rejected credit note {r.credit_note_ref} of the bai' ajel rebate of contract {c.number}: "
-                  f"nothing was waived and the instalments were restored ({r.gross_amount}); approve the rebate "
-                  "again (a new credit note) or discard it (R128).")
-            ar = (f"رفضت الهيئة الإشعار الدائن {r.credit_note_ref} لإبراء عقد البيع الآجل {c.number}: لم يُبرأ من "
-                  f"شيء وأُعيدت الأقساط ({r.gross_amount})؛ اعتمد الإبراء مجددًا (إشعار جديد) أو ألغه.")
-            key = f"rebate:{r.pk}:{r.credit_note_ref}:rejected"[:120]
-            _send_alerts(entity, [(PayrollAlert.Kind.BAI_AJEL_REBATE, key, en, ar, ("payroll_officer",))])
-            if r.approved_by_id:
-                PayrollAlert.objects.get_or_create(entity=entity, recipient_id=r.approved_by_id,
-                                                   kind=PayrollAlert.Kind.BAI_AJEL_REBATE, key=key,
-                                                   defaults=dict(text_en=en, text_ar=ar))
+            with transaction.atomic():  # review 2026-10-20c, finding 2: restore, status and alerts together
+                after_exit = _restore_rebate_cuts(r, c)
+                r.status, r.credit_note_status = DeferredSaleRebate.Status.REJECTED, "rejected"
+                _save(r)
+                en, ar = _rebate_rejected_text(r, c, after_exit)
+                key = f"rebate:{r.pk}:{r.credit_note_ref}:rejected"[:120]
+                _send_alerts(entity, [(PayrollAlert.Kind.BAI_AJEL_REBATE, key, en, ar, ("payroll_officer",))])
+                if r.approved_by_id:
+                    PayrollAlert.objects.get_or_create(entity=entity, recipient_id=r.approved_by_id,
+                                                       kind=PayrollAlert.Kind.BAI_AJEL_REBATE, key=key,
+                                                       defaults=dict(text_en=en, text_ar=ar))
             out.append(r)
     return out
+
+
+def _rebate_rejected_text(r, c, after_exit):
+    """The ``bai_ajel_rebate`` alert (en, ar) of a rejected rebate credit note: the instalments restored (planned,
+    approve again or discard) or, after the employee's approved final settlement, the amount outstanding after exit
+    on 1240 (the rebate is discarded: no instalment is left to reduce; review 2026-10-20c, finding 1)."""
+    head_en = (f"ZATCA rejected credit note {r.credit_note_ref} of the bai' ajel rebate of contract {c.number}: "
+               "nothing was waived")
+    head_ar = f"رفضت الهيئة الإشعار الدائن {r.credit_note_ref} لإبراء عقد البيع الآجل {c.number}: لم يُبرأ من شيء"
+    if after_exit:
+        return (f"{head_en}. The employee's final settlement is approved, so the {r.gross_amount} is outstanding after "
+                "exit on 1240 (bai' ajel receivable), not collected by any run; recover it from the former employee "
+                "as for any balance the final dues did not cover. No instalment is left to reduce: discard the "
+                "rebate (R49, R128).",
+                f"{head_ar}. المخالصة النهائية للموظف معتمدة، لذا فإن مبلغ {r.gross_amount} قائم بعد انتهاء الخدمة في "
+                "الحساب 1240 (ذمم البيع الآجل) ولا يحصّله أي مسير؛ استرده من الموظف السابق كأي رصيد لم تغطه المستحقات "
+                "النهائية. لم يبقَ قسط يُخفَّض: ألغِ الإبراء.")
+    return (f"{head_en} and the instalments were restored ({r.gross_amount}); approve the rebate again (a new credit "
+            "note) or discard it (R128).",
+            f"{head_ar} وأُعيدت الأقساط ({r.gross_amount})؛ اعتمد الإبراء مجددًا (إشعار جديد) أو ألغه.")
 
 
 SALE_INVOICE_DELIVERY = {"printed": ("printed copy handed to the employee", "نسخة مطبوعة سُلّمت للموظف"),

@@ -183,7 +183,7 @@ def backwards_guard(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-    dependencies = [("payroll", "0019_slice3")]
+    dependencies = [("payroll", "0020_slice3")]
 
     operations = [
         migrations.RunPython(seed_parameters, migrations.RunPython.noop),

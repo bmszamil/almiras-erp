@@ -448,6 +448,8 @@ class AccessLog(models.Model):
         USER_ACTIVE_CHANGED = "user_active_changed", "User activated or deactivated"
         PERSONAL_DATA_VIEWED = "personal_data_viewed", "Personal data viewed"  # hr R10, access R29
         PERSONAL_DATA_EXPORTED = "personal_data_exported", "Personal data exported"  # hr R12
+        LOGIN_SUCCEEDED = "login_succeeded", "Signed in to the web UI"  # web.md 3.4, R26
+        LOGOUT = "logout", "Signed out of the web UI"  # web.md 3.4, R26
 
     at = models.DateTimeField(default=timezone.now)
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+")

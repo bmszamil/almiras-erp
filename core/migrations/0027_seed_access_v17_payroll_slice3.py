@@ -5,7 +5,7 @@
 - hr_officer: payroll.approve_mudad_justification (A; matrix activity payroll.mudad_justification, code default).
 - managing_partner: payroll.approve_mudad_justification as fallback (OQ-1); payroll's seam refuses it for the activity.
 
-The parallel approval-engine build may add its own seed version after core.0025; the two are renumbered at merge.
+The parallel approval-engine build may add its own seed version; the two are renumbered at merge.
 """
 from django.db import migrations
 
@@ -21,6 +21,6 @@ def unseed(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-    dependencies = [("core", "0025_seed_access_v16_payroll_slice2")]
+    dependencies = [("core", "0026_alter_accesslog_event")]
 
     operations = [migrations.RunPython(seed, unseed)]

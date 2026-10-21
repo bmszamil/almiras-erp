@@ -26,6 +26,19 @@ from payroll.test_slice2_bai_ajel import bai_ajel
 backfill = importlib.import_module("payroll.migrations.0018_review_fixes_rebate_wht").backfill_wht_parts
 
 
+def approval_marker(w, r, user, grant=True):
+    """What ``approve_deferred_sale_rebate`` sets around invoicing's call (review 2026-10-20c, finding 4): a one-time
+    token written on the rebate row and the approver's grant for the contract (``grant=None``: none)."""
+    from core import access
+
+    if grant is True:
+        grant = access.require(user, r.entity, "payroll.approve_deferred_sale", document=r.contract)
+    row = DeferredSaleRebate.objects.get(pk=r.pk)
+    row.approval_token = "t" * 64  # test token
+    services._save(row, update_fields=["approval_token"])
+    return invoicing_port.rebating(row, user, token=row.approval_token, grant=grant)
+
+
 def sold(w, emp=None, **kw):
     c = services.approve_deferred_sale(bai_ajel(w, emp or saudi(w), **kw), user=w.mp, sale_date=date(2027, 3, 20))
     services._refresh_deferred_sales(w.alm)
@@ -48,14 +61,14 @@ def test_f1_the_port_is_called_only_inside_the_rebate_marker_of_that_rebate_by_i
     r = rebate(w, c)
     ref = f"payroll.deferredsalerebate:{r.pk}"
     assert invoicing_port.rebate_problems(c, source_ref=ref, amount=r.amount, approver=w.mp)  # no marker
-    with invoicing_port.rebating(r, w.mp):
+    with approval_marker(w, r, w.mp):  # review 2026-10-20c, finding 4: the marker carries the token and grant
         assert invoicing_port.rebate_problems(c, source_ref=ref, amount=r.amount, approver=w.mp) == []
         assert invoicing_port.rebate_problems(c, source_ref=ref, amount=D("61.00"), approver=w.mp)  # other amount
         assert invoicing_port.rebate_problems(c, source_ref="manual-1", amount=r.amount, approver=w.mp)
         assert invoicing_port.rebate_problems(c, source_ref=ref, amount=r.amount, approver=w.c)  # not its approver
         other = sold(w, first="2027-05")
         assert invoicing_port.rebate_problems(other, source_ref=ref, amount=r.amount, approver=w.mp)  # other contract
-    with invoicing_port.rebating(r, w.p):  # the preparer never approves (four eyes)
+    with approval_marker(w, r, w.p, grant=None):  # the preparer never approves (four eyes)
         assert invoicing_port.rebate_problems(c, source_ref=ref, amount=r.amount, approver=w.p)
     with pytest.raises(PayrollError) as exc:  # the fake port mirrors the real one: no marker, no credit note
         w.invoicing.create_bai_ajel_rebate(c, user=w.mp, source_ref=ref, amount=r.amount, reason_ar="x")
