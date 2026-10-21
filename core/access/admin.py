@@ -6,6 +6,7 @@ with no membership sees no memberships and can grant nothing.
 from django import forms
 from django.contrib import admin, messages
 from django.contrib.auth import get_user_model
+from django.contrib.admin.utils import unquote
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db.models import Q
@@ -237,6 +238,19 @@ class UserAdmin(DjangoUserAdmin):
 
     def get_inlines(self, request, obj=None):
         return [UserProfileInline] if obj is not None else []
+
+    def user_change_password(self, request, id, form_url=""):
+        """Setting the password of a person who must use MFA (web.md R13) is for superusers and the group managing
+        partner of all their entities only (verification review of f95e1c8, item 2): otherwise an access admin could
+        take over an approver's account by password while the MFA reset stays out of reach. Refused and logged."""
+        target = self.get_object(request, unquote(id))
+        if target is not None and not services.may_set_password(request.user, target):
+            services.log(AccessLog.Event.PERMISSION_DENIED, actor=request.user, subject_user=target,
+                         permission="admin.set_password", details={"reason": "mfa_user_password"})
+            raise PermissionDenied(
+                "Only a superuser or the group managing partner sets the password of a person who must use MFA. / "
+                "لا يعيّن كلمة مرور من يلزمه التحقق بخطوتين إلا مستخدم أعلى أو الشريك المدير للمجموعة.")
+        return super().user_change_password(request, id, form_url)
 
     def get_readonly_fields(self, request, obj=None):
         fields = list(super().get_readonly_fields(request, obj))

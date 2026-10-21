@@ -1281,3 +1281,37 @@ def test_a_band_row_applies_to_a_draft_sales_invoice_amount(g):
     with pytest.raises(access.AccessDenied) as exc:
         inv.submit_sales_document(small, user=g.ac)
     assert exc.value.code == "no_authority_rule"
+
+
+def test_an_issued_total_outside_the_routed_band_is_refused_and_returned_for_re_routing(g, monkeypatch):
+    """Verification review of f95e1c8, item 6: the band is checked again on the issued total."""
+    from core.access import inbox
+    from invoicing.testing import fake_zatca
+    from ledger.services_setup import create_monthly_periods
+
+    create_monthly_periods(g.sub, timezone.localdate().year)  # issue is dated today
+    approved_matrix(g, g.sub, [dict(activity="invoicing.sales_document", approver_roles=["approver"],
+                                    amount_from="1200.00", amount_to="2000.00")])
+    doc = _sales_draft(g, "1000.00")  # issues at 1,150.00
+    monkeypatch.setattr(inv, "approval_amount", lambda d: Decimal("1500.00"))  # e.g. priced differently at submission
+    inv.submit_sales_document(doc, user=g.ac)
+    monkeypatch.undo()
+    req = ApprovalRequest.objects.get(document_type="invoicing.salesdocument", document_id=doc.pk, status="open")
+    with fake_zatca():
+        with pytest.raises(access.AccessDenied) as direct:  # a module call: refused, nothing issued
+            inv.approve_sales_document(doc, user=g.cf)
+        assert direct.value.code == "amount_outside_band" and direct.value.message_ar
+        doc.refresh_from_db()
+        req.refresh_from_db()
+        assert (doc.status, doc.number, doc.total_gross) == ("submitted", "", 0)
+        assert req.status == "open" and not req.decisions.exists()  # the approval decision rolled back with it
+        with pytest.raises(inbox.InboxRefused) as through_inbox:
+            inbox.decide(g.cf, g.sub, req.pk, version=req.document_version, approve=True)
+    assert through_inbox.value.code_name == "amount_outside_band"
+    doc.refresh_from_db()
+    req.refresh_from_db()
+    assert doc.status == "draft" and doc.number == "" and req.status == "returned"  # back to its preparer
+    assert ApprovalDecision.objects.get(request=req, decision="returned").note_en.startswith("Amount at issue")
+    with pytest.raises(access.AccessDenied) as again:  # resubmitted: routed again on 1,150.00, no band covers it
+        inv.submit_sales_document(doc, user=g.ac)
+    assert again.value.code == "no_authority_rule"

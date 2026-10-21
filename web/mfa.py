@@ -163,9 +163,14 @@ def _totp(device):
     return pyotp.TOTP(device.secret, digits=DIGITS, interval=INTERVAL)
 
 
+REPLAY = "replay"
+
+
 def _totp_matches(device, code, now):
     """Accept ``code`` for the current step or one step either way, never a step at or before the last accepted
-    one (each code works once). Updates ``device.last_counter`` in memory when it matches."""
+    one (each code works once). Updates ``device.last_counter`` in memory when it matches. The code of the last
+    accepted step itself (a double submit, or the code just used to sign in) returns :data:`REPLAY`: refused but not
+    counted as a wrong code (verification review of f95e1c8, item 7)."""
     code = normalise_code(code)
     if len(code) != DIGITS:
         return False
@@ -173,6 +178,8 @@ def _totp_matches(device, code, now):
     current = _counter(now)
     for step in range(current - DRIFT_STEPS, current + DRIFT_STEPS + 1):
         if device.last_counter is not None and step <= device.last_counter:
+            if step == device.last_counter and hmac.compare_digest(totp.generate_otp(step), code):
+                return REPLAY
             continue
         if hmac.compare_digest(totp.generate_otp(step), code):
             device.last_counter = step
@@ -208,10 +215,24 @@ def _alert_second_lock(device, now):
     ar = (f"قُفل التحقق بخطوتين للمستخدم {user.get_username()} مرة أخرى بعد رموز خاطئة متكررة، حتى "
           f"{timezone.localtime(device.locked_until):%Y-%m-%d %H:%M}. إن لم يكن ذلك صاحب الحساب فأعد تعيين الجهاز "
           "وراجع الحساب.")
+    recipients = {}
     for entity in entities:
         admins = set(Membership.objects.active(access_services.now()).filter(entity=entity, role__code="access_admin")
                      .values_list("user_id", flat=True))
-        for uid in admins | {user.pk}:
+        recipients[entity] = admins | {user.pk}
+    if not entities:
+        # Verification review item 8: a person without memberships (a superuser or a staff user) has no access admin;
+        # the operators (active superusers other than the person) are told, on the group parent(s), and the person.
+        from django.contrib.auth import get_user_model
+
+        operators = set(get_user_model()._default_manager.filter(is_superuser=True, is_active=True)
+                        .exclude(pk=user.pk).values_list("pk", flat=True))
+        for root in Entity.objects.filter(parent__isnull=True, consolidation=Entity.Consolidation.PARENT):
+            recipients[root] = operators | {user.pk}
+    # The alert row and its access_alert_sent log row are written in this same transaction (the code check's own,
+    # committed even if the request fails, item 1): both are kept or neither.
+    for entity, uids in recipients.items():
+        for uid in uids:
             engine.alert(entity, uid, AccessAlert.Kind.MFA_LOCKED, en, ar, key=f"{key}:{entity.pk}:{uid}",
                          details={"subject_user": user.pk, "lock_count": device.lock_count})
 
@@ -236,21 +257,25 @@ def _attempt(device_pk, check, *, purpose, kind="totp"):
         elif device.failures and device.last_failure_at and now < device.last_failure_at + _delay(device.failures):
             refusal = "throttled"
         else:
-            if check(device, now):
+            result = check(device, now)
+            if result == REPLAY:
+                refusal = "replayed"
+            elif result:
                 device.failures, device.last_failure_at, device.locked_until, device.lock_count = 0, None, None, 0
                 device.save(update_fields=["last_counter", "failures", "last_failure_at", "locked_until",
                                            "lock_count"])
                 return device, None
-            device.failures += 1
-            device.last_failure_at = now
-            if device.failures >= max_failures:
-                device.lock_count += 1
-                device.locked_until = now + _lock_length(device.lock_count)
-                refusal = "locked"
-                if device.lock_count == 2:
-                    _alert_second_lock(device, now)
             else:
-                refusal = "wrong_code"
+                device.failures += 1
+                device.last_failure_at = now
+                if device.failures >= max_failures:
+                    device.lock_count += 1
+                    device.locked_until = now + _lock_length(device.lock_count)
+                    refusal = "locked"
+                    if device.lock_count == 2:
+                        _alert_second_lock(device, now)
+                else:
+                    refusal = "wrong_code"
         device.save(update_fields=["failures", "last_failure_at", "locked_until", "lock_count"])
         access_services.log(AccessLog.Event.MFA_VERIFY_FAILED, actor=device.user, subject_user=device.user,
                             details={"purpose": purpose, "kind": kind, "reason": refusal,
@@ -392,26 +417,24 @@ def renew_recovery_codes(user, code):
 TOP_ROLES = frozenset({"managing_partner", "chairman"})
 
 
-def _is_group_managing_partner(user, at):
-    return Membership.objects.active(at).filter(
-        user=user, role__code="managing_partner", entity__parent__isnull=True,
-        entity__consolidation=Entity.Consolidation.PARENT).exists()
-
-
 def may_reset(actor, user):
     """Who may reset another person's device (R16; OQ-11 default as tightened by the security review of 2026-10-21,
     item 2). Never oneself, never a superuser (operator command only), and only:
 
-    * the **group managing partner** (``managing_partner`` on a group parent): anyone else; the only person (besides
-      the operator command) who may reset a ``managing_partner`` or ``chairman``;
-    * an **access admin**: a person who holds none of the MFA roles (``web.services.MFA_ROLES``) and has active
-      memberships only in entities where the actor is ``access_admin``.
+    * the **group managing partner** (``managing_partner`` on a group parent): anyone else whose memberships all lie
+      in that group's tree; the only person (besides the operator command) who may reset a ``managing_partner`` or
+      ``chairman``;
+    * an **access admin**: a person who does not need MFA at all (no MFA role, no approval right, no active
+      delegation; ``requires_mfa``) and has active memberships only in entities where the actor is ``access_admin``
+      (in practice staff users who enrolled for Django admin).
     """
     if not web_services.is_web_user(actor) or user is None or actor.pk == user.pk or user.is_superuser:
         return False
     at = access_services.now()
-    if _is_group_managing_partner(actor, at):
+    if access_services.group_managing_partner_covers(actor, user):  # own group tree only (verification item 5)
         return True
+    if requires_mfa(user):  # verification item 2: never by an access admin (roles, approval rights, delegates)
+        return False
     theirs = list(Membership.objects.active(at).filter(user=user).select_related("role"))
     if not theirs or {m.role.code for m in theirs} & (web_services.MFA_ROLES | TOP_ROLES):
         return False
@@ -467,23 +490,31 @@ def rekey(*, expire_old_recovery_codes=False):
     """``manage.py web_mfa_rekey`` after a key rotation: re-encrypt every device secret under the current first key
     and report the unused recovery codes still hashed under an older key (one-way hashes cannot be re-hashed);
     ``expire_old_recovery_codes`` retires them (their holders renew their codes). Logged in the access log."""
+    from django.db.models import TextField
+    from django.db.models.functions import Cast
+
     current = crypto.key_id()
     reencrypted = 0
     with transaction.atomic():
-        for device in MfaDevice.objects.select_for_update().order_by("pk"):
-            raw = MfaDevice.objects.filter(pk=device.pk).values_list("secret", flat=True).first()
-            if crypto.is_current(raw):
-                continue
+        # The stored ciphertext, not the decrypted value (verification review item 3): Cast reads the column as text.
+        raw = dict(MfaDevice.objects.select_for_update().annotate(raw=Cast("secret", TextField()))
+                   .values_list("pk", "raw"))
+        for device in MfaDevice.objects.filter(pk__in=[pk for pk, value in raw.items() if not crypto.is_current(value)]):
             device.secret = device.secret  # decrypted on read; encrypted under the first key on save
             device.save(update_fields=["secret"])
             reencrypted += 1
-        old = RecoveryCode.objects.filter(used_at__isnull=True).exclude(key_id=current)
+        unused = RecoveryCode.objects.filter(used_at__isnull=True)
+        old = unused.exclude(key_id__in=[current, ""])
+        unknown = unused.filter(key_id="")  # item 4: hashed before key_id existed, key not known: never auto-expired
         users = sorted(set(old.values_list("user__username", flat=True)))
-        old_count = old.count()
-        if expire_old_recovery_codes and old_count:
+        unknown_users = sorted(set(unknown.values_list("user__username", flat=True)))
+        old_count, unknown_count = old.count(), unknown.count()
+        expired = bool(expire_old_recovery_codes and old_count)
+        if expired:
             old.update(used_at=_now())
         access_services.log(AccessLog.Event.MFA_REKEYED, source="command:web_mfa_rekey",
                             details={"rekey": True, "reencrypted": reencrypted, "old_recovery_codes": old_count,
-                                     "expired": bool(expire_old_recovery_codes and old_count), "key_id": current})
-    return {"reencrypted": reencrypted, "old_recovery_codes": old_count, "users": users,
-            "expired": bool(expire_old_recovery_codes and old_count)}
+                                     "unknown_key_recovery_codes": unknown_count, "expired": expired,
+                                     "key_id": current})
+    return {"reencrypted": reencrypted, "old_recovery_codes": old_count, "users": users, "expired": expired,
+            "unknown_key_recovery_codes": unknown_count, "unknown_key_users": unknown_users}

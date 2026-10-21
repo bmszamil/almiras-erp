@@ -82,6 +82,12 @@ MESSAGES = {
         "This approval request is closed; the document was returned, rejected or changed.",
         "طلب الاعتماد هذا مغلق؛ فقد أعيد المستند أو رُفض أو تغيّر.",
     ),
+    "amount_outside_band": (
+        "The issued amount {amount} is outside the authority band this approval was routed by; nothing was issued. "
+        "The document goes back to its preparer so it is routed again under the right rule (R71, R73).",
+        "المبلغ عند الإصدار {amount} خارج نطاق الصلاحية الذي وُجّه به هذا الاعتماد؛ ولم يُصدر شيء. يعاد المستند إلى مُعدّه "
+        "ليُوجَّه من جديد وفق القاعدة الصحيحة.",
+    ),
     "amount_decimals": (
         "{amount} has more decimals than {currency} allows ({places}).",
         "المبلغ {amount} يتجاوز عدد الخانات العشرية المسموح بها للعملة {currency} ({places}).",
@@ -308,6 +314,17 @@ def version_text(value):
     return str(value.isoformat() if hasattr(value, "isoformat") else value)
 
 
+def document_version(adapter, document):
+    """The version the engine binds a request to (web.md R7): the adapter's hook, else an integer ``version``, else
+    ``submitted_at`` / ``modified_at``. Empty means "no version": the inbox refuses to decide it."""
+    if adapter.version:
+        return str(adapter.version(document))
+    value = getattr(document, "version", None)
+    if not isinstance(value, int):
+        value = getattr(document, "submitted_at", None) or getattr(document, "modified_at", None) or ""
+    return version_text(value)
+
+
 def describe(document, permission, entity):
     """What the engine needs to know about ``document`` (through its adapter, else generic attributes)."""
     adapter = adapter_for(permission, document)
@@ -322,13 +339,7 @@ def describe(document, permission, entity):
         functional = amount
     else:
         functional = _to_functional(entity, amount, currency, document)
-    if adapter.version:
-        version = str(adapter.version(document))
-    else:
-        value = getattr(document, "version", None)
-        if not isinstance(value, int):
-            value = getattr(document, "submitted_at", None) or getattr(document, "modified_at", None) or ""
-        version = version_text(value)
+    version = document_version(adapter, document)
     people = frozenset(adapter.beneficiaries(document) or ()) if adapter.beneficiaries else frozenset()
     en = ar = ""
     if adapter.label:
@@ -1019,6 +1030,45 @@ def inbox(user, *, at=None):
         if _eligible_by_rules(user, req.entity, permission, step, req.rule_source, req.activity.code, at)[0]:
             out.append(req)
     return out
+
+
+def check_issued_band(grant, *, amount, currency, functional_amount=None):
+    """After a module has computed the final amount of the document it is approving (e.g. a sales document's issued
+    total), check that it still lies in the band of every step of the request the grant was given under (R71, R73;
+    verification review of f95e1c8, item 6). Requests under code defaults, or without bands, pass. Refused
+    ``amount_outside_band`` (logged, en/ar): the caller's transaction rolls back and nothing is issued; the inbox
+    then returns the document to its preparer for re-routing (``core.access.inbox.decide``)."""
+    request_id = getattr(grant, "approval_request_id", None)
+    if request_id is None:
+        return
+    req = ApprovalRequest.objects.select_related("entity").filter(pk=request_id).first()
+    if req is None or req.rule_source != ApprovalRequest.Source.MATRIX or not req.rule_ids:
+        return
+    entity = req.entity
+    rules = {r.pk: r for r in AuthorityRule.objects.filter(pk__in=req.rule_ids)}
+    functional = entity.base_currency_id
+    for step in req.steps:
+        rows = [rules[rid] for rid in step["rule_ids"] if rid in rules]
+        if not rows:
+            continue
+
+        def covers(row):
+            if currency != functional and row.band_currency_id == currency:
+                measure = amount
+            elif row.band_currency_id in (None, functional):
+                measure = functional_amount if functional_amount is not None else (
+                    amount if currency == functional else None)
+            else:
+                return False
+            if measure is None:
+                return True  # no functional amount known: the submission-time measure stands
+            return row.amount_from <= measure and (row.amount_to is None or measure <= row.amount_to)
+
+        if not any(covers(r) for r in rows):
+            refuse("amount_outside_band", grant.user, entity, grant.permission,
+                   {"request": req.pk, "step_no": step["step_no"], "amount": str(amount), "currency": currency,
+                    "requested_amount": None if req.amount is None else str(req.amount)},
+                   amount=f"{currency} {amount}")
 
 
 @dataclass(frozen=True)

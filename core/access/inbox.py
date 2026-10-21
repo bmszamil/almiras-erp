@@ -36,6 +36,12 @@ MESSAGES = {
         "This document has no version to check, so it cannot be decided from the inbox; its module must supply one.",
         "لا يوجد إصدار لهذا المستند للتحقق منه، فلا يمكن البت فيه من صندوق الاعتمادات؛ يجب أن توفره وحدته.",
     ),
+    "amount_outside_band": (
+        "The amount at issue is outside the authority band this request was routed by. Nothing was issued; the "
+        "document was returned to its preparer so it is routed again under the right rule.",
+        "المبلغ عند الإصدار خارج نطاق الصلاحية الذي وُجّه به هذا الطلب. لم يُصدر شيء؛ وأعيد المستند إلى مُعدّه ليُوجَّه من "
+        "جديد وفق القاعدة الصحيحة.",
+    ),
     "no_send_back": (
         "This document type cannot be sent back from the inbox yet; approve it or leave it for its preparer.",
         "لا يمكن إعادة هذا النوع من المستندات من صندوق الاعتمادات بعد؛ اعتمده أو اتركه لمُعدّه.",
@@ -176,11 +182,19 @@ def decide(user, entity, pk, *, version, approve, reason_ar="", reason_en=""):
     service; a refusal raises ``AccessDenied`` and is logged there.
     """
     reason_ar, reason_en = (reason_ar or "").strip(), (reason_en or "").strip()
+    if approve:
+        try:
+            with transaction.atomic():
+                req, document = _locked_request(entity, pk, version)
+                return engine.decide(document, user, approve=True, permission=req.activity.permission)
+        except access.AccessDenied as exc:
+            if exc.code != "amount_outside_band":
+                raise
+        _reroute(user, entity, pk, version)
+        raise InboxRefused("amount_outside_band")
     with transaction.atomic():
         req, document = _locked_request(entity, pk, version)
         permission = req.activity.permission
-        if approve:
-            return engine.decide(document, user, approve=True, permission=permission)
         action = engine.send_back_action(req, document)
         if action is None:
             raise InboxRefused("no_send_back")
@@ -188,6 +202,21 @@ def decide(user, entity, pk, *, version, approve, reason_ar="", reason_en=""):
             raise InboxRefused("reason_required")
         return engine.decide(document, user, approve=False, action=action, permission=permission, note=reason_ar,
                              note_en=reason_en)
+
+
+def _reroute(user, entity, pk, version):
+    """Verification review of f95e1c8, item 6: the approval was refused because the amount at issue left the band the
+    request was routed by. The approval was rolled back; now the document goes back to its preparer the way its
+    module allows (its request closes), so resubmitting routes it again on the new amount. Without a module service
+    to send it back the request stays open and the refusal is shown."""
+    with transaction.atomic():
+        req, document = _locked_request(entity, pk, version)
+        action = engine.send_back_action(req, document)
+        if action is None:
+            return
+        engine.decide(document, user, approve=False, action=action, permission=req.activity.permission,
+                      note="المبلغ عند الإصدار خارج نطاق الصلاحية؛ أعيد للتوجيه من جديد",
+                      note_en="Amount at issue outside the authority band; returned for re-routing")
 
 
 def decision_labels():
