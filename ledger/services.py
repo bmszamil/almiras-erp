@@ -135,6 +135,30 @@ def validate_entry(entry):
     return problems
 
 
+# Checks another app adds to the posting of the drafts it created (e.g. migration R16 and R22: an import draft whose
+# lines changed, or an opening entry whose control accounts do not tie out to the open items loaded, never posts,
+# whichever path posts it: the migration command or the approval engine's inbox). ``fn(entry)`` returns problems
+# ("English / العربية"), empty when the entry is not the app's or passes; it runs inside the posting transaction,
+# after the entry and its period are locked. Registered from ``AppConfig.ready()``.
+_POST_CHECKS = []
+
+
+def register_post_check(fn, *, code):
+    """Register ``fn`` (idempotent); a posting it refuses raises LedgerError with ``code``."""
+    if all(f is not fn for f, _ in _POST_CHECKS):
+        _POST_CHECKS.append((fn, code))
+
+
+def _post_check_problems(entry):
+    out, code = [], None
+    for fn, fn_code in _POST_CHECKS:
+        found = list(fn(entry) or [])
+        if found and code is None:
+            code = fn_code
+        out += found
+    return out, code
+
+
 def _restricted_codes(lines):
     return sorted({line.account.code for line in lines} & restricted.codes())
 
@@ -705,10 +729,14 @@ def _post(entry, posted_by):
     _lock_restricted(entry)
     period = _lock_for_posting(entry)
     problems = validate_entry(entry)
+    extra, extra_code = _post_check_problems(entry)
+    problems += extra
     if problems:
         exc = LedgerError(problems)
         if {restricted.refusal(code) for code in restricted.codes()} & set(problems):
             exc.code = "restricted_account"
+        elif extra_code:
+            exc.code = extra_code
         raise exc
     entry.period = period
     lines = list(entry.lines.select_related("account"))

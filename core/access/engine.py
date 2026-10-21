@@ -1000,6 +1000,12 @@ def inbox(user, *, at=None):
 
 # --- module seams --------------------------------------------------------------------------------------------------
 
+def deciding():
+    """True while :func:`decide` (the engine inbox) runs a module's approve service. A module whose approvals must
+    come through the inbox only (e.g. the migration account map, migration R13) refuses a direct call otherwise."""
+    return _explicit.get() is not None
+
+
 def grant_rule_source(grant):
     """``matrix`` or ``default``: which rules the engine applied for ``grant`` (payroll's seam, R70)."""
     return getattr(grant, "rule_source", "") or ""
