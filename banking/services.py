@@ -652,7 +652,7 @@ def close_bank_account(account, *, user, active_to, reason):
     """Close an active account from ``active_to`` (approver, not its creator or last modifier)."""
     account = _account(account)
     entity = account.entity
-    access.require(user, entity, "banking.approve_bank_account", document=account)
+    access.require(user, entity, "banking.approve_bank_account", document=account, purpose="check")
     with transaction.atomic():
         if account.status != BankAccount.Status.ACTIVE:
             raise error("Only an active account is closed.", "يُغلق الحساب النشط فقط.", code="not_active")

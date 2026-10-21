@@ -74,11 +74,14 @@ def test_h3_seed_v12_gives_the_accountant_the_proposal_and_keeps_verification_wi
     assert "tax.propose_box_verification" in perms["accountant"]
     assert "tax.maintain_rates" not in perms["accountant"]
     assert "tax.maintain_rates" in perms["approver"] and "tax.propose_box_verification" not in perms["approver"]
-    assert {c for c, p in perms.items() if "tax.propose_box_verification" in p} == {"accountant"}
+    # access §10 seed V17 (A28): the ceo also holds the accountant's rights; it may hold both steps, but tax.services
+    # still refuses a verifier who proposed (H3) and the verification is never self-approved (NSA, R80 b).
+    assert {c for c, p in perms.items() if "tax.propose_box_verification" in p} == {"accountant", "ceo"}
     stored = set(RolePermission.objects.filter(role__code="accountant").values_list("codename", flat=True))
     assert "tax.propose_box_verification" in stored  # migration core.0021 applied the seed
-    apply_seed(Role, RolePermission, ROLE_SEED_V11)  # what core.0021 reverses to
-    assert not RolePermission.objects.filter(codename="tax.propose_box_verification").exists()
+    apply_seed(Role, RolePermission, ROLE_SEED_V11)  # what core.0021 reverses to (roles of V11; V17's ceo is later)
+    assert not RolePermission.objects.filter(codename="tax.propose_box_verification",
+                                             role__code__in=ROLE_SEED_V11).exists()
     apply_seed(Role, RolePermission, ROLE_SEED_V12)
     assert RolePermission.objects.filter(role__code="accountant", codename="tax.propose_box_verification").exists()
 

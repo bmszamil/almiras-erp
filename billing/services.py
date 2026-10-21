@@ -775,7 +775,7 @@ def submit_contract(contract, *, user):
 def return_contract(contract, *, user, reason_ar, reason_en=""):
     """The CFO sends a submitted draft back (event ``returned``)."""
     c = Contract.objects.select_for_update(of=("self",)).select_related("entity").get(pk=contract.pk)
-    access.require(user, c.entity, "billing.approve_contract", document=c)
+    access.require(user, c.entity, "billing.approve_contract", document=c, purpose="return")
     if c.status != CStatus.DRAFT or c.submitted_at is None:
         _fail("Only submitted draft contracts are returned.", "تُعاد مسودات العقود المقدمة فقط.", "not_submitted")
     if not (reason_ar or "").strip():
@@ -823,7 +823,8 @@ def approve_contract(contract, *, user):
     c = Contract.objects.select_related("entity", "customer", "currency", "advance_terms").get(pk=contract.pk)
     v1 = c.versions.get(version_no=1)
     grant = access.require(user, c.entity, "billing.approve_contract", document=c)
-    if user.pk in (v1.created_by_id, v1.modified_by_id, c.created_by_id, c.modified_by_id, c.submitted_by_id):
+    if user.pk in (v1.created_by_id, v1.modified_by_id, c.created_by_id, c.modified_by_id, c.submitted_by_id) and \
+            not grant.top_authority:  # access R79: the engine's top-authority self-approval passes (it counts v1's makers)
         access.deny(user, c.entity, "billing.approve_contract", "self_approval")
     with transaction.atomic():
         c = Contract.objects.select_for_update(of=("self",)).select_related(
@@ -1070,7 +1071,7 @@ def submit_version(version, *, user):
 @transaction.atomic
 def reject_version(version, *, user, reason_ar, reason_en=""):
     v = ContractVersion.objects.select_for_update(of=("self",)).select_related("contract__entity").get(pk=version.pk)
-    access.require(user, v.entity, "billing.approve_version", document=v)
+    access.require(user, v.entity, "billing.approve_version", document=v, purpose="reject")
     if v.status != VStatus.SUBMITTED:
         _fail("Only submitted versions are rejected.", "تُرفض النسخ المقدمة فقط.", "version_not_submitted")
     if not (reason_ar or "").strip():

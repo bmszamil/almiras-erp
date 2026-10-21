@@ -351,8 +351,79 @@ ROLE_SEED_V16 = {
                               "payroll.approve_loan_write_off"),
     "accountant": _plus(ROLE_SEED_V15, "accountant", "payroll.prepare_profit_recognition"),
 }
+# V17 (migration core.0027, access §10, A24 to A32, R60, R76, R89; OQ-42, OQ-43, OQ-50, OQ-53 defaults):
+# - ceo (entity; default top authority of every entity but the group parent, R67): the accountant's create and
+#   submit rights, every approval (A) and posting (P) right the CFO or the managing partner holds outside G, and the
+#   access §10 rights (grant memberships, delegate, propose and approve matrix versions, read the governance report,
+#   assign personal assistants). Which approvals it gives in an entity is set by that entity's matrix or the code
+#   default (R70; OQ-41: parallel to the CFO).
+# - internal_auditor (OQ-53: the code is kept): read-only on every module of the entity (each view permission,
+#   personal data logged), the access log, and the governance report, which it alone reviews (R86, OQ-50). It has
+#   no create, submit, approve, post, reverse or export right (R89).
+# - external_auditor: read-only, personal data masked (no view_personal_data, view_iban, view_payslip or
+#   view_employee_ref), no exports; reads the governance report while its time-limited membership lasts (R89).
+# - business_analyst: views and reports of the ledger, invoicing and billing, no personal data (OQ-37).
+# - personal_assistant: drafts only (bills, contract drafts); never submits, approves or posts (R60, R81).
+# - board_representative (OQ-42): the second person for a matrix change proposed by a subsidiary's top authority;
+#   reads the governance report; nothing else.
+# - managing_partner, chairman, access_admin, approver: the §10 rights of 10.3 / 10.7.
+# - system_governance (Sys:governance): generates the monthly governance report in each entity it is a member of.
+_VIEW_ALL = (
+    "core.view_access", "invoicing.view", "invoicing.view_personal_data", "billing.view", "billing.view_employee_ref",
+    "zatca.view", "zatca.view_status", "ledger.view", "ledger.view_rates", "ledger.view_translation", "hr.view",
+    "hr.view_counts", "hr.view_personal_data", "payroll.view", "payroll.view_payslip", "payroll.view_cost_reports",
+    "banking.view", "banking.view_iban", "migration.view", "tax.view",
+)
+_PERSONAL_DATA_VIEWS = ("invoicing.view_personal_data", "billing.view_employee_ref", "hr.view_personal_data",
+                        "payroll.view_payslip", "banking.view_iban")
+_MATRIX = ("core.propose_authority_matrix", "core.approve_authority_matrix")
+_GOVERNANCE = ("core.view_governance_report",)
+# G rights stay with the group parent's roles (G8): the ceo never holds them.
+_NOT_FOR_CEO = frozenset({"core.change_entity_settings", "core.manage_users", "core.disable_sharia_enforcement",
+                          "zatca.grant_key_delegation", "ledger.change_functional_currency",
+                          "hr.verify_statutory_parameter", "ledger.maintain_global_rate", "hr.set_overtime_route"})
+
+
+def _ceo_permissions(seed):
+    from .catalogue import CATALOGUE
+
+    perms = set(seed["accountant"][5]) | set(seed["approver"][5])
+    perms |= {p for p in seed["managing_partner"][5] if CATALOGUE[p].is_approval or CATALOGUE[p].posts}
+    perms |= set(_PAYROLL_APPROVALS) | {"payroll.approve_run", "payroll.approve_loan_write_off",
+                                        *_PAYROLL_SLICE2_APPROVALS}
+    perms |= set(_VIEW_ALL) | {"core.grant_membership", "core.delegate_approval", *_MATRIX, *_GOVERNANCE,
+                               "core.manage_assistant_assignment"}
+    return tuple(sorted(perms - _NOT_FOR_CEO))
+
+
+ROLE_SEED_V17 = {
+    **ROLE_SEED_V16,
+    "ceo": ("Chief executive officer / General manager", "الرئيس التنفيذي / المدير العام", "entity", "human", None,
+            _ceo_permissions(ROLE_SEED_V16)),
+    "internal_auditor": ("Internal auditor", "المدقق الداخلي", "entity", "human", None,
+                         (*_VIEW_ALL, *_GOVERNANCE, "core.review_governance_report")),
+    "external_auditor": ("External auditor", "المدقق الخارجي", "entity", "human", None,
+                         (*(p for p in _VIEW_ALL if p not in _PERSONAL_DATA_VIEWS and p != "core.view_access"),
+                          *_GOVERNANCE)),
+    "business_analyst": ("Business analyst", "محلل أعمال", "entity", "human", None,
+                         ("ledger.view", "ledger.view_rates", "ledger.view_translation", "invoicing.view",
+                          "billing.view", "payroll.view_cost_reports")),
+    "personal_assistant": ("Personal assistant", "مساعد شخصي", "entity", "human", None,
+                           ("invoicing.create_bill", "billing.edit_contract_draft")),
+    "board_representative": ("Board representative", "ممثل مجلس الإدارة", "entity", "human", None,
+                             ("core.approve_authority_matrix", *_GOVERNANCE)),
+    "managing_partner": _plus(ROLE_SEED_V16, "managing_partner", *_MATRIX, *_GOVERNANCE,
+                              "core.manage_assistant_assignment"),
+    "chairman": _plus(ROLE_SEED_V16, "chairman", "core.approve_authority_matrix"),
+    "access_admin": _plus(ROLE_SEED_V16, "access_admin", "core.propose_authority_matrix"),
+    # payroll.approve_overtime lets an entity's matrix name the CFO for overtime (AT-87); under the code default
+    # payroll's hr route (managing partner or department head) still decides (R70, payroll R45).
+    "approver": _plus(ROLE_SEED_V16, "approver", "core.manage_assistant_assignment", "payroll.approve_overtime"),
+    "system_governance": ("Governance report system user", "مستخدم نظام تقرير الحوكمة", "entity", "system",
+                          "governance", ("core.generate_governance_report",)),
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V16
+ROLE_SEED = ROLE_SEED_V17
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
@@ -365,8 +436,13 @@ SYSTEM_USERS_V2 = {
     **SYSTEM_USERS_V1,
     "deferred_sale": ("system.deferred_sale", "Bai' ajel system user", "مستخدم نظام البيع الآجل"),
 }
+# V3 (migration core.0027, access R84): the governance report system user.
+SYSTEM_USERS_V3 = {
+    **SYSTEM_USERS_V2,
+    "governance": ("system.governance", "Governance report system user", "مستخدم نظام تقرير الحوكمة"),
+}
 # The current system users: what a fresh (or flushed test) database is seeded with.
-SYSTEM_USERS = SYSTEM_USERS_V2
+SYSTEM_USERS = SYSTEM_USERS_V3
 
 
 def apply_seed(Role, RolePermission, roles=ROLE_SEED):

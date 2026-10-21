@@ -28,7 +28,10 @@ DELEGATION_START_TOLERANCE = timedelta(minutes=1)
 
 # OQ-2 default: an access_admin grants every entity role except these. hr_officer and payroll_officer: granted by
 # the managing partner only (A21, R52).
-ACCESS_ADMIN_CANNOT_GRANT = frozenset({"access_admin", "approver", "zatca_admin", "hr_officer", "payroll_officer"})
+ACCESS_ADMIN_CANNOT_GRANT = frozenset({"access_admin", "approver", "zatca_admin", "hr_officer", "payroll_officer",
+                                       # OQ-2 amended (R65, access §10): nor the CEO, the external auditor, or the
+                                       # roles that decide or read the top authority's own changes (OQ-42, OQ-33)
+                                       "ceo", "external_auditor", "board_representative", "internal_auditor"})
 
 
 def now():
@@ -203,6 +206,12 @@ class Grant:
     log_id: int | None = None
     document_ref: tuple | None = None  # (app_label.model, pk) for A / S! checks
     self_approval: bool = False
+    # access §10 (R58, R62, R79): set by the approval engine for A permissions.
+    top_authority: bool = False  # a self-approval by the entity's top authority (R79), logged (R83)
+    delegation_id: int | None = None  # the ApprovalDelegation the user acted under (R62)
+    on_behalf_of_id: int | None = None  # the delegator
+    rule_source: str = ""  # "matrix" or "default" (R70)
+    approval_request_id: int | None = None
 
 
 # --- helpers ---------------------------------------------------------------
@@ -382,7 +391,7 @@ def _memberships_for(user, entity, permission, at):
     forced into the database on the wrong role grants nothing.
     """
     kind = kind_of(user)
-    chain = covering_entities(entity)
+    chain = [entity] if permission in catalogue.NO_CASCADE else covering_entities(entity)  # R90: no cascade
     qs = (
         Membership.objects.active(at)
         .filter(user=user, role__permission_rows__codename=permission, role__kind=kind)
@@ -421,7 +430,8 @@ def _evaluate(user, entity, permission, at, *, reactivation=False):
 
 # --- checking rights --------------------------------------------------------
 
-def require(user, entity, permission, *, document=None, allow_self_approval=False, reactivation=False):
+def require(user, entity, permission, *, document=None, allow_self_approval=False, reactivation=False,
+            purpose="approve"):
     """Return a Grant if ``user`` may use ``permission`` in ``entity`` now; else log and raise AccessDenied.
 
     Superuser, staff, Django groups and user_permissions give nothing (R3, R24).
@@ -438,6 +448,13 @@ def require(user, entity, permission, *, document=None, allow_self_approval=Fals
     if perm.is_dual_control:
         raise AccessUsageError(f"{permission} needs dual control; use require_dual_control (R19).")
     at = now()
+    if perm.is_approval:  # R61: every approval goes through the one approval engine (access §10)
+        if purpose not in APPROVAL_PURPOSES:
+            raise AccessUsageError(f"purpose must be one of {APPROVAL_PURPOSES}.")
+        from . import engine
+
+        with engine.purpose(purpose):
+            return _require_approval(user, entity, permission, perm, document, at)
     memberships, reason = _evaluate(user, entity, permission, at, reactivation=reactivation)
     if reason:
         _deny(user, entity, permission, reason)
@@ -478,6 +495,54 @@ def require(user, entity, permission, *, document=None, allow_self_approval=Fals
     )
 
 
+# What a module uses an approval permission for (access §10): ``approve`` records the engine decision; ``return`` and
+# ``reject`` (an approver sends the document back or refuses it) close the open request; ``check`` (e.g. an approver
+# closing a record, or a reviewer step) checks eligibility only. Every purpose applies the same eligibility rules.
+APPROVAL_PURPOSES = ("approve", "return", "reject", "check")
+
+
+def _require_approval(user, entity, permission, perm, document, at):
+    """``require`` for an **A** permission: the approval engine decides (R57 to R62, R69 to R83).
+
+    The user's own memberships are not required up front: a recorded delegate acts on the delegator's authority
+    (R62). ``allow_self_approval`` is not taken from callers any more (R14 amended): only the engine's
+    top-authority path accepts a creator, submitter, modifier or ``drafted_for`` principal (R79).
+    """
+    from . import engine
+
+    memberships, reason = _evaluate(user, entity, permission, at)
+    if reason and reason != "no_membership":
+        _deny(user, entity, permission, reason)
+    auth = engine.authorise(user, entity, permission, document, at=at)
+    if not auth.final:
+        engine.step_pending(auth, user, permission)
+    ref = _document_ref(document)
+    details = {
+        "self_approval": auth.self_approval,
+        "top_authority": auth.top_authority,
+        "document": list(ref) if ref else None,
+        "membership_ids": [m.pk for m in auth.memberships],
+        "approval_request": auth.request.pk,
+        "step_no": auth.step["step_no"],
+        "rule_source": auth.request.rule_source,
+        "rule_id": auth.rule.pk if auth.rule else None,
+        "matrix_version": auth.request.matrix_version_id,
+        "activity": auth.info.activity,
+    }
+    if auth.delegation is not None:
+        details.update(delegation=auth.delegation.pk, on_behalf_of=auth.delegation.delegator_id)
+    entry = log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity, permission=permission, at=at,
+                details=details)
+    engine.record(auth, user, permission, entry, at)
+    return Grant(
+        user=user, entity=entity, permission=permission, membership_ids=tuple(m.pk for m in auth.memberships),
+        checked_at=at, log_id=entry.pk, document_ref=ref, self_approval=auth.self_approval,
+        top_authority=auth.top_authority, delegation_id=auth.delegation.pk if auth.delegation else None,
+        on_behalf_of_id=auth.delegation.delegator_id if auth.delegation else None,
+        rule_source=auth.request.rule_source, approval_request_id=auth.request.pk,
+    )
+
+
 def has(user, entity, permission):
     """True if ``user`` currently holds ``permission`` in ``entity``. No logging, no segregation check."""
     memberships, reason = _evaluate(user, entity, permission, now())
@@ -497,7 +562,9 @@ def entities_for(user, permission):
         if catalogue.role_may_hold(m.role.kind, m.role.scope, m.role.system_code, perm):
             continue
         if m.role.scope == Role.Scope.GROUP:
-            if m.entity.consolidation == Entity.Consolidation.PARENT:
+            if m.entity.consolidation == Entity.Consolidation.PARENT and permission in catalogue.NO_CASCADE:
+                ids.add(m.entity_id)  # R90: access §10 rights act only on the entity granted
+            elif m.entity.consolidation == Entity.Consolidation.PARENT:
                 ids.update(e.pk for e in _covered_by_group(m.entity))
         else:
             ids.add(m.entity_id)
@@ -539,6 +606,10 @@ def _grant_row_matches(grant, row):
         details = row.details or {}
         expected = list(grant.document_ref) if grant.document_ref else None
         if details.get("document") != expected or bool(details.get("self_approval")) != bool(grant.self_approval):
+            return False
+        if bool(details.get("top_authority")) != bool(grant.top_authority):  # R79: only the engine sets it
+            return False
+        if details.get("delegation") != grant.delegation_id or details.get("on_behalf_of") != grant.on_behalf_of_id:
             return False
         if sorted(details.get("membership_ids") or []) != sorted(grant.membership_ids or ()):
             return False
@@ -582,18 +653,33 @@ def verify_grant(grant, entity, allowed_permissions, *, document=None, allow_sel
     if GrantUse.objects.filter(log_id=row.pk).exists():
         _deny(actor, entity, grant.permission, "grant_used")
     _, reason = _evaluate(user, entity, grant.permission, now())
+    if reason == "no_membership" and grant.delegation_id is not None:
+        reason = _delegation_still_valid(grant, entity)  # R62, R87: a delegate acts while the delegation lasts
     if reason:
         _deny(actor, entity, grant.permission, reason)
     if document is not None:
         if grant.document_ref is None or grant.document_ref != _document_ref(document):
             _deny(actor, entity, grant.permission, "grant_wrong_document")
         if (perm.is_approval or perm.is_segregated) and user.pk in _document_people(document) and not (
-            allow_self_approval and grant.self_approval and not perm.is_segregated
-        ):
+            grant.self_approval and not perm.is_segregated and (allow_self_approval or grant.top_authority)
+        ):  # R79: the engine's top-authority grant (its log row says so, R31) is the only self-approval accepted
             _deny(actor, entity, grant.permission, "self_approval")
     if use:
         use_grant(grant, target=target if target is not None else document)
     return user
+
+
+def _delegation_still_valid(grant, entity):
+    """None if the grant's delegation is still active and its delegator still holds the right in ``entity``."""
+    from .authority_models import ApprovalDelegation, active_window_q
+
+    at = now()
+    d = ApprovalDelegation.objects.filter(active_window_q(at), pk=grant.delegation_id, entity=entity,
+                                          delegate_id=_user_id(grant.user)).first()
+    if d is None or d.delegator_id != grant.on_behalf_of_id:
+        return "no_membership"
+    _, reason = _evaluate(d.delegator, entity, grant.permission, at)
+    return reason
 
 
 def use_grant(grant, *, target=None):
@@ -638,9 +724,14 @@ def recorded_approvers(entity, permission, document, *, used=False, since=None, 
 # --- memberships -------------------------------------------------------------
 
 def _grantor_is_restricted(grant):
-    """True when the grant to manage access comes only from access_admin, not managing_partner (OQ-2)."""
-    codes = set(Membership.objects.filter(pk__in=grant.membership_ids).values_list("role__code", flat=True))
-    return "managing_partner" not in codes
+    """True when the grant to manage access comes only from access_admin, not managing_partner (OQ-2) nor, in that
+    entity, the entity's top-authority role (R65 / OQ-2 amended: the CEO grants in its own company)."""
+    from .engine import governance_of
+
+    rows = Membership.objects.filter(pk__in=grant.membership_ids).values_list("role__code", "entity_id")
+    top = governance_of(grant.entity).top_authority_role
+    return not any(code == "managing_partner" or (code == top and entity_id == grant.entity.pk)
+                   for code, entity_id in rows)
 
 
 def _check_grantable(actor, grant, entity, role):

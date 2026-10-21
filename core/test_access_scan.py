@@ -83,16 +83,62 @@ ALLOW = {
     "ledger/fx.py:convert": "pure helper",
     "ledger/fx.py:inverse": "pure helper",
     "ledger/fx.py:implied_rate": "pure helper",
+    # access §10: the approval engine is the mechanism that require() itself calls for every A permission (R61);
+    # its helpers read the matrix and governance data for a check that require() is making.
+    "core/access/engine.py:register": "called once per type from the owning app's AppConfig.ready(); no user action",
+    "core/access/engine.py:adapters": "read-only view of the code registry",
+    "core/access/engine.py:adapter_for": "pure lookup in the code registry",
+    "core/access/engine.py:activity_row": "the catalogue row of a code activity (global data, like roles)",
+    "core/access/engine.py:describe": "reads the document a check is being made for (inside require)",
+    "core/access/engine.py:document_people": "helper of the R14 / R81 check inside require",
+    "core/access/engine.py:effective_version": "helper of the rule resolution inside require (R77)",
+    "core/access/engine.py:resolve": "rule resolution inside require / submit (R69 to R73); refuses gaps",
+    "core/access/engine.py:find_request": "helper of authorise (inside require)",
+    "core/access/engine.py:eligible_users": "helper of the R72 alert and R82 step skipping inside require",
+    "core/access/engine.py:record": "writes the decision of a grant require() has just issued",
+    "core/access/engine.py:step_pending": "raises inside require (non-final step, R61)",
+    "core/access/engine.py:refuse": "logs a permission_denied row and raises, like deny",
+    "core/access/engine.py:purpose": "context manager used by require(purpose=...)",
+    "core/access/engine.py:submit": "called by module submit services after their own require; opens the request",
+    "core/access/engine.py:inbox": "the scope mechanism for the inbox: requests the user is eligible to decide",
+    "core/access/engine.py:alert": "writes an in-app alert from a check or job that already ran",
+    "core/access/engine.py:governance_of": "reads an entity's governance settings for a check (R67, R79)",
+    "core/access/engine.py:ensure_governance": "called by create_entity / request_governance_change after their checks",
+    "core/access/engine.py:default_top_authority": "pure (R67 default)",
+    "core/access/engine.py:is_group_parent": "pure",
+    "core/access/engine.py:check_amount_places": "pure (CLAUDE.md rule 7)",
+    "core/access/engine.py:grant_rule_source": "pure read of a grant",
+    "core/access/engine.py:top_authority_holders": "helper of the alert jobs",
+    "core/access/matrix.py:versions": "the scope mechanism for matrix versions (entities_for, no cascade, R90)",
+    "core/access/matrix.py:get_version": "the scope mechanism for one version (404 outside, R2)",
+    "core/access/matrix.py:rules": "the scope mechanism for a version's rows (404 outside, R2)",
+    "core/access/matrix.py:entities_reading": "the scope mechanism itself (entities_for of the §10 rights)",
+    "core/access/matrix.py:activate_due_versions": "matrix job (and called by decide_version); records effective dates",
+    "core/access/matrix.py:decider_roles": "pure (R76, OQ-42)",
+    "core/access/matrix.py:rows_hash": "pure (R76 payload hash)",
+    "core/access/matrix.py:governance_payload": "pure (R76 payload)",
+    "core/access/delegations.py:delegations": "the scope mechanism for delegations (no cascade, R90)",
+    "core/access/delegations.py:get_delegation": "the scope mechanism for one delegation (404 outside, R2)",
+    "core/access/delegations.py:assistant_assignments": "the scope mechanism for assistant assignments (R90)",
+    "core/access/delegations.py:send_delegation_reminders": "daily reminder job (R87); alerts only",
+    "core/access/reports.py:reports": "the scope mechanism for governance reports (reader roles, R86, R90)",
+    "core/access/reports.py:get_report": "the scope mechanism for one report (404 outside, R2)",
+    "core/access/reports.py:build_content": "pure builder; called by generate_report after its check",
+    "core/access/reports.py:send_unreviewed_alerts": "daily alert job (R86)",
+    "core/access/reports.py:month_start": "pure",
+    "core/access/reports.py:previous_month": "pure",
 }
 
 # Modules with public functions that are not called services.py but act like them.
-EXTRA_MODULES = ("ledger/services_setup.py", "ledger/fx.py")
+EXTRA_MODULES = ("ledger/services_setup.py", "ledger/fx.py", "core/access/engine.py", "core/access/matrix.py",
+                 "core/access/delegations.py", "core/access/reports.py")
 
 
 def service_modules():
     extra = [REPO / name for name in EXTRA_MODULES]
     for path in sorted(REPO.glob("*/services.py")) + sorted(REPO.glob("*/*/services.py")) + extra:
-        if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.parts):
+        # Only parts inside the repository: the checkout itself may live under a dot-directory (e.g. a worktree).
+        if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.relative_to(REPO).parts):
             continue
         yield path
 

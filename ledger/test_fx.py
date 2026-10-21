@@ -773,9 +773,8 @@ def test_at31_post_revaluation_grants(w):
     with pytest.raises(access.AccessDenied) as exc:
         access.require(w.clerk, w.alm, "ledger.post_entry", document=run.entry)
     assert exc.value.code == "self_approval"
-    own = access.require(w.clerk, w.alm, "ledger.post_entry", document=run.entry, allow_self_approval=True)
-    with pytest.raises(access.AccessDenied) as exc:  # the ledger has no self-approval switch
-        services.post_revaluation(run, own)
+    with pytest.raises(access.AccessDenied) as exc:  # access R14 amended / R79: no caller switch, only the engine's
+        access.require(w.clerk, w.alm, "ledger.post_entry", document=run.entry, allow_self_approval=True)  # top authority
     assert exc.value.code == "self_approval"
     other = draft(w, w.alm, date(2027, 1, 20), [{"account": "1100", "debit": 1}, {"account": "3100", "credit": 1}])
     with pytest.raises(access.AccessDenied) as exc:
@@ -1261,7 +1260,11 @@ def test_at33_no_posting_to_translation_reserve(w, entity_name):
     entity = getattr(w, entity_name)
     lines = [{"account": "1100", "debit": "10.00"}, {"account": "3400", "credit": "10.00"}]
     entry = draft(w, entity, date(2027, 1, 10), lines)  # drafted by the accountant
-    for approver in (w.cfo, w.mp):  # the CFO and the Managing Partner alike
+    top = w.mp  # access R70 / R64 (§10): outside the group parent the MP approves nothing; EGY's top authority does
+    if entity_name == "egy":
+        top = make_user("egy_ceo")
+        member(top, entity, "ceo")
+    for approver in (w.cfo, top):  # the CFO and the entity's top authority alike
         with pytest.raises(LedgerError) as exc:
             post(w, entry, approver=approver)
         text = problems_text(exc)
@@ -1273,5 +1276,5 @@ def test_at33_no_posting_to_translation_reserve(w, entity_name):
     before = JournalEntry.objects.count()
     with pytest.raises(LedgerError, match="3400"):  # nor through a sub-ledger document's posting
         services.create_entry(entity, date(2027, 1, 10), "Bill", lines, user=w.clerk, post=True, document=bill,
-                              grant=access.require(w.mp, entity, "invoicing.approve_bill", document=bill))
+                              grant=access.require(top, entity, "invoicing.approve_bill", document=bill))
     assert JournalEntry.objects.count() == before

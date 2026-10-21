@@ -11,6 +11,9 @@ Flags:
          that caller then allows only reactivation (R38). ``require()`` on its own does not limit what an
          I permission is used for, so without ``reactivation=True`` an inactive entity refuses it like any
          other non-view permission (``inactive_entity``).
+- ``NSA`` never self-approved (access §10, R80): not even the entity's top authority may approve a document of this
+         permission that they created, submitted, modified or had drafted for them. A code flag like ``S!``; it
+         cannot be changed in admin. ``S!``, ``DC`` and ``G`` imply it (:attr:`Perm.never_self_approved`).
 ``system`` is set for "Sys:x" permissions: only system user ``x`` may hold them (R13).
 
 Arabic labels are marked for review [AR-review] like the role names in the spec.
@@ -24,12 +27,13 @@ GROUP_ONLY = "G"
 AGENT_OK = "Ag"
 POSTS = "P"
 INACTIVE_OK = "I"
+NEVER_SELF_APPROVED = "NSA"
 
-FLAGS = frozenset({APPROVAL, SEGREGATED, DUAL_CONTROL, GROUP_ONLY, AGENT_OK, POSTS, INACTIVE_OK})
+FLAGS = frozenset({APPROVAL, SEGREGATED, DUAL_CONTROL, GROUP_ONLY, AGENT_OK, POSTS, INACTIVE_OK, NEVER_SELF_APPROVED})
 # Flags an agent user can never use, whatever its role says (R12, A7).
 AGENT_FORBIDDEN_FLAGS = frozenset({APPROVAL, SEGREGATED, DUAL_CONTROL, GROUP_ONLY, POSTS})
 
-SYSTEM_CODES = ("billing", "zatca_queue", "fx_import", "deferred_sale")
+SYSTEM_CODES = ("billing", "zatca_queue", "fx_import", "deferred_sale", "governance")
 
 
 @dataclass(frozen=True)
@@ -73,6 +77,11 @@ class Perm:
         return INACTIVE_OK in self.flags
 
     @property
+    def never_self_approved(self):
+        """R80: the NSA flag, explicit or implied by S!, DC or G."""
+        return bool(self.flags & {NEVER_SELF_APPROVED, SEGREGATED, DUAL_CONTROL, GROUP_ONLY})
+
+    @property
     def is_view(self):
         """Read-only permissions; these still work on an inactive entity (OQ-8 default)."""
         return self.codename.split(".", 1)[1].startswith("view")
@@ -103,6 +112,18 @@ _PERMS = [
     # partner requests it (first approval), the group's chairman approves it (second). Steps are role-bound below.
     _p("core.disable_sharia_enforcement", "Turn Sharia enforcement off (two-step approval)",
        "إيقاف تطبيق الضوابط الشرعية (اعتماد على مرحلتين)", GROUP_ONLY, DUAL_CONTROL, SEGREGATED),
+    # access §10 (R69 to R90): per-entity authority matrix, governance report, assistant assignments. None of them
+    # cascades from a group role to another entity (R90, R64): see NO_CASCADE below.
+    _p("core.propose_authority_matrix", "Draft and submit authority matrix versions",
+       "إعداد إصدارات مصفوفة الصلاحيات وتقديمها"),
+    _p("core.approve_authority_matrix", "Approve authority matrix versions (second person)",
+       "اعتماد إصدارات مصفوفة الصلاحيات (الشخص الثاني)", DUAL_CONTROL, SEGREGATED, NEVER_SELF_APPROVED),
+    _p("core.view_governance_report", "View the monthly governance report", "عرض تقرير الحوكمة الشهري"),
+    _p("core.review_governance_report", "Record the review of the governance report", "تسجيل مراجعة تقرير الحوكمة"),
+    _p("core.generate_governance_report", "Generate the monthly governance report", "إنشاء تقرير الحوكمة الشهري",
+       system="governance"),
+    _p("core.manage_assistant_assignment", "Assign personal assistants to their principals",
+       "تعيين المساعدين الشخصيين لأصحاب الصلاحية", SEGREGATED),
     # invoicing
     _p("invoicing.manage_customer", "Manage customers", "إدارة العملاء"),
     _p("invoicing.manage_vendor", "Manage vendors", "إدارة الموردين"),
@@ -135,7 +156,8 @@ _PERMS = [
     _p("invoicing.verify_wht_data", "Verify withholding tax data", "التحقق من بيانات ضريبة الاستقطاع"),
     _p("invoicing.manage_settings", "Manage invoicing settings", "إدارة إعدادات الفوترة"),
     _p("invoicing.post_purification_transfer", "Post purification transfers", "ترحيل تحويلات التطهير", POSTS),
-    _p("invoicing.approve_purification_payout", "Approve purification payouts", "اعتماد صرف مبالغ التطهير", APPROVAL, POSTS),
+    _p("invoicing.approve_purification_payout", "Approve purification payouts", "اعتماد صرف مبالغ التطهير", APPROVAL, POSTS,
+       NEVER_SELF_APPROVED),  # R80 g
     # invoicing R54 amendment D31b: charity recipients of purification payouts, added by the accountant and approved
     # by a Managing Partner who did not add them (S!: whatever roles the person holds).
     _p("invoicing.manage_charity_recipient", "Add and deactivate charity recipients",
@@ -145,7 +167,7 @@ _PERMS = [
     # Owner decisions 2026-10-18: C2, the CFO approves (= posts) the funding of the purification account, never its
     # recorder; C4, an accounting user marks purification bank instructions exported or sent.
     _p("invoicing.approve_purification_funding", "Approve purification account fundings",
-       "اعتماد تمويل حساب التطهير", APPROVAL, POSTS),
+       "اعتماد تمويل حساب التطهير", APPROVAL, POSTS, NEVER_SELF_APPROVED),  # R80 g
     _p("invoicing.mark_purification_instruction_sent", "Mark purification bank instructions exported or sent",
        "تعليم أوامر صرف التطهير البنكية كمُصدَّرة أو مُرسلة"),
     _p("invoicing.view", "View invoicing", "عرض الفوترة", AGENT_OK),
@@ -197,7 +219,9 @@ _PERMS = [
     _p("hr.view", "View HR records (personal data masked)", "عرض سجلات الموارد البشرية (البيانات الشخصية مخفية)"),
     _p("hr.view_counts", "View HR head counts only", "عرض أعداد الموظفين فقط"),
     _p("hr.view_personal_data", "View employees' personal data", "عرض البيانات الشخصية للموظفين"),
-    _p("hr.manage_employee", "Create and edit employees and their documents", "إنشاء الموظفين ومستنداتهم وتعديلها"),
+    # R80 f: the second person who approves an employee's IBAN change holds this right (hr approve_iban_change).
+    _p("hr.manage_employee", "Create and edit employees and their documents", "إنشاء الموظفين ومستنداتهم وتعديلها",
+       NEVER_SELF_APPROVED),
     _p("hr.edit_contract_draft", "Edit draft employment contracts", "تعديل مسودات عقود العمل"),
     _p("hr.submit_contract", "Submit employment contracts", "تقديم عقود العمل"),
     _p("hr.approve_contract", "Approve employment contracts", "اعتماد عقود العمل", APPROVAL),
@@ -288,7 +312,8 @@ _PERMS = [
        APPROVAL, POSTS),
     _p("banking.reverse_bank_transaction", "Reverse bank transactions", "عكس العمليات البنكية", POSTS),
     _p("banking.prepare_reconciliation", "Prepare and submit bank reconciliations", "إعداد التسويات البنكية وتقديمها"),
-    _p("banking.approve_reconciliation", "Approve bank reconciliations", "اعتماد التسويات البنكية", APPROVAL),
+    _p("banking.approve_reconciliation", "Approve bank reconciliations", "اعتماد التسويات البنكية", APPROVAL,
+       NEVER_SELF_APPROVED),  # R80 i
     _p("banking.reopen_reconciliation", "Reopen an approved bank reconciliation", "إعادة فتح تسوية بنكية معتمدة",
        SEGREGATED),
     _p("banking.manage_settings", "Manage banking settings and CSV layouts", "إدارة إعدادات البنوك وتنسيقات ملفات CSV"),
@@ -296,7 +321,8 @@ _PERMS = [
     # entries also needs ledger.create_entry; posting them needs ledger.post_entry (a second person).
     _p("migration.view", "View account maps and imports", "عرض خرائط الحسابات وعمليات الاستيراد"),
     _p("migration.manage_account_map", "Draft and edit legacy account maps", "إعداد خرائط حسابات النظام السابق وتعديلها"),
-    _p("migration.approve_account_map", "Approve legacy account maps", "اعتماد خرائط حسابات النظام السابق", APPROVAL),
+    _p("migration.approve_account_map", "Approve legacy account maps", "اعتماد خرائط حسابات النظام السابق", APPROVAL,
+       NEVER_SELF_APPROVED),  # R80 h
     _p("migration.import", "Validate legacy exports and draft their entries", "فحص ملفات النظام السابق وإعداد مسودات قيودها"),
     # tax, VAT slice (tax-returns.md §7, R8, R14). Agents may read and compute drafts only (R14). Preparer, reviewer
     # and approver are three different people (R8, OQ-7: no exception); tax.services enforces reviewer != preparer
@@ -305,15 +331,16 @@ _PERMS = [
     _p("tax.view", "View tax returns", "عرض الإقرارات الضريبية", AGENT_OK),
     _p("tax.prepare_return", "Prepare VAT returns and draft tax payments and records", "إعداد الإقرارات الضريبية "
        "ومسودات الدفعات والسجلات الضريبية", AGENT_OK),
-    _p("tax.review_return", "Review VAT returns", "مراجعة الإقرارات الضريبية"),
-    _p("tax.approve_return", "Approve and lock VAT returns", "اعتماد الإقرارات الضريبية وإقفالها", APPROVAL, POSTS),
+    _p("tax.review_return", "Review VAT returns", "مراجعة الإقرارات الضريبية", NEVER_SELF_APPROVED),  # R80 a (G3)
+    _p("tax.approve_return", "Approve and lock VAT returns", "اعتماد الإقرارات الضريبية وإقفالها", APPROVAL, POSTS,
+       NEVER_SELF_APPROVED),  # R80 a (G3)
     _p("tax.record_filing", "Record the filing of tax returns", "تسجيل تقديم الإقرارات الضريبية"),
     _p("tax.approve_payment", "Approve and post tax payments, refunds and import VAT", "اعتماد الدفعات والاستردادات "
-       "الضريبية وضريبة الاستيراد وترحيلها", APPROVAL, POSTS),
+       "الضريبية وضريبة الاستيراد وترحيلها", APPROVAL, POSTS, NEVER_SELF_APPROVED),  # R80 b
     _p("tax.reverse_document", "Reverse tax documents", "عكس المستندات الضريبية", POSTS),
-    _p("tax.change_settings", "Change tax settings", "تغيير إعدادات الضرائب", APPROVAL),
+    _p("tax.change_settings", "Change tax settings", "تغيير إعدادات الضرائب", APPROVAL, NEVER_SELF_APPROVED),  # R80 b
     _p("tax.maintain_rates", "Verify statutory tax rates and VAT box definitions",
-       "التحقق من النسب الضريبية النظامية وتعريفات خانات الإقرار"),
+       "التحقق من النسب الضريبية النظامية وتعريفات خانات الإقرار", NEVER_SELF_APPROVED),  # R80 b (H3)
     # Owner decision H3 (2026-10-19, tax-returns OQ-46): the accountant proposes a box definition as checked; the
     # approver (CFO), holding tax.maintain_rates, verifies it.
     _p("tax.propose_box_verification", "Propose VAT box definitions as checked against the ZATCA form",
@@ -345,6 +372,30 @@ def dual_control_roles(codename, step):
     return DUAL_CONTROL_STEPS.get(codename, {}).get(step)
 
 
+# R80: the activities where self-approval is never allowed, also for the top authority, as rows a to i of the
+# spec's table. Held in code (the NSA flag and the flags implying it), never as data. Test AT-85 scans it.
+NSA_ROWS = {
+    "a": ("tax.review_return", "tax.approve_return"),
+    "b": ("tax.approve_payment", "tax.change_settings", "tax.maintain_rates"),
+    "c": ("core.disable_sharia_enforcement", "zatca.switch_to_production", "core.approve_authority_matrix"),
+    "d": ("core.grant_membership", "core.delegate_approval", "zatca.grant_key_delegation", "zatca.onboard",
+          "banking.approve_bank_account", "banking.reopen_reconciliation", "invoicing.approve_charity_recipient",
+          "hr.export_personal_data", "core.manage_assistant_assignment"),
+    "e": ("core.change_entity_settings", "core.manage_users", "ledger.maintain_global_rate",
+          "ledger.change_functional_currency", "hr.verify_statutory_parameter"),
+    "f": ("hr.manage_employee",),
+    "g": ("invoicing.approve_purification_funding", "invoicing.approve_purification_payout"),
+    "h": ("migration.approve_account_map",),
+    "i": ("banking.approve_reconciliation",),
+}
+
+# R90, R64 (A27): rights of access §10 never come from a group membership on the group parent for another entity.
+# A group role (e.g. the managing partner, the chairman) uses them only on the entity it is granted on.
+NO_CASCADE = frozenset({
+    "core.propose_authority_matrix", "core.approve_authority_matrix", "core.view_governance_report",
+    "core.review_governance_report", "core.generate_governance_report", "core.manage_assistant_assignment",
+})
+
 # Plain (non-Sys) permissions a system user may also hold (3.6 holders column, R13).
 SYSTEM_EXTRA = {
     # billing R67: the run's own right, plus the rate reads create_from_billing needs.
@@ -352,6 +403,7 @@ SYSTEM_EXTRA = {
     "zatca_queue": frozenset(),
     "fx_import": frozenset(),
     "deferred_sale": frozenset(),
+    "governance": frozenset(),
 }
 
 # Ledger postings (R23, R30): which P grants each ledger service accepts.

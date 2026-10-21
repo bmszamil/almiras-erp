@@ -661,8 +661,10 @@ def approve_overtime(payroll_input, *, user):
     if inp.kind != IK.OVERTIME_HOURS:
         raise error("Only overtime inputs.", "مدخلات العمل الإضافي فقط.", code="wrong_approval")
     roles, head = _overtime_route(inp.employee, inp.overtime_date)
-    _approve_input_common(inp, user, "payroll.approve_overtime", "payroll.overtime", roles=roles)
-    if head is not None and head.pk != user.pk:
+    grant = _approve_input_common(inp, user, "payroll.approve_overtime", "payroll.overtime", roles=roles)
+    # access R54 as replaced (§10.5): where the entity's matrix has rows for payroll.overtime, they decide; the hr
+    # route (and its department head) is the code default only.
+    if head is not None and head.pk != user.pk and approvals.grant_rule_source(grant) != "matrix":
         access_services.log_denial(actor=user, entity=inp.entity, permission="payroll.approve_overtime",
                                    details={"reason": "not_department_head"})
         raise error("Overtime of this department is approved by its head (R45).",
@@ -2557,7 +2559,7 @@ def submit_run(run, *, user, exclude_refused=False):
 def return_run(run, *, user, reason_ar):
     """R7: the approver returns a submitted run for recalculation (``payroll.approve_run``)."""
     run = _lock(PayrollRun, run.pk)
-    grant = _require(user, run.entity, "payroll.approve_run", document=run)
+    grant = _require(user, run.entity, "payroll.approve_run", document=run, purpose="return")
     approvals.check(grant, run.entity, "payroll.run")  # review 17: the same matrix row as approval
     if run.status != RS.SUBMITTED or not (reason_ar or "").strip():
         raise error("Only a submitted run is returned, with a reason in Arabic.",
@@ -2597,9 +2599,12 @@ def _next_number(entity, kind, year):
     return f"{entity.code}-{kind}-{year}-{seq.last_number:06d}"
 
 
-def _approver_checks(run, user):
+def _approver_checks(run, user, grant=None):
     """R39, R50 (defaults OQ-14, OQ-36): an approver whose own payslip in the run has inputs, or who created or
-    approved an input taken by the run, is refused for it."""
+    approved an input taken by the run, is refused for it, unless the grant is the entity's top authority's logged
+    self-approval (access R79, payroll R39 as amended by R84)."""
+    if grant is not None and grant.top_authority:
+        return
     employee_ids = list(Payslip.objects.filter(run=run, refused=False).values_list("employee_id", flat=True))
     input_ids = [i for ids in Payslip.objects.filter(run=run, refused=False).values_list("input_ids", flat=True)
                  for i in (ids or [])]
@@ -2622,7 +2627,7 @@ def approve_run(run, *, user):
     run = PayrollRun.objects.select_related("entity").get(pk=run.pk)
     grant = _require(user, run.entity, "payroll.approve_run", document=run)
     approvals.check(grant, run.entity, "payroll.run")
-    _approver_checks(run, user)
+    _approver_checks(run, user, grant)
     _entity_lock(run.entity)  # review 1, 9: one approval at a time takes inputs and installments
     run = _lock(PayrollRun, run.pk)
     if run.status != RS.SUBMITTED:
@@ -3692,7 +3697,7 @@ def submit_final_settlement(settlement, *, user):
 @transaction.atomic
 def return_final_settlement(settlement, *, user, reason_ar):
     fs = _lock(FS, settlement.pk)
-    grant = _require(user, fs.entity, "payroll.approve_final_settlement", document=fs)
+    grant = _require(user, fs.entity, "payroll.approve_final_settlement", document=fs, purpose="return")
     approvals.check(grant, fs.entity, "payroll.final_settlement")
     if fs.status != FSS.SUBMITTED or not (reason_ar or "").strip():
         raise error("Only a submitted final settlement is returned, with a reason in Arabic.",
@@ -3710,7 +3715,7 @@ def approve_final_settlement(settlement, *, user):
     fs = FS.objects.select_related("entity").get(pk=settlement.pk)
     grant = _require(user, fs.entity, "payroll.approve_final_settlement", document=fs)
     approvals.check(grant, fs.entity, "payroll.final_settlement")
-    if user.pk in {fs.calculated_by_id, fs.submitted_by_id}:
+    if user.pk in {fs.calculated_by_id, fs.submitted_by_id} and not grant.top_authority:  # access R79 / payroll R84: the engine's top-authority self-approval passes
         access.deny(user, fs.entity, "payroll.approve_final_settlement", "self_approval")
     emp = Employee.objects.get(pk=fs.employee_id)
     if emp.user_id is not None and emp.user_id == user.pk:
@@ -5110,7 +5115,7 @@ def submit_settlement_correction(correction, *, user):
 @transaction.atomic
 def return_settlement_correction(correction, *, user, reason_ar):
     c = _lock(SC, correction.pk)
-    grant = _require(user, c.entity, "payroll.approve_settlement_correction", document=c)
+    grant = _require(user, c.entity, "payroll.approve_settlement_correction", document=c, purpose="return")
     approvals.check(grant, c.entity, "payroll.settlement_correction")
     if c.status != SCS.SUBMITTED or not (reason_ar or "").strip():
         raise error("Only a submitted correction is returned, with a reason in Arabic.",
@@ -5142,7 +5147,8 @@ def approve_settlement_correction(correction, *, user):
     grant = _require(user, c.entity, "payroll.approve_settlement_correction", document=c)
     approvals.check(grant, c.entity, "payroll.settlement_correction")
     emp = Employee.objects.get(pk=c.employee_id)
-    if user.pk in {c.created_by_id, c.submitted_by_id, c.modified_by_id} or (emp.user_id and emp.user_id == user.pk):
+    if (user.pk in {c.created_by_id, c.submitted_by_id, c.modified_by_id} and not grant.top_authority) or (
+            emp.user_id and emp.user_id == user.pk):  # access R79 / payroll R84: the engine's top-authority self-approval passes
         access.deny(user, c.entity, "payroll.approve_settlement_correction", "self_approval")
     _entity_lock(c.entity)
     fs = _lock(FS, c.settlement_id)
@@ -5347,7 +5353,7 @@ def submit_loan_write_off(write_off, *, user):
 @transaction.atomic
 def reject_loan_write_off(write_off, *, user, reason_ar):
     w = _lock(WO, write_off.pk)
-    grant = _require(user, w.entity, "payroll.approve_loan_write_off", document=w)
+    grant = _require(user, w.entity, "payroll.approve_loan_write_off", document=w, purpose="reject")
     approvals.check(grant, w.entity, "payroll.loan_write_off")
     if w.status not in (WOS.DRAFT, WOS.SUBMITTED) or not (reason_ar or "").strip():
         raise error("An open write-off is rejected with a reason in Arabic.", "يُرفض الشطب المفتوح مع سبب بالعربية.",
@@ -5366,7 +5372,8 @@ def approve_loan_write_off(write_off, *, user):
     grant = _require(user, w.entity, "payroll.approve_loan_write_off", document=w)
     approvals.check(grant, w.entity, "payroll.loan_write_off")
     emp = Employee.objects.get(pk=w.employee_id)
-    if user.pk in {w.created_by_id, w.submitted_by_id, w.modified_by_id} or (emp.user_id and emp.user_id == user.pk):
+    if (user.pk in {w.created_by_id, w.submitted_by_id, w.modified_by_id} and not grant.top_authority) or (
+            emp.user_id and emp.user_id == user.pk):  # access R79 / payroll R84: the engine's top-authority self-approval passes
         access.deny(user, w.entity, "payroll.approve_loan_write_off", "self_approval")
     _entity_lock(w.entity)
     loan = _lock(EmployeeLoan, w.loan_id)
@@ -5501,7 +5508,7 @@ def approve_gosi_fine(fine, *, user):
     f = GF.objects.select_related("entity").get(pk=fine.pk)
     grant = _require(user, f.entity, "payroll.approve_gosi_fine", document=f)
     approvals.check(grant, f.entity, "payroll.gosi_fine")
-    if user.pk in {f.created_by_id, f.submitted_by_id, f.modified_by_id}:
+    if user.pk in {f.created_by_id, f.submitted_by_id, f.modified_by_id} and not grant.top_authority:  # access R79 / payroll R84: the engine's top-authority self-approval passes
         access.deny(user, f.entity, "payroll.approve_gosi_fine", "self_approval")
     _entity_lock(f.entity)
     f = _lock(GF, f.pk)
@@ -5699,7 +5706,7 @@ def approve_cost_item(item, *, user):
 @transaction.atomic
 def reject_cost_item(item, *, user):
     i = CI.objects.select_related("entity").get(pk=item.pk)
-    grant = _require(user, i.entity, "payroll.approve_cost_item", document=i)
+    grant = _require(user, i.entity, "payroll.approve_cost_item", document=i, purpose="reject")
     approvals.check(grant, i.entity, "payroll.cost_item")
     i = _lock(CI, i.pk)
     if i.status != CIS.DRAFT:
@@ -5821,7 +5828,7 @@ def submit_cost_report(report, *, user):
 @transaction.atomic
 def return_cost_report(report, *, user):
     r = CR.objects.select_related("entity").get(pk=report.pk)
-    grant = _require(user, r.entity, "payroll.approve_cost_report", document=r)
+    grant = _require(user, r.entity, "payroll.approve_cost_report", document=r, purpose="return")
     approvals.check(grant, r.entity, "payroll.cost_report")
     r = _lock(CR, r.pk)
     if r.status != CRS.SUBMITTED:
@@ -5838,7 +5845,7 @@ def approve_cost_report(report, *, user):
     r = CR.objects.select_related("entity").get(pk=report.pk)
     grant = _require(user, r.entity, "payroll.approve_cost_report", document=r)
     approvals.check(grant, r.entity, "payroll.cost_report")
-    if user.pk in {r.created_by_id, r.submitted_by_id, r.modified_by_id}:
+    if user.pk in {r.created_by_id, r.submitted_by_id, r.modified_by_id} and not grant.top_authority:  # access R79 / payroll R84: the engine's top-authority self-approval passes
         access.deny(user, r.entity, "payroll.approve_cost_report", "self_approval")
     r = _lock(CR, r.pk)
     if r.status != CRS.SUBMITTED:
@@ -6386,7 +6393,8 @@ def approve_deferred_sale_rebate(rebate, *, user):
     grant = _require(user, r.entity, "payroll.approve_deferred_sale", document=r.contract)
     approvals.check(grant, r.entity, "payroll.deferred_sale")
     emp = Employee.objects.get(pk=r.contract.employee_id)
-    if user.pk in {r.created_by_id, r.modified_by_id} or (emp.user_id and emp.user_id == user.pk):
+    if (user.pk in {r.created_by_id, r.modified_by_id} and not grant.top_authority) or (
+            emp.user_id and emp.user_id == user.pk):  # access R79 / payroll R84: the engine's top-authority self-approval passes
         access.deny(user, r.entity, "payroll.approve_deferred_sale", "self_approval")
     _entity_lock(r.entity)
     c = _lock(DeferredSaleContract, r.contract_id)

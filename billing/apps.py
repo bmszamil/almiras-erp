@@ -11,3 +11,8 @@ class BillingConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "billing"
     verbose_name = "Billing / الفوترة الدورية"
+
+    def ready(self):
+        from . import approval_adapters
+
+        approval_adapters.register()  # access R61: the module's documents go through the one approval engine

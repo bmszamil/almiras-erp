@@ -1,54 +1,32 @@
-"""Seam to the per-entity authority matrix (access 3.8, A24 to A26; payroll P20). Not built yet.
+"""Payroll's seam to the one approval engine (access.md §10, R70; payroll.md §11 R82 to R84).
 
-Until the approval engine and matrix exist, the seed rows of payroll.md §7 / OQ-47 live here as code, read by
-``payroll.services`` after ``core.access.require`` has issued the grant:
+Every payroll approval permission is an **A** permission, so ``core.access.require`` hands it to the approval engine
+(``core.access.engine``): the entity's authority matrix decides who approves, and where the entity has no row for
+the activity the engine applies the activity's **code default** (``core/access/authority_defaults.py``):
 
-- ``payroll.run``: ``hr_officer`` in every entity (P14); never the Managing Partner ("contracted payroll needs no
-  Managing Partner approval", P20(a)), although managing_partner holds every A permission as fallback (OQ-1).
+- ``payroll.run``: ``hr_officer`` in every entity (P14); never the managing partner ("contracted payroll needs no
+  Managing Partner approval", P20(a)).
 - ``payroll.overtime``: the entity's hr route (``HrSettings.overtime_approval_route``, data): ``managing_partner`` or
   the head of the employee's department (role ``department_head``); see ``payroll.services._overtime_route``.
-- ``payroll.loan``, ``payroll.deferred_sale_terms``, ``payroll.deferred_sale``: ``managing_partner`` (P12; the
-  ``ceo`` seed row of other entities waits for the ``ceo`` role, access A28).
-- ``payroll.payment``, ``payroll.reversal``, ``payroll.maternity_clearance``, ``payroll.final_settlement``:
-  ``approver``, ``managing_partner`` as fallback (OQ-36).
+- ``payroll.loan``, ``payroll.deferred_sale_terms``, ``payroll.deferred_sale``, ``payroll.loan_write_off``: the
+  entity's top authority (``EntityGovernance``: the managing partner in Almiras, its ``ceo`` elsewhere; OQ-39).
+- the other activities: the CFO (``approver``), the ``ceo`` in parallel (OQ-41) and, in the group parent only, the
+  managing partner (no cascade, R64).
 
-- ``payroll.loan_write_off`` (slice 2, OQ-7 default): the entity's top authority: ``managing_partner`` in the group
-  parent (Almiras), ``ceo`` in every other entity (access A26, R58 default). The ``ceo`` role is part of the access
-  build (A28); until it exists a subsidiary's write-off is refused, naming the role.
-- ``payroll.settlement_correction``, ``payroll.cost_item``, ``payroll.cost_report``, ``payroll.gosi_fine``,
-  ``payroll.payment_reversal``, ``payroll.profit_recognition`` (slice 2): ``approver``, ``managing_partner`` as
-  fallback (OQ-36 default).
-
-Top-authority self-approval (access R58) needs the matrix's ``top_authority_role``; until then nobody self-approves
-in payroll (the access layer refuses the creator, submitter and last modifier of every A document).
-
-When the matrix is built, :func:`allowed_roles` reads it instead of ``SEED_ROWS``; callers do not change.
+:func:`check` is the module's own extra check after the engine issued the grant: under code defaults it applies the
+roles above (and the overtime route); when the entity's matrix rows applied (``grant.rule_source == "matrix"``) the
+engine already checked the named roles and users, so nothing is added. Top-authority self-approval is decided only by
+the engine (access R79, payroll R84); payroll never passes ``allow_self_approval``.
 """
+from core.access import authority_defaults
 from core.access import services as access_services
+from core.access.engine import governance_of, grant_rule_source, is_group_parent
 from core.access.models import Membership
 
-
-SEED_ROWS = {
-    "payroll.run": ("hr_officer",),
-    "payroll.loan": ("managing_partner",),
-    "payroll.deferred_sale_terms": ("managing_partner",),
-    "payroll.deferred_sale": ("managing_partner",),
-    "payroll.payment": ("approver", "managing_partner"),
-    "payroll.reversal": ("approver", "managing_partner"),
-    "payroll.maternity_clearance": ("approver", "managing_partner"),
-    "payroll.input": ("payroll_officer", "managing_partner"),
-    "payroll.final_settlement": ("approver", "managing_partner"),
-    "payroll.settlement_correction": ("approver", "managing_partner"),
-    "payroll.cost_item": ("approver", "managing_partner"),
-    "payroll.cost_report": ("approver", "managing_partner"),
-    "payroll.gosi_fine": ("approver", "managing_partner"),
-    "payroll.payment_reversal": ("approver", "managing_partner"),
-    "payroll.profit_recognition": ("approver", "managing_partner"),
-}
-
-# Activities whose seed row is the entity's top authority (access A26): the MP in the group parent, the CEO elsewhere.
-TOP_AUTHORITY_ROWS = {
-    "payroll.loan_write_off": {"group_parent": ("managing_partner",), "other": ("ceo",)},
+# Payroll's names for its approvals -> the engine's activity codes (payroll.md §11 R82).
+ACTIVITY = {
+    "payroll.reversal": "payroll.run_reversal",
+    "payroll.cost_report": "payroll.secondment_cost_report",
 }
 
 LABELS = {
@@ -71,23 +49,33 @@ LABELS = {
 }
 
 
-def is_group_parent(entity):
-    """The group parent (Almiras): a parent-consolidation entity without a parent (data, never a code)."""
-    return entity.parent_id is None and entity.consolidation == "parent"
+def _spec(activity):
+    return authority_defaults.get(ACTIVITY.get(activity, activity)).default
 
 
 def allowed_roles(entity, activity):
-    """Role codes eligible for ``activity`` in ``entity`` (matrix seed rows; the same in every entity except the
-    top-authority rows, which differ between the group parent and the other entities)."""
-    if activity in TOP_AUTHORITY_ROWS:
-        return TOP_AUTHORITY_ROWS[activity]["group_parent" if is_group_parent(entity) else "other"]
-    return SEED_ROWS[activity]
+    """Role codes eligible for ``activity`` in ``entity`` under the code default (R70): the default's roles, or the
+    entity's top-authority role. ``None`` for an activity whose default is every holder of the permission."""
+    spec = _spec(activity)
+    if spec.top_authority:
+        return (governance_of(entity).top_authority_role,)
+    if spec.roles is None:
+        return None
+    if not is_group_parent(entity):  # no cascade (R64): the managing partner approves only in the group parent
+        return tuple(r for r in spec.roles if r != "managing_partner")
+    return spec.roles
 
 
 def check(grant, entity, activity, *, roles=None):
-    """The grant's memberships must include a role eligible for ``activity`` in ``entity``; else a logged refusal
-    (``AccessDenied``, en/ar) naming the activity. ``roles`` overrides the seed (overtime routes)."""
-    roles = tuple(roles if roles is not None else allowed_roles(entity, activity))
+    """Under code defaults, the grant's memberships must include a role eligible for ``activity`` in ``entity``;
+    else a logged refusal (``AccessDenied``, en/ar) naming the activity. ``roles`` overrides the default (overtime
+    routes). Under the entity's matrix the engine has already decided (R69 to R75)."""
+    if grant_rule_source(grant) == "matrix":
+        return
+    roles = roles if roles is not None else allowed_roles(entity, activity)
+    if roles is None:
+        return
+    roles = tuple(roles)
     held = set(Membership.objects.filter(pk__in=grant.membership_ids).values_list("role__code", flat=True))
     if held & set(roles):
         return

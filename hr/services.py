@@ -1560,7 +1560,7 @@ def approve_contract(contract, *, user):
 @transaction.atomic
 def reject_contract(contract, *, user, reason_ar, reason_en=""):
     c = _lock(EmploymentContract, contract.pk)
-    access.require(user, c.entity, "hr.approve_contract", document=c)
+    access.require(user, c.entity, "hr.approve_contract", document=c, purpose="reject")
     if c.status != CStatus.SUBMITTED or not reason_ar:
         raise error("A submitted version is rejected with an Arabic reason.", "تُرفض النسخة المقدمة مع ذكر السبب بالعربية.",
                     code="reject")
@@ -2318,7 +2318,7 @@ def approve_leave(leave_request, *, user):
 @transaction.atomic
 def reject_leave(leave_request, *, user, reason_ar=""):
     req = _lock(LeaveRequest, leave_request.pk)
-    access.require(user, req.entity, "hr.approve_leave", document=req)
+    access.require(user, req.entity, "hr.approve_leave", document=req, purpose="reject")
     if req.status != LR.SUBMITTED:
         raise error("Only submitted requests are rejected.", "تُرفض الطلبات المقدمة فقط.", code="not_submitted")
     req.status = LR.REJECTED
@@ -2428,7 +2428,7 @@ def reject_leave_adjustment(adjustment, *, user, reason_ar):
     """R29: the approver refuses a draft adjustment or opening balance (Arabic reason required); nothing is written
     to the ledger."""
     adj = _lock(LeaveAdjustment, adjustment.pk)
-    access.require(user, adj.entity, "hr.adjust_leave_balance", document=adj)
+    access.require(user, adj.entity, "hr.adjust_leave_balance", document=adj, purpose="reject")
     if adj.status != LeaveAdjustment.Status.DRAFT or not reason_ar:
         raise error("A draft adjustment is rejected with an Arabic reason.", "تُرفض التسوية المسودة مع ذكر السبب بالعربية.",
                     code="reject")
@@ -3376,7 +3376,7 @@ def postpone_resignation(termination, *, user, postponed_until, reason_ar, reaso
     may postpone accepting a resignation by up to the parameter's days after day 30, with a written reason; the last
     working day becomes the end of the postponement. Postponed again only within the same limit."""
     t = _lock(Termination, termination.pk)
-    access.require(user, t.entity, "hr.approve_termination", document=t)
+    access.require(user, t.entity, "hr.approve_termination", document=t, purpose="check")
     _deny_own(user, t.entity, "hr.approve_termination", t.employee)
     if t.kind != TKind.RESIGNATION or t.status not in (TS.DRAFT, TS.SUBMITTED) or t.submitted_on is None:
         raise error("Only an open resignation is postponed.", "لا يُؤجَّل إلا قبول استقالة قائمة.", code="postpone")
@@ -3493,7 +3493,7 @@ def withdraw_termination(termination, *, user, reason_ar):
         if t.kind == TKind.RESIGNATION:
             t.withdrawn_on = _today()  # Art. 79 bis statutory withdrawal
         return _save(t), []
-    access.require(user, t.entity, "hr.approve_termination", document=t)
+    access.require(user, t.entity, "hr.approve_termination", document=t, purpose="check")
     if t.status != TS.APPROVED:
         raise error("This termination cannot be withdrawn.", "لا يمكن سحب إنهاء الخدمة هذا.", code="withdraw")
     if t.kind == TKind.RESIGNATION:

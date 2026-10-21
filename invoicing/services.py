@@ -27,6 +27,7 @@ from django.db.models import Q, Sum
 from django.utils import timezone
 
 from core import access
+from core.access import engine as approval_engine
 from core.access import services as access_services
 from core.access.models import AccessLog, Kind, Membership
 from core.models import Currency, Entity, validate_country_code, validate_vat_number
@@ -969,6 +970,7 @@ def submit_sales_document(document, *, user):
     _bump(doc)
     doc._service_write = True
     doc.save()
+    approval_engine.submit(doc, user)  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
     return doc
 
 
@@ -977,7 +979,7 @@ def return_to_draft(document, *, user):
     """submitted -> draft for edits (R57): by staff who submit, or by the approver."""
     doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity").get(pk=document.pk)
     if not access.has(user, doc.entity, "invoicing.submit_sales_document"):
-        access.require(user, doc.entity, "invoicing.approve_sales_document", document=doc)
+        access.require(user, doc.entity, "invoicing.approve_sales_document", document=doc, purpose="return")
     if doc.status != Status.SUBMITTED:
         raise error("Only submitted documents return to draft.", "تعود المستندات المقدمة فقط إلى مسودة.",
                     code="not_submitted")
@@ -2175,6 +2177,7 @@ def submit_purchase_document(document, *, user):
     _bump(doc)
     doc._service_write = True
     doc.save()
+    approval_engine.submit(doc, user)  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
     return doc
 
 
@@ -2583,6 +2586,7 @@ def submit_vendor_payment(payment, *, user):
     _bump(payment)
     payment._service_write = True
     payment.save()
+    approval_engine.submit(payment, user)  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
     return payment
 
 

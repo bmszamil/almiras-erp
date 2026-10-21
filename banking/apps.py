@@ -28,3 +28,7 @@ class BankingConfig(AppConfig):
         # invoicing D31b review fix 1: the bank transactions that may touch the purification account's GL 1140
         restricted.allow(services.PURIFICATION_GL, document_type="banking.banktransaction",
                          predicate=services._purification_gl_allowed)
+
+        from . import approval_adapters
+
+        approval_adapters.register()  # access R61: the module's documents go through the one approval engine

@@ -36,3 +36,7 @@ class TaxConfig(AppConfig):
                            reverse_guard=services._reverse_guard)
         # R4 / review item 6: a VAT frequency change is dated and the schedule regenerated with it.
         entity_settings_changed.connect(services._on_entity_settings_changed, dispatch_uid="tax_vat_frequency")
+
+        from . import approval_adapters
+
+        approval_adapters.register()  # access R61: the module's documents go through the one approval engine

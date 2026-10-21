@@ -114,7 +114,8 @@ def test_c2_funding_is_approved_by_the_cfo_never_by_its_recorder(w):
 
 def test_c2_the_seed_gives_the_funding_approval_to_the_cfo_and_the_managing_partner_only():
     holders = {code for code, row in ROLE_SEED.items() if "invoicing.approve_purification_funding" in row[5]}
-    assert holders == {"approver", "managing_partner"}
+    # access §10 seed V17 (OQ-41): an entity's ceo holds the CFO's approvals in parallel; never the recorder (NSA, R80 g)
+    assert holders == {"approver", "managing_partner", "ceo"}
     from core.access import catalogue
     perm = catalogue.get("invoicing.approve_purification_funding")
     assert perm.is_approval and perm.posts

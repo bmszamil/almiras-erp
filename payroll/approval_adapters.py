@@ -1,0 +1,107 @@
+"""Payroll's adapters to the one approval engine (access.md §10.5; payroll.md §11 R82 to R84). Registered in
+``PayrollConfig.ready``.
+
+Each adapter supplies the activity, the amount basis in the functional currency (payroll R82 table, OQ-54), the
+employee who benefits (access R82: never approved by that employee, whatever their role) and a label with the
+document number and period only (no names, no individual pay; payroll R36). Payroll's own checks stay in
+``payroll.services`` and run on every decision (fingerprints, own inputs, the 3 x BASIC loan cap). Payroll never
+passes ``allow_self_approval``: only the engine's top-authority path lets the entity's top authority approve a payroll
+document they made (access R79, payroll R84). Slice 3's new documents (off-cycle runs reuse ``PayrollRun``; Mudad
+justifications) register their own adapters when they are built.
+"""
+
+
+def _employee_user(record):
+    employee = getattr(record, "employee", None)
+    user_id = getattr(employee, "user_id", None)
+    return {user_id} if user_id else set()
+
+
+def _label(en, ar):
+    def label(doc):
+        ref = getattr(doc, "number", "") or f"#{doc.pk}"
+        period = getattr(doc, "period", "") or ""
+        return f"{en} {ref} {period}".strip(), f"{ar} {ref} {period}".strip()
+    return label
+
+
+def register():
+    from core.access import engine
+
+    from . import services
+    from .models import (DeferredSaleContract, EmployeeCostItem, EmployeeLoan, FinalSettlement, GosiFine,
+                         LoanWriteOff, PayrollInput, PayrollPayment, PayrollRun, SecondmentCostReport,
+                         SettlementCorrection)
+
+    IK = PayrollInput.Kind
+
+    def approve_input(inp, user):
+        if inp.kind == IK.OVERTIME_HOURS:
+            return services.approve_overtime(inp, user=user)
+        if inp.kind == IK.MATERNITY_SUPPORT:
+            return services.approve_maternity_support(inp, user=user)
+        return services.approve_input(inp, user=user)
+
+    none = lambda d: None  # noqa: E731  (amount basis "none", payroll R82 table)
+    for activity, permission in (("payroll.input", "payroll.approve_input"),
+                                 ("payroll.overtime", "payroll.approve_overtime"),
+                                 ("payroll.maternity_clearance", "payroll.approve_maternity_clearance")):
+        engine.register(PayrollInput, activity, permission=permission, amount=none, beneficiaries=_employee_user,
+                        label=_label("Payroll input", "مدخل رواتب"), approve=approve_input,
+                        reject=lambda d, user, note: services.reject_input(d, user=user, reason_ar=note or "مرفوض"))
+    engine.register(PayrollRun, "payroll.run", permission="payroll.approve_run", amount=none,
+                    version=lambda r: r.stored_hash or r.inputs_hash or "",
+                    label=_label("Payroll run", "مسير رواتب"),
+                    approve=lambda r, user: services.approve_run(r, user=user),
+                    return_=lambda r, user, note: services.return_run(r, user=user, reason_ar=note or "أعيد للاحتساب"))
+    engine.register(EmployeeLoan, "payroll.loan", permission="payroll.approve_loan", amount=lambda d: d.principal,
+                    currency=lambda d: d.entity.base_currency_id, beneficiaries=_employee_user,
+                    label=_label("Employee loan", "قرض موظف"),
+                    approve=lambda d, user: services.approve_loan(d, user=user))
+    engine.register(DeferredSaleContract, "payroll.deferred_sale_terms", permission="payroll.approve_deferred_sale_terms",
+                    amount=none, beneficiaries=_employee_user, version=lambda d: "terms",
+                    label=_label("Bai' ajel contract", "عقد بيع آجل"),
+                    approve=lambda d, user: services.approve_deferred_sale_terms(d, user=user))
+    engine.register(DeferredSaleContract, "payroll.deferred_sale", permission="payroll.approve_deferred_sale",
+                    amount=lambda d: (d.cost or 0) + (d.profit_amount or 0), currency=lambda d: d.entity.base_currency_id,
+                    beneficiaries=_employee_user, label=_label("Bai' ajel sale", "بيع آجل"),
+                    approve=lambda d, user: services.approve_deferred_sale(d, user=user))
+    engine.register(FinalSettlement, "payroll.final_settlement", permission="payroll.approve_final_settlement",
+                    amount=lambda d: d.net, currency=lambda d: d.entity.base_currency_id, beneficiaries=_employee_user,
+                    version=lambda d: d.stored_hash or d.inputs_hash or "", people=lambda d: {d.calculated_by_id},
+                    label=_label("Final settlement", "مخالصة نهائية"),
+                    approve=lambda d, user: services.approve_final_settlement(d, user=user),
+                    return_=lambda d, user, note: services.return_final_settlement(d, user=user,
+                                                                                   reason_ar=note or "أعيدت"))
+    engine.register(SettlementCorrection, "payroll.settlement_correction",
+                    permission="payroll.approve_settlement_correction", amount=lambda d: abs(d.net_change),
+                    currency=lambda d: d.entity.base_currency_id, beneficiaries=_employee_user,
+                    version=lambda d: d.stored_hash or "", label=_label("Settlement correction", "تصحيح مخالصة"),
+                    approve=lambda d, user: services.approve_settlement_correction(d, user=user),
+                    return_=lambda d, user, note: services.return_settlement_correction(d, user=user,
+                                                                                        reason_ar=note or "أعيد"))
+    engine.register(LoanWriteOff, "payroll.loan_write_off", permission="payroll.approve_loan_write_off",
+                    amount=lambda d: d.amount, currency=lambda d: d.entity.base_currency_id,
+                    beneficiaries=_employee_user, label=_label("Loan write-off", "شطب قرض"),
+                    approve=lambda d, user: services.approve_loan_write_off(d, user=user),
+                    reject=lambda d, user, note: services.reject_loan_write_off(d, user=user, reason_ar=note or "مرفوض"))
+    engine.register(PayrollPayment, "payroll.payment", permission="payroll.approve_payment", amount=lambda d: d.amount,
+                    currency=lambda d: d.currency_id, label=_label("Payroll payment", "دفعة رواتب"),
+                    approve=lambda d, user: services.approve_payment(d, user=user))
+    engine.register(GosiFine, "payroll.gosi_fine", permission="payroll.approve_gosi_fine", amount=lambda d: d.amount,
+                    currency=lambda d: d.entity.base_currency_id, label=_label("GOSI fine", "غرامة تأمينات"),
+                    approve=lambda d, user: services.approve_gosi_fine(d, user=user))
+    engine.register(EmployeeCostItem, "payroll.cost_item", permission="payroll.approve_cost_item",
+                    amount=lambda d: d.amount, currency=lambda d: d.entity.base_currency_id,
+                    beneficiaries=_employee_user, label=_label("Employee cost item", "بند تكلفة موظف"),
+                    approve=lambda d, user: services.approve_cost_item(d, user=user),
+                    reject=lambda d, user, note: services.reject_cost_item(d, user=user))
+    engine.register(SecondmentCostReport, "payroll.secondment_cost_report", permission="payroll.approve_cost_report",
+                    amount=none, label=_label("Secondment cost report", "تقرير تكلفة إعارة"),
+                    approve=lambda d, user: services.approve_cost_report(d, user=user),
+                    return_=lambda d, user, note: services.return_cost_report(d, user=user))
+    # The maternity case (GOSI) clearance needs the legal clearance reference: decided directly, not from the inbox.
+    from .models import MaternityGosiCase
+
+    engine.register(MaternityGosiCase, "payroll.maternity_clearance", permission="payroll.approve_maternity_clearance",
+                    amount=none, beneficiaries=_employee_user, label=_label("Maternity case", "حالة أمومة"))

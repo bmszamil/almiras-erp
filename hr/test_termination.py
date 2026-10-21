@@ -49,7 +49,7 @@ def test_at19_reason_and_approval_segregation(w):
     t2 = services.submit_termination(_record(w, own, "employee_notice_art75"), user=w.h)
     with pytest.raises(access.AccessDenied) as exc:
         services.approve_termination(t2, user=w.c)
-    assert exc.value.code == "self_approval"
+    assert exc.value.code == "beneficiary"  # access R82 (§10): one's own termination is refused as its beneficiary
 
 
 def test_r37_notice_shortfall_is_a_warning(w):

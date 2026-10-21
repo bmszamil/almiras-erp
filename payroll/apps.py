@@ -51,3 +51,7 @@ class PayrollConfig(AppConfig):
         # OQ-30 (R43): payroll's remuneration WHT goes into invoicing's monthly WHT return and its 2220 tie-out.
         from invoicing import services as invoicing_services
         invoicing_services.register_wht_return_source("payroll.payrollpayment", services._wht_return_source)
+
+        from . import approval_adapters
+
+        approval_adapters.register()  # access R61: the module's documents go through the one approval engine

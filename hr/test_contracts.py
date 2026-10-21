@@ -37,7 +37,7 @@ def test_at9_segregation_and_immutability(w):
     c = _submit(w, own)
     with pytest.raises(access.AccessDenied) as exc:
         services.approve_contract(c, user=w.c)
-    assert exc.value.code == "self_approval"
+    assert exc.value.code == "beneficiary"  # access R82 (§10): one's own contract is refused as its beneficiary
     assert services.approve_contract(c, user=w.mp).status == "approved"  # managing_partner fallback (OQ-25)
 
 

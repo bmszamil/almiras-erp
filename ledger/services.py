@@ -512,8 +512,9 @@ def _authorise_document_post(entity, grant, posted_by, document, created_by):
     if creator_id is None:  # nobody recorded as creator: segregation could not keep the creator out (R35)
         access.deny(user, entity, grant.permission, "document_no_creator")
     if user.pk in access_services._document_people(stored) | {creator_id} and not (
-        grant.permission != CLEARANCE_PERMISSION and doc_type.self_post_allowed(stored)
-    ):  # access R46: only a type's own creator_may_post (customer receipts) lets its makers post it
+        grant.permission != CLEARANCE_PERMISSION and (doc_type.self_post_allowed(stored) or grant.top_authority)
+    ):  # access R46: only a type's own creator_may_post (customer receipts) lets its makers post it; access R58 /
+        # R79: or the approval engine's top-authority self-approval (verified against its log row above, R31)
         access.deny(user, entity, grant.permission, "self_approval")
     if _document_booked(entity, stored):
         raise _document_booked_error((doc_type.label, stored.pk))

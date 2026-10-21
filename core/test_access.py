@@ -313,12 +313,18 @@ def test_r14_submitter_cannot_approve_either(w):
 
 
 def test_at7_self_approval_when_module_switch_allows_it_is_logged(w):
+    # Amended by access R14 (2026-10-18, A26) and R79 (§10): the per-module switch is withdrawn; a caller passing
+    # allow_self_approval=True is refused unless the user is the entity's top authority (engine path, AT-83).
     c = make_user()
     member(c, w.alm, "approver")
-    grant = services.require(c, w.alm, "invoicing.approve_bill", document=bill(w.alm, created_by=c), allow_self_approval=True)
-    assert grant.self_approval
+    with pytest.raises(services.AccessDenied) as exc:
+        services.require(c, w.alm, "invoicing.approve_bill", document=bill(w.alm, created_by=c), allow_self_approval=True)
+    assert exc.value.code == "self_approval" and denied_logged(c, "invoicing.approve_bill", w.alm)
+    grant = services.require(w.mp, w.alm, "invoicing.approve_bill", document=bill(w.alm, created_by=w.mp))
+    assert grant.self_approval and grant.top_authority  # ALM's top authority (managing partner, R79)
     row = AccessLog.objects.get(pk=grant.log_id)
     assert row.event == "permission_granted" and row.details["self_approval"] is True
+    assert row.details["top_authority"] is True
 
 
 def test_at8_other_approver_approves_and_grant_is_logged(w):
@@ -338,12 +344,16 @@ def test_r14_approval_without_document_is_a_programming_error(w):
 
 
 def test_mp_is_fallback_approver_but_not_for_own_document(w):  # OQ-1 default + R14
+    # Amended by access R70 / R64 (§10): the managing partner's fallback approval applies only in the group parent;
+    # a group membership gives no approval in a subsidiary (no cascade). In ALM, where the MP is the top authority,
+    # the MP's own document is a logged top-authority self-approval (R79, AT-83); a clerk's is a plain approval.
     clerk = make_user()
-    assert services.require(w.mp, w.sub, "invoicing.approve_bill", document=bill(w.sub, created_by=clerk))
-    with pytest.raises(services.AccessDenied):
-        services.require(w.mp, w.sub, "invoicing.approve_bill", document=bill(w.sub, created_by=w.mp))
+    assert services.require(w.mp, w.alm, "invoicing.approve_bill", document=bill(w.alm, created_by=clerk))
+    with pytest.raises(services.AccessDenied) as exc:
+        services.require(w.mp, w.sub, "invoicing.approve_bill", document=bill(w.sub, created_by=clerk, pk=2))
+    assert exc.value.code == "no_membership"
     with pytest.raises(services.AccessDenied):  # minority holding not covered (OQ-3)
-        services.require(w.mp, w.min, "invoicing.approve_bill", document=bill(w.min, created_by=clerk))
+        services.require(w.mp, w.min, "invoicing.approve_bill", document=bill(w.min, created_by=clerk, pk=3))
 
 
 # --- AT-9, AT-10, R12: agents -----------------------------------------------------

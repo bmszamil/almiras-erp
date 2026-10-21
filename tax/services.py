@@ -1294,7 +1294,8 @@ def return_to_draft(vat_return, *, user, reason_ar, reason_en=""):
     """in_review or reviewed -> draft with a reason (R7), by a reviewer or approver."""
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     permission = "tax.review_return" if access.has(user, ret.entity, "tax.review_return") else "tax.approve_return"
-    access.require(user, ret.entity, permission, **({"document": ret} if permission == "tax.approve_return" else {}))
+    access.require(user, ret.entity, permission,
+                   **({"document": ret, "purpose": "return"} if permission == "tax.approve_return" else {}))
     _human(user, ret.entity, permission)
     if not (reason_ar or "").strip():
         raise error("An Arabic reason is required.", "السبب بالعربية مطلوب.", code="reason_required")
