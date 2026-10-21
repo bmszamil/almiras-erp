@@ -92,7 +92,7 @@ EXTRA_MODULES = ("ledger/services_setup.py", "ledger/fx.py")
 def service_modules():
     extra = [REPO / name for name in EXTRA_MODULES]
     for path in sorted(REPO.glob("*/services.py")) + sorted(REPO.glob("*/*/services.py")) + extra:
-        if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.parts):
+        if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.relative_to(REPO).parts):
             continue
         yield path
 
