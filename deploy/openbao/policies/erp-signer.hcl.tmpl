@@ -12,3 +12,18 @@ path "zatca-${ENTITY}/decrypt/master_key" {
 path "zatca-${ENTITY}/keys/master_key" {
   capabilities = ["read"]
 }
+# D-19 / zatca OQ-34 (f): the signer reads metadata/ to refuse retired versions (custom_metadata "retired_v<n>",
+# R-57) and never writes it. It reads only explicit versions.
+path "zatca-kv/metadata/zatca/${ENTITY}/*" {
+  capabilities = ["read"]
+}
+# Nothing is ever deleted or destroyed from the ERP (R-30, R-57).
+path "zatca-kv/delete/*" {
+  capabilities = ["deny"]
+}
+path "zatca-kv/undelete/*" {
+  capabilities = ["deny"]
+}
+path "zatca-kv/destroy/*" {
+  capabilities = ["deny"]
+}

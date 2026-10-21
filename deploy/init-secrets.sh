@@ -22,7 +22,8 @@ generated=(django_secret_key db_superuser_password db_owner_password db_app_pass
            grafana_admin_password)
 provided=(smtp_password backup-recipients.txt tls/erp.crt tls/erp.key openbao-tls/server.crt
           openbao-tls/server.key openbao-tls/ca.crt)
-from_bootstrap=(openbao_backup_token openbao_erp_role_id openbao_erp_secret_id)
+from_bootstrap=(openbao_backup_token openbao_erp_role_id openbao_erp_secret_id openbao_retire_role_id
+                openbao_retire_secret_id)
 
 if [[ "${1:-}" == "--check" ]]; then
     missing=0

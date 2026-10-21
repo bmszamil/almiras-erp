@@ -11,3 +11,13 @@ path "zatca-kv/data/zatca/${ENTITY}/*" {
 path "zatca-kv/metadata/zatca/${ENTITY}/*" {
   capabilities = ["read"]
 }
+# Nothing is ever deleted or destroyed from the ERP (R-30, R-57).
+path "zatca-kv/delete/*" {
+  capabilities = ["deny"]
+}
+path "zatca-kv/undelete/*" {
+  capabilities = ["deny"]
+}
+path "zatca-kv/destroy/*" {
+  capabilities = ["deny"]
+}

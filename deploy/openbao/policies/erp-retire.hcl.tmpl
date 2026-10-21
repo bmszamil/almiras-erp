@@ -1,0 +1,18 @@
+# Policy "erp-retire-${ENTITY}": the ERP's secret-version retirement identity (AppRole "erp-retire") for entity
+# ${ENTITY} (zatca D-19, R-57 to R-60, OQ-34 (f) default; security sign-off pending). It flags a version retired
+# by patching the path's custom_metadata ("retired_v<n>" = UTC time|reason). It reads metadata/ to stay idempotent,
+# never reads data/ (no key material), writes nothing else and cannot delete, undelete or destroy any version.
+# Un-retiring is an MP-run OpenBao procedure outside the ERP, logged by the OpenBao audit device.
+
+path "zatca-kv/metadata/zatca/${ENTITY}/*" {
+  capabilities = ["read", "patch"]
+}
+path "zatca-kv/delete/*" {
+  capabilities = ["deny"]
+}
+path "zatca-kv/undelete/*" {
+  capabilities = ["deny"]
+}
+path "zatca-kv/destroy/*" {
+  capabilities = ["deny"]
+}

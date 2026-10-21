@@ -90,6 +90,11 @@ signer_policies="$(printf 'erp-signer-%s,' "${entities[@],,}")"
 bao write auth/approle/role/erp-zatca \
     token_policies="${signer_policies%,}" token_ttl=1h token_max_ttl=4h \
     secret_id_ttl=2160h token_bound_cidrs="${app_cidr}" secret_id_bound_cidrs="${app_cidr}" > /dev/null
+# D-19 / zatca OQ-34 (f): the separate retirement identity; it only reads and patches KV metadata (erp-retire-*).
+retire_policies="$(printf 'erp-retire-%s,' "${entities[@],,}")"
+bao write auth/approle/role/erp-retire \
+    token_policies="${retire_policies%,}" token_ttl=1h token_max_ttl=4h \
+    secret_id_ttl=2160h token_bound_cidrs="${app_cidr}" secret_id_bound_cidrs="${app_cidr}" > /dev/null
 for e in "${entities[@]}"; do
     bao write "auth/approle/role/erp-onboard-${e}" \
         token_policies="erp-onboard-${e,,}" token_ttl=15m token_max_ttl=30m \
@@ -100,6 +105,10 @@ echo "== credentials for the ERP and the backup service"
 if [[ ! -s "${secrets_dir}/openbao_erp_role_id" ]]; then
     bao read -field=role_id auth/approle/role/erp-zatca/role-id | write_secret_file openbao_erp_role_id
     bao write -f -field=secret_id auth/approle/role/erp-zatca/secret-id | write_secret_file openbao_erp_secret_id
+fi
+if [[ ! -s "${secrets_dir}/openbao_retire_role_id" ]]; then
+    bao read -field=role_id auth/approle/role/erp-retire/role-id | write_secret_file openbao_retire_role_id
+    bao write -f -field=secret_id auth/approle/role/erp-retire/secret-id | write_secret_file openbao_retire_secret_id
 fi
 if [[ ! -s "${secrets_dir}/openbao_backup_token" ]]; then
     bao token create -orphan -policy=backup-snapshot -period=768h -display-name=almiras-backup -field=token \

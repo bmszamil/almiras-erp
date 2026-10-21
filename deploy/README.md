@@ -111,6 +111,7 @@ mount). `./init-secrets.sh` generates the random ones; `./init-secrets.sh --chec
 | `smtp_password` | yes (from mail admin) | web, scheduler, alertmanager | `DJANGO_EMAIL_PASSWORD` |
 | `grafana_admin_password` | yes (generated) | grafana | |
 | `openbao_erp_role_id`, `openbao_erp_secret_id` | yes (bootstrap) | web, scheduler | ERP AppRole login (for the OpenBao client, OQ-34) |
+| `openbao_retire_role_id`, `openbao_retire_secret_id` | yes (bootstrap) | web, scheduler | AppRole `erp-retire`: secret-version retirement only (zatca D-19, R-57 to R-60, OQ-34 (f)); KV metadata read + patch, no data read |
 | `openbao_backup_token` | yes (bootstrap) | backup | periodic token, `backup-snapshot` policy only |
 | `backup-recipients.txt` | no (public age keys) | db (WAL), backup | encryption recipients |
 | `tls/erp.crt`, `tls/erp.key` | key is secret | proxy | site certificate |

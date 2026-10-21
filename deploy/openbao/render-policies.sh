@@ -6,7 +6,8 @@
 #   ./render-policies.sh ALM ALM SUB1 SUB2 --out /tmp/almiras-policies
 #
 # Writes <out>/group-super-admin-<group>.hcl, <out>/entity-custodian-<e>.hcl, <out>/erp-signer-<e>.hcl,
-# <out>/erp-onboard-<e>.hcl (policy names in lower case, as OpenBao stores them) and backup-snapshot.hcl.
+# <out>/erp-onboard-<e>.hcl, <out>/erp-retire-<e>.hcl (policy names in lower case, as OpenBao stores them) and
+# backup-snapshot.hcl.
 # Contains no secret; review the files, then load them with bootstrap.sh (or "bao policy write <name> <file>").
 set -euo pipefail
 
@@ -61,6 +62,7 @@ for e in "${entities[@]}"; do
     render "${here}/policies/entity-custodian.hcl.tmpl" "${out}/entity-custodian-${e,,}.hcl" "ENTITY=${e}"
     render "${here}/policies/erp-signer.hcl.tmpl" "${out}/erp-signer-${e,,}.hcl" "ENTITY=${e}"
     render "${here}/policies/erp-onboard.hcl.tmpl" "${out}/erp-onboard-${e,,}.hcl" "ENTITY=${e}"
+    render "${here}/policies/erp-retire.hcl.tmpl" "${out}/erp-retire-${e,,}.hcl" "ENTITY=${e}"
 done
 cp "${here}/policies/backup-snapshot.hcl" "${out}/backup-snapshot.hcl"
 echo "rendered $(find "${out}" -name '*.hcl' | wc -l) policies into ${out}"

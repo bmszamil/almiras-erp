@@ -37,6 +37,13 @@ x-app: &app
     ZATCA_SECRET_STORE: zatca.keystore.OpenBaoSecretStore
     ZATCA_OPENBAO_ADDRESS: https://openbao:8200
     ZATCA_OPENBAO_AUTH_ROLE: erp-zatca
+    ZATCA_OPENBAO_KV_MOUNT: zatca-kv
+    ZATCA_OPENBAO_CA_FILE: /run/secrets/openbao_ca
+    ZATCA_OPENBAO_ROLE_ID_FILE: /run/secrets/openbao_erp_role_id
+    ZATCA_OPENBAO_SECRET_ID_FILE: /run/secrets/openbao_erp_secret_id
+    # zatca D-19 / OQ-34 (f): the separate retirement identity (KV metadata read + patch only).
+    ZATCA_OPENBAO_RETIRE_ROLE_ID_FILE: /run/secrets/openbao_retire_role_id
+    ZATCA_OPENBAO_RETIRE_SECRET_ID_FILE: /run/secrets/openbao_retire_secret_id
     ZATCA_SANDBOX_BASE_URL: ${ZATCA_SANDBOX_BASE_URL:-}
     ZATCA_SIMULATION_BASE_URL: ${ZATCA_SIMULATION_BASE_URL:-}
     ZATCA_PRODUCTION_BASE_URL: ${ZATCA_PRODUCTION_BASE_URL:-}
@@ -57,6 +64,8 @@ x-app: &app
     - openbao_ca
     - openbao_erp_role_id
     - openbao_erp_secret_id
+    - openbao_retire_role_id
+    - openbao_retire_secret_id
     - smtp_password
 
 services:
@@ -418,5 +427,7 @@ secrets:
   openbao_backup_token: {file: ./secrets/openbao_backup_token}
   openbao_erp_role_id: {file: ./secrets/openbao_erp_role_id}
   openbao_erp_secret_id: {file: ./secrets/openbao_erp_secret_id}
+  openbao_retire_role_id: {file: ./secrets/openbao_retire_role_id}
+  openbao_retire_secret_id: {file: ./secrets/openbao_retire_secret_id}
   smtp_password: {file: ./secrets/smtp_password}
   grafana_admin_password: {file: ./secrets/grafana_admin_password}
