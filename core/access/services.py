@@ -975,3 +975,72 @@ def set_user_active(actor, user, active, reason):
             )
     user.is_active = stored.is_active
     return stored
+
+
+# --- web UI support (web.md R9, R10, R27; web.md appendix B) ------------------------------------------
+
+def _is_active_human(user):
+    return bool(user is not None and getattr(user, "pk", None) and user.is_active and kind_of(user) == Kind.HUMAN)
+
+
+def visible_entities(user):
+    """Entities where ``user`` holds at least one active, membership-backed catalogue permission (web.md R9).
+
+    The union of :func:`entities_for` over the whole catalogue, computed from the user's memberships in one pass
+    instead of once per permission (same coverage rules: entity roles on their entity, group roles on a group parent
+    and the descendants :func:`entities_for` gives them, R6 as built). Inactive entities are included, because their
+    view permissions still work (R38); the caller marks them. A superuser without memberships sees none (R24).
+    Agent and system users see none: they never use the web UI (R20, R21).
+    """
+    if not _is_active_human(user):
+        return Entity.objects.none()
+    ids = set()
+    memberships = (
+        Membership.objects.active(now())
+        .filter(user=user, role__kind=Kind.HUMAN)
+        .select_related("role", "entity")
+        .prefetch_related("role__permission_rows")
+    )
+    for m in memberships:
+        perms = (catalogue.CATALOGUE.get(row.codename) for row in m.role.permission_rows.all())
+        if not any(p is not None and catalogue.role_may_hold(m.role.kind, m.role.scope, m.role.system_code, p) is None
+                   for p in perms):
+            continue
+        if m.role.scope == Role.Scope.GROUP:
+            if m.entity.consolidation == Entity.Consolidation.PARENT:
+                ids.update(e.pk for e in _covered_by_group(m.entity))
+        else:
+            ids.add(m.entity_id)
+    return Entity.objects.filter(pk__in=ids).order_by("code")
+
+
+def holds_any_role(user, role_codes):
+    """True if ``user`` holds an active membership in any entity in one of the roles ``role_codes`` (e.g. the MFA
+    roles of web.md R13). Reads the user's own memberships; grants nothing."""
+    if not _is_active_human(user):
+        return False
+    return Membership.objects.active(now()).filter(user=user, role__code__in=list(role_codes)).exists()
+
+
+def set_preferred_language(user, language):
+    """Change ``user``'s own UI and message language (web.md R27), logged as ``profile_changed`` (R27).
+
+    Only the person themselves changes it, and only people have a UI language. Returns the stored language.
+    """
+    if language not in UserProfile.Language.values:
+        raise ValidationError("Unknown language. / لغة غير معروفة.")
+    if not _is_active_human(user):
+        raise ValidationError("Only an active person has a language setting. / إعداد اللغة للأشخاص النشطين فقط.")
+    with transaction.atomic():
+        profile = UserProfile.objects.select_for_update().get(user=user)
+        before = profile.preferred_language
+        if before != language:
+            profile.preferred_language = language
+            profile.save(update_fields=["preferred_language"])
+            log(
+                AccessLog.Event.PROFILE_CHANGED, actor=user, subject_user=user,
+                details={"field": "preferred_language", "before": before, "after": language},
+            )
+    if hasattr(user, "_state") and "access_profile" in user._state.fields_cache:
+        user.access_profile.preferred_language = language
+    return language

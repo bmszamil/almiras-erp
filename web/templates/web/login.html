@@ -1,0 +1,40 @@
+{% extends "web/base.html" %}{% load static web_tags %}
+{% block title %}{% t "login_title" %}{% endblock %}
+{% block shell %}
+<div class="alm-auth">
+  <main class="alm-auth__card" id="main" tabindex="-1">
+    <div class="alm-auth__top">
+      {% include "web/_language_switch.html" %}
+    </div>
+    <div class="alm-auth__logo">
+      {% if ui.lang == "ar" %}
+      <img src="{% static 'web/brand/almiras-logo-ar.svg' %}" alt="{% t 'brand_name' %}" width="220" height="48">
+      {% else %}
+      <img src="{% static 'web/brand/almiras-logo-en.svg' %}" alt="{% t 'brand_name' %}" width="220" height="45">
+      {% endif %}
+    </div>
+    <h1 class="alm-title">{% t "login_title" %}</h1>
+    <p class="alm-muted">{% t "login_intro" %}</p>
+    {% if error or form.errors %}
+    <div class="alm-error-summary" role="alert" tabindex="-1" id="alm-errors">
+      <p class="alm-error-summary__title">{% t "error_summary" %}</p>
+      <ul>
+        {% if error %}<li><a href="#id_username">{{ error }}</a></li>{% endif %}
+        {% for field in form %}{% for e in field.errors %}<li><a href="#{{ field.id_for_label }}">{{ field.label }}: {{ e }}</a></li>{% endfor %}{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+    <form method="post" action="{% url 'web:login' %}" novalidate>
+      {% csrf_token %}
+      <input type="hidden" name="next" value="{{ next }}">
+      {% for field in form %}
+      <div class="mb-3">
+        <label class="form-label" for="{{ field.id_for_label }}">{{ field.label }}</label>
+        {{ field }}
+      </div>
+      {% endfor %}
+      <button type="submit" class="btn btn-primary w-100">{% t "sign_in" %}</button>
+    </form>
+  </main>
+</div>
+{% endblock %}

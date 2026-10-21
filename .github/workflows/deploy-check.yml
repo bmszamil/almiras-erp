@@ -88,6 +88,8 @@ jobs:
         run: |
           cp deploy/env.example deploy/.env
           echo "ALMIRAS_BACKUP_ROOT=$RUNNER_TEMP/backups" >> deploy/.env
+          # CI only: the web UI has no MFA yet, so the release check (web.E001) would refuse the stack (web.md).
+          echo "DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN=1" >> deploy/.env
           deploy/init-secrets.sh
           echo ci-only > deploy/secrets/smtp_password
           docker run --rm --entrypoint age-keygen almiras-postgres:16 > "$RUNNER_TEMP/ci.agekey" 2>/dev/null

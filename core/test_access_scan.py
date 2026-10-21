@@ -33,6 +33,28 @@ ALLOW = {
     "core/access/services.py:group_parent_of": "helper (walks parent links)",
     "core/access/services.py:recorded_approvers": "reads the access log for a ledger check that already verified a grant",
     "core/access/services.py:visible_access_log": "the scope mechanism for access-log rows (entities_for + group parent)",
+    "core/access/services.py:visible_entities": "the scope mechanism of the web entity switcher (union of "
+                                                 "entities_for over the catalogue, web.md R9)",
+    "core/access/services.py:holds_any_role": "reads the user's own memberships (web session timeout, R13); "
+                                               "grants nothing",
+    "core/access/services.py:set_preferred_language": "the signed-in person's own UI language; logged "
+                                                       "profile_changed (web.md R27)",
+    "invoicing/services.py:listed_customer_name": "pure: masks an individual's name on a row the caller read through "
+                                             "list_sales_documents (checked); never unmasks (web.md R24, R51)",
+    # web/services.py: UI preferences, sessions and the sign-in throttle (web.md §1); no business data.
+    "web/services.py:language_for": "pure: picks the UI language from the profile, cookie or header (R27)",
+    "web/services.py:set_language": "the signed-in person's own language through set_preferred_language (R27)",
+    "web/services.py:switcher_entities": "the entities the user may see (visible_entities, R9)",
+    "web/services.py:entity_from": "pure: picks the URL's entity among the visible ones, else 404 (R4, R10)",
+    "web/services.py:start_entity": "the user's own remembered entity, only among the visible ones (R10)",
+    "web/services.py:remember_entity": "the user's own UI preference, only for a visible entity (R10, R11)",
+    "web/services.py:is_web_user": "helper: active human users only (R12)",
+    "web/services.py:idle_timeout": "session timeout setting (OQ-8)",
+    "web/services.py:absolute_timeout": "session timeout setting (OQ-8)",
+    "web/services.py:log_login": "writes the access log (R26)",
+    "web/services.py:log_logout": "writes the access log (R26)",
+    "web/services.py:client_ip": "pure: the client address for the sign-in throttle (OQ-27)",
+    "web/services.py:sign_in": "the password check itself, under the sign-in throttle (R12, R18)",
     "ledger/services.py:counterparty_choices": "choice list for admin; posting checks every line",
     "invoicing/services.py:party_problems": "pure check of a party record the caller passes (model clean, services)",
     "invoicing/services.py:deferred_sale_of": "payroll invoicing port only: the live bai' ajel sale of a contract payroll "
@@ -92,7 +114,9 @@ EXTRA_MODULES = ("ledger/services_setup.py", "ledger/fx.py")
 def service_modules():
     extra = [REPO / name for name in EXTRA_MODULES]
     for path in sorted(REPO.glob("*/services.py")) + sorted(REPO.glob("*/*/services.py")) + extra:
-        if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.parts):
+        # Parts relative to the repository: a checkout inside a dot-folder (e.g. a git worktree under .claude/)
+        # must not make the scan skip every module.
+        if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.relative_to(REPO).parts):
             continue
         yield path
 

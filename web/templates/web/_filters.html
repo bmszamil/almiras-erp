@@ -1,0 +1,21 @@
+{% load web_tags %}<form class="alm-filters" method="get" action="" aria-labelledby="alm-filters-title">
+  <h2 class="alm-filters__title" id="alm-filters-title">{% t "filters" %}</h2>
+  {% if invalid_filters %}
+  <div class="alm-error-summary" role="alert">
+    <p class="alm-error-summary__title">{% t "invalid_filter" %}</p>
+    <ul>{% for field in form %}{% for e in field.errors %}<li><a href="#{{ field.id_for_label }}">{{ field.label }}: {{ e }}</a></li>{% endfor %}{% endfor %}</ul>
+  </div>
+  {% endif %}
+  <div class="row g-2 align-items-end">
+    {% for field in form %}
+    <div class="col-6 col-md-4 col-xl-2">
+      <label class="form-label" for="{{ field.id_for_label }}">{{ field.label }}</label>
+      {{ field }}
+    </div>
+    {% endfor %}
+    <div class="col-12 col-xl-auto alm-filters__actions">
+      <button type="submit" class="btn btn-primary btn-sm">{% t "apply_filters" %}</button>
+      <a class="btn btn-outline-primary btn-sm" href="?">{% t "clear_filters" %}</a>
+    </div>
+  </div>
+</form>
