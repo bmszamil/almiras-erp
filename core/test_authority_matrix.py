@@ -188,7 +188,8 @@ def test_at74_no_row_means_the_code_default_and_is_recorded(g):
     assert posted.status == "posted"
     d = ApprovalDecision.objects.get(request=req)
     assert (d.rule_source, d.user, d.decision) == ("default", g.cf, "approved")
-    month = reports.build_content(g.sub, date(timezone.localdate().year, timezone.localdate().month, 1))
+    month = reports._build_content(g.sub,  # private since the review of 92c35c2 (item 11)
+                                    date(timezone.localdate().year, timezone.localdate().month, 1))
     listed = month["sections"]["default_rule_approvals"]
     assert [x["document"] for x in listed] == [["invoicing.purchasedocument", b.pk]]
 
@@ -1035,3 +1036,46 @@ def test_rv_r12_engine_submit_checks_the_submit_right_itself(g):
     with pytest.raises(access.AccessUsageError):
         engine.submit(draft, g.ac, submit_permission="invoicing.approve_bill")
     assert not ApprovalRequest.objects.filter(document_id=draft.pk, document_type="invoicing.purchasedocument").exists()
+
+
+def test_rv_r84_group_actions_cover_every_descendant_of_the_group_parent(g):
+    """Review item 11: a grandchild's entity settings change is a group-level action in the parent's report."""
+    grand = make_entity("GRD", "full", g.sub, vat="312222222200003", cr="1010000009")
+    access.log(AccessLog.Event.ENTITY_SETTINGS_CHANGED, actor=g.mp, entity=grand,
+               permission="core.change_entity_settings", details={"field": "test"})
+    first = timezone.localdate(access.now()).replace(day=1)
+    rows = reports._build_content(g.alm, first)["sections"]["group_actions"]
+    assert any(r["event"] == "entity_settings_changed" and r["details"] == {"field": "test"} for r in rows)
+    assert reports._build_content(g.sub, first)["sections"]["group_actions"] is None
+
+
+def test_rv_r77_approver_roles_of_a_frozen_version_never_change(g):
+    """Review item 13: also on SQLite (m2m_changed); PostgreSQL adds the core.0029 trigger."""
+    v = approved_matrix(g, g.sub, [dict(activity="invoicing.bill", approver_roles=["ceo"])])
+    rule = v.rules.get()
+    approver = Role.objects.get(code="approver")
+    for change in (lambda: rule.approver_roles.add(approver), lambda: rule.approver_roles.clear(),
+                   lambda: rule.approver_roles.set([approver])):
+        with pytest.raises(AppendOnlyError), transaction.atomic():
+            change()
+    assert list(rule.approver_roles.values_list("code", flat=True)) == ["ceo"]
+    draft = matrix.draft_version(g.sub, user=g.aa, effective_from=timezone.localdate(access.now()),
+                                 summary_en="v", summary_ar="ن")
+    copy = draft.rules.get()
+    copy.approver_roles.add(approver)  # a draft's rows still change
+    assert set(copy.approver_roles.values_list("code", flat=True)) == {"ceo", "approver"}
+
+
+def test_rv_oq42_oversight_roles_in_a_subsidiary_come_from_the_group_top_authority(g):
+    """Review item 14 (OQ-42 team default): SUB's ceo never grants or revokes the board representative or the
+    internal auditor who oversee them; the managing partner of the group parent does."""
+    for code in ("board_representative", "internal_auditor"):
+        role = Role.objects.get(code=code)
+        with pytest.raises(access.AccessDenied) as exc:
+            access.grant_membership(g.ce, make_user(f"x_{code}"), g.sub, role, access.now(), reason="oversight")
+        assert exc.value.code == "role_not_grantable"
+        m = access.grant_membership(g.mp, make_user(f"y_{code}"), g.sub, role, access.now(), reason="oversight")
+        assert m.granted_by == g.mp
+    with pytest.raises(access.AccessDenied):
+        access.revoke_membership(g.ce, Membership.objects.get(user=g.br, entity=g.sub), "removed")
+    assert Membership.objects.get(user=g.br, entity=g.sub).revoked_at is None

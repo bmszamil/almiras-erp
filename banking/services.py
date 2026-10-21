@@ -27,6 +27,7 @@ from django.utils import timezone
 
 from core import access
 from core.access import services as access_services
+from core.access import engine as approval_engine
 from core.access.models import AccessLog, Kind
 from core.models import Currency, Entity
 from ledger import fx
@@ -1856,6 +1857,7 @@ def submit_bank_transaction(txn, *, user):
         txn.status, txn.submitted_by, txn.submitted_at = TStatus.SUBMITTED, user, timezone.now()
         _save(txn)
         _event(txn.entity, user, Event.BANK_TRANSACTION_SUBMITTED, txn)
+        approval_engine.submit(txn, user, submit_permission="banking.submit_bank_transaction")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
         return txn
 
 
@@ -2322,6 +2324,7 @@ def submit_reconciliation(reconciliation, *, user):
         rec.status, rec.submitted_by, rec.submitted_at = Reconciliation.Status.SUBMITTED, user, timezone.now()
         _save(rec)
         _event(rec.entity, user, Event.RECONCILIATION_SUBMITTED, rec)
+        approval_engine.submit(rec, user, submit_permission="banking.prepare_reconciliation")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
         return rec
 
 

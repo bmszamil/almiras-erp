@@ -2553,6 +2553,7 @@ def submit_run(run, *, user, exclude_refused=False):
             "المرفوضة: ادفعها بمسير خارج الدورة"]
     run.status, run.submitted_by, run.submitted_at = RS.SUBMITTED, user, _now()
     _save(run)
+    approvals.submit(run, user, submit_permission="payroll.submit_run")  # payroll R82
     return run
 
 
@@ -2601,11 +2602,10 @@ def _next_number(entity, kind, year):
 
 
 def _approver_checks(run, user, grant=None):
-    """R39, R50 (defaults OQ-14, OQ-36): an approver whose own payslip in the run has inputs, or who created or
-    approved an input taken by the run, is refused for it, unless the grant is the entity's top authority's logged
-    self-approval (access R79, payroll R39 as amended by R84)."""
-    if grant is not None and grant.top_authority:
-        return
+    """R39, R50 (defaults OQ-14, OQ-36): an approver whose own payslip in the run has inputs is refused for it, the
+    top authority included (access R79(e), R82: nobody approves their own benefit; review of 92c35c2, item 5); one who
+    created or approved an input taken by the run is refused unless the grant is the entity's top authority's logged
+    self-approval (access R79, payroll R84)."""
     employee_ids = list(Payslip.objects.filter(run=run, refused=False).values_list("employee_id", flat=True))
     input_ids = [i for ids in Payslip.objects.filter(run=run, refused=False).values_list("input_ids", flat=True)
                  for i in (ids or [])]
@@ -2615,8 +2615,21 @@ def _approver_checks(run, user, grant=None):
                             or PayslipLine.objects.filter(payslip__run=run, payslip__employee=own,
                                                           line_type=LT.RETRO).exists()):
         access.deny(user, run.entity, "payroll.approve_run", "self_approval")
+    if grant is not None and grant.top_authority:  # R84: their own inputs as maker, never their own pay
+        return
     if inputs.filter(Q(created_by=user) | Q(approved_by=user)).exists():
         access.deny(user, run.entity, "payroll.approve_run", "self_approval")
+
+
+def _run_beneficiaries(run):
+    """access R82 for a run: the users of the employees whose own payslip in it has inputs or retro lines (the R39
+    set). Payslips without inputs are not counted: the hr_officer is paid in the runs they approve (R50)."""
+    slips = list(Payslip.objects.filter(run=run, refused=False).select_related("employee"))
+    input_ids = [i for s in slips for i in (s.input_ids or [])]
+    with_inputs = set(PayrollInput.objects.filter(pk__in=input_ids).values_list("employee_id", flat=True))
+    with_inputs |= set(PayslipLine.objects.filter(payslip__run=run, line_type=LT.RETRO)
+                       .values_list("payslip__employee_id", flat=True))
+    return {s.employee.user_id for s in slips if s.employee_id in with_inputs and s.employee.user_id}
 
 
 @transaction.atomic
@@ -3027,7 +3040,9 @@ def submit_loan(loan, *, user):
     if loan.status != EmployeeLoan.Status.DRAFT:
         raise error("Only a draft loan is submitted.", "يُقدم القرض المسودة فقط.", code="loan_status")
     loan.status, loan.submitted_by, loan.submitted_at = EmployeeLoan.Status.SUBMITTED, user, _now()
-    return _save(loan)
+    _save(loan)
+    approvals.submit(loan, user, submit_permission="payroll.create_loan")  # payroll R82
+    return loan
 
 
 @transaction.atomic
@@ -3152,7 +3167,10 @@ def submit_deferred_sale_terms(contract, *, user):
     if c.status != DeferredSaleContract.Status.DRAFT:
         raise error("Only draft terms are submitted.", "تُقدم الشروط المسودة فقط.", code="sale_status")
     c.status, c.submitted_by = DeferredSaleContract.Status.TERMS_SUBMITTED, user
-    return _save(c)
+    _save(c)
+    approvals.submit(c, user, submit_permission="payroll.create_deferred_sale",  # payroll R82: the terms, not
+                     permission="payroll.approve_deferred_sale_terms")  # the sale, on the same contract
+    return c
 
 
 @transaction.atomic
@@ -3692,7 +3710,9 @@ def submit_final_settlement(settlement, *, user):
         raise error("Only a calculated final settlement is submitted.", "تُقدّم المخالصة المحتسبة فقط.",
                     code="settlement_status")
     fs.status, fs.submitted_by, fs.submitted_at = FSS.SUBMITTED, user, _now()
-    return _save(fs)
+    _save(fs)
+    approvals.submit(fs, user, submit_permission="payroll.prepare_final_settlement")  # payroll R82
+    return fs
 
 
 @transaction.atomic
@@ -4096,7 +4116,9 @@ def submit_payment(payment, *, user):
     if p.status != PayrollPayment.Status.DRAFT:
         raise error("Only a draft payment is submitted.", "تُقدم الدفعة المسودة فقط.", code="payment_status")
     p.status, p.submitted_by, p.submitted_at = PayrollPayment.Status.SUBMITTED, user, _now()
-    return _save(p)
+    _save(p)
+    approvals.submit(p, user, submit_permission="payroll.record_payment")  # payroll R82
+    return p
 
 
 @transaction.atomic
@@ -5158,7 +5180,9 @@ def submit_settlement_correction(correction, *, user):
     if problems:
         raise _problems(problems, "correction_invalid")
     c.status, c.submitted_by, c.submitted_at, c.modified_by, c.modified_at = SCS.SUBMITTED, user, _now(), user, _now()
-    return _save(c)
+    _save(c)
+    approvals.submit(c, user, submit_permission="payroll.prepare_settlement_correction")  # payroll R82
+    return c
 
 
 @transaction.atomic
@@ -5396,7 +5420,9 @@ def submit_loan_write_off(write_off, *, user):
     if w.status != WOS.DRAFT:
         raise error("Only a draft write-off is submitted.", "يُقدّم الشطب المسودة فقط.", code="write_off_status")
     w.status, w.submitted_by, w.submitted_at, w.modified_by, w.modified_at = WOS.SUBMITTED, user, _now(), user, _now()
-    return _save(w)
+    _save(w)
+    approvals.submit(w, user, submit_permission="payroll.prepare_loan_write_off")  # payroll R82
+    return w
 
 
 @transaction.atomic
@@ -5546,7 +5572,9 @@ def submit_gosi_fine(fine, *, user):
     if f.status != GFS.DRAFT:
         raise error("Only a draft fine is submitted.", "تُقدّم الغرامة المسودة فقط.", code="fine_status")
     f.status, f.submitted_by, f.modified_by, f.modified_at = GFS.SUBMITTED, user, user, _now()
-    return _save(f)
+    _save(f)
+    approvals.submit(f, user, submit_permission="payroll.record_gosi_fine")  # payroll R82
+    return f
 
 
 @transaction.atomic
@@ -5871,7 +5899,9 @@ def submit_cost_report(report, *, user):
     if r.status != CRS.DRAFT:
         raise error("Only a draft report is submitted.", "يُقدّم التقرير المسودة فقط.", code="cost_report_status")
     r.status, r.submitted_by, r.submitted_at = CRS.SUBMITTED, user, _now()
-    return _save(r)
+    _save(r)
+    approvals.submit(r, user, submit_permission="payroll.prepare_cost_report")  # payroll R82
+    return r
 
 
 @transaction.atomic

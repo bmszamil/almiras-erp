@@ -50,6 +50,7 @@ def register():
                         label=_label("Payroll input", "مدخل رواتب"), approve=approve_input,
                         reject=lambda d, user, note: services.reject_input(d, user=user, reason_ar=note or "مرفوض"))
     engine.register(PayrollRun, "payroll.run", permission="payroll.approve_run", amount=none,
+                    beneficiaries=services._run_beneficiaries,  # access R82, payroll R39 (review of 92c35c2, item 5)
                     version=lambda r: r.stored_hash or r.inputs_hash or "",
                     label=_label("Payroll run", "مسير رواتب"),
                     approve=lambda r, user: services.approve_run(r, user=user),
@@ -58,8 +59,15 @@ def register():
                     currency=lambda d: d.entity.base_currency_id, beneficiaries=_employee_user,
                     label=_label("Employee loan", "قرض موظف"),
                     approve=lambda d, user: services.approve_loan(d, user=user))
+    def terms_version(c):  # review of 92c35c2, item 7: the terms decided are the terms submitted (content hash)
+        from core.access.authority_models import canonical_hash
+
+        return "terms:" + canonical_hash([c.employee_id, c.asset_description_en, c.asset_description_ar, c.asset_type,
+                                          c.term_months, str(c.cost), str(c.profit_amount), str(c.vat_amount),
+                                          c.first_period, c.consent_ref, c.final_dues_undertaking])[:40]
+
     engine.register(DeferredSaleContract, "payroll.deferred_sale_terms", permission="payroll.approve_deferred_sale_terms",
-                    amount=none, beneficiaries=_employee_user, version=lambda d: "terms",
+                    amount=none, beneficiaries=_employee_user, version=terms_version,
                     label=_label("Bai' ajel contract", "عقد بيع آجل"),
                     approve=lambda d, user: services.approve_deferred_sale_terms(d, user=user))
     from . import approvals
@@ -100,8 +108,14 @@ def register():
                     beneficiaries=_employee_user, label=_label("Loan write-off", "شطب قرض"),
                     approve=lambda d, user: services.approve_loan_write_off(d, user=user),
                     reject=lambda d, user, note: services.reject_loan_write_off(d, user=user, reason_ar=note or "مرفوض"))
+    def payment_beneficiaries(p):  # access R82: a final-settlement payment benefits its employee. A net-salaries
+        # payment pays what the approved run fixed; its payees are not counted (the run's R82 check did that).
+        fs = p.final_settlement if p.final_settlement_id else None
+        return _employee_user(fs) if fs is not None else set()
+
     engine.register(PayrollPayment, "payroll.payment", permission="payroll.approve_payment", amount=lambda d: d.amount,
-                    currency=lambda d: d.currency_id, label=_label("Payroll payment", "دفعة رواتب"),
+                    currency=lambda d: d.currency_id, beneficiaries=payment_beneficiaries,
+                    label=_label("Payroll payment", "دفعة رواتب"),
                     approve=lambda d, user: services.approve_payment(d, user=user))
     engine.register(GosiFine, "payroll.gosi_fine", permission="payroll.approve_gosi_fine", amount=lambda d: d.amount,
                     currency=lambda d: d.entity.base_currency_id, label=_label("GOSI fine", "غرامة تأمينات"),

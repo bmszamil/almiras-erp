@@ -22,6 +22,7 @@ from django.utils import timezone
 
 from core import access
 from core.access import services as access_services
+from core.access import engine as approval_engine
 from core.access.models import AccessLog, Kind, Membership
 from core.models import Currency, Entity
 from ledger.models import Account, FiscalPeriod
@@ -768,6 +769,7 @@ def submit_contract(contract, *, user):
     c.submitted_by, c.submitted_at = user, timezone.now()
     _save(c)
     _event(c, Event.SUBMITTED, user)
+    approval_engine.submit(c, user, submit_permission="billing.edit_contract_draft")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
     return c
 
 
@@ -1065,6 +1067,7 @@ def submit_version(version, *, user):
     v.status, v.submitted_by, v.submitted_at = VStatus.SUBMITTED, user, timezone.now()
     _save(v)
     _event(v.contract, Event.VERSION_SUBMITTED, user, version=v.version_no, kind=v.kind)
+    approval_engine.submit(v, user, submit_permission="billing.edit_version_draft")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
     return v
 
 

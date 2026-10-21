@@ -23,6 +23,7 @@ from django.utils import timezone
 
 from core import access
 from core.access import catalogue
+from core.access import engine as approval_engine
 from core.access.models import AccessLog, Kind
 from core.access import services as access_services
 from core.access.services import kind_of
@@ -1057,6 +1058,7 @@ def submit_entry(entry, *, user):
         entry.submitted_by = user
         entry.submitted_at = timezone.now()
         entry.save(update_fields=["submitted_by", "submitted_at"])
+        approval_engine.submit(entry, user, submit_permission="ledger.create_entry")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
     return entry
 
 

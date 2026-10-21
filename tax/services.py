@@ -31,6 +31,7 @@ from django.utils.module_loading import import_string
 from core import access
 from core.access.models import AccessLog, Kind
 from core.access import services as access_services
+from core.access import engine as approval_engine
 from core.access.services import kind_of
 from core.models import Entity
 from ledger import restricted
@@ -1287,6 +1288,7 @@ def submit_for_review(vat_return, *, user):
         ret.returned_reason_en = ret.returned_reason_ar = ""
         ret._service_write = True
         ret.save()
+        approval_engine.submit(ret, user, submit_permission="tax.prepare_return")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
         return ret
 
 
@@ -1978,6 +1980,7 @@ def submit_tax_document(document, *, user):
         doc.status, doc.submitted_by, doc.submitted_at = DocStatus.SUBMITTED, user, _now()
         doc._service_write = True
         doc.save()
+        approval_engine.submit(doc, user, submit_permission="tax.prepare_return")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
         return doc
 
 

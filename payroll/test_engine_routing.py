@@ -138,3 +138,46 @@ def test_r70_sub_loans_default_to_the_top_authority_not_the_mp(ws):
         with pytest.raises(PermissionDenied):
             services.approve_loan(loan, user=user)
     assert services.approve_loan(loan, user=w.ce_sub).status in ("approved", "disbursed", "active")
+
+
+def test_r82_the_top_authority_never_approves_a_run_with_their_own_inputs(ws):
+    """access R79(e), R82; payroll R39 (review of 92c35c2, item 5): SUB's ceo self-approves a run they prepared, but
+    not one in which their own payslip has an input; the input's approver is no beneficiary."""
+    w = ws
+    sub_matrix(w, [dict(activity="payroll.run", approver_roles=["ceo", "hr_officer"])])
+    member(w.ce_sub, w.sub, "payroll_officer")
+    ps2 = make_user("sub_ps2")
+    member(ps2, w.sub, "payroll_officer")
+    me = saudi(w, w.sub, linked_user=w.ce_sub)
+    inp = services.create_input(me, user=w.ps, kind="one_off_earning", period="2027-03", amount="100.00",
+                                reason_ar="مكافأة")
+    services.approve_input(inp, user=ps2)
+    run = submitted(w, entity=w.sub, user=w.ce_sub)
+    assert services._run_beneficiaries(run) == {w.ce_sub.pk}
+    with pytest.raises(PermissionDenied) as exc:
+        services.approve_run(run, user=w.ce_sub)
+    assert exc.value.code == "beneficiary" and exc.value.message_ar
+    assert not ApprovalDecision.objects.filter(request__document_id=run.pk,
+                                               request__document_type="payroll.payrollrun").exists()
+
+
+def test_r71_a_band_gap_is_refused_when_payroll_submits(ws):
+    """access R61, R71 (review of 92c35c2, item 7): payroll's submit services open the engine request, so a loan
+    above the last band of SUB's matrix is refused at submission and stays a draft."""
+    from payroll.models import EmployeeLoan
+
+    w = ws
+    sub_matrix(w, [dict(activity="payroll.loan", approver_roles=["ceo"], amount_from="0", amount_to="1000.00")])
+    emp = saudi(w, w.sub)
+    small = services.create_loan(emp, user=w.ps, kind="loan", principal="800.00", disbursement_date=date(2027, 2, 1),
+                                 purpose_ar="سلفة", installments=[("2027-03", "400.00"), ("2027-04", "400.00")])
+    services.submit_loan(small, user=w.ps)
+    req = ApprovalRequest.objects.get(document_type="payroll.employeeloan", document_id=small.pk)
+    assert (req.status, req.rule_source, req.submitted_by) == ("open", "matrix", w.ps)
+    big = services.create_loan(emp, user=w.ps, kind="loan", principal="3000.00", disbursement_date=date(2027, 2, 1),
+                               purpose_ar="سلفة", installments=[("2027-03", "1500.00"), ("2027-04", "1500.00")])
+    with pytest.raises(PermissionDenied) as exc:
+        services.submit_loan(big, user=w.ps)
+    assert exc.value.code == "no_authority_rule"
+    assert EmployeeLoan.objects.get(pk=big.pk).status == "draft"
+    assert not ApprovalRequest.objects.filter(document_type="payroll.employeeloan", document_id=big.pk).exists()

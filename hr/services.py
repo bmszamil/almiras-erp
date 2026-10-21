@@ -32,6 +32,7 @@ from hijridate import Gregorian, Hijri
 
 from core import access
 from core.access import services as access_services
+from core.access import engine as approval_engine
 from core.access.models import AccessLog, Kind, Membership
 from core.models import Currency, Entity
 from ledger import fx
@@ -856,6 +857,7 @@ def request_iban_change(employee, *, user, iban, reason_ar, bank_name=""):
                                  "request": req.pk, "iban_before": _last4(emp.iban or ""), "iban_after": _last4(iban),
                                  "message_en": "Employee IBAN change requested",
                                  "message_ar": "طُلب تغيير آيبان الموظف"})
+    approval_engine.submit(req, user, submit_permission="hr.manage_employee")  # access R61: the request opens now
     return req
 
 
@@ -865,7 +867,8 @@ def approve_iban_change(request, *, user):
     IBAN change, which then replaces the employee's IBAN and bank. Payroll lists a payslip calculated on the old IBAN
     as a WPS exception. Logged."""
     req = _lock(IbanChangeRequest, request.pk)
-    access.require(user, req.entity, "hr.manage_employee")
+    # access R61, R80 f (review of 92c35c2, item 10): the second person is decided by the engine (hr.iban_change)
+    access.require(user, req.entity, "hr.manage_employee", document=req, through_engine=True)
     emp = _lock(Employee, req.employee_id)
     if user.pk == req.created_by_id:
         access.deny(user, req.entity, "hr.manage_employee", "self_approval")
@@ -887,7 +890,7 @@ def approve_iban_change(request, *, user):
 @transaction.atomic
 def reject_iban_change(request, *, user, reason_ar):
     req = _lock(IbanChangeRequest, request.pk)
-    access.require(user, req.entity, "hr.manage_employee")
+    access.require(user, req.entity, "hr.manage_employee", document=req, through_engine=True, purpose="reject")
     if req.status != IbanChangeRequest.Status.PENDING or not (reason_ar or "").strip():
         raise error("Only a pending IBAN change is rejected, with a reason in Arabic.",
                     "يُرفض طلب تغيير الآيبان المعلق فقط مع سبب بالعربية.", code="iban_change_status")
@@ -1527,7 +1530,9 @@ def submit_contract(contract, *, user):
         raise _problems(problems, "contract_invalid")
     c.status, c.submitted_by, c.warnings = CStatus.SUBMITTED, user, warnings
     c.modified_by, c.modified_at = user, timezone.now()
-    return _save(c)
+    _save(c)
+    approval_engine.submit(c, user, submit_permission="hr.submit_contract")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
+    return c
 
 
 @transaction.atomic
@@ -1755,7 +1760,9 @@ def submit_assignment(assignment, *, user):
     if problems:
         raise _problems(problems, "assignment_invalid")
     a.status, a.submitted_by = ASt.SUBMITTED, user
-    return _save(a)
+    _save(a)
+    approval_engine.submit(a, user, submit_permission="hr.manage_assignment")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
+    return a
 
 
 @transaction.atomic
@@ -3051,7 +3058,9 @@ def submit_termination(termination, *, user):
     if t.status != TS.DRAFT:
         raise error("Only drafts are submitted.", "تُقدَّم المسودات فقط.", code="not_draft")
     t.status, t.submitted_by = TS.SUBMITTED, user
-    return _save(t)
+    _save(t)
+    approval_engine.submit(t, user, submit_permission="hr.record_termination")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
+    return t
 
 
 @dataclass(frozen=True)

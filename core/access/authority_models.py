@@ -487,3 +487,24 @@ class GovernanceReport(models.Model):
 
     def __str__(self):
         return f"{self.entity.code} {self.month:%Y-%m} r{self.revision}"
+
+
+def _freeze_approver_roles(sender, instance, action, reverse, pk_set, **kwargs):
+    """R77 (review of 92c35c2, item 13): ``approver_roles`` of a row in a submitted, approved or superseded version
+    never change, on any database (PostgreSQL also refuses it in the core.0029 trigger)."""
+    if action not in ("pre_add", "pre_remove", "pre_clear"):
+        return
+    if reverse:  # from the role's side: every row touched
+        rule_ids = set(pk_set or ()) if action != "pre_clear" else set(
+            sender.objects.filter(role_id=instance.pk).values_list("authorityrule_id", flat=True))
+    else:
+        rule_ids = {instance.pk}
+    frozen = AuthorityRule.objects.filter(pk__in=rule_ids).exclude(
+        version__status=AuthorityMatrixVersion.Status.DRAFT).exists()
+    if frozen:
+        raise AppendOnlyError("Rows of a submitted or approved matrix version never change (R77). / "
+                              "لا تتغير أسطر إصدار مقدّم أو معتمد.")
+
+
+models.signals.m2m_changed.connect(_freeze_approver_roles, sender=AuthorityRule.approver_roles.through,
+                                   dispatch_uid="core_access_freeze_approver_roles")

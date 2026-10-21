@@ -111,3 +111,11 @@ def check(grant, entity, activity, *, roles=None):
         "not_in_matrix", f"Under {entity.code}'s authority matrix, {en} are approved by {', '.join(roles)} only (P20).",
         f"وفق مصفوفة الصلاحيات في {entity.code} يعتمد {ar} {', '.join(roles)} فقط.",
         access_services._language(grant.user))
+
+
+def submit(document, user, *, submit_permission, permission=None):
+    """payroll R82: open the engine request when a payroll submit service submits ``document`` (access R61, R77);
+    the engine checks ``submit_permission`` itself and refuses a gap in the entity's bands (R71)."""
+    from core.access import engine
+
+    return engine.submit(document, user, submit_permission=submit_permission, permission=permission)

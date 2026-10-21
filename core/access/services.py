@@ -436,7 +436,7 @@ def _evaluate(user, entity, permission, at, *, reactivation=False):
 # --- checking rights --------------------------------------------------------
 
 def require(user, entity, permission, *, document=None, allow_self_approval=False, reactivation=False,
-            purpose="approve"):
+            purpose="approve", through_engine=False):
     """Return a Grant if ``user`` may use ``permission`` in ``entity`` now; else log and raise AccessDenied.
 
     Superuser, staff, Django groups and user_permissions give nothing (R3, R24).
@@ -444,8 +444,14 @@ def require(user, entity, permission, *, document=None, allow_self_approval=Fals
     (R38); only a caller that then allows nothing but reactivation passes it
     (core.services._require_settings_right). Without it an inactive entity
     refuses every permission that is not a view permission.
+
+    ``through_engine=True`` sends a non-**A** permission that a module uses as a second-person approval (the hr IBAN
+    change under ``hr.manage_employee``, activity ``hr.iban_change``) through the approval engine like an **A** one:
+    matrix or code default, makers, beneficiary and NSA rules, decision record (R61; review of 92c35c2, item 10).
     """
     perm = catalogue.get(permission)
+    if through_engine and document is None:
+        raise AccessUsageError(f"{permission} through the engine needs the document (R61).")
     if perm.is_approval and document is None:
         raise AccessUsageError(f"{permission} is an approval permission; pass the document (R14).")
     if perm.posts and _document_ref(document) is None:
@@ -453,7 +459,7 @@ def require(user, entity, permission, *, document=None, allow_self_approval=Fals
     if perm.is_dual_control:
         raise AccessUsageError(f"{permission} needs dual control; use require_dual_control (R19).")
     at = now()
-    if perm.is_approval:  # R61: every approval goes through the one approval engine (access §10)
+    if perm.is_approval or through_engine:  # R61: every approval goes through the one approval engine (access §10)
         if purpose not in APPROVAL_PURPOSES:
             raise AccessUsageError(f"purpose must be one of {APPROVAL_PURPOSES}.")
         from . import engine
@@ -744,8 +750,25 @@ def _grantor_is_restricted(grant):
                    for code, entity_id in rows)
 
 
+# OQ-42 (team default, review of 92c35c2 item 14; for the owner to confirm): the roles that decide or read a
+# subsidiary's top authority's own changes are granted or revoked there only by the group parent's top authority.
+OVERSIGHT_ROLES = frozenset({"board_representative", "internal_auditor"})
+
+
+def _by_group_top_authority(grant, entity):
+    from .engine import governance_of, is_group_parent
+
+    if is_group_parent(entity):
+        return True
+    parent = group_parent_of(entity)
+    top = governance_of(parent).top_authority_role
+    return Membership.objects.filter(pk__in=grant.membership_ids, entity=parent, role__code=top).exists()
+
+
 def _check_grantable(actor, grant, entity, role):
     if _grantor_is_restricted(grant) and (role.code in ACCESS_ADMIN_CANNOT_GRANT or role.scope == Role.Scope.GROUP):
+        _deny(actor, entity, "core.grant_membership", "role_not_grantable", role=role.code, role_ar=role.name_ar)
+    if role.code in OVERSIGHT_ROLES and not _by_group_top_authority(grant, entity):
         _deny(actor, entity, "core.grant_membership", "role_not_grantable", role=role.code, role_ar=role.name_ar)
 
 

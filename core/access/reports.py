@@ -107,7 +107,17 @@ def _counts(decision):
     return not (perm and perm.posts) or GrantUse.objects.filter(log_id=log.pk).exists()
 
 
-def build_content(entity, month, *, revision=1, replaces=None, reason=""):
+def _descendant_ids(entity):
+    """``entity`` and every entity below it, at any depth (review of 92c35c2, item 11)."""
+    ids, frontier = {entity.pk}, [entity.pk]
+    while frontier:
+        frontier = [pk for pk in Entity.objects.filter(parent_id__in=frontier).values_list("pk", flat=True)
+                    if pk not in ids]
+        ids.update(frontier)
+    return ids
+
+
+def _build_content(entity, month, *, revision=1, replaces=None, reason=""):
     """The report's content for ``entity`` and ``month`` (R84), as plain bilingual data."""
     start, end = _window(month)
     s = {}
@@ -157,7 +167,7 @@ def build_content(entity, month, *, revision=1, replaces=None, reason=""):
             | Q(event__in=(AccessLog.Event.DUAL_CONTROL_REQUESTED, AccessLog.Event.DUAL_CONTROL_DECIDED,
                            AccessLog.Event.DUAL_CONTROL_USED), permission="core.disable_sharia_enforcement")
             | Q(permission__in=G_PERMISSIONS) & ~Q(event=AccessLog.Event.PERMISSION_DENIED)
-        ).filter(Q(entity=entity) | Q(entity__parent=entity) | Q(entity__isnull=True)).select_related("actor")
+        ).filter(Q(entity_id__in=_descendant_ids(entity)) | Q(entity__isnull=True)).select_related("actor")
         s["group_actions"] = [_log_item(r) for r in group_rows.order_by("at", "id")]
     else:
         s["group_actions"] = None
@@ -207,7 +217,7 @@ def generate_report(entity, month, *, user, reissue_reason=""):
     if latest is not None and not reissue_reason:
         return latest
     revision = latest.revision + 1 if latest else 1
-    content = build_content(entity, month, revision=revision, replaces=latest.revision if latest else None,
+    content = _build_content(entity, month, revision=revision, replaces=latest.revision if latest else None,
                             reason=reissue_reason)
     report = _save(GovernanceReport(entity=entity, month=month, revision=revision, replaces=latest,
                                     generated_at=access.now(), generated_by=user, content=content,
