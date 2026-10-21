@@ -1,0 +1,36 @@
+{% extends "web/base.html" %}{% load web_tags %}
+{% block title %}{% t "dashboard_title" %} | {{ entity.code }}{% endblock %}
+{% block content %}
+<div class="alm-page-head">
+  <h1 class="alm-title">{% t "dashboard_title" %}</h1>
+  <p class="alm-page-head__entity">{% pick entity "name" %} <span class="alm-code">{{ entity.code|ident }}</span></p>
+</div>
+{% if cards %}
+<div class="row g-4">
+  {% for card in cards %}
+  <section class="col-12 col-lg-6" aria-labelledby="card-{{ card.key }}">
+    <div class="alm-card h-100">
+      <h2 class="alm-card__title" id="card-{{ card.key }}">{% t card.title %}</h2>
+      {% if card.total %}
+      <p class="alm-kpi"><bdi dir="ltr">{{ card.total }}</bdi></p>
+      <table class="table table-sm alm-table alm-table--compact">
+        <caption class="visually-hidden">{% t card.title %}</caption>
+        <thead><tr><th scope="col">{% t "status" %}</th><th scope="col" class="text-end">{% t "count_label" %}</th></tr></thead>
+        <tbody>
+          {% for row in card.rows %}
+          <tr><td>{% if card.kind == "je" %}{% status "je" row.value %}{% else %}{% status "sd" row.value row.label %}{% endif %}</td><td class="text-end"><bdi dir="ltr">{{ row.count }}</bdi></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <a class="btn btn-outline-primary btn-sm" href="{{ card.url }}">{% t "open_list" %}</a>
+      {% else %}
+      {% include "web/_empty.html" with message_key=card.empty %}
+      {% endif %}
+    </div>
+  </section>
+  {% endfor %}
+</div>
+{% else %}
+{% include "web/_empty.html" with message_key="empty_dashboard" %}
+{% endif %}
+{% endblock %}

@@ -3,7 +3,7 @@
 Loaded by ``core.access.models`` so they belong to the ``core`` app. Every model has an ``entity`` FK except the
 global ``ApprovalActivity`` catalogue (like ``Role``). Records are append-only except where a docstring says which
 single write is allowed; writes go through ``core.access`` services (``_service_write``). On PostgreSQL, migration
-``core.0028`` adds triggers freezing non-draft matrix versions and their rows (R77) and generated reports (R85).
+``core.0029`` adds triggers freezing non-draft matrix versions and their rows (R77) and generated reports (R85).
 """
 import hashlib
 import json

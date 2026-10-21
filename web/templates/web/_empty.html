@@ -1,0 +1,5 @@
+{% load static web_tags %}<div class="alm-empty">
+  <img class="alm-empty__symbol" src="{% static 'web/brand/almiras-symbol.svg' %}" alt="" width="48" height="35">
+  <p class="alm-empty__text">{% t message_key %}</p>
+  {% if link %}<a class="btn btn-outline-primary btn-sm" href="{{ link }}">{% t link_key %}</a>{% endif %}
+</div>

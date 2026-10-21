@@ -351,7 +351,7 @@ ROLE_SEED_V16 = {
                               "payroll.approve_loan_write_off"),
     "accountant": _plus(ROLE_SEED_V15, "accountant", "payroll.prepare_profit_recognition"),
 }
-# V17 (migration core.0027, access §10, A24 to A32, R60, R76, R89; OQ-42, OQ-43, OQ-50, OQ-53 defaults):
+# V17 (migration core.0028, access §10, A24 to A32, R60, R76, R89; OQ-42, OQ-43, OQ-50, OQ-53 defaults):
 # - ceo (entity; default top authority of every entity but the group parent, R67): the accountant's create and
 #   submit rights, every approval (A) and posting (P) right the CFO or the managing partner holds outside G, and the
 #   access §10 rights (grant memberships, delegate, propose and approve matrix versions, read the governance report,
@@ -436,7 +436,7 @@ SYSTEM_USERS_V2 = {
     **SYSTEM_USERS_V1,
     "deferred_sale": ("system.deferred_sale", "Bai' ajel system user", "مستخدم نظام البيع الآجل"),
 }
-# V3 (migration core.0027, access R84): the governance report system user.
+# V3 (migration core.0028, access R84): the governance report system user.
 SYSTEM_USERS_V3 = {
     **SYSTEM_USERS_V2,
     "governance": ("system.governance", "Governance report system user", "مستخدم نظام تقرير الحوكمة"),

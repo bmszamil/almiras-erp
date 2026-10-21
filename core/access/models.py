@@ -492,6 +492,8 @@ class AccessLog(models.Model):
         REPORT_EXPORTED = "governance_report_exported", "Governance report exported"
         REPORT_REVIEWED = "governance_report_reviewed", "Governance report reviewed"
         ALERT_SENT = "access_alert_sent", "Access alert sent"
+        LOGIN_SUCCEEDED = "login_succeeded", "Signed in to the web UI"  # web.md 3.4, R26
+        LOGOUT = "logout", "Signed out of the web UI"  # web.md 3.4, R26
 
     at = models.DateTimeField(default=timezone.now)
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+")

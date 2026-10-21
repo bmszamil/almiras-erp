@@ -18,6 +18,9 @@ roles above (and the overtime route); when the entity's matrix rows applied (``g
 engine already checked the named roles and users, so nothing is added. Top-authority self-approval is decided only by
 the engine (access R79, payroll R84); payroll never passes ``allow_self_approval``.
 """
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 from core.access import authority_defaults
 from core.access import services as access_services
 from core.access.engine import governance_of, grant_rule_source, is_group_parent
@@ -47,6 +50,28 @@ LABELS = {
     "payroll.payment_reversal": ("payroll payment reversals", "عكس مدفوعات الرواتب"),
     "payroll.profit_recognition": ("bai' ajel profit recognition", "إثبات أرباح البيع الآجل"),
 }
+
+
+_rebate = ContextVar("payroll_rebate_in_approval", default=None)
+
+
+@contextmanager
+def approving_rebate(rebate):
+    """Set by ``payroll.services.approve_deferred_sale_rebate``: the ibra' rebate is approved with
+    ``payroll.approve_deferred_sale`` on its contract (invoicing binds the grant to the contract), but it is its own
+    approval in the engine (access 10.5 ``payroll.deferred_sale_rebate`` under ``payroll.deferred_sale``): its own
+    request and rules, its makers counted as makers (R14, R79), its employee as beneficiary (R82)."""
+    token = _rebate.set(rebate)
+    try:
+        yield
+    finally:
+        _rebate.reset(token)
+
+
+def rebate_in_approval(contract):
+    """The rebate of ``contract`` being approved now, if any."""
+    r = _rebate.get()
+    return r if r is not None and r.contract_id == contract.pk else None
 
 
 def _spec(activity):

@@ -441,7 +441,7 @@ def _drafted_for(entity, document, at):
 
 def activity_row(code):
     """The ``ApprovalActivity`` row of ``code``; created from the code catalogue if a flushed test database lacks it
-    (the rows mirror core/access/authority_defaults.py; migration core.0027 seeds them)."""
+    (the rows mirror core/access/authority_defaults.py; migration core.0028 seeds them)."""
     row = ApprovalActivity.objects.filter(code=code).first()
     if row is None:
         spec = authority_defaults.get(code)

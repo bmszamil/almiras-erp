@@ -106,6 +106,26 @@ def test_r79_payroll_top_authority_self_approval_under_the_matrix(ws):
         .top_authority
 
 
+def test_r61_an_ibra_rebate_is_its_own_engine_request_on_the_contract(w):
+    """access 10.5 (payroll.deferred_sale_rebate under payroll.deferred_sale): the rebate is approved with
+    payroll.approve_deferred_sale on its contract, but as its own request (own rules, own decision), its preparer
+    refused as its maker; the sale's request is untouched."""
+    from payroll.test_review_fixes_2026_10_20b import rebate, sold
+
+    c = sold(w)
+    r = rebate(w, c)
+    with pytest.raises(PermissionDenied):  # the preparer never approves it
+        services.approve_deferred_sale_rebate(r, user=w.p)
+    services.approve_deferred_sale_rebate(r, user=w.mp)
+    reqs = {q.document_version: q for q in ApprovalRequest.objects.filter(
+        document_type="payroll.deferredsalecontract", document_id=c.pk, activity__code="payroll.deferred_sale")}
+    assert set(reqs) == {"sale", f"rebate:{r.pk}"}
+    rebate_req = reqs[f"rebate:{r.pk}"]
+    assert rebate_req.status == "approved" and rebate_req.amount == r.amount
+    assert list(rebate_req.decisions.values_list("user", "decision")) == [(w.mp.pk, "approved")]
+    assert list(reqs["sale"].decisions.values_list("user", flat=True)) == [w.mp.pk]
+
+
 def test_r70_sub_loans_default_to_the_top_authority_not_the_mp(ws):
     """OQ-39 / R70: without SUB rows, SUB's loans are approved by SUB's top authority (its ceo); the MP's group
     membership gives nothing in SUB (no cascade, R64)."""

@@ -18,10 +18,10 @@ from invoicing.conftest import zatca  # noqa: F401  (invoicing's fake ZATCA port
 from invoicing.models import DeferredSale, DeferredSaleAdjustment, InvoicingError, SalesDocument, VatRate
 from invoicing.test_deferred_sale import (  # noqa: F401  (the real port and its world)
     balance, bilingual, bw, collect, entry_by_account, invoicing, sale_doc, sold)
-from payroll import invoicing_port as payroll_port
 from payroll import services as payroll
 from payroll.conftest import D, amount, approved, asset_bill, calculated, clock, entry_lines, pclock, saudi, w  # noqa: F401
 from payroll.models import DeferredSaleContract, DeferredSaleRebate, PayrollAlert
+from payroll.test_review_fixes_2026_10_20b import approval_marker
 from payroll.test_slice2_bai_ajel import bai_ajel
 
 
@@ -66,7 +66,7 @@ def test_f1_a_direct_adjustment_call_is_refused(sold_contract, django_capture_on
     with pytest.raises(InvoicingError) as exc:  # through the port, naming a real draft rebate: still no marker
         port.create_bai_ajel_rebate(c, user=w.mp, source_ref=ref, amount=D("600.00"), reason_ar="سداد مبكر")
     assert exc.value.code == "rebate_not_from_payroll"
-    with payroll_port.rebating(r, w.mp):  # inside the marker but at another amount, or for another reference
+    with approval_marker(w, r, w.mp):  # inside a valid marker but at another amount, or for another reference
         for kwargs in ({"source_ref": ref, "amount": "100.00"}, {"source_ref": "manual-1", "amount": "600.00"}):
             with pytest.raises(InvoicingError) as exc:
                 inv.create_deferred_sale_adjustment(c, approver=w.mp, reason_ar="سداد مبكر", **kwargs)

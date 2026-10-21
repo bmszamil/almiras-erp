@@ -10,7 +10,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("core", "0025_seed_access_v16_payroll_slice2"),
+        ("core", "0026_alter_accesslog_event"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
@@ -125,6 +125,8 @@ class Migration(migrations.Migration):
                     ("governance_report_exported", "Governance report exported"),
                     ("governance_report_reviewed", "Governance report reviewed"),
                     ("access_alert_sent", "Access alert sent"),
+                    ("login_succeeded", "Signed in to the web UI"),
+                    ("logout", "Signed out of the web UI"),
                 ],
                 max_length=30,
             ),

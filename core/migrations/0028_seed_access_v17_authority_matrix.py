@@ -44,6 +44,6 @@ def unseed(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-    dependencies = [("core", "0026_authority_matrix")]
+    dependencies = [("core", "0027_authority_matrix")]
 
     operations = [migrations.RunPython(seed, unseed)]

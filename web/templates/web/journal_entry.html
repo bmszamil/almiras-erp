@@ -1,0 +1,74 @@
+{% extends "web/base.html" %}{% load web_tags %}
+{% block title %}{% t "je_detail_title" %} {{ entry.number|default:entry.pk }} | {{ entity.code }}{% endblock %}
+{% block content %}
+<nav aria-label="{% t 'breadcrumb' %}"><ol class="breadcrumb alm-breadcrumb">
+  <li class="breadcrumb-item"><a href="{% url 'web:journal_entries' entity.code %}">{% t "je_list_title" %}</a></li>
+  <li class="breadcrumb-item active" aria-current="page">{% if entry.number %}{{ entry.number|ident }}{% else %}<bdi dir="ltr">#{{ entry.pk }}</bdi>{% endif %}</li>
+</ol></nav>
+<div class="alm-page-head">
+  <h1 class="alm-title">{% t "je_detail_title" %} {% if entry.number %}{{ entry.number|ident }}{% else %}<span class="alm-muted-inline">{% t "no_number" %}</span>{% endif %}</h1>
+  <p>{% status "je" entry.status %}</p>
+</div>
+<p class="alm-readonly">{% t "read_only_notice" %}</p>
+<section class="alm-card" aria-labelledby="alm-header">
+  <h2 class="alm-card__title" id="alm-header">{% t "header" %}</h2>
+  <dl class="alm-dl">
+    <div><dt>{% t "date" %}</dt><dd>{% day entry.date %}</dd></div>
+    <div><dt>{% t "period" %}</dt><dd>{{ entry.period.name|ident }}</dd></div>
+    <div><dt>{% t "description" %}</dt><dd dir="auto">{{ entry.description }}</dd></div>
+    <div><dt>{% t "reference" %}</dt><dd>{{ entry.reference|ident }}</dd></div>
+    <div><dt>{% t "source" %}</dt><dd>{% half entry.get_source_display %}</dd></div>
+    <div><dt>{% t "functional_currency" %}</dt><dd><bdi dir="ltr">{{ entity.base_currency.code }}</bdi></dd></div>
+    <div><dt>{% t "created_by" %}</dt><dd>{% person entry.created_by %}</dd></div>
+    <div><dt>{% t "created_at" %}</dt><dd>{% moment entry.created_at %}</dd></div>
+    {% if entry.posted_at %}
+    <div><dt>{% t "posted_by" %}</dt><dd>{% person entry.posted_by %}</dd></div>
+    <div><dt>{% t "posted_at" %}</dt><dd>{% moment entry.posted_at %}</dd></div>
+    {% endif %}
+    {% if entry.reversal_of %}
+    <div><dt>{% t "reversal_of" %}</dt><dd><a href="{% url 'web:journal_entry' entity.code entry.reversal_of.pk %}">{{ entry.reversal_of.number|default:entry.reversal_of.pk|ident }}</a></dd></div>
+    {% endif %}
+    {% if entry.reversed_by %}
+    <div><dt>{% t "reversed_by" %}</dt><dd><a href="{% url 'web:journal_entry' entity.code entry.reversed_by.pk %}">{{ entry.reversed_by.number|default:entry.reversed_by.pk|ident }}</a></dd></div>
+    {% endif %}
+  </dl>
+</section>
+<section class="alm-card alm-card--table" aria-labelledby="alm-lines">
+  <h2 class="alm-card__title" id="alm-lines">{% t "lines" %}</h2>
+  <div class="table-responsive">
+    <table class="table alm-table">
+      <caption class="visually-hidden">{% t "lines" %}</caption>
+      <thead>
+        <tr>
+          <th scope="col">{% t "account" %}</th>
+          <th scope="col">{% t "description" %}</th>
+          <th scope="col">{% t "counterparty" %}</th>
+          <th scope="col" class="text-end">{% t "txn_amount" %}</th>
+          <th scope="col" class="text-end">{% t "debit" %} <bdi dir="ltr">{{ entity.base_currency.code }}</bdi></th>
+          <th scope="col" class="text-end">{% t "credit" %} <bdi dir="ltr">{{ entity.base_currency.code }}</bdi></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for line in lines %}
+        <tr>
+          <td>{{ line.account.code|ident }} {% pick line.account "name" %}</td>
+          <td dir="auto">{{ line.description }}</td>
+          <td>{% if line.counterparty_entity %}{{ line.counterparty_entity.code|ident }}{% endif %}</td>
+          <td class="text-end">{% money line.txn_amount line.currency %}</td>
+          <td class="text-end">{% if line.debit %}{% amount line.debit entity.base_currency.minor_units %}{% endif %}</td>
+          <td class="text-end">{% if line.credit %}{% amount line.credit entity.base_currency.minor_units %}{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+      <tfoot>
+        <tr>
+          <th scope="row" colspan="4">{% t "totals" %}</th>
+          <td class="text-end">{% money totals.debit entity.base_currency %}</td>
+          <td class="text-end">{% money totals.credit entity.base_currency %}</td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+</section>
+<p><a href="{% url 'web:journal_entries' entity.code %}">{% t "back_to_list" %}</a></p>
+{% endblock %}

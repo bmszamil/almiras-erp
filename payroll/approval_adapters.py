@@ -62,9 +62,24 @@ def register():
                     amount=none, beneficiaries=_employee_user, version=lambda d: "terms",
                     label=_label("Bai' ajel contract", "عقد بيع آجل"),
                     approve=lambda d, user: services.approve_deferred_sale_terms(d, user=user))
+    from . import approvals
+
+    def sale_or_rebate_amount(c):
+        r = approvals.rebate_in_approval(c)
+        return r.amount if r is not None else (c.cost or 0) + (c.profit_amount or 0)
+
+    def sale_or_rebate_version(c):  # an ibra' rebate is its own request on the contract (10.5)
+        r = approvals.rebate_in_approval(c)
+        return f"rebate:{r.pk}" if r is not None else "sale"
+
+    def rebate_makers(c):
+        r = approvals.rebate_in_approval(c)
+        return {r.created_by_id, r.modified_by_id} if r is not None else set()
+
     engine.register(DeferredSaleContract, "payroll.deferred_sale", permission="payroll.approve_deferred_sale",
-                    amount=lambda d: (d.cost or 0) + (d.profit_amount or 0), currency=lambda d: d.entity.base_currency_id,
-                    beneficiaries=_employee_user, label=_label("Bai' ajel sale", "بيع آجل"),
+                    amount=sale_or_rebate_amount, currency=lambda d: d.entity.base_currency_id,
+                    version=sale_or_rebate_version, people=rebate_makers, beneficiaries=_employee_user,
+                    label=_label("Bai' ajel sale or ibra' rebate", "بيع آجل أو إبراء"),
                     approve=lambda d, user: services.approve_deferred_sale(d, user=user))
     engine.register(FinalSettlement, "payroll.final_settlement", permission="payroll.approve_final_settlement",
                     amount=lambda d: d.net, currency=lambda d: d.entity.base_currency_id, beneficiaries=_employee_user,
