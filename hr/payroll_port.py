@@ -40,6 +40,10 @@ class AdditionalWage:
 
     amount: Decimal = Decimal("0.00")
     parts: dict = None
+    # Payroll slice 3 (verification 1, hr R7): the parameter rows the additions used (taken into the caller's
+    # ParamUse, so they are checked and recorded) and bilingual warnings (e.g. an unverified row not used).
+    rows: tuple = ()
+    warnings: tuple = ()
 
 
 @dataclass(frozen=True)
