@@ -44,6 +44,87 @@ CONTROL_CODES = frozenset({"1200", "2100", "1210", "2110", "2310", "2320"})
 CUSTOMER_STATEMENT = "مستخلص عميل"
 
 
+def _is_control(account):
+    return account.code in CONTROL_CODES or bool(getattr(account, "is_control", False))
+
+
+# --- open items loaded into the sub-ledgers (R22, R23) ---------------------------------------------------------------
+# R23: open receivables and payables are loaded into invoicing as ``source="import"`` documents (no journal entry) by
+# the loader of OQ-12, which registers a source here. A source is ``fn(entity) -> {(control code, counterparty entity
+# code or ""): Decimal}``: the signed SAR balance (debit positive, so payables are negative) of the open items loaded
+# for that entity, per control account and counterparty. Until a source is registered nothing is loaded, and an
+# opening entry with a control-account balance cannot be posted (R22).
+_OPEN_ITEM_SOURCES = []
+
+
+def register_open_items_source(fn):
+    """Register a sub-ledger's open-item balances for the R22 posting gate (idempotent)."""
+    if fn not in _OPEN_ITEM_SOURCES:
+        _OPEN_ITEM_SOURCES.append(fn)
+
+
+def unregister_open_items_source(fn):
+    if fn in _OPEN_ITEM_SOURCES:
+        _OPEN_ITEM_SOURCES.remove(fn)
+
+
+def _open_item_balances(entity):
+    """The open items loaded into the sub-ledgers of ``entity`` per (control code, counterparty code or ""), signed
+    (debit positive); ``None`` when no sub-ledger has registered a source yet (R23 not built)."""
+    if not _OPEN_ITEM_SOURCES:
+        return None
+    out = defaultdict(lambda: ZERO)
+    for fn in _OPEN_ITEM_SOURCES:
+        for (code, counterparty), amount in (fn(entity) or {}).items():
+            out[(str(code), counterparty or "")] += Decimal(amount)
+    return dict(out)
+
+
+def _control_balances(entry):
+    """The entry's net per (control code, counterparty code or ""), debit positive."""
+    out = defaultdict(lambda: ZERO)
+    for line in JournalLine.objects.filter(entry=entry).select_related("account", "counterparty_entity"):
+        if _is_control(line.account):
+            key = (line.account.code, line.counterparty_entity.code if line.counterparty_entity_id else "")
+            out[key] += line.debit - line.credit
+    return dict(out)
+
+
+def _label(code, counterparty):
+    return f"{code} ({counterparty})" if counterparty else code
+
+
+def _open_item_tie_out(entry):
+    """R22: the opening entry's control-account balances against the open items loaded into the sub-ledgers.
+    Returns (rows, problems); rows have account, counterparty, ledger, open_items, difference; problems are bilingual
+    texts (one per difference, or one when no open items can be loaded yet)."""
+    ledger_side = _control_balances(entry)
+    loaded = _open_item_balances(entry.entity)
+    if loaded is None:
+        if not any(ledger_side.values()):
+            return [], []
+        shown = ", ".join(f"{_label(*k)} {v}" for k, v in sorted(ledger_side.items()) if v)
+        return [], [bi(f"The opening entry has control-account balances ({shown}) but no open items are loaded into "
+                       "invoicing yet (R23); it is posted only when they tie out (R22).",
+                       f"في القيد الافتتاحي أرصدة على حسابات المراقبة ({shown}) ولم تُحمَّل البنود المفتوحة في الفوترة "
+                       "بعد؛ لا يُرحَّل إلا بعد مطابقتها.")]
+    rows, problems = [], []
+    keys = set(ledger_side) | {k for k in loaded if k[0] in CONTROL_CODES}
+    for code, cp in sorted(keys):
+        book = ledger_side.get((code, cp), ZERO).quantize(CENT)
+        items = loaded.get((code, cp), ZERO).quantize(CENT)
+        if not book and not items:
+            continue
+        diff = book - items
+        rows.append({"account": code, "counterparty": cp, "ledger": book, "open_items": items, "difference": diff})
+        if diff:
+            problems.append(bi(f"Control account {_label(code, cp)}: opening entry {book}, open items loaded {items}, "
+                               f"difference {diff}.",
+                               f"حساب المراقبة {_label(code, cp)}: القيد الافتتاحي {book}، البنود المفتوحة المحمّلة "
+                               f"{items}، الفرق {diff}."))
+    return rows, problems
+
+
 def _opening_entry_allowed(entry):
     """``ledger.restricted`` allowance: the opening entry of an import (``source="import"``, linked to its
     ``ImportedEntry`` of kind ``opening``). Replayed journals are not accepted on restricted accounts."""
@@ -324,8 +405,10 @@ def _map_rows(amap):
     return {r.legacy_code: r for r in amap.rows.select_related("account", "counterparty")}
 
 
-def _mapping_problems(report, entity, amap, used):
-    """R7 to R9 for the codes in ``used`` ({code: {name, rows, debit, credit}}); fills unmapped and erp totals."""
+def _mapping_problems(report, entity, amap, used, kind):
+    """R7 to R9 for the codes in ``used`` ({code: {name, rows, debit, credit}}); fills unmapped and erp totals.
+    ``kind``: ``opening`` (control accounts allowed, listed as info, gated by R22) or ``journal`` (control accounts
+    refused per entry in :func:`_journal_report`)."""
     if amap is None:
         report.problems.append(error("no_map", "No account map exists for this entity; draft and approve one.",
                                      "لا توجد خريطة حسابات لهذا الكيان؛ أعدّ خريطة واعتمدها."))
@@ -337,6 +420,7 @@ def _mapping_problems(report, entity, amap, used):
         report.map_version, report.map_status = amap.version, amap.status
     rows = _map_rows(amap)
     erp = defaultdict(lambda: [ZERO, ZERO, set()])
+    control = []
     for code, t in sorted(used.items()):
         row = rows.get(code)
         has_amount = bool(t["debit"] or t["credit"])
@@ -356,13 +440,9 @@ def _mapping_problems(report, entity, amap, used):
         if has_amount:
             for key, en, ar in _row_problems(entity, row.account, code, row.counterparty):
                 report.problems.append(error(key, f"{code}: {en}", f"{code}: {ar}", account_code=code))
-            if row.account.code in CONTROL_CODES or getattr(row.account, "is_control", False):
-                report.problems.append(warning(
-                    "control_account", f"{code} maps to control account {row.account.code}: under invoicing R97 its "
-                    "balance must come from invoicing import documents (open items); a manual journal line will be "
-                    "refused once R97 is built (OQ-11).",
-                    f"الكود {code} مربوط بحساب المراقبة {row.account.code}: وفق القاعدة R97 يأتي رصيده من مستندات "
-                    "استيراد الفوترة (البنود المفتوحة)؛ وسيُرفض بند القيد اليدوي عند تطبيقها.", account_code=code))
+            if _is_control(row.account):
+                cp = row.counterparty.code if row.counterparty_id else ""
+                control.append(f"{code}→{_label(row.account.code, cp)}")
             if row.account.sharia_prohibited and entity.sharia_enforced:
                 report.problems.append(error(
                     "sharia_prohibited", f"{code} maps to {row.account.code} ({row.account.name_en}), Sharia-prohibited "
@@ -373,6 +453,13 @@ def _mapping_problems(report, entity, amap, used):
         e[0] += t["debit"]
         e[1] += t["credit"]
         e[2].add(code)
+    if control and kind == ImportedEntry.Kind.OPENING:  # R8 amended (M6, B2): allowed, tied out before posting
+        shown = ", ".join(control)
+        report.problems.append(Problem("control_account_open_items", "info", bi(
+            f"Control accounts in the opening entry: {shown}. The entry is posted only when the open items loaded into "
+            "invoicing tie out to them (R22).",
+            f"حسابات المراقبة في القيد الافتتاحي: {shown}. لا يُرحَّل القيد إلا بعد مطابقة البنود المفتوحة المحمّلة "
+            "في الفوترة معها.")))
     report.erp_totals = [{"erp_code": k, "debit": v[0], "credit": v[1], "net": v[0] - v[1],
                           "legacy_codes": ",".join(sorted(v[2]))} for k, v in sorted(erp.items())]
     return rows
@@ -582,7 +669,19 @@ def _journal_report(entity, journal, *, cutover, trial_balance, source_system, a
                                              "أخرى).", entry_no=no))
     groups = _journal_checks(report, entity, journal, cutover, imported=unchanged)
     used = _journal_totals(journal.rows)
-    rows = _mapping_problems(report, entity, amap, used)
+    rows = _mapping_problems(report, entity, amap, used, ImportedEntry.Kind.JOURNAL)
+    for no, lines in sorted(groups.items()):  # R8 amended (M7): replayed journals never touch control accounts
+        if no in unchanged:
+            continue
+        hits = sorted({f"{l.account_code}→{rows[l.account_code].account.code}" for l in lines
+                       if l.account_code in rows and _is_control(rows[l.account_code].account)})
+        if hits:
+            shown = ", ".join(hits)
+            report.problems.append(error(
+                "control_account", f"Entry {no} ({shown}): replayed journals cannot post to control accounts; load "
+                "open items through the template.",
+                f"القيد {no} ({shown}): لا تُرحَّل القيود المعاد ترحيلها إلى حسابات المراقبة؛ حمّل البنود المفتوحة من "
+                "خلال القالب.", entry_no=no, row=lines[0].row, account_code=hits[0].split("→")[0]))
     report.account_totals = [{"code": c, "name": t["name"], "rows": t["rows"], "debit": t["debit"],
                               "credit": t["credit"], "net": t["debit"] - t["credit"],
                               "erp_code": rows[c].account.code if c in rows else ""} for c, t in sorted(used.items())]
@@ -613,7 +712,7 @@ def _tb_report(entity, tb, *, cutover, basis, source_system, amap):
     amounts = _tb_amounts(leaves, basis)
     used = {c: {"name": leaves[c].name, "rows": 1, "debit": max(a, ZERO), "credit": max(-a, ZERO)}
             for c, a in amounts.items()}
-    rows = _mapping_problems(report, entity, amap, used)
+    rows = _mapping_problems(report, entity, amap, used, ImportedEntry.Kind.OPENING)
     report.account_totals = [{"code": c, "name": leaves[c].name, "rows": 1, "debit": used[c]["debit"],
                               "credit": used[c]["credit"], "net": amounts[c],
                               "erp_code": rows[c].account.code if c in rows else ""} for c in sorted(amounts)]
@@ -841,6 +940,17 @@ def post_imported_entries(entity, *, user, kind, legacy_keys=None, apply=False, 
         if period is not None:
             problems.append(f"{imp.legacy_key}: {period.message}")
         problems += [f"{imp.legacy_key}: {p}" for p in ledger.validate_entry(entry)]
+        if imp.kind == ImportedEntry.Kind.OPENING:  # R22: control accounts tie out to the open items loaded
+            rows, gate = _open_item_tie_out(entry)
+            result.setdefault("open_items", {})[imp.legacy_key] = rows
+            problems += [f"{imp.legacy_key}: {p}" for p in gate]
+        else:  # R16 amended (M7): a replayed draft with a control-account line is refused
+            hits = sorted({code for code, _cp in _control_balances(entry)})
+            if hits:
+                problems.append(bi(f"{imp.legacy_key}: replayed journals cannot post to control accounts "
+                                   f"({', '.join(hits)}); load open items through the template.",
+                                   f"{imp.legacy_key}: لا تُرحَّل القيود المعاد ترحيلها إلى حسابات المراقبة "
+                                   f"({', '.join(hits)})؛ حمّل البنود المفتوحة من خلال القالب."))
         (result["problems"] if problems else result["ready"]).append(imp.legacy_key)
         result.setdefault("details", {})[imp.legacy_key] = problems
     if not apply or result["problems"] or not result["ready"]:

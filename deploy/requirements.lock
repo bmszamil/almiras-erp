@@ -1,5 +1,5 @@
 # Runtime dependencies of the Almiras ERP image, exact versions with sha256 hashes (pip --require-hashes).
-# Same packages as ../requirements.txt minus the test tools (pytest, pytest-django, pytest-xdist), plus gunicorn and every
+# Same packages as ../requirements.txt minus the test tools (pytest, pytest-django, pytest-xdist, PyYAML), plus gunicorn and every
 # transitive dependency. Wheels for CPython 3.13 on linux x86_64/aarch64 (and the sdists) only.
 # lxml: imported by zatca (crypto.py, ubl.py; zatca.md section 6) but missing from ../requirements.txt; pinned here
 # so the image works. Add it to ../requirements.txt too (owner of that file).

@@ -20,6 +20,7 @@ from .workbook import problem
 AR_CONTROL, AR_GROUP, AP_CONTROL, AP_GROUP = "1200", "1210", "2100", "2110"
 BANK_PARENT, PURIFICATION, EOSB = "1100", "1140", "2500"
 ASSET_COST_CODES, ACCUMULATED_DEPRECIATION = frozenset({"1500", "1510", "1520"}), "1590"
+BAI_AJEL_RECEIVABLE, BAI_AJEL_DEFERRED, BAI_AJEL_INCOME = "1240", "1241", "4610"
 AR_SIGNS = {"invoice": 1, "debit_note": 1, "credit_note": -1, "advance": -1}
 AP_SIGNS = {"bill": 1, "vendor_credit_note": -1, "advance": -1}
 NAMES = {s.key: (s.name, s.title_ar) for s in spec.SHEETS}
@@ -517,6 +518,34 @@ class _Checker:
                      en=f"Accumulated depreciation on Falcon {code}", ar=f"مجمع الاستهلاك على الكود {code}")
         self.report.summary[entity]["fixed_assets_rows"] = len(records)
 
+    # bai' ajel (payroll.md slice 2 item 3, invoicing R127) ---------------------------------------------------------
+
+    def bai_ajel(self, entity, net, mapping):
+        """1240 / 1241 / 4610 load through the opening entry (the migration allowance on restricted accounts), but the
+        workbook has no sheet for the contracts behind them: the balance is listed for the CFO's decision (warning),
+        and a deferred profit (1241, contra 1240) that is a debit or larger than the receivable is an error."""
+        receivable = self.on(net, mapping, {BAI_AJEL_RECEIVABLE}, any_counterparty=True)
+        deferred = self.on(net, mapping, {BAI_AJEL_DEFERRED}, any_counterparty=True)
+        income = self.on(net, mapping, {BAI_AJEL_INCOME}, any_counterparty=True)
+        if not (receivable or deferred or income):
+            return
+        self.report.summary[entity].update({"bai_ajel_1240": receivable, "bai_ajel_1241": deferred,
+                                            "bai_ajel_4610": income})
+        if receivable or deferred:
+            self.warning("bai_ajel_contracts", f"Bai' ajel balances {BAI_AJEL_RECEIVABLE} {receivable}, "
+                         f"{BAI_AJEL_DEFERRED} {deferred}: the workbook has no contract detail, so they are not tied to "
+                         "a sub-ledger; the open contracts must be set up in invoicing before payroll collects their "
+                         "instalments (CFO decision).", f"أرصدة البيع الآجل {BAI_AJEL_RECEIVABLE} {receivable}، "
+                         f"{BAI_AJEL_DEFERRED} {deferred}: لا يحتوي الملف على تفاصيل العقود فلا تُطابق مع سجل فرعي؛ "
+                         "ويلزم إعداد العقود القائمة في الفوترة قبل أن تحصّل الرواتب أقساطها (قرار المدير المالي).",
+                         sheet="account_map", entity=entity, account_code=BAI_AJEL_RECEIVABLE)
+        if deferred > 0 or -deferred > max(receivable, ZERO):
+            self.error("bai_ajel_contra", f"Deferred bai' ajel profit {BAI_AJEL_DEFERRED} ({deferred}) must be a credit "
+                       f"no larger than the receivable {BAI_AJEL_RECEIVABLE} ({receivable}).",
+                       f"أرباح البيع الآجل المؤجلة {BAI_AJEL_DEFERRED} ({deferred}) يجب أن تكون دائنة ولا تزيد على "
+                       f"الذمة {BAI_AJEL_RECEIVABLE} ({receivable}).", sheet="account_map", entity=entity,
+                       account_code=BAI_AJEL_DEFERRED)
+
     def run(self):
         self.rows()
         self.entities()
@@ -530,6 +559,7 @@ class _Checker:
             self.banks(entity, net, mapping)
             self.employees(entity, net, mapping)
             self.fixed_assets(entity, net, mapping)
+            self.bai_ajel(entity, net, mapping)
         unknown = set(self.only) - set(self.codes)
         for code in sorted(unknown):
             self.error("unknown_entity", f"Entity {code} is not on the Entities sheet.",

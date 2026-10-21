@@ -1,6 +1,6 @@
 # Migration: Falcon (or other legacy system) exports into opening balances and replayed journals
 
-Django app: `migration`. Status: **draft spec**. Written 2026-10-17 by the migration-agent. Amended 2026-10-18 by the spec-writer agent (M7, project-owner answers `docs/approvals/owner-answers-2026-10-18.md` A4, A10, with M6: replayed journals refused on control accounts, approvals through the engine, per-entity grants, posting gate on the open-item tie-out; R8, R13, R16 notes, new R21 to R24, AT-23 to AT-26, OQ-5, OQ-11, new OQ-14; to build).
+Django app: `migration`. Status: **draft spec**. Written 2026-10-17 by the migration-agent. Amended 2026-10-18 by the spec-writer agent (M7, project-owner answers `docs/approvals/owner-answers-2026-10-18.md` A4, A10, with M6: replayed journals refused on control accounts, approvals through the engine, per-entity grants, posting gate on the open-item tie-out; R8, R13, R16 notes, new R21 to R24, AT-23 to AT-26, OQ-5, OQ-11, new OQ-14; to build). Amended 2026-10-21 by the migration-agent (opening-balance dry run, `docs/migration/dry-run-2026-10-21.md`: R8, R16 and R22 as built, the open-item source of R23, W14; AT-23 and AT-24 built; R13 / R16 engine requests, R23 loader and AT-25 still to build).
 Depends on: `core` (`Entity`), `core.access` (`require`, `scope`, segregation R14), `ledger.services` (`create_entry`
 as draft with `source="import"`, `post_entry` with a `ledger.post_entry` grant, `trial_balance`), the chart template
 (`ledger/coa_template.py`, account 3900 *Opening balance equity (migration)*), `.claude/agents/migration-agent.md`.
@@ -82,6 +82,7 @@ The validation report and profiles are not stored: they are printed and optional
    control account (1200, 2100, 1210, 2110, 2310, 2320; invoicing R97, policy A) is a warning: once R97 is built the
    ledger refuses manual-journal lines on them, so their balances must come from invoicing import documents (OQ-11).
    *Amended 2026-10-18 (M6, M7; to build):* for the **opening** entry a control-account code is allowed (no warning) and its balance must tie out to the open items of the workbook (§11 W8, R22). For **replayed** journals a line on a control account is an **error** (blocks loading), en/ar: "replayed journals cannot post to control accounts; load open items through the template".
+   *Amended 2026-10-21 (as built):* opening reports carry one `control_account_open_items` **info** listing the Falcon → ERP control codes (with counterparty) and naming the R22 gate; replay reports carry one `control_account` error per entry (entry number, row, Falcon code → ERP code); an entry imported unchanged earlier is skipped as before. **[tests `test_validation.py::test_at23_*`]**
 9. Totals by Falcon account and by ERP account (debit, credit, net), entries by source (`Journal`,
    `مستخلص عميل`), date range, and entries already imported are part of the report.
 10. Trial balance: duplicate codes refused; rows whose code is a prefix of another row's code are treated as
@@ -122,6 +123,7 @@ The validation report and profiles are not stored: they are printed and optional
     refused when posted (`restricted_account`, listed in the posting dry run). PostgreSQL: `invoicing/0023`.
     **[ledger hook + DB; tests `test_restricted_accounts.py`]**
     *Amended 2026-10-18 (M6, M7; to build):* posting an imported draft is an engine request (activity `ledger.manual_entry`, matrix approvers); the opening entry is posted only after the open-item tie-out (R22) shows zero differences; a replayed draft with a control-account line is refused (`control_account`, invoicing R97 amended).
+    *Amended 2026-10-21 (as built, except the engine request):* the R22 gate and the replayed-draft refusal run in `post_imported_entries`, in the dry run too, and are listed per draft (en/ar); all or nothing as before. Posting still uses the `ledger.post_entry` grant directly; the engine request (`ledger.manual_entry`) is still to build. **[tests `test_loading.py::test_r16_*`, `test_at24_*`]**
 17. Discard: import drafts may be discarded (link and draft deleted) by `migration.import`; posted entries are only
     reversed in the ledger (CLAUDE.md rule 1).
 18. Post-load tie-out: the ERP trial balance at the as-of date (posted entries, optionally plus import drafts),
@@ -140,6 +142,14 @@ The validation report and profiles are not stored: they are printed and optional
     control account (1200, 2100; 1210 and 2110 per counterparty entity; 2310 and 2320 if any) **against the open items
     actually loaded into invoicing** (R23); any difference refuses the posting and is listed (account, counterparty,
     amount, en/ar).
+    *Amended 2026-10-21 (as built):* `_open_item_tie_out(entry)` compares the entry's net per (control code,
+    counterparty) with the open items reported by the sources registered with
+    `migration.services.register_open_items_source(fn)`; `fn(entity)` returns {(control code, counterparty entity
+    code or ""): signed SAR, debit positive}. An open item on a control account the entry does not carry is a
+    difference too. **While no source is registered (the R23 loader is not built) an opening entry with any
+    control-account balance is refused** ("no open items are loaded into invoicing yet"); an entry without one posts.
+    The posting result lists the per-account rows (`open_items`). **[tests `test_loading.py::test_r22_*`,
+    `test_at24_*`; `test_dry_run.py`]**
 23. Open items are loaded into invoicing as `source="import"` documents, status `final`, no ZATCA call, **no journal
     entry** (invoicing R115, OQ-24), by the loader of OQ-12, in the dry-run / `--apply` model; a re-run skips existing
     items (unique on entity, party, document type, legacy number). Intercompany items need the party's group entity and
@@ -201,8 +211,8 @@ SUB; synthetic Falcon files with fake names and amounts, built in the test.
 | AT-13 | S (SUB only) | Validate or load for ALM | Refused (`permission_denied`) |
 | AT-14 | Agent user | Load | Refused |
 | AT-15 | Commands without `--apply` | Run | Nothing written |
-| AT-23 | *Added 2026-10-18 (M6, M7, R8; to build).* Approved map with Falcon 1201 → 1200; TB 1200 debit 50,000.00; a replayed journal with a 1200 line | Validate opening; validate replay | Opening: no warning for 1200; replay: error (en/ar) naming the entry and the control account, load refused |
-| AT-24 | *Added 2026-10-18 (R22, R23).* Opening draft with 1200 50,000.00 and 1210 (SUB) 20,000.00; open items loaded 50,000.00 and SUB 19,000.00 | P posts the opening entry; load the missing 1,000.00 SUB item; P posts | First refused (1210 SUB difference 1,000.00, en/ar), nothing posted; then posted; open items have no journal entries |
+| AT-23 | *Added 2026-10-18 (M6, M7, R8; built 2026-10-21).* Approved map with Falcon 1201 → 1200; TB 1200 debit 50,000.00; a replayed journal with a 1200 line | Validate opening; validate replay | Opening: no warning for 1200; replay: error (en/ar) naming the entry and the control account, load refused |
+| AT-24 | *Added 2026-10-18 (R22, R23; R22 built 2026-10-21 with a test source standing in for the R23 loader).* Opening draft with 1200 50,000.00 and 1210 (SUB) 20,000.00; open items loaded 50,000.00 and SUB 19,000.00 | P posts the opening entry; load the missing 1,000.00 SUB item; P posts | First refused (1210 SUB difference 1,000.00, en/ar), nothing posted; then posted; open items have no journal entries |
 | AT-25 | *Added 2026-10-18 (R13, R16, M7).* ALM matrix `migration.account_map` → `approver`; `ledger.manual_entry` → `approver` | A approves the map through the service directly; P approves through the engine; P posts the opening draft through the engine | Direct call refused (`approval_request_required`); engine approvals accepted, each logged with the rule used |
 | AT-26 | *Added 2026-10-18 (R24).* Accountant A with an ALM membership only | A loads SUB's workbook rows | Refused for SUB (`permission_denied`); ALM rows unaffected |
 
@@ -300,6 +310,15 @@ is the bilingual guide. Code: `migration/workbook_spec.py` (sheets, columns, lis
   the Account mapping sheet; `migration_validate`, `migration_load` and `migration_tieout` use the entity's TB as
   closing balances at its cut-over date (`--cutover` defaults to the sheet's date and must equal it). Rules R12 to
   R18 apply unchanged.
+- W14 *Bai' ajel* (added 2026-10-21, as built; payroll.md slice 2 item 3, invoicing R127). Codes mapped to 1240,
+  1241 or 4610 load through the opening entry (the migration allowance on restricted accounts). The workbook has no
+  sheet for the contracts behind them, so a 1240 or 1241 balance is a warning (`bai_ajel_contracts`, the CFO decides
+  how the open contracts are set up in invoicing before payroll collects them); a 1241 (contra 1240) debit balance
+  or a 1241 credit larger than 1240 is an error (`bai_ajel_contra`). **[test `test_dry_run.py`]**
+
+**Dry run** (added 2026-10-21): `migration/fixtures/dry_run.py` is a fictional two-entity fixture set (workbook,
+Falcon journal sample, TB with opening / movement / closing, map CSVs); `migration/test_dry_run.py` runs it end to end
+through the commands and services; the tie-out report is `docs/migration/dry-run-2026-10-21.md`.
 
 **Acceptance tests** (synthetic workbooks built in the test; `migration/test_workbook*.py`)
 

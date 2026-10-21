@@ -22,7 +22,7 @@ def ledger_tb(w, as_of):
     return {r["code"]: r["debit"] - r["credit"] for r in ledger.trial_balance(w.alm, as_of, user=w.p)}
 
 
-def test_at9_opening_from_closing_tb_dry_run_draft_second_person_post_and_tie_out(w, mapped):
+def test_at9_opening_from_closing_tb_dry_run_draft_second_person_post_and_tie_out(w, mapped, loaded):
     tb = tb_file()
     plan = services.load_opening_balances(w.alm, tb, user=w.a, cutover=YEAR_END)
     assert plan.report.ok and not plan.applied and plan.entries[0]["lines"] == 9
@@ -115,7 +115,7 @@ def replay(w, journal=None, apply=True, user=None):
                                          trial_balance=tb_file(), apply=apply)
 
 
-def test_at7_replay_opening_plus_journals_tagged_idempotent_and_tied_out(w, mapped):
+def test_at7_replay_opening_plus_journals_tagged_idempotent_and_tied_out(w, mapped, loaded):
     opening = services.load_opening_balances(w.alm, tb_file(), user=w.a, cutover=CUTOVER, basis="opening", apply=True)
     assert opening.created[0].journal_entry.lines.count() == 6  # P&L codes have no opening balance
     plan = replay(w, apply=False)
@@ -178,14 +178,15 @@ def test_discard_drafts_then_import_again(w, mapped):
 
 
 def test_intercompany_code_posts_with_its_counterparty(w):
-    rows = map_rows() + [{"legacy_code": "1301", "legacy_name": "مستحق من شركة تابعة", "erp_code": "1210",
+    # 1220 (loans to group entities) is intercompany but not a control account, so a replayed journal may post to it
+    rows = map_rows() + [{"legacy_code": "1301", "legacy_name": "قرض لشركة تابعة", "erp_code": "1220",
                           "counterparty": "SUB"}]
     services.approve_account_map(services.create_account_map(w.alm, user=w.a, rows=rows), user=w.p)
-    journal = journal_file([t.line(26000010, date(2026, 3, 5), "1301", "مستحق من شركة تابعة", debit="500.00"),
+    journal = journal_file([t.line(26000010, date(2026, 3, 5), "1301", "قرض لشركة تابعة", debit="500.00"),
                             t.line(26000010, date(2026, 3, 5), "1102", "بنك تجريبي", credit="500.00")])
     services.load_journal_entries(w.alm, journal, user=w.a, apply=True)
     entry = services.post_imported_entries(w.alm, user=w.p, kind="journal", apply=True)["posted"][0]
-    assert entry.lines.get(account__code="1210").counterparty_entity == w.sub
+    assert entry.lines.get(account__code="1220").counterparty_entity == w.sub
 
 
 def test_at13_entity_separation(w, mapped):
@@ -220,3 +221,57 @@ def test_rerun_after_posting_and_closing_a_period_skips_imported_entries(w, mapp
     plan = services.load_journal_entries(w.alm, journal_file(rows), user=w.a, cutover=CUTOVER, apply=True)
     assert plan.report.ok, [p.message for p in plan.report.errors]
     assert [i.legacy_key for i in plan.created] == ["26000005"] and len(plan.skipped) == 4
+
+
+def test_r22_opening_entry_waits_for_the_open_items_when_none_are_loaded(w, mapped):
+    services.load_opening_balances(w.alm, tb_file(), user=w.a, cutover=YEAR_END, apply=True)
+    result = services.post_imported_entries(w.alm, user=w.p, kind="opening", apply=True)
+    assert result["problems"] == ["opening"] and not result["posted"]
+    text = " ".join(result["details"]["opening"])
+    assert "no open items are loaded" in text and "1200 20000.00" in text and "2100 -15000.00" in text
+    assert "البنود المفتوحة" in text
+    assert not JournalEntry.objects.filter(entity=w.alm, status="posted").exists()
+
+
+def test_at24_opening_entry_posts_only_when_each_control_account_ties_to_the_open_items(w, open_items):
+    rows = map_rows() + [{"legacy_code": "1301", "legacy_name": "مستحق من شركة تابعة", "erp_code": "1210",
+                          "counterparty": "SUB"}]
+    services.approve_account_map(services.create_account_map(w.alm, user=w.a, rows=rows), user=w.p)
+    balances = {**BALANCES, "1201": ("عملاء تجريبيون", "50000.00", "0", "0"),
+                "1301": ("مستحق من شركة تابعة", "20000.00", "0", "0"),
+                "2501": ("رأس المال", "-110000.00", "0", "0")}
+    plan = services.load_opening_balances(w.alm, tb_file(balances), user=w.a, cutover=YEAR_END, apply=True)
+    assert plan.applied, [p.message for p in plan.report.errors]
+    open_items["ALM"] = {("1200", ""): D("50000.00"), ("1210", "SUB"): D("19000.00"), ("2100", ""): D("-15000.00")}
+
+    result = services.post_imported_entries(w.alm, user=w.p, kind="opening", apply=True)
+    assert result["problems"] == ["opening"] and not result["posted"]
+    assert result["details"]["opening"] == [
+        "opening: Control account 1210 (SUB): opening entry 20000.00, open items loaded 19000.00, difference 1000.00. / "
+        "حساب المراقبة 1210 (SUB): القيد الافتتاحي 20000.00، البنود المفتوحة المحمّلة 19000.00، الفرق 1000.00."]
+    assert not JournalEntry.objects.filter(entity=w.alm, status="posted").exists()
+
+    open_items["ALM"][("1210", "SUB")] += D("1000.00")  # the missing SUB item is loaded
+    open_items["ALM"][("2110", "SUB")] = D("-1.00")  # an open item on a control account the entry does not carry
+    result = services.post_imported_entries(w.alm, user=w.p, kind="opening")
+    assert "opening entry 0.00, open items loaded -1.00, difference 1.00" in " ".join(result["details"]["opening"])
+    del open_items["ALM"][("2110", "SUB")]
+    result = services.post_imported_entries(w.alm, user=w.p, kind="opening", apply=True)
+    assert result["posted"][0].status == "posted"
+    assert {(r["account"], r["counterparty"]): r["difference"] for r in result["open_items"]["opening"]} == {
+        ("1200", ""): 0, ("1210", "SUB"): 0, ("2100", ""): 0}
+
+
+def test_r16_replayed_draft_with_a_control_account_line_is_refused_at_posting(w, mapped):
+    """A draft imported before the M7 rule (or written around the loader) is still refused when posted."""
+    amap = services._approved_map(w.alm, services.FALCON)
+    entry = ledger.create_entry(w.alm, date(2026, 3, 1), "Falcon 26000009", [
+        {"account": "1200", "debit": D("100.00")}, {"account": "4100", "credit": D("100.00")}],
+        user=w.a, reference="FALCON-26000009", source="import")
+    ImportedEntry.objects.create(entity=w.alm, source_system="falcon", kind="journal", legacy_key="26000009",
+                                 journal_entry=entry, account_map=amap, lines_hash=services._entry_lines_hash(entry),
+                                 created_by=w.a)
+    result = services.post_imported_entries(w.alm, user=w.p, kind="journal", apply=True)
+    assert result["problems"] == ["26000009"] and not result["posted"]
+    text = " ".join(result["details"]["26000009"])
+    assert "replayed journals cannot post to control accounts (1200)" in text and "حسابات المراقبة" in text

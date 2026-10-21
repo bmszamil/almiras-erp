@@ -22,7 +22,7 @@ def mapped_1140(w):
     return services.approve_account_map(amap, user=w.p)
 
 
-def test_opening_entry_may_carry_the_purification_account_balance(w, mapped_1140):
+def test_opening_entry_may_carry_the_purification_account_balance(w, mapped_1140, loaded):
     balances = {**BALANCES, "1103": ("حساب التطهير", "500.00", "0", "0"),
                 "2501": ("رأس المال", "-60500.00", "0", "0")}
     plan = services.load_opening_balances(w.alm, tb_file(balances), user=w.a, cutover=YEAR_END, apply=True)

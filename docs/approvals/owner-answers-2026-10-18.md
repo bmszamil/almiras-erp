@@ -104,3 +104,13 @@ Migration later. The journal export already sent is close to the final one. The 
 | I3 | B2G supplies under VAT Law Art. 20(5): the **payment order date** decides the VAT tax point, so it sets the VAT return period and the SAMA rate date. |
 | I4 | HT Rakik web fonts: permission confirmed to use them in the ERP (webfont licence, H6). |
 | I5 | Network access added for the ZATCA sandbox and uqn.gov.sa (GOSI regulations). |
+
+## J. Owner confirmations of 2026-10-21 ("confirmed, go with your defaults on all four")
+
+| # | Decision |
+| --- | --- |
+| J1 | In a subsidiary, the `board_representative` and the `internal_auditor` are granted and revoked by the group parent's top authority (the Managing Partner), never by that company's CEO (access OQ-42). |
+| J2 | A change to a subsidiary's `self_approval_enabled` switch or its top-authority role is decided at group level (Managing Partner, group chairman or group board representative), never by the subsidiary CEO whose powers change (access OQ-42). |
+| J3 | Payroll runs: an approver may not approve a run in which their own payslip carries inputs or retro lines (R39 narrow set), and may approve no off-cycle run that pays them; a regular run that only includes their plain contract salary may be approved (access R82, payroll R84). |
+| J4 | The "brand shape" file in the identity guide draws a Rabeez logo; the ERP does not use it and uses the Almiras symbol instead until Almiras supplies the correct shape (web OQ-28). |
+| J5 | Licences: only free / open-source dependencies. The team confirmed that the licences in use (MIT, BSD, Apache-2.0, OFL) are free open-source licences: no fee, commercial use, modification and redistribution allowed, with the copyright notice kept. Paid or proprietary components remain excluded (HT Rakik is licensed separately by Almiras, H6). |
