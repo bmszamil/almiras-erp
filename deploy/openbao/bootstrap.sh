@@ -102,14 +102,12 @@ for e in "${entities[@]}"; do
 done
 
 echo "== credentials for the ERP and the backup service"
-if [[ ! -s "${secrets_dir}/openbao_erp_role_id" ]]; then
-    bao read -field=role_id auth/approle/role/erp-zatca/role-id | write_secret_file openbao_erp_role_id
-    bao write -f -field=secret_id auth/approle/role/erp-zatca/secret-id | write_secret_file openbao_erp_secret_id
-fi
-if [[ ! -s "${secrets_dir}/openbao_retire_role_id" ]]; then
-    bao read -field=role_id auth/approle/role/erp-retire/role-id | write_secret_file openbao_retire_role_id
-    bao write -f -field=secret_id auth/approle/role/erp-retire/secret-id | write_secret_file openbao_retire_secret_id
-fi
+# Role ids are stable; secret-ids are issued fresh on EVERY run (bootstrap or rotation), so a run rotates them.
+# Restart web and scheduler afterwards, then destroy the previous secret-ids (deploy/README.md "OpenBao").
+bao read -field=role_id auth/approle/role/erp-zatca/role-id | write_secret_file openbao_erp_role_id
+bao write -f -field=secret_id auth/approle/role/erp-zatca/secret-id | write_secret_file openbao_erp_secret_id
+bao read -field=role_id auth/approle/role/erp-retire/role-id | write_secret_file openbao_retire_role_id
+bao write -f -field=secret_id auth/approle/role/erp-retire/secret-id | write_secret_file openbao_retire_secret_id
 if [[ ! -s "${secrets_dir}/openbao_backup_token" ]]; then
     bao token create -orphan -policy=backup-snapshot -period=768h -display-name=almiras-backup -field=token \
         | write_secret_file openbao_backup_token

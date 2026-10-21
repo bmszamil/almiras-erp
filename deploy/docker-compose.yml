@@ -41,9 +41,6 @@ x-app: &app
     ZATCA_OPENBAO_CA_FILE: /run/secrets/openbao_ca
     ZATCA_OPENBAO_ROLE_ID_FILE: /run/secrets/openbao_erp_role_id
     ZATCA_OPENBAO_SECRET_ID_FILE: /run/secrets/openbao_erp_secret_id
-    # zatca D-19 / OQ-34 (f): the separate retirement identity (KV metadata read + patch only).
-    ZATCA_OPENBAO_RETIRE_ROLE_ID_FILE: /run/secrets/openbao_retire_role_id
-    ZATCA_OPENBAO_RETIRE_SECRET_ID_FILE: /run/secrets/openbao_retire_secret_id
     ZATCA_SANDBOX_BASE_URL: ${ZATCA_SANDBOX_BASE_URL:-}
     ZATCA_SIMULATION_BASE_URL: ${ZATCA_SIMULATION_BASE_URL:-}
     ZATCA_PRODUCTION_BASE_URL: ${ZATCA_PRODUCTION_BASE_URL:-}
@@ -64,8 +61,6 @@ x-app: &app
     - openbao_ca
     - openbao_erp_role_id
     - openbao_erp_secret_id
-    - openbao_retire_role_id
-    - openbao_retire_secret_id
     - smtp_password
 
 services:
@@ -118,6 +113,22 @@ services:
     environment:
       <<: *app-env
       ALMIRAS_ALERT_WEBHOOK_URL: ${ALMIRAS_ALERT_WEBHOOK_URL:-}
+      # zatca D-19 / OQ-34 (f): the retirement identity (KV metadata read + patch of custom_metadata only). Only
+      # the scheduler holds it: the web process just records retirement requests; zatca_retire_secrets retires.
+      ZATCA_OPENBAO_RETIRE_ROLE_ID_FILE: /run/secrets/openbao_retire_role_id
+      ZATCA_OPENBAO_RETIRE_SECRET_ID_FILE: /run/secrets/openbao_retire_secret_id
+    secrets:
+      - django_secret_key
+      - db_app_password
+      - hr_personal_data_keys
+      - hr_personal_data_hash_key
+      - banking_data_keys
+      - openbao_ca
+      - openbao_erp_role_id
+      - openbao_erp_secret_id
+      - openbao_retire_role_id
+      - openbao_retire_secret_id
+      - smtp_password
     volumes:
       - metrics:/var/lib/almiras/metrics
     networks: [backend, egress]

@@ -111,7 +111,7 @@ mount). `./init-secrets.sh` generates the random ones; `./init-secrets.sh --chec
 | `smtp_password` | yes (from mail admin) | web, scheduler, alertmanager | `DJANGO_EMAIL_PASSWORD` |
 | `grafana_admin_password` | yes (generated) | grafana | |
 | `openbao_erp_role_id`, `openbao_erp_secret_id` | yes (bootstrap) | web, scheduler | ERP AppRole login (for the OpenBao client, OQ-34) |
-| `openbao_retire_role_id`, `openbao_retire_secret_id` | yes (bootstrap) | web, scheduler | AppRole `erp-retire`: secret-version retirement only (zatca D-19, R-57 to R-60, OQ-34 (f)); KV metadata read + patch, no data read |
+| `openbao_retire_role_id`, `openbao_retire_secret_id` | yes (bootstrap) | scheduler only | AppRole `erp-retire`: secret-version retirement only (zatca D-19, R-57 to R-60, OQ-34 (f)); KV metadata read + patch, no data read |
 | `openbao_backup_token` | yes (bootstrap) | backup | periodic token, `backup-snapshot` policy only |
 | `backup-recipients.txt` | no (public age keys) | db (WAL), backup | encryption recipients |
 | `tls/erp.crt`, `tls/erp.key` | key is secret | proxy | site certificate |
@@ -224,7 +224,22 @@ template below.
   during a custodian-issued 15-minute window), `backup-snapshot`. Tested: a custodian of SUB1 cannot rotate
   SUB1's master key or touch ALM; the signer for ALM cannot read SUB1; the MP cannot read `sys/raw` or disable
   the audit device; the backup token can only take snapshots.
+  `erp-retire-<entity>` (zatca D-19, OQ-34 (f): the AppRole `erp-retire`, held by the **scheduler only**;
+  read and patch `metadata/` of that entity, `custom_metadata` only; `max_versions`, `delete_version_after`
+  and `cas_required` refused; no `data/`). Every ERP policy denies `delete/`, `undelete/` and `destroy/`.
 - Audit: file device declared in `config.hcl` (cannot be disabled through the API); values HMAC-ed.
+  **Monitor** (zatca OQ-34 (f)): any `patch`/`update` on `zatca-kv/metadata/zatca/*` whose token is not
+  `erp-retire`, and any patch whose `custom_metadata.retired_versions` drops a number or is null, is an
+  un-retirement outside the ERP and must match a recorded MP procedure. Values are HMAC-ed in the log, so
+  compare the HMAC of the previous value or re-read the metadata (`bao kv metadata get`) when such a request
+  appears.
+- Un-retiring a version (MP only, root token, outside the ERP): generate a root token with the unseal key
+  (`bao operator generate-root`), `bao kv metadata patch -custom-metadata=retired_versions=<list without n>
+  zatca-kv/zatca/<ENTITY>/<EGS>/<item>`, revoke the root token, and record the reason in the ERP (a note on
+  the unit; the ERP's retirement job would otherwise retire an unreferenced version again).
+- AppRole secret-ids: every `bootstrap.sh` run (also a rotation run) issues **new** secret-ids for `erp-zatca`
+  and `erp-retire` and writes them to `secrets/`; restart `web` and `scheduler` afterwards, then destroy the old
+  secret-ids (`bao list auth/approle/role/<role>/secret-id`, `bao write .../secret-id-accessor/destroy`).
 
 **Known limits for the security review:** transit does not chain entity master keys cryptographically under
 the super key (the chain is enforced by policy and by the barrier key behind the unseal key); per-entity

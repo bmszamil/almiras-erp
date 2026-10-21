@@ -1,11 +1,26 @@
 # Policy "erp-retire-${ENTITY}": the ERP's secret-version retirement identity (AppRole "erp-retire") for entity
-# ${ENTITY} (zatca D-19, R-57 to R-60, OQ-34 (f) default; security sign-off pending). It flags a version retired
-# by patching the path's custom_metadata ("retired_v<n>" = UTC time|reason). It reads metadata/ to stay idempotent,
-# never reads data/ (no key material), writes nothing else and cannot delete, undelete or destroy any version.
-# Un-retiring is an MP-run OpenBao procedure outside the ERP, logged by the OpenBao audit device.
+# ${ENTITY} (zatca D-19, R-57 to R-60, OQ-34 (f) default; security sign-off pending). Used only by the scheduler's
+# retirement job (the web container never holds this credential). It adds a version number to the path's
+# custom_metadata key "retired_versions" with a JSON merge patch and reads metadata/ back; it never reads data/
+# (no key material) and cannot delete, undelete or destroy any version.
+#
+# The patch may carry only custom_metadata: max_versions, delete_version_after and cas_required are refused, so
+# this identity cannot make OpenBao trim or expire versions. A patch can still technically shorten or null the
+# "retired_versions" value (policies cannot constrain values inside custom_metadata): the ERP never sends one
+# (asserted in zatca.keystore), and the OpenBao audit log is monitored for any metadata PATCH of zatca/* that is
+# not from erp-retire or that removes a version (deploy/README.md, zatca OQ-34 (f)).
+# Un-retiring is an MP-run, root-token OpenBao procedure outside the ERP (zatca OQ-34 (f)).
 
 path "zatca-kv/metadata/zatca/${ENTITY}/*" {
   capabilities = ["read", "patch"]
+  allowed_parameters = {
+    "custom_metadata" = []
+  }
+  denied_parameters = {
+    "max_versions" = []
+    "delete_version_after" = []
+    "cas_required" = []
+  }
 }
 path "zatca-kv/delete/*" {
   capabilities = ["deny"]
