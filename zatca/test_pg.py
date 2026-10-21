@@ -192,3 +192,31 @@ def test_at12_concurrent_stamps_get_consecutive_icvs_and_an_intact_chain():
     assert a.pih == services.crypto.INITIAL_PIH and b.pih == a.invoice_hash
     unit = EgsUnit.objects.get(pk=egs.pk)
     assert unit.last_icv == 2 and unit.last_invoice_hash == b.invoice_hash
+
+
+@pytest.mark.django_db
+def test_attention_flag_changes_only_with_its_events_migration_0006(zw, django_capture_on_commit_callbacks):
+    """Review 2026-10-21 item 7: on PostgreSQL ``attention_reason`` is set only right after a
+    ``renewal_needs_attention`` event and cleared only after ``attention_cleared``, a renewal or a revocation."""
+    from zatca.models import OnboardingEvent
+
+    egs = onboard(zw, zw.tst1, zw.admin1)
+    _refused("UPDATE zatca_egsunit SET attention_reason = 'renewal_key_mismatch' WHERE id = %s", [egs.pk])
+    zw.fakes.client.developer_portal_production_certificate = True
+    with pytest.raises(services.ZatcaError), django_capture_on_commit_callbacks(execute=True):
+        services.renew_production_csid(egs, "246810", user=zw.admin1)  # the service path passes the trigger
+    assert EgsUnit.objects.get(pk=egs.pk).attention_reason == "renewal_key_mismatch"
+    _refused("UPDATE zatca_egsunit SET attention_reason = '' WHERE id = %s", [egs.pk])
+    _ok("UPDATE zatca_egsunit SET attention_reason = 'renewal_unconfirmed' WHERE id = %s", [egs.pk])  # still flagged
+    services.grant_key_delegation(zw.tst1, user=zw.mp, custodian=zw.admin1b, scope="onboard_renew",
+                                  openbao_policy_ref="entity-custodian-tst1")
+    services.clear_egs_attention(egs, user=zw.admin1b, reason="ZATCA confirmed (ticket 42)")
+    assert EgsUnit.objects.get(pk=egs.pk).attention_reason == ""
+    assert OnboardingEvent.objects.filter(egs_unit=egs, action="attention_cleared").exists()
+    # one retired event per version, also against raw SQL
+    _ok("INSERT INTO zatca_onboardingevent (entity_id, egs_unit_id, action, actor_id, at, detail, secret_ref) "
+        "VALUES (%s, %s, 'secret_version_retired', %s, now(), '{}', 'zatca/TST1/EGS1/private_key#v9')",
+        [zw.tst1.pk, egs.pk, zw.queue.pk])
+    _refused("INSERT INTO zatca_onboardingevent (entity_id, egs_unit_id, action, actor_id, at, detail, secret_ref) "
+             "VALUES (%s, %s, 'secret_version_retired', %s, now(), '{}', 'zatca/TST1/EGS1/private_key#v9')",
+             [zw.tst1.pk, egs.pk, zw.queue.pk])

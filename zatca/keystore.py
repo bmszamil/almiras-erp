@@ -69,6 +69,18 @@ def retired_refusal():
     return SecretStoreRefused(RETIRED_EN, RETIRED_AR, code=RETIRED_CODE)
 
 
+FLAG_LIMIT_CODE = "retirement_flag_limit"
+
+
+def flag_limit_refusal():
+    """OQ-34 (f): the store cannot record one more retired version for this path (KV v2 metadata limit)."""
+    return SecretStoreRefused(
+        "The secret store cannot record another retired version for this key path (metadata size limit); the "
+        "Managing Partner must handle it in OpenBao.",
+        "لا يستطيع مخزن الأسرار تسجيل إصدار موقوف آخر لمسار هذا المفتاح (حد حجم البيانات الوصفية)؛ يعالجه الشريك "
+        "المدير في OpenBao.", code=FLAG_LIMIT_CODE)
+
+
 def same_entity(path, master_ref):
     """R-50 a / R-57: an item path belongs to the entity whose master key is named (``zatca/<entity>/...``)."""
     master_path, _ = parse_ref(master_ref)
@@ -119,35 +131,45 @@ class OpenBaoSecretStore:
     Built (OQ-34 (f) default, D-19; security sign-off pending): version **retirement** on the KV v2 engine
     (``ZATCA_OPENBAO_KV_MOUNT``, default ``zatca-kv`` as ``deploy/openbao/bootstrap.sh`` creates it):
 
-    - :meth:`retire_version` writes ``retired_v<n>`` = ``<UTC time>|<reason>`` into the path's ``custom_metadata``
-      with a JSON merge patch (``PATCH <mount>/metadata/<path>``). It never deletes, destroys or trims a version
-      and reads no ``data/``. It runs as the separate **retirement identity** (AppRole ``erp-retire``, policy
-      ``erp-retire-<entity>``: read and patch on ``metadata/`` of its own entity only).
+    - :meth:`retire_version` adds the version number to **one** ``custom_metadata`` key, ``retired_versions``
+      (ascending, comma-separated, e.g. ``"1,2,5"``), with a JSON merge patch (``PATCH <mount>/metadata/<path>``)
+      and reads it back. It only ever adds a number: it never sends a null or a shorter list (asserted), never
+      deletes, destroys or trims a version and reads no ``data/``. It runs as the separate **retirement
+      identity** (AppRole ``erp-retire``, policy ``erp-retire-<entity>``: metadata read and patch of its own
+      entity, ``custom_metadata`` only), whose credentials only the scheduler container holds; only the
+      retirement job calls it, one run at a time and under the entity's lock, so the read-modify-write of the
+      list never races.
     - :meth:`list_versions` and :meth:`check_usable` read ``metadata/`` as the signing identity, which may read
       ``data/`` and ``metadata/`` but never write ``metadata/`` (policy ``erp-signer-<entity>``).
     - every read of a version (:meth:`sign`, :meth:`public_key_der`, :meth:`read_secret`) names one explicit
-      version and first checks its flag: a retired version is refused with ``SecretStoreRefused``
+      version and first checks the list: a retired version is refused with ``SecretStoreRefused``
       (``secret_version_retired``, R-57) before any data is read.
+
+    Limit: KV v2 allows 512 bytes per ``custom_metadata`` value, i.e. about 140 retired versions of one path (a
+    renewal adds one per path). Beyond it the store refuses with ``retirement_flag_limit``, checked locally before
+    the patch and mapped from OpenBao's 400 (OQ-34 (f)). Redirects are never followed (as R-44 for ZATCA).
 
     Not built until the OpenBao design is signed off (OQ-3 b, OQ-34 a): reading and unwrapping key material,
     writes and the key hierarchy. Those calls raise :class:`SecretStoreUnavailable` (reads only after the
-    retirement check), so no environment silently signs without the real store. Known limit: KV v2 allows 64
-    ``custom_metadata`` keys per path, i.e. 64 retired versions of one path (a renewal adds one per path).
+    retirement check), so no environment silently signs without the real store.
 
-    ``transport`` (tests): ``callable(method, url, headers, body_bytes) -> (status, dict)``; the default uses
-    urllib with ``ZATCA_OPENBAO_CA_FILE``. Tests never reach a real OpenBao.
+    ``transport`` (tests): ``callable(method, url, headers, body_bytes) -> (status, dict)``; ``handlers`` (tests):
+    extra urllib handlers for the default transport. Tests never reach a real OpenBao.
     """
 
     IDENTITIES = {
         "signer": ("ZATCA_OPENBAO_ROLE_ID_FILE", "ZATCA_OPENBAO_SECRET_ID_FILE"),
         "retire": ("ZATCA_OPENBAO_RETIRE_ROLE_ID_FILE", "ZATCA_OPENBAO_RETIRE_SECRET_ID_FILE"),
     }
+    RETIRED_KEY = "retired_versions"
+    VALUE_LIMIT = 512  # bytes per custom_metadata value (KV v2)
 
-    def __init__(self, transport=None):
+    def __init__(self, transport=None, handlers=()):
         self.address = getattr(settings, "ZATCA_OPENBAO_ADDRESS", "").rstrip("/")
         self.auth_role = getattr(settings, "ZATCA_OPENBAO_AUTH_ROLE", "")
         self.kv_mount = getattr(settings, "ZATCA_OPENBAO_KV_MOUNT", "") or "zatca-kv"
         self.ca_file = getattr(settings, "ZATCA_OPENBAO_CA_FILE", "") or None
+        self._handlers = tuple(handlers)
         self._transport = transport or self._http
         self._tokens = {}  # identity -> (token, monotonic expiry); process memory only, never logged or stored
         self._lock = threading.Lock()
@@ -160,14 +182,19 @@ class OpenBaoSecretStore:
     write_private_key = write_secret = _unavailable
 
     # -- transport and login --
+    def _opener(self):
+        from .client import NoRedirects  # never follow a redirect (R-44 pattern)
+
+        context = ssl.create_default_context(cafile=self.ca_file)
+        return urllib.request.build_opener(NoRedirects, urllib.request.HTTPSHandler(context=context), *self._handlers)
+
     def _http(self, method, url, headers, body):
         request = urllib.request.Request(url, data=body, method=method, headers=headers)
-        context = ssl.create_default_context(cafile=self.ca_file)
         try:
-            with urllib.request.urlopen(request, timeout=10, context=context) as response:  # noqa: S310 (https only)
+            with self._opener().open(request, timeout=10) as response:  # noqa: S310 (https only)
                 raw = response.read()
                 return response.status, (json.loads(raw) if raw else {})
-        except urllib.error.HTTPError as exc:
+        except urllib.error.HTTPError as exc:  # also every 3xx: NoRedirects returns it as the answer
             try:
                 raw = exc.read()
                 return exc.code, (json.loads(raw) if raw else {})
@@ -187,6 +214,10 @@ class OpenBaoSecretStore:
         status, payload = self._transport(method, f"{self.address}/v1/{api_path}", headers, data)
         if status is None or status >= 500 or status == 429:  # 503 = sealed (R-47)
             raise SecretStoreUnavailable()
+        if 300 <= status < 400:
+            raise SecretStoreRefused("OpenBao answered with a redirect; the ERP never follows redirects.",
+                                     "أجاب مخزن OpenBao بإعادة توجيه؛ لا يتبع النظام إعادة التوجيه.",
+                                     code="openbao_redirect")
         if status in (401, 403):
             if identity:
                 self._tokens.pop(identity, None)
@@ -226,16 +257,17 @@ class OpenBaoSecretStore:
 
     # -- KV v2 metadata (R-57 to R-60) --
     @staticmethod
-    def _flag(version):
-        return f"retired_v{version}"
-
-    @staticmethod
     def _parse_time(text):
         if not text:
             return None
         head, _, tail = text.rstrip("Z").partition(".")
         fraction = (tail[:6] if tail else "0").ljust(6, "0")
         return datetime.fromisoformat(f"{head}.{fraction}+00:00")
+
+    @classmethod
+    def _retired_set(cls, metadata):
+        text = ((metadata or {}).get("custom_metadata") or {}).get(cls.RETIRED_KEY) or ""
+        return {int(v) for v in text.split(",") if v.strip().isdigit()}
 
     def _metadata(self, path, identity):
         status, payload = self._call("GET", f"{self.kv_mount}/metadata/{path}", identity=identity)
@@ -245,11 +277,11 @@ class OpenBaoSecretStore:
             raise SecretStoreUnavailable()
         return payload.get("data") or {}
 
-    def _is_retired(self, metadata, version):
+    @staticmethod
+    def _known(metadata, version):
         info = ((metadata or {}).get("versions") or {}).get(str(version))
         if info is None or info.get("destroyed"):
             raise SecretStoreRefused("Unknown secret-store item.", "عنصر غير معروف في مخزن الأسرار.")
-        return self._flag(version) in ((metadata or {}).get("custom_metadata") or {})
 
     def list_versions(self, path, master_ref):
         """Every version at ``path`` with its write time and retired flag (R-60); signing identity, metadata only."""
@@ -257,9 +289,9 @@ class OpenBaoSecretStore:
         metadata = self._metadata(path, "signer")
         if metadata is None:
             return []
-        flags = metadata.get("custom_metadata") or {}
+        retired = self._retired_set(metadata)
         return sorted(({"version": int(v), "created_at": self._parse_time(info.get("created_time")),
-                        "retired": self._flag(v) in flags}
+                        "retired": int(v) in retired}
                        for v, info in (metadata.get("versions") or {}).items() if not info.get("destroyed")),
                       key=lambda row: row["version"])
 
@@ -267,21 +299,41 @@ class OpenBaoSecretStore:
         """Refuse a retired (or unknown) version before anything reads it (R-57)."""
         path, version = parse_ref(ref)
         _refuse_other_entity(path, master_ref)
-        if self._is_retired(self._metadata(path, "signer"), version):
+        metadata = self._metadata(path, "signer")
+        self._known(metadata, version)
+        if version in self._retired_set(metadata):
             raise retired_refusal()
 
     def retire_version(self, ref, master_ref, *, reason, at=None):
-        """Flag one version retired (R-57). Returns False when it already was (idempotent: nothing written)."""
+        """Add one version to the path's retired list (R-57). Returns False when it already was retired (nothing
+        written). Time and reason are kept in the ERP's events, not in the store."""
         path, version = parse_ref(ref)
         _refuse_other_entity(path, master_ref)
-        if self._is_retired(self._metadata(path, "retire"), version):
+        metadata = self._metadata(path, "retire")
+        self._known(metadata, version)
+        before = self._retired_set(metadata)
+        if version in before:
             return False
-        stamp = (at or datetime.now(dt_timezone.utc)).astimezone(dt_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        status, _ = self._call("PATCH", f"{self.kv_mount}/metadata/{path}", identity="retire",
-                               body={"custom_metadata": {self._flag(version): f"{stamp}|{reason}"}},
-                               content_type="application/merge-patch+json")
+        after = before | {version}
+        value = ",".join(str(v) for v in sorted(after))
+        # Never a null, never a shorter list: the ERP cannot un-retire (R-57).
+        assert value and after > before and self._retired_set({"custom_metadata": {self.RETIRED_KEY: value}}) == after
+        if len(value.encode()) > self.VALUE_LIMIT:
+            raise flag_limit_refusal()
+        status, payload = self._call("PATCH", f"{self.kv_mount}/metadata/{path}", identity="retire",
+                                     body={"custom_metadata": {self.RETIRED_KEY: value}},
+                                     content_type="application/merge-patch+json")
+        if 400 <= status < 500:
+            errors = " ".join(str(e) for e in (payload.get("errors") or []))
+            if status == 400 and "custom_metadata" in errors:  # e.g. the 512-byte value limit
+                raise flag_limit_refusal()
+            raise SecretStoreRefused(f"OpenBao refused the retirement patch (HTTP {status}).",
+                                     f"رفض مخزن OpenBao تعديل الإيقاف (HTTP {status}).", code="openbao_patch_refused")
         if status not in (200, 204):
             raise SecretStoreUnavailable()
+        if version not in self._retired_set(self._metadata(path, "retire")):  # read back: never assume
+            raise SecretStoreUnavailable("OpenBao did not keep the retirement flag; it is retried.",
+                                         "لم يحتفظ مخزن OpenBao بعلامة الإيقاف؛ ستُعاد المحاولة.")
         return True
 
     # -- reads: the retirement check runs first; reading key material is not built (OQ-3 b, OQ-34 a) --
@@ -297,7 +349,6 @@ class OpenBaoSecretStore:
         self.check_usable(ref, master_ref)
         self._unavailable()
 
-
 class LocalSecretStore:
     """In-memory store (tests and local development only; nothing survives a restart)."""
 
@@ -311,6 +362,7 @@ class LocalSecretStore:
         self.sealed = False
         self.unavailable_master_paths = set()
         self.retirement_unavailable = False  # tests: retirement alone fails as "unavailable" (R-58, AT-97)
+        self.retirement_refusal = None  # tests: a callable returning the SecretStoreRefused that retirement raises
         self.clock = lambda: datetime.now(dt_timezone.utc)  # tests may move it
         self.calls = []  # operation names, for tests (never values)
 
@@ -490,6 +542,8 @@ class LocalSecretStore:
             self._check_open()
             if self.retirement_unavailable:
                 raise SecretStoreUnavailable()
+            if self.retirement_refusal is not None:
+                raise self.retirement_refusal()
             self.calls.append("retire_version")
             path, version = self._item_version(ref, master_ref)
             if version in self._retired.get(path, {}):

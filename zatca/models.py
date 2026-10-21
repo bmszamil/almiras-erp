@@ -170,6 +170,9 @@ class EgsUnit(Tracked, ServiceWritten):
     attention_reason = models.CharField(bi("Needs attention because", "يحتاج إلى متابعة بسبب"), max_length=30,
                                         choices=AttentionReason.choices, blank=True)
     attention_since = models.DateTimeField(bi("Needs attention since", "يحتاج إلى متابعة منذ"), null=True, blank=True)
+    # One renewal at a time per unit (review 2026-10-21 item 8): a lease taken before the ZATCA call and released
+    # afterwards; a lease older than ZATCA_RENEWAL_LEASE_MINUTES (crashed worker) no longer blocks.
+    renewal_started_at = models.DateTimeField(null=True, blank=True, editable=False)
 
     class Meta:
         verbose_name = bi("EGS unit", "وحدة إصدار الفواتير")
@@ -467,6 +470,8 @@ class OnboardingEvent(AppendOnly):
         SUPER_KEY_REGISTERED = "super_key_registered", bi("Group super key registered", "سُجل المفتاح الأعلى")
         PROFILE_ENABLED = "profile_enabled", bi("Profile enabled", "فُعّل الملف")
         # D-19, R-57 to R-60 (2026-10-21): one event per secret-store version.
+        SECRET_RETIREMENT_REQUESTED = "secret_retirement_requested", bi("Secret version retirement requested",
+                                                                        "طُلب إيقاف إصدار السر")
         SECRET_VERSION_RETIRED = "secret_version_retired", bi("Secret version retired", "أُوقف إصدار السر")
         SECRET_RETIREMENT_FAILED = "secret_retirement_failed", bi("Secret version retirement failed",
                                                                   "تعذر إيقاف إصدار السر")
@@ -481,11 +486,17 @@ class OnboardingEvent(AppendOnly):
     actor = models.ForeignKey(USER, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Actor", "المنفذ"))
     at = models.DateTimeField(bi("At", "الوقت"), default=timezone.now)
     detail = models.JSONField(bi("Detail (never secrets)", "التفاصيل (دون أسرار)"), default=dict)
+    # D-19: the secret-store reference (path + version, never a value) of a retirement event, so the database
+    # holds at most one ``secret_version_retired`` per version (review 2026-10-21 item 9).
+    secret_ref = models.CharField(bi("Secret reference", "مرجع السر"), max_length=300, blank=True, default="")
 
     class Meta:
         verbose_name = bi("onboarding event", "حدث تسجيل")
         verbose_name_plural = bi("onboarding events", "أحداث التسجيل")
         ordering = ["at", "id"]
+        constraints = [models.UniqueConstraint(fields=["entity", "secret_ref"],
+                                               condition=models.Q(action="secret_version_retired"),
+                                               name="zatca_one_retired_event_per_version")]
 
 
 class ComplianceTask(Tracked, ServiceWritten):

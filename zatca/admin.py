@@ -6,7 +6,10 @@ Every change goes through ``zatca.services``. Lists are scoped to the entities w
 """
 from django.contrib import admin
 
+from core import access
 from core.admin import EntityScopedAdmin
+
+from . import services
 
 from .models import (
     ComplianceTask,
@@ -70,9 +73,29 @@ class ValidationMessageAdmin(ReadOnly):
     list_display = ("entity", "einvoice", "level", "origin", "code", "message_en", "display_ar")
 
 
+class HidesKeyEvents(ReadOnly):
+    """§7 (D-19): secret-version retirement events and their alerts are shown only where the user holds
+    ``zatca.view_key_events`` for the row's entity (ZATCA admin, viewer); ``zatca.view`` alone does not show them."""
+
+    key_event_field = None
+
+    def get_queryset(self, request):
+        return services.hide_key_events(super().get_queryset(request), request.user, field=self.key_event_field)
+
+    def has_view_permission(self, request, obj=None):
+        if obj is not None and getattr(obj, self.key_event_field) in self.key_event_kinds() and not access.has(
+                request.user, obj.entity, services.VIEW_KEY_EVENTS):
+            return False
+        return super().has_view_permission(request, obj)
+
+    def key_event_kinds(self):
+        return services.RETIREMENT_ACTIONS if self.key_event_field == "action" else services.RETIREMENT_ALERT_KINDS
+
+
 @admin.register(OnboardingEvent)
-class OnboardingEventAdmin(ReadOnly):
+class OnboardingEventAdmin(HidesKeyEvents):
     list_display = ("entity", "egs_unit", "action", "actor", "at")
+    key_event_field = "action"
 
 
 @admin.register(ComplianceTask)
@@ -86,5 +109,6 @@ class KeyCustodianDelegationAdmin(ReadOnly):
 
 
 @admin.register(ZatcaAlert)
-class ZatcaAlertAdmin(ReadOnly):
+class ZatcaAlertAdmin(HidesKeyEvents):
     list_display = ("entity", "recipient", "kind", "created_at")
+    key_event_field = "kind"

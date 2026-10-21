@@ -15,13 +15,14 @@ import dataclasses
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, time, timedelta
 from datetime import timezone as dt_timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
-from django.db import models, transaction
+from django.db import IntegrityError, models, transaction
 from django.db.models import Exists, ExpressionWrapper, OuterRef, Q
 from django.utils import timezone
 from lxml import etree
@@ -417,7 +418,14 @@ def create_egs_unit(entity, *, user, code, name_en, name_ar, serial_number, indu
                   supports_simplified=supports_simplified, branch_name_en=branch_name_en,
                   branch_name_ar=branch_name_ar, created_by=user, source=_source(user))
     _check_csr_values(egs, entity)  # at input time, so a bad value never waits until ZATCA refuses the CSR
+    if not EGS_CODE_RE.fullmatch(code):  # the code is part of secret-store paths (keystore.private_key_path)
+        raise ZatcaError("The EGS code may contain only Latin letters, digits, '-' and '_' (1 to 20 characters).",
+                         "يقتصر رمز وحدة الفوترة على الحروف اللاتينية والأرقام و'-' و'_' (من 1 إلى 20 حرفًا).",
+                         code="egs_code")
     return _save(egs)
+
+
+EGS_CODE_RE = re.compile(r"[A-Za-z0-9_-]{1,20}")
 
 
 def _egs_transition(egs, new):
@@ -801,15 +809,59 @@ class _RenewalKeyMismatch(Exception):
     """The renewed certificate ZATCA issued is not for the new key pair (raised inside the renewal transaction)."""
 
 
+def _refuse_inside_transaction():
+    """Review 2026-10-21 item 1: a renewal calls ZATCA, which may revoke the old CSID, and then records the outcome
+    (credential, "needs attention" flag, retirement requests) in its own transactions. Inside a caller's
+    transaction (e.g. ``ATOMIC_REQUESTS``) those would be savepoints, rolled back with the caller while ZATCA's
+    change stays. Django's durable check refuses any enclosing atomic block except the test framework's own (as
+    billing R33). A view calling a renewal service must be ``transaction.non_atomic_requests``."""
+    try:
+        with transaction.atomic(durable=True):
+            pass
+    except RuntimeError:
+        raise ZatcaError("A certificate renewal is never run inside another database transaction: ZATCA's answer must "
+                         "be recorded even if the caller rolls back (the view must be non_atomic_requests).",
+                         "لا يُجرى تجديد الشهادة داخل معاملة قاعدة بيانات أخرى: يجب تسجيل رد الهيئة حتى لو تراجع "
+                         "المستدعي.", code="renewal_in_transaction") from None
+
+
+def _take_renewal_lease(egs):
+    """Item 8: one renewal at a time per unit. The lease is taken under the row lock before the ZATCA call (a
+    second renewal is refused while it is held) and released when the renewal ends; a lease older than
+    ``ZATCA_RENEWAL_LEASE_MINUTES`` (default 15; the client times out after 30 s) is treated as abandoned."""
+    now = _now()
+    lease = timedelta(minutes=int(_setting("ZATCA_RENEWAL_LEASE_MINUTES", 15)))
+    with transaction.atomic():
+        unit = EgsUnit.objects.select_for_update().get(pk=egs.pk)
+        if unit.renewal_started_at and unit.renewal_started_at > now - lease:
+            raise ZatcaError(f"A renewal of EGS unit {unit.code} is already in progress; wait for it to finish. The "
+                             "OTP was not used.",
+                             f"يجري تجديد شهادة وحدة الفوترة {unit.code} حاليًا؛ انتظر انتهاءه. لم يُستخدم رمز التحقق.",
+                             code="renewal_in_progress")
+        unit.renewal_started_at = now
+        _save(unit)
+
+
+def _release_renewal_lease(egs):
+    with transaction.atomic():
+        unit = EgsUnit.objects.select_for_update().get(pk=egs.pk)
+        if unit.renewal_started_at is not None:
+            unit.renewal_started_at = None
+            _save(unit)
+
+
 def renew_production_csid(egs, otp, *, user):
     """R-10 / AT-9: new OTP + new CSR with a **new key pair**; the old credential becomes superseded.
 
     D-19: once the renewal commits, the old key version and the superseded and compliance CSID secret versions
-    are retired after commit (R-57, R-58). If the renewal fails after the new key version was written, the
-    versions it wrote are retired (R-59) and the user gets the original error. If ZATCA issued the renewed CSID
-    but it cannot be taken into use (``key_mismatch``, or the store failed in between), ZATCA may already have
-    revoked the old CSID: the unit is marked as needing attention, so it stops signing and submitting with a
-    clear en/ar error, and its ZATCA admins and the Managing Partner are alerted (R-10 note, 2026-10-21)."""
+    are requested for retirement after commit (R-57, R-58; the retirement job performs it). If the renewal fails
+    after the new key version was written, the versions it wrote are requested too (R-59) and the user gets the
+    original error. If ZATCA issued the renewed CSID but it cannot be taken into use (``key_mismatch``, or the
+    store failed in between), ZATCA may already have revoked the old CSID: the unit is marked as needing
+    attention, so it stops signing and submitting, the error says so (en/ar), and its ZATCA admins and the
+    Managing Partner are alerted (R-10 note, 2026-10-21). Never inside a caller's transaction; one at a time per
+    unit."""
+    _refuse_inside_transaction()
     egs = EgsUnit.objects.select_related("entity").get(pk=egs.pk)
     entity = egs.entity
     _require_key_action(user, entity, Scope.ONBOARD_RENEW)
@@ -820,12 +872,25 @@ def renew_production_csid(egs, otp, *, user):
     _refuse_renewal_in_flight(egs)
     profile = _profile_of(entity)
     old = _active_credential(egs, EgsCredential.Kind.PRODUCTION)
+    if old is None:
+        raise ZatcaError("The unit has no active production CSID to renew (R-10).",
+                         "لا تملك الوحدة شهادة إنتاج نشطة لتجديدها.", code="credential")
+    _take_renewal_lease(egs)
+    try:
+        return _renew(egs, otp, user, entity, profile, old)
+    finally:
+        _release_renewal_lease(egs)
+
+
+def _renew(egs, otp, user, entity, profile, old):
     try:
         master = _master_ref(entity)
         auth = _auth(old, master)
         ref, csr = _new_key_and_csr(egs, profile.environment)
     except SecretStoreUnavailable as exc:
         raise ZatcaError(exc.en, exc.ar, code="secret_store_unavailable") from None
+    except SecretStoreRefused as exc:  # e.g. the old CSID secret was retired: never a raw store error
+        raise ZatcaError(exc.en, exc.ar, code=exc.code or "secret_store_refused") from None
     written = [(ref, RetiredItem.PRIVATE_KEY)]  # R-59: what this attempt wrote to the store
     issued = False  # ZATCA answered with a certificate (and may have revoked the old CSID, DTG p.32)
     try:
@@ -859,6 +924,7 @@ def renew_production_csid(egs, otp, *, user):
             _egs_transition(egs, EgsStatus.ACTIVE)
             egs.private_key_ref, egs.csr_pem = ref, crypto.csr_pem(csr).decode("ascii")
             egs.attention_reason, egs.attention_since = "", None  # a successful renewal resolves it
+            egs.renewal_started_at = None
             _save(egs)
             renewed = _event(entity, egs, Action.PCSID_RENEWED, user, credential=new.pk, replaces=old.pk,
                              private_key_ref=ref)
@@ -866,37 +932,46 @@ def renew_production_csid(egs, otp, *, user):
                                  renewal_event=renewed.pk)
     except Exception as exc:
         mismatch = isinstance(exc, _RenewalKeyMismatch)
-        if issued:
-            _renewal_needs_attention(egs, user, AttentionReason.RENEWAL_KEY_MISMATCH if mismatch
-                                     else AttentionReason.RENEWAL_UNCONFIRMED, type(exc).__name__)
         _retire_after_commit(entity, egs, written, RetireReason.RENEWAL_FAILED)  # R-59
+        if not issued:
+            if isinstance(exc, SecretStoreUnavailable):
+                raise ZatcaError(exc.en, exc.ar, code="secret_store_unavailable") from None
+            raise
+        _renewal_needs_attention(egs, user, AttentionReason.RENEWAL_KEY_MISMATCH if mismatch
+                                 else AttentionReason.RENEWAL_UNCONFIRMED, type(exc).__name__)
+        _, stop_en, stop_ar = local("egs_needs_attention", unit=egs.code)
         if mismatch:
-            raise ZatcaError(
-                "The renewed certificate ZATCA issued is not for the new key pair; it was not stored. ZATCA may "
-                f"already have revoked the old certificate, so EGS unit {egs.code} stops signing and submitting "
-                "until a ZATCA admin resolves it (R-10).",
-                "شهادة التجديد التي أصدرتها الهيئة لا تخص زوج المفاتيح الجديد ولم تُحفظ. ربما ألغت الهيئة الشهادة "
-                f"السابقة، لذا تتوقف وحدة الفوترة {egs.code} عن التوقيع والإرسال حتى يعالجها مسؤول الربط.",
-                code="key_mismatch") from None
-        if isinstance(exc, SecretStoreUnavailable):
-            raise ZatcaError(exc.en, exc.ar, code="secret_store_unavailable") from None
-        raise
+            raise ZatcaError("The renewed certificate ZATCA issued is not for the new key pair; it was not stored. "
+                             f"{stop_en}",
+                             f"شهادة التجديد التي أصدرتها الهيئة لا تخص زوج المفاتيح الجديد ولم تُحفظ. {stop_ar}",
+                             code="key_mismatch") from None
+        cause_en = getattr(exc, "en", "") or f"The renewed certificate could not be stored ({type(exc).__name__})."
+        cause_ar = getattr(exc, "ar", "") or "تعذر حفظ شهادة التجديد."
+        code = "secret_store_unavailable" if isinstance(exc, SecretStoreUnavailable) else "renewal_unconfirmed"
+        raise ZatcaError(f"{cause_en} {stop_en}", f"{cause_ar} {stop_ar}", code=code) from None
     return egs
+
+
+def _attention_event(unit):
+    """The latest of ``renewal_needs_attention`` / ``attention_cleared`` for the unit (or None)."""
+    return OnboardingEvent.objects.filter(egs_unit=unit, action__in=(
+        Action.RENEWAL_NEEDS_ATTENTION, Action.ATTENTION_CLEARED)).order_by("-id").first()
 
 
 def _renewal_needs_attention(egs, user, reason, error):
     """R-10 note (2026-10-21): ZATCA issued a renewed CSID that could not be taken into use; ZATCA may already have
     revoked the old one (DTG p.32), while it is still ``active`` here. The unit stops signing and submitting with
     a clear en/ar error (``egs_needs_attention``) instead of failing at ZATCA; one event; ZATCA admins and the
-    Managing Partner are alerted (en/ar). Runs after the renewal transaction rolled back."""
+    Managing Partner are alerted (en/ar). Runs after the renewal transaction rolled back. The event is written
+    before the flag: on PostgreSQL the flag changes only right after its event (migration 0006)."""
     entity = egs.entity
     with transaction.atomic():
         unit = EgsUnit.objects.select_for_update().get(pk=egs.pk)
+        _event(entity, unit, Action.RENEWAL_NEEDS_ATTENTION, user, reason=str(reason), error=error[:100])
         if not unit.attention_reason:
             unit.attention_since = _now()
         unit.attention_reason = reason
         _save(unit)
-        _event(entity, unit, Action.RENEWAL_NEEDS_ATTENTION, user, reason=str(reason), error=error[:100])
         _, en, ar = local("egs_needs_attention", unit=unit.code)
         _alert(entity, _zatca_admins(entity) + _managing_partners(entity), "egs_needs_attention",
                f"{en} Check the unit's credentials in the Fatoora portal.",
@@ -905,20 +980,32 @@ def _renewal_needs_attention(egs, user, reason, error):
 
 def clear_egs_attention(egs, *, user, reason):
     """R-10 note: a ZATCA admin with an ``onboard_renew`` delegation (R-41) records that ZATCA confirmed the old
-    CSID is still valid; the unit signs and submits again. (A successful renewal or a revocation also ends it.)"""
+    CSID is still valid; the unit signs and submits again. Four eyes: not the user whose renewal raised the flag.
+    The ZATCA admins and the Managing Partner are told (en/ar). A successful renewal or a revocation also ends it."""
     egs = EgsUnit.objects.select_related("entity").get(pk=egs.pk)
-    _require_key_action(user, egs.entity, Scope.ONBOARD_RENEW)
+    entity = egs.entity
+    _require_key_action(user, entity, Scope.ONBOARD_RENEW)
     if not egs.attention_reason:
         return egs
     if not (reason or "").strip():
         raise ZatcaError("Give the reason (e.g. ZATCA's confirmation reference).",
                          "اذكر السبب (مثل مرجع تأكيد الهيئة).", code="reason_required")
+    flagged = _attention_event(egs)
+    if flagged is not None and flagged.action == Action.RENEWAL_NEEDS_ATTENTION and flagged.actor_id == user.pk:
+        _refuse(user, entity, "zatca.onboard", "four_eyes",
+                "The flag is cleared by another ZATCA admin than the one whose renewal raised it (four eyes).",
+                "يرفع العلامة مسؤول ربط غير الذي أدى تجديده إلى وضعها (مبدأ الأربع أعين).")
     with transaction.atomic():
         unit = EgsUnit.objects.select_for_update().get(pk=egs.pk)
         previous = unit.attention_reason
+        _event(entity, unit, Action.ATTENTION_CLEARED, user, previous=str(previous), reason=reason[:300])
         unit.attention_reason, unit.attention_since = "", None
         _save(unit)
-        _event(unit.entity, unit, Action.ATTENTION_CLEARED, user, previous=str(previous), reason=reason[:300])
+        _alert(entity, _zatca_admins(entity) + _managing_partners(entity), "egs_attention_cleared",
+               f"{user.get_username()} cleared the 'needs attention' flag of EGS unit {unit.code} ({previous}); it "
+               f"signs and submits again. Reason: {reason[:300]}",
+               f"رفع {user.get_username()} علامة «يحتاج إلى متابعة» عن وحدة الفوترة {unit.code}؛ تعود للتوقيع والإرسال. "
+               f"السبب: {reason[:300]}", egs=unit)
     return unit
 
 
@@ -1029,7 +1116,8 @@ class RetireReason:
     UNREFERENCED = "unreferenced"
 
 
-RETIREMENT_ACTIONS = (Action.SECRET_VERSION_RETIRED, Action.SECRET_RETIREMENT_FAILED)
+RETIREMENT_ACTIONS = (Action.SECRET_RETIREMENT_REQUESTED, Action.SECRET_VERSION_RETIRED, Action.SECRET_RETIREMENT_FAILED)
+RETIREMENT_ALERT_KINDS = ("secret_retirement_failed", keystore.FLAG_LIMIT_CODE)
 VIEW_KEY_EVENTS = "zatca.view_key_events"
 
 
@@ -1054,18 +1142,27 @@ def _renewal_retirements(egs, old_key_ref):
 
 def _retire_after_commit(entity, egs, items, reason, renewal_event=None):
     """R-58 / R-59: registered with ``transaction.on_commit`` on the current transaction, so it runs only once that
-    commits (at once outside a transaction). If the transaction rolls back nothing is retired by this path; the
-    versions left behind are found by the retirement job (R-60). Never raises into the caller: the renewal (or
-    the user's original error) never depends on retirement."""
+    commits (at once outside a transaction). It records one ``secret_retirement_requested`` event per version; the
+    retirement job (scheduler, the only process holding the store's retirement identity, OQ-34 (f)) retires it at
+    its next run. If the transaction rolls back nothing is requested; the versions left behind are found by the
+    job's reconciliation (R-60). Never raises into the caller: the renewal (or the user's original error) never
+    depends on retirement."""
     entity_id, egs_id, items = entity.pk, egs.pk, list(items)
 
     def run():
         try:
-            unit = EgsUnit.objects.select_related("entity").get(pk=egs_id)
-            _retire_versions(unit.entity, [(unit, ref, item, reason, renewal_event) for ref, item in items], _now())
-        except Exception as exc:  # noqa: BLE001 - left for the retirement job (R-60)
-            log.warning("zatca: secret retirement after commit for entity %s failed: %s", entity_id,
-                        type(exc).__name__)
+            with transaction.atomic():
+                unit = EgsUnit.objects.select_related("entity").get(pk=egs_id)
+                actor, now = _queue_user(), _now()
+                for ref, item in dict.fromkeys(items):
+                    if not ref:
+                        continue
+                    detail = {"ref": ref, "item": item, "reason": reason}
+                    if renewal_event:
+                        detail["renewal_event"] = renewal_event  # links the renewal's pcsid_renewed event (§3.7)
+                    _event_at(unit.entity, unit, Action.SECRET_RETIREMENT_REQUESTED, actor, now, **detail)
+        except Exception as exc:  # noqa: BLE001 - left for the retirement job's reconciliation (R-60)
+            log.warning("zatca: recording secret retirement for entity %s failed: %s", entity_id, type(exc).__name__)
 
     transaction.on_commit(run, robust=True)
 
@@ -1073,29 +1170,37 @@ def _retire_after_commit(entity, egs, items, reason, renewal_event=None):
 def _event_at(entity, egs, action, actor, at, **detail):
     check_no_secret(detail)
     return OnboardingEvent.objects.create(entity=entity, egs_unit=egs, action=action, actor=actor, at=at,
-                                          detail=detail)
+                                          detail=detail, secret_ref=detail.get("ref", ""))
 
 
 def _pending_retirements(entity):
-    """R-58 (c): versions of ``entity`` whose last retirement event is a failure: ``ref -> detail`` of that failure
-    (with ``at`` and ``egs_unit_id``). Derived from the append-only events, nothing updated in place (§3.7)."""
+    """R-58 (c): versions of ``entity`` whose last retirement event is a request or a failure: ``ref -> detail`` of
+    that event (with ``action``, ``at`` and ``egs_unit_id``). Derived from the append-only events (§3.7)."""
     pending = {}
     for event in OnboardingEvent.objects.filter(entity=entity, action__in=RETIREMENT_ACTIONS).order_by("id"):
         ref = (event.detail or {}).get("ref")
-        if event.action == Action.SECRET_RETIREMENT_FAILED:
-            pending[ref] = {**event.detail, "at": event.at, "egs_unit_id": event.egs_unit_id}
-        else:
+        if event.action == Action.SECRET_VERSION_RETIRED:
             pending.pop(ref, None)
+        elif event.action == Action.SECRET_RETIREMENT_FAILED or ref not in pending:
+            pending[ref] = {**event.detail, "action": event.action, "at": event.at, "egs_unit_id": event.egs_unit_id}
     return pending
+
+
+def _due(entry, now):
+    """A request is due at once; a failure after the R-24 backoff of its attempt (1 min, doubling, cap 1 h)."""
+    if entry["action"] == Action.SECRET_RETIREMENT_REQUESTED:
+        return True
+    return entry["at"] + _backoff(int(entry.get("attempt", 1))) <= now
 
 
 def _retire_versions(entity, rows, now):
     """Retire each ``(egs, ref, item, reason, renewal_event)`` of one entity under that entity's own master key
     (R-50, R-57). Writes ``secret_version_retired`` for a version it changed (or a pending one now found retired),
-    nothing for one already retired (idempotent), and ``secret_retirement_failed`` per version and attempt with
-    ``error_code``. At the first failure (no pending failure for the entity before) one en/ar alert goes to the
-    entity's ZATCA admins, the Managing Partner and the entity's ``master_key`` custodians (R-58 b); retries do
-    not repeat it. Returns ``(retired, failed)``."""
+    nothing for one already retired (idempotent; at most one such event per version, DB constraint), and
+    ``secret_retirement_failed`` per version and attempt with ``error_code`` (and ``refusal_code`` when the store
+    refused). A version failing for the first time (attempt 1) is alerted once, en/ar, to the entity's ZATCA
+    admins, the Managing Partner and the entity's ``master_key`` custodians (R-58 b), one alert per run for all
+    such versions; retries never repeat it. Returns ``(retired, failed)``."""
     pending = _pending_retirements(entity)
     store = keystore.get_store()
     try:
@@ -1104,37 +1209,55 @@ def _retire_versions(entity, rows, now):
         master = None
     actor = _queue_user()
     retired = failed = 0
-    error_codes, seen = [], set()
+    first_failures, limit_refs, seen = [], [], set()
     for egs, ref, item, reason, renewal_event in rows:
         if not ref or ref in seen:
             continue
         seen.add(ref)
         detail = {"ref": ref, "item": item, "reason": reason}
         if renewal_event:
-            detail["renewal_event"] = renewal_event  # links the renewal's pcsid_renewed event (§3.7)
+            detail["renewal_event"] = renewal_event
         try:
             if master is None:
                 raise SecretStoreRefused("The entity has no master key.", "ليس للكيان مفتاح رئيسي.")
             changed = store.retire_version(ref, master, reason=reason, at=now)
         except (SecretStoreUnavailable, SecretStoreRefused) as exc:
-            error_code = "secret_store_unavailable" if isinstance(exc, SecretStoreUnavailable) else "secret_store_refused"
+            unavailable = isinstance(exc, SecretStoreUnavailable)
+            extra = {} if unavailable or not getattr(exc, "code", None) else {"refusal_code": exc.code}
             attempt = int(pending.get(ref, {}).get("attempt", 0)) + 1
-            _event_at(entity, egs, Action.SECRET_RETIREMENT_FAILED, actor, now, **detail, error_code=error_code,
+            _event_at(entity, egs, Action.SECRET_RETIREMENT_FAILED, actor, now, **detail, **extra,
+                      error_code="secret_store_unavailable" if unavailable else "secret_store_refused",
                       attempt=attempt)
-            error_codes.append(error_code)
             failed += 1
+            if attempt == 1:
+                first_failures.append(ref)
+                if extra.get("refusal_code") == keystore.FLAG_LIMIT_CODE:
+                    limit_refs.append(ref)
             continue
         if changed or ref in pending:
-            _event_at(entity, egs, Action.SECRET_VERSION_RETIRED, actor, now, **detail)
+            try:
+                with transaction.atomic():
+                    _event_at(entity, egs, Action.SECRET_VERSION_RETIRED, actor, now, **detail)
+            except IntegrityError:  # another run recorded it meanwhile: one event per version
+                continue
             retired += 1
-    if failed and not pending:
-        recipients = _zatca_admins(entity) + _managing_partners(entity) + _master_key_custodians(entity)
+    recipients = _zatca_admins(entity) + _managing_partners(entity) + _master_key_custodians(entity)
+    if first_failures:
         _alert(entity, recipients, "secret_retirement_failed",
-               f"{entity.code}: {failed} old key or secret version(s) could not be retired in the secret store "
-               f"({', '.join(sorted(set(error_codes)))}). The certificate renewal stands and nothing was lost; the ERP "
+               f"{entity.code}: {len(first_failures)} old key or secret version(s) could not be retired in the secret "
+               f"store ({', '.join(first_failures)}). The certificate renewal stands and nothing was lost; the ERP "
                "retries automatically. Check the secret store and the entity's master key.",
-               f"{entity.code}: تعذر إيقاف {failed} من إصدارات المفاتيح أو الأسرار القديمة في مخزن الأسرار. يبقى تجديد "
-               "الشهادة قائمًا ولم يُفقد شيء؛ يعيد النظام المحاولة تلقائيًا. راجع مخزن الأسرار والمفتاح الرئيسي للكيان.")
+               f"{entity.code}: تعذر إيقاف {len(first_failures)} من إصدارات المفاتيح أو الأسرار القديمة في مخزن الأسرار "
+               f"({', '.join(first_failures)}). يبقى تجديد الشهادة قائمًا ولم يُفقد شيء؛ يعيد النظام المحاولة تلقائيًا. "
+               "راجع مخزن الأسرار والمفتاح الرئيسي للكيان.")
+    if limit_refs:
+        _alert(entity, recipients, keystore.FLAG_LIMIT_CODE,
+               f"{entity.code}: the secret store cannot record more retired versions for {', '.join(limit_refs)} "
+               "(OpenBao metadata size limit). These versions are not retired yet and the ERP keeps retrying. The "
+               "Managing Partner must handle it in OpenBao (zatca OQ-34 (f)).",
+               f"{entity.code}: لا يستطيع مخزن الأسرار تسجيل مزيد من الإصدارات الموقوفة لـ {', '.join(limit_refs)} (حد "
+               "حجم البيانات الوصفية في OpenBao). لم تُوقف هذه الإصدارات بعد ويواصل النظام المحاولة. يعالجها الشريك "
+               "المدير في OpenBao.")
     return retired, failed
 
 
@@ -1152,10 +1275,11 @@ def _kept_refs(egs):
 
 
 def run_secret_retirement(*, user, now=None):
-    """R-60 scheduled job (the ZATCA system user only, §7): per entity and under that entity's master key, retry
-    pending retirements (R-58, R-59) with the R-24 backoff, never giving up, and retire every version at the
-    entity's EGS key and secret paths that is no longer referenced (R-60) once it is older than
-    ``ZATCA_RETIRE_GRACE_MINUTES`` (default 120). Events only for versions it changes. Returns counts."""
+    """R-58 / R-60 scheduled job (the ZATCA system user only, §7), the only caller of the store's retirement:
+    per entity, under that entity's lock and master key, retire requested versions, retry failed ones with the
+    R-24 backoff (never giving up), and retire every version at the entity's EGS key and secret paths that is no
+    longer referenced once it is older than ``ZATCA_RETIRE_GRACE_MINUTES`` (default 120). Events only for
+    versions it changes. Returns counts."""
     _require_system(user)
     now = now or _now()
     counts = {"retired": 0, "failed": 0, "errors": 0}
@@ -1173,36 +1297,37 @@ def run_secret_retirement(*, user, now=None):
 
 
 def _reconcile_secrets(entity, now):
-    if not EntityMasterKey.objects.filter(entity=entity).exists():
-        return 0, 0
-    master = _master_ref(entity)
-    store = keystore.get_store()
-    grace = timedelta(minutes=int(_setting("ZATCA_RETIRE_GRACE_MINUTES", 120)))
-    units = {u.pk: u for u in EgsUnit.objects.filter(entity=entity).select_related("entity").order_by("pk")}
-    keep = set()
-    for unit in units.values():
-        keep |= _kept_refs(unit)
-    pending = _pending_retirements(entity)
-    rows = []
-    for ref, failure in pending.items():  # R-58 (c): retried with the R-24 backoff, never given up
-        if ref in keep or failure["at"] + _backoff(int(failure.get("attempt", 1))) > now:
-            continue
-        rows.append((units.get(failure["egs_unit_id"]), ref, failure.get("item"), failure.get("reason"),
-                     failure.get("renewal_event")))
-    try:
+    with transaction.atomic():  # item 9: one run per entity at a time (the master-key row is the lock)
+        if EntityMasterKey.objects.select_for_update().filter(entity=entity).first() is None:
+            return 0, 0
+        master = _master_ref(entity)
+        store = keystore.get_store()
+        grace = timedelta(minutes=int(_setting("ZATCA_RETIRE_GRACE_MINUTES", 120)))
+        units = {u.pk: u for u in EgsUnit.objects.filter(entity=entity).select_related("entity").order_by("pk")}
+        keep = set()
         for unit in units.values():
-            for item, path in _unit_paths(unit):
-                for version in store.list_versions(path, master):
-                    ref = keystore.make_ref(path, version["version"])
-                    if version["retired"] or ref in keep or ref in pending:
-                        continue
-                    written = version.get("created_at")
-                    if written is None or written > now - grace:  # R-60 (c): a renewal may be in progress
-                        continue
-                    rows.append((unit, ref, item, RetireReason.UNREFERENCED, None))
-    except (SecretStoreUnavailable, SecretStoreRefused) as exc:  # cannot list now: the next run tries again
-        log.warning("zatca: listing secret versions of %s failed: %s", entity.code, type(exc).__name__)
-    return _retire_versions(entity, rows, now)
+            keep |= _kept_refs(unit)
+        pending = _pending_retirements(entity)
+        rows = []
+        for ref, entry in pending.items():  # R-58 (c)
+            if ref in keep or not _due(entry, now):
+                continue
+            rows.append((units.get(entry["egs_unit_id"]), ref, entry.get("item"), entry.get("reason"),
+                         entry.get("renewal_event")))
+        try:
+            for unit in units.values():
+                for item, path in _unit_paths(unit):
+                    for version in store.list_versions(path, master):
+                        ref = keystore.make_ref(path, version["version"])
+                        if version["retired"] or ref in keep or ref in pending:
+                            continue
+                        written = version.get("created_at")
+                        if written is None or written > now - grace:  # R-60 (c): a renewal may be in progress
+                            continue
+                        rows.append((unit, ref, item, RetireReason.UNREFERENCED, None))
+        except (SecretStoreUnavailable, SecretStoreRefused) as exc:  # cannot list now: the next run tries again
+            log.warning("zatca: listing secret versions of %s failed: %s", entity.code, type(exc).__name__)
+        return _retire_versions(entity, rows, now)
 
 
 def secret_retirement_events(user, entity):
@@ -1213,9 +1338,17 @@ def secret_retirement_events(user, entity):
 
 
 def pending_secret_retirements(user, entity):
-    """§7: the versions whose retirement failed and is still being retried (``ref -> last failure``)."""
+    """§7: the versions requested or failed and not retired yet (``ref -> last event``)."""
     access.require(user, entity, VIEW_KEY_EVENTS)
     return _pending_retirements(entity)
+
+
+def hide_key_events(queryset, user, *, field):
+    """§7 for list views (admin): rows of the retirement kinds in ``field`` are shown only for entities where
+    ``user`` holds ``zatca.view_key_events``."""
+    kinds = RETIREMENT_ACTIONS if field == "action" else RETIREMENT_ALERT_KINDS
+    allowed = access.entities_for(user, VIEW_KEY_EVENTS)
+    return queryset.exclude(Q(**{f"{field}__in": kinds}) & ~Q(entity__in=allowed))
 
 
 # --- documents: hand-off (R-28, R-32), stamping (R-9 to R-16), submission (R-21 to R-27, R-44) -------------
