@@ -185,7 +185,8 @@ def test_r16_totp_is_rfc6238_with_one_step_of_drift_and_each_code_works_once(w, 
     assert mfa.verify(w.cfo, now_code)
     with pytest.raises(mfa.MfaError) as replay:  # the same step again: refused (no replay)
         mfa.verify(w.cfo, now_code)
-    assert replay.value.code == "wrong_code"
+    assert replay.value.code == "replayed"  # refused, but not counted as a wrong code (verification item 7)
+    assert MfaDevice.objects.get(user=w.cfo).failures == 0
     mfa_clock.tick(10)  # wait out the throttle
     assert mfa.verify(w.cfo, totp.at(mfa_clock.at + timedelta(seconds=30)))  # one step ahead (drift)
     mfa_clock.tick(120)
@@ -301,16 +302,28 @@ def _clock_wait():
     _CLOCK[0].tick(60)
 
 
-def test_r16_access_admins_reset_only_people_without_mfa_roles_wholly_in_their_entities(w, group_mp):
+def test_r16_access_admins_reset_only_people_who_need_no_mfa_wholly_in_their_entities(w, group_mp):
     admin = person("alm_admin", (w.alm, "access_admin"))
-    hr = w.hr  # hr_officer in ALM: needs MFA through an approval right (OQ-29) but holds no MFA role
-    enrol(hr)
     assert not mfa.may_reset(admin, w.cfo)  # approver: an MFA role (review item 2)
-    assert not mfa.may_reset(person("sub_admin", (w.sub, "access_admin")), hr)  # another entity's admin
-    assert mfa.may_reset(admin, hr)
-    member(hr, w.sub, "viewer")
-    assert not mfa.may_reset(admin, hr)  # a membership where the actor is not access admin
-    assert mfa.may_reset(group_mp, hr) and mfa.may_reset(group_mp, w.cfo)
+    assert mfa.requires_mfa(w.hr) and not mfa.may_reset(admin, w.hr)  # approval right (OQ-29): verification item 2
+    staff = person("staff_v", (w.alm, "viewer"))  # a staff user who enrolled for Django admin, needs no MFA
+    staff.is_staff = True
+    staff.save(update_fields=["is_staff"])
+    enrol(staff)
+    assert not mfa.requires_mfa(staff)
+    assert not mfa.may_reset(person("sub_admin", (w.sub, "access_admin")), staff)  # another entity's admin
+    assert mfa.may_reset(admin, staff)
+    member(staff, w.sub, "viewer")
+    assert not mfa.may_reset(admin, staff)  # a membership where the actor is not access admin
+    delegate_target = w.acc  # an accountant needs no MFA, until made a delegate (verification item 1)
+    assert not mfa.requires_mfa(delegate_target)
+    from core.access import delegations
+    from core.access import services as access
+
+    delegations.delegate_authority(w.cfo, entity=w.alm, delegate=delegate_target,
+                                   valid_to=access.now() + timedelta(days=5), reason_en="Leave", reason_ar="إجازة")
+    assert mfa.requires_mfa(delegate_target) and not mfa.may_reset(admin, delegate_target)
+    assert mfa.may_reset(group_mp, w.hr) and mfa.may_reset(group_mp, w.cfo) and mfa.may_reset(group_mp, staff)
 
 
 def test_r16_managing_partner_and_chairman_are_reset_only_by_the_group_managing_partner(w, group_mp):

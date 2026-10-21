@@ -1143,6 +1143,60 @@ def approval_permissions():
     return sorted(code for code, perm in catalogue.CATALOGUE.items() if perm.is_approval)
 
 
+# web.md R13 (W-D6, OQ-3 default): roles whose holders need MFA. ``ceo`` (access §10): a subsidiary's top authority.
+MFA_ROLES = frozenset({"approver", "managing_partner", "chairman", "zatca_admin", "access_admin", "ceo"})
+
+
+def needs_mfa(user):
+    """True if ``user`` must use MFA in the web UI (web.md R13; OQ-29; verification review of f95e1c8, item 1): a
+    superuser, or an active person who holds an MFA role or any approval (**A**) permission in any entity, or who is
+    the delegate of an approval delegation in its active window (R62: a delegate approves). One query; grants
+    nothing. Shared by the web MFA gate and the admin password guard."""
+    if not _is_active_human(user):
+        return False
+    if user.is_superuser:
+        return True
+    from django.db.models import Exists
+
+    from .authority_models import ApprovalDelegation, active_window_q
+
+    at = now()
+    roles = Membership.objects.active(at).filter(
+        Q(role__code__in=list(MFA_ROLES)) | Q(role__permission_rows__codename__in=approval_permissions()),
+        user_id=user.pk, role__kind=Kind.HUMAN)
+    delegate = ApprovalDelegation.objects.filter(active_window_q(at), delegate_id=user.pk)
+    from django.contrib.auth import get_user_model  # request.user is a lazy wrapper: never type(user)
+
+    return get_user_model()._default_manager.filter(pk=user.pk).filter(Exists(roles) | Exists(delegate)).exists()
+
+
+def group_managing_partner_covers(actor, user):
+    """True if ``actor`` is the managing partner of a group parent and every active membership of ``user`` lies in
+    that group's tree (verification review of f95e1c8, item 5): the group MP acts for their own group only. A user
+    without memberships is covered by nobody (operator and superusers only)."""
+    if not _is_active_human(actor):
+        return False
+    at = now()
+    roots = set(Membership.objects.active(at).filter(
+        user=actor, role__code="managing_partner", entity__parent__isnull=True,
+        entity__consolidation=Entity.Consolidation.PARENT).values_list("entity_id", flat=True))
+    if not roots:
+        return False
+    theirs = list(Membership.objects.active(at).filter(user=user).select_related("entity"))
+    return bool(theirs) and all(group_parent_of(m.entity).pk in roots for m in theirs)
+
+
+def may_set_password(actor, user):
+    """Who may set another person's password in Django admin (verification review of f95e1c8, item 2): for a person
+    who must use MFA, only a superuser or the group managing partner of all their entities; for others, as before
+    (the admin's own permissions). A password reset must not undo the second factor's owner check."""
+    if actor is not None and getattr(actor, "pk", None) == getattr(user, "pk", None):
+        return True
+    if not needs_mfa(user):
+        return True
+    return bool(getattr(actor, "is_superuser", False)) or group_managing_partner_covers(actor, user)
+
+
 def set_preferred_language(user, language):
     """Change ``user``'s own UI and message language (web.md R27), logged as ``profile_changed`` (R27).
 

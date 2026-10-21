@@ -12,6 +12,7 @@ from core.access.authority_models import ApprovalDecision, ApprovalRequest
 from core.access.models import AccessLog
 from core.access.testing import make_agent
 from web.conftest import draft_invoice, next_code, person
+from web.models import MfaDevice
 
 pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("periods_now")]
 
@@ -128,8 +129,12 @@ def test_a_delegate_sees_and_approves_on_behalf_of_the_delegator(w, signed_in):
     listing = client.get("/e/ALM/inbox/").content.decode()
     assert f"/e/ALM/inbox/{req.pk}/" in listing
     assert ("On behalf of" in listing) or ("نيابة عن" in listing)
-    done = approve(client, "ALM", req)  # the accountant needs no MFA (R13): no step-up code
+    assert approve(client, "ALM", req).status_code == 400  # a delegate gives a fresh code (verification item 1)
+    assert status_of(w.alm_invoice) == "submitted"
+    assert MfaDevice.objects.filter(user=w.acc, confirmed=True).exists()  # the delegation made MFA required
+    done = approve(client, "ALM", req, code=next_code(w.acc))
     assert done.status_code == 302 and status_of(w.alm_invoice) != "submitted"
+    assert AccessLog.objects.filter(event="mfa_verified", actor=w.acc, details__purpose="step_up").exists()
     decision = request_of(w.alm_invoice, status="approved").decisions.get()
     assert decision.user == w.acc and decision.on_behalf_of == w.cfo and decision.delegation is not None
 

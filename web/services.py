@@ -25,7 +25,7 @@ LANGUAGE_COOKIE = "alm_lang"
 # R13 (W-D6, OQ-3 default): roles whose holders need MFA. Used in slice 1 for the shorter idle timeout (OQ-8).
 # ``ceo`` added 2026-10-21 (access §10, seed V18): the default top authority of every subsidiary holds every non-G
 # approval and may self-approve (R79), so it needs MFA like the approver and the managing partner.
-MFA_ROLES = frozenset({"approver", "managing_partner", "chairman", "zatca_admin", "access_admin", "ceo"})
+MFA_ROLES = access_services.MFA_ROLES  # defined with the access layer, which also guards admin passwords
 
 
 def _setting(name, default):
@@ -124,10 +124,11 @@ def is_web_user(user):
 def _requires_mfa(user):
     """R13: superusers, holders of an active MFA-role membership in any entity, and (OQ-29, team decision
     2026-10-21) holders of any approval (**A**) permission in any entity, e.g. ``hr_officer``, ``department_head``,
-    ``payroll_officer``. Derived from the catalogue, so a new role needs no code (one query)."""
+    ``payroll_officer``, and the delegates of active approval delegations. Derived from the catalogue, so a new role
+    needs no code (one query)."""
     if not is_web_user(user):
         return False
-    return user.is_superuser or access_services.holds_any_role(user, MFA_ROLES, or_approval_right=True)
+    return access_services.needs_mfa(user)  # also active approval delegates (verification review, item 1)
 
 
 def idle_timeout(user, required=None):

@@ -25,3 +25,9 @@ class Command(BaseCommand):
                           f"{result['old_recovery_codes']}{' (retired)' if result['expired'] else ''}.")
         for username in result["users"]:
             self.stdout.write(f"  renew recovery codes: {username}")
+        if result["unknown_key_recovery_codes"]:
+            self.stdout.write(f"Recovery codes with no key fingerprint (made before web/0004 with several keys "
+                              f"configured): {result['unknown_key_recovery_codes']}; not retired. Ask these people "
+                              "to renew their codes before an old key is removed:")
+            for username in result["unknown_key_users"]:
+                self.stdout.write(f"  renew recovery codes: {username}")

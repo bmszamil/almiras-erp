@@ -404,7 +404,7 @@ def _item_page(request, entity, pk, *, approve_form=None, send_back_form=None, e
     user, lang = request.user, request.web_lang
     found = inbox_services.item(user, entity, pk)
     found.why_key = f"inbox_why.{found.eligibility.why or 'not_eligible'}"
-    step_up = _step_up_needed(user)
+    step_up = _step_up_needed(user) or found.eligibility.delegation is not None
     version = {"version": found.version}
     context = {
         "item": found, "req": found.request, "step_up": step_up, "error": error, "active": "inbox",
@@ -471,8 +471,9 @@ def inbox_approve(request, entity, pk):
     if refused_response is not None:
         return refused_response
     user, lang = request.user, request.web_lang
-    inbox_services.item(user, entity, pk)  # 404 before any code is checked: nothing to guess against (review item 1)
-    step_up = _step_up_needed(user)
+    found = inbox_services.item(user, entity, pk)  # 404 before any code is read: nothing to guess against
+    # R15: a fresh code from everyone who must use MFA, and always when deciding as a delegate (verification item 1).
+    step_up = _step_up_needed(user) or found.eligibility.delegation is not None
     form = ApproveForm(request.POST, lang=lang)
     if not step_up:
         form.fields["code"].required = False

@@ -645,14 +645,22 @@ def approval_amount(document):
     """The amount the approval engine measures a sales document by (access R71, R73; web inbox): its stored total
     once issued; before issue, the gross of its priced lines computed in memory exactly as at issue (VAT per
     category and rate, half-up to the currency's decimals, R9, R93). Nothing is saved: the header totals are
-    still fixed at issue (R57). Lines are priced on the supply / draft date, so a VAT rate change between drafting
-    and issue would change the issued total (the request then refers to the drafted version). Security review
-    2026-10-21: the adapter measured ``total_gross``, which is 0 until issue."""
+    still fixed at issue (R57). The lines are re-priced in memory on the date issue would use (the supply date,
+    else today in Riyadh), so the measure is what approving now would issue; if pricing fails the stored line
+    amounts are used. ``approve_sales_document`` checks the issued total against the request's band again
+    (``engine.check_issued_band``). Security review 2026-10-21: the adapter measured ``total_gross``, 0 until
+    issue."""
     if document.status in PRICED_STATUSES:
         return document.total_gross
     lines = list(document.lines.select_related("vat_rate", "vat_exemption_reason"))
     if not lines:
         return document.total_gross
+    on = document.supply_date or _riyadh_now().date()
+    try:
+        for line in lines:
+            _price_line(line, on, _doc_places(document))  # in memory only: never saved here
+    except (InvoicingError, LedgerError):
+        lines = list(document.lines.select_related("vat_rate", "vat_exemption_reason"))
     _breakdown, net, vat, _vat_sar = _sales_breakdown(document, lines)
     return net + vat
 
@@ -1447,14 +1455,20 @@ def approve_sales_document(document, *, user):
     (bilingual), which do not block.
     """
     doc = SalesDocument.objects.select_related("entity", "customer").get(pk=document.pk)
-    grant = access.require(user, doc.entity, "invoicing.approve_sales_document", document=doc)
-    seen_version = doc.version  # the version the grant was checked against (segregation, R14)
     with transaction.atomic():
+        # The engine records the approval decision when it grants (access §10); granting inside this transaction
+        # means a refusal below (e.g. the issued total outside the routed band) also undoes that decision.
+        grant = access.require(user, doc.entity, "invoicing.approve_sales_document", document=doc)
+        seen_version = doc.version  # the version the grant was checked against (segregation, R14)
         doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity", "customer").get(pk=doc.pk)
         if doc.status != Status.SUBMITTED:
             raise error("Only submitted documents are approved.", "تُعتمد المستندات المقدمة فقط.", code="not_submitted")
         _refuse_stale_grant(grant, doc, seen_version)
         _issue_submitted(doc, rate_user=user, approved_by=user, approved_at=timezone.now())
+        # Verification review of f95e1c8, item 6: the issued total must still fall in the band the request was
+        # routed by (access R71, R73); otherwise refused (amount_outside_band) and nothing is issued.
+        approval_engine.check_issued_band(grant, amount=doc.total_gross, currency=doc.currency_id,
+                                 functional_amount=doc.total_gross_sar if doc.entity.base_currency_id == "SAR" else None)
         access.use_grant(grant, target=doc)  # a used, current approval: the clearance posting checks it (access R42)
         port = zatca_port.get_port()
         transaction.on_commit(lambda: port.submit_document(SalesDocument.objects.get(pk=doc.pk), user))

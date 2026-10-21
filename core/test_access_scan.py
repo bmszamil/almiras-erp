@@ -38,6 +38,10 @@ ALLOW = {
     "core/access/services.py:holds_any_role": "reads the user's own memberships (web session timeout, R13); "
                                                "grants nothing",
     "core/access/services.py:approval_permissions": "pure (catalogue codenames)",
+    "core/access/services.py:needs_mfa": "reads the user's own memberships and delegations (web.md R13); grants nothing",
+    "core/access/services.py:group_managing_partner_covers": "reads memberships for the MFA reset / admin password "
+                                                             "rule (web.md R16); grants nothing",
+    "core/access/services.py:may_set_password": "the admin password rule itself (web.md R13, R16); grants nothing",
     "core/access/services.py:set_preferred_language": "the signed-in person's own UI language; logged "
                                                        "profile_changed (web.md R27)",
     "invoicing/services.py:listed_customer_name": "pure: masks an individual's name on a row the caller read through "
@@ -151,6 +155,9 @@ ALLOW = {
     "core/access/engine.py:can_decide": "side-effect-free mirror of authorise for the inbox hint; decides nothing",
     "core/access/engine.py:document_of": "reads the document of a request already read in its entity",
     "core/access/engine.py:send_back_action": "pure lookup of the module adapter's return / reject service",
+    "core/access/engine.py:document_version": "pure (the version of a document the caller holds)",
+    "core/access/engine.py:check_issued_band": "re-checks a grant already issued by require() against the issued "
+                                               "amount (R71, R73); refuses, never grants",
     "core/access/engine.py:note_en": "pure read of the reason of the decide() call now running (web.md R8)",
     "invoicing/services.py:approval_amount": "pure: the engine's band measure of a document the engine already holds "
                                              "(priced lines summed in memory, nothing saved; access R71, R73)",

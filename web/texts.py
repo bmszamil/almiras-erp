@@ -161,6 +161,8 @@ TEXTS = {
                                  "تطبيق المصادقة مُعدّ لديك. إن فقدته فاطلب من مسؤول الصلاحيات إعادة تعيينه."),
     "mfa_err_not_allowed": ("You may not do this.", "لا يحق لك القيام بذلك."),
     "mfa_err_reason_required": ("A reason is required.", "السبب مطلوب."),
+    "mfa_err_replayed": ("This code was already used. Wait for the next code from your app.",
+                         "سبق استخدام هذا الرمز. انتظر الرمز التالي من التطبيق."),
     "mfa_err_expired": ("This set-up was started more than 15 minutes ago. Start again with a new key.",
                         "بدأ هذا الإعداد قبل أكثر من 15 دقيقة. ابدأ من جديد بمفتاح جديد."),
     "mfa_err_session_not_verified": ("Verify your own session with two-step verification first.",

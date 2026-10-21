@@ -38,7 +38,7 @@ def register():
     engine.register(
         SalesDocument, "invoicing.sales_document", permission="invoicing.approve_sales_document",
         submit_permission="invoicing.submit_sales_document",
-        amount=services.approval_amount, currency=lambda d: d.currency_id,
+        amount=lambda d: services.approval_amount(d), currency=lambda d: d.currency_id,
         beneficiaries=lambda d: _employee_users(d.customer),
         label=lambda d: _label(d, "Sales document", "مستند مبيعات"),
         approve=lambda d, user: services.approve_sales_document(d, user=user),

@@ -5,10 +5,11 @@
   DEBUG is off: approvers, the Managing Partner, the chairman, CEOs, ZATCA and access admins and superusers would
   sign in with a password only. Since slice 2 MFA is built and on by default, so the check passes unless someone
   switches MFA off.
+* ``web.E003``: ``SECRET_KEY`` is the development default or shorter than 50 characters while DEBUG is off.
 * ``web.E002``: ``WEB_MFA_KEYS`` missing, shorter than 32 characters, with white space or a placeholder, while DEBUG
   is off: TOTP secrets could not be encrypted at rest (R16, OQ-2).
 
-Both are deploy-only checks, so ``migrate``, scheduled jobs and the test suite are not affected.
+All are deploy-only checks, so ``migrate``, scheduled jobs and the test suite are not affected.
 """
 from django.conf import settings
 from django.core.checks import Error, Tags, register
@@ -23,6 +24,31 @@ def mfa_enforced(app_configs=None, **kwargs):
         "(web.md R13 to R16). / المصادقة متعددة العوامل معطلة في واجهة الويب.",
         hint="Go-live blocker. Remove DJANGO_WEB_MFA_ENFORCED=0 (MFA is on by default).",
         id="web.E001",
+    )]
+
+
+DEV_SECRET_KEY = "dev-only-change-me"  # config/settings.py default
+
+
+@register(Tags.security, deploy=True)
+def secret_key_strong(app_configs=None, **kwargs):
+    """web.E003 (verification review of f95e1c8, item 9): with DEBUG off, ``SECRET_KEY`` must not be the development
+    default and must be at least 50 characters. It signs sessions and keys the sign-in throttle (R17, R18)."""
+    key = settings.SECRET_KEY or ""
+    if settings.DEBUG:
+        return []
+    problems = []
+    if key == DEV_SECRET_KEY or key.startswith(("dev-only", "django-insecure")):
+        problems.append("it is the development default")
+    if len(key) < 50:
+        problems.append("it is shorter than 50 characters")
+    if not problems:
+        return []
+    return [Error(
+        "SECRET_KEY is not fit for production: " + "; ".join(problems) + ". / مفتاح SECRET_KEY غير صالح للتشغيل.",
+        hint="Set DJANGO_SECRET_KEY (DJANGO_SECRET_KEY_FILE, Docker secret django_secret_key, made by "
+             "deploy/init-secrets.sh) to a random value of 50 characters or more.",
+        id="web.E003",
     )]
 
 
