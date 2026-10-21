@@ -258,8 +258,10 @@ _PERMS = [
     _p("payroll.approve_settlement_correction", "Approve and post final settlement corrections",
        "اعتماد تصحيحات المخالصات النهائية وترحيلها", APPROVAL, POSTS),
     _p("payroll.prepare_loan_write_off", "Prepare loan write-offs on exit", "إعداد شطب القروض عند انتهاء الخدمة"),
-    _p("payroll.approve_loan_write_off", "Approve and post loan write-offs", "اعتماد شطب القروض وترحيله", APPROVAL,
-       POSTS),
+    # Payroll review 5 (2026-10-21, item 7): the same right approves bai' ajel balances after exit (write-off or
+    # recovery); a separate activity comes with the authority-matrix branch.
+    _p("payroll.approve_loan_write_off", "Approve and post loan and bai' ajel write-offs and recoveries",
+       "اعتماد شطب القروض والبيع الآجل واستردادها وترحيلها", APPROVAL, POSTS),
     _p("payroll.manage_cost_items", "Enter employee cost items", "إدخال بنود تكاليف الموظفين"),
     _p("payroll.approve_cost_item", "Approve employee cost items", "اعتماد بنود تكاليف الموظفين", APPROVAL),
     _p("payroll.prepare_cost_report", "Prepare secondment cost reports", "إعداد تقارير تكلفة الإعارة"),

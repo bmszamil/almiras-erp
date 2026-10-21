@@ -822,7 +822,7 @@ Every row becomes an `ApprovalActivity` with an engine adapter. "Default" = the 
 | `payroll.loan`, `payroll.loan_schedule` | `approve_loan`, `approve_schedule` | `payroll.approve_loan` | Almiras: MP; others: top authority (OQ-39) | Y | R82 |
 | `payroll.deferred_sale_terms`, `payroll.deferred_sale`, `payroll.deferred_sale_rebate` | `approve_deferred_sale_terms`, `approve_deferred_sale`, `approve_deferred_sale_rebate` | `payroll.approve_deferred_sale_terms` / `_sale` | Almiras: MP; others: top authority (OQ-39) | via invoicing | R82 |
 | `payroll.final_settlement`, `payroll.settlement_correction` | `approve_final_settlement`, `approve_settlement_correction` | `payroll.approve_final_settlement` / `_settlement_correction` | `approver` | Y | R82 |
-| `payroll.loan_write_off` | `approve_loan_write_off` | `payroll.approve_loan_write_off` | top authority (payroll OQ-7) | Y | R82 |
+| `payroll.loan_write_off` (loan and bai' ajel write-offs and recoveries) | `approve_loan_write_off`, `approve_deferred_sale_closure` (bai' ajel balance after exit written off or recovered; payroll §10.9 item 27, review 5 item 7) | `payroll.approve_loan_write_off` ("Approve and post loan and bai' ajel write-offs and recoveries") | top authority (payroll OQ-7) | Y | R82 |
 | `payroll.cost_item`, `payroll.cost_report` | `approve_cost_item`, `approve_cost_report` | `payroll.approve_cost_item` / `_cost_report` | `approver` | | |
 | `payroll.gosi_fine` | `approve_gosi_fine` | `payroll.approve_gosi_fine` | `approver` | Y | |
 | `payroll.profit_recognition` | (bai' ajel E12) | `payroll.approve_profit_recognition` | `approver` | via invoicing | |
