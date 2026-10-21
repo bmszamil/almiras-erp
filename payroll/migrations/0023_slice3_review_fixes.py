@@ -57,7 +57,7 @@ END;
 $$ LANGUAGE plpgsql;
 """
 
-# payroll.0021's version, restored on the way back.
+# payroll.0022's version, restored on the way back.
 TRIGGER_0021 = r"""
 CREATE OR REPLACE FUNCTION payroll_mudad_justification_lock() RETURNS trigger AS $$
 DECLARE
@@ -126,7 +126,7 @@ class Migration(migrations.Migration):
     dependencies = [
         ("core", "0027_seed_access_v17_payroll_slice3"),
         ("hr", "0021_contract_pay_rate_basis"),
-        ("payroll", "0021_slice3_data_and_guards"),
+        ("payroll", "0022_slice3_data_and_guards"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

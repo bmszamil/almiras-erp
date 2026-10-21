@@ -12,7 +12,7 @@ class Migration(migrations.Migration):
     dependencies = [
         ("core", "0026_alter_accesslog_event"),
         ("hr", "0021_contract_pay_rate_basis"),
-        ("payroll", "0019_review_fixes_rebate_token"),
+        ("payroll", "0020_review_fixes_rebate_closure_wht"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

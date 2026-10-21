@@ -4,6 +4,7 @@ from importlib import import_module
 
 import pytest
 from django.contrib.auth import SESSION_KEY
+from django.db import connection
 from django.test import Client
 
 from core.access.models import AccessLog
@@ -127,7 +128,10 @@ def test_r10_a_remembered_entity_no_longer_visible_is_not_used(w, signed_in):
     assert response.headers["Location"] == "/e/ALM/"
 
 
-def test_wt5_page_without_the_view_right_is_a_bilingual_403_and_hidden_from_the_menu(w, signed_in):
+def test_wt5_page_without_the_view_right_is_a_bilingual_403_and_hidden_from_the_menu(w, signed_in, monkeypatch):
+    # On PostgreSQL each request is atomic and the denial rolls it back; in production the log row survives on its
+    # own connection (core/test_access_log_rollback.py). Here the request runs without that transaction.
+    monkeypatch.setitem(connection.settings_dict, "ATOMIC_REQUESTS", False)
     client = signed_in(w.hr)  # hr_officer: ledger.view, no invoicing.view
     before = AccessLog.objects.filter(event="permission_denied").count()
     response = client.get("/e/ALM/sales/documents/")

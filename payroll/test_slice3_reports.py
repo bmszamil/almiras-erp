@@ -165,7 +165,7 @@ def test_r75_reports_are_stored_never_edited_and_superseded(w):
         l.delete()
     from django.db import connection, transaction
     sql = "UPDATE payroll_payrollliabilityreportline SET amount = 1 WHERE report_id = %s"
-    if connection.vendor == "postgresql":  # the database refuses a change of a stored line (0021)
+    if connection.vendor == "postgresql":  # the database refuses a change of a stored line (payroll.0022)
         with pytest.raises(Exception), transaction.atomic(), connection.cursor() as cursor:
             cursor.execute(sql, [second.pk])
     else:  # SQLite has no trigger: reading the tampered snapshot is refused by its hash

@@ -19,6 +19,7 @@ class FakeInvoicingPort:
         self.reversed = []  # (contract pk, source_ref, user pk)
         self.rebates = []  # (contract pk, source_ref, amount, user pk)
         self.rebate_status = "issued"
+        self.unearned = None  # review 4: what unearned_bai_ajel_profit reports (None: pro rata, see there)
 
     def create_bai_ajel_sale(self, contract, *, user):
         vat = (contract.sale_price * Decimal("0.15")).quantize(Decimal("0.01"))
@@ -52,6 +53,18 @@ class FakeInvoicingPort:
             return None
         return SimpleNamespace(document_ref=f"TEST-CN-{contract.pk}-{len(self.rebates)}", net_amount=mine[-1][2],
                                vat_amount=Decimal("0"), status=self.rebate_status)
+
+    def unearned_bai_ajel_profit(self, contract):
+        """Review 4 (item 5): the profit not yet recognised on the contract. The fake books nothing, so unless
+        ``unearned`` is set it is the fixed profit's share of what is outstanding after exit (profit x balance /
+        receivable, rounded)."""
+        if self.unearned is not None:
+            return Decimal(self.unearned)
+        from .models import DeferredSaleInstallment
+
+        rows = DeferredSaleInstallment.objects.filter(contract=contract, status="outstanding_after_exit")
+        balance = sum((i.amount for i in rows), Decimal("0"))
+        return (contract.profit_amount * balance / contract.receivable).quantize(Decimal("0.01"))
 
     def reverse_bai_ajel_profit(self, contract, *, source_ref, user, on=None, reason=""):
         self.reversed.append((contract.pk, source_ref, user.pk))

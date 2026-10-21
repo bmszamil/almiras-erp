@@ -16,6 +16,9 @@ class PayrollConfig(AppConfig):
     (``payroll.approve_gosi_fine``, E14); ``PayrollPayment`` is reversed with ``payroll.reverse_payment`` only inside
     ``payroll.services.reverse_payment``.
 
+    Review 4 (2026-10-21): ``DeferredSaleClosure`` (``payroll.approve_loan_write_off``): a bai' ajel balance left after
+    exit written off (posts 1240 and 1241) or recovered (posts 1240).
+
     Every type builds its own lines from stored data, only inside a ``payroll.services`` posting.
     """
 
@@ -26,8 +29,8 @@ class PayrollConfig(AppConfig):
         from ledger import documents, restricted
 
         from . import services
-        from .models import (EmployeeLoan, FinalSettlement, GosiFine, LoanWriteOff, PayrollPayment, PayrollRun,
-                             SettlementCorrection)
+        from .models import (DeferredSaleClosure, EmployeeLoan, FinalSettlement, GosiFine, LoanWriteOff,
+                             PayrollPayment, PayrollRun, SettlementCorrection)
 
         documents.register(PayrollRun, post_permissions={"payroll.approve_run"},
                            reverse_permissions={"payroll.reverse_run"}, build_lines=services._run_lines,
@@ -48,6 +51,12 @@ class PayrollConfig(AppConfig):
         # (the bai' ajel instalments they collect, E11, E13), and so do their reversals.
         for doc_type in ("payroll.payrollrun", "payroll.finalsettlement"):
             restricted.allow("1240", document_type=doc_type)
+        # Review 4 (2026-10-21, item 5): a bai' ajel balance left after exit, written off (Dr 1241 unearned profit /
+        # Dr write-off account / Cr 1240) or recovered (Dr bank / Cr 1240); four eyes under the write-off right.
+        documents.register(DeferredSaleClosure, post_permissions={"payroll.approve_loan_write_off"},
+                           build_lines=services._closure_lines)
+        restricted.allow("1240", document_type="payroll.deferredsaleclosure")
+        restricted.allow("1241", document_type="payroll.deferredsaleclosure", predicate=services._closure_entry_allowed)
         # OQ-30 (R43): payroll's remuneration WHT goes into invoicing's monthly WHT return and its 2220 tie-out.
         from invoicing import services as invoicing_services
         invoicing_services.register_wht_return_source("payroll.payrollpayment", services._wht_return_source)
