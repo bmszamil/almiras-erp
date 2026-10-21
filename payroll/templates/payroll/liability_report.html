@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head><meta charset="utf-8"><title>{% if kind == "leave" %}التزام الإجازات{% else %}مخصص مكافأة نهاية الخدمة{% endif %} {{ as_of|date:"Y-m-d" }} / <span lang="en" dir="ltr">Liability report</span></title></head>
+<body>
+<header>
+  <h1>{% if kind == "leave" %}تقرير التزام الإجازات / <span lang="en" dir="ltr">Leave liability report</span>{% else %}تقرير مخصص مكافأة نهاية الخدمة / <span lang="en" dir="ltr">End-of-service provision report</span>{% endif %}</h1>
+  <p><strong>النص العربي هو المعتمد / <span lang="en" dir="ltr">The Arabic text prevails</span></strong></p>
+  <p><strong>تقرير فقط: لا يُرحَّل شيء / <span lang="en" dir="ltr">Report only: nothing is posted</span></strong></p>
+  <p>الكيان / <span lang="en" dir="ltr">Entity</span>: {{ entity }} &middot; كما في / <span lang="en" dir="ltr">As at</span>: {{ as_of|date:"Y-m-d" }} &middot; الحالة / <span lang="en" dir="ltr">Status</span>: {{ status }} &middot; العملة / <span lang="en" dir="ltr">Currency</span>: {{ currency }}</p>
+  <p>{{ basis_ar }}</p>
+  <p lang="en" dir="ltr">{{ basis_en }}</p>
+</header>
+<section>
+  <h2>الإجمالي / <span lang="en" dir="ltr">Totals</span></h2>
+  <p>الأيام / <span lang="en" dir="ltr">Days</span>: {{ total_days }} &middot; المبلغ / <span lang="en" dir="ltr">Amount</span>: {{ total_amount }}</p>
+  {% if account_2500_memo is not None %}<p>رصيد الحساب 2500 في التاريخ (للعلم) / <span lang="en" dir="ltr">Account 2500 on the date (memo)</span>: {{ account_2500_memo }}</p>{% endif %}
+  <p>مُقيّم / <span lang="en" dir="ltr">Valued</span>: {{ counts.valued }} &middot; غير مُقيّم / <span lang="en" dir="ltr">Not valued</span>: {{ counts.not_valued }} &middot; مستبعد / <span lang="en" dir="ltr">Excluded</span>: {{ counts.excluded }}</p>
+</section>
+{% if detail %}
+<table>
+  <thead><tr><th>رقم الموظف / <span lang="en" dir="ltr">Employee code</span></th><th>التقييم / <span lang="en" dir="ltr">Valuation</span></th>
+  {% if kind == "leave" %}<th>رصيد السجل / <span lang="en" dir="ltr">Balance</span></th><th>نسبة الشهر / <span lang="en" dir="ltr">Pro rata</span></th><th>إجازة لاحقة / <span lang="en" dir="ltr">Future leave</span></th><th>غير مستخدمة / <span lang="en" dir="ltr">Untaken</span></th><th>الأجر اليومي / <span lang="en" dir="ltr">Daily wage</span></th>
+  {% else %}<th>بداية الخدمة / <span lang="en" dir="ltr">Service start</span></th><th>أيام الخدمة / <span lang="en" dir="ltr">Service days</span></th><th>أساس الأجر / <span lang="en" dir="ltr">Wage basis</span></th><th>المادة 84 / <span lang="en" dir="ltr">Art. 84</span></th><th>المادة 85 للعلم / <span lang="en" dir="ltr">Art. 85 memo</span></th><th>رصيد السجل للعلم / <span lang="en" dir="ltr">Sub-ledger memo</span></th>{% endif %}
+  <th>المبلغ / <span lang="en" dir="ltr">Amount</span></th><th>السبب / <span lang="en" dir="ltr">Reason</span></th></tr></thead>
+  <tbody>
+  {% for l in lines %}<tr><td>{{ l.employee_code }}</td><td>{{ l.valuation }}</td>
+  {% if kind == "leave" %}<td>{{ l.balance_days|default_if_none:"" }}</td><td>{{ l.pro_rata_days|default_if_none:"" }}</td><td>{{ l.future_leave_days|default_if_none:"" }}</td><td>{{ l.untaken_days|default_if_none:"" }}</td><td>{{ l.daily_wage|default_if_none:"" }}</td>
+  {% else %}<td>{{ l.service_start|date:"Y-m-d" }}</td><td>{{ l.service_days|default_if_none:"" }}</td><td>{{ l.wage_basis|default_if_none:"" }}</td><td>{{ l.art84_full_award|default_if_none:"" }}</td><td>{{ l.art85_resignation_memo|default_if_none:"" }}</td><td>{{ l.subledger_balance_memo|default_if_none:"" }}</td>{% endif %}
+  <td>{{ l.amount }}</td><td>{{ l.reason_ar }}{% if l.reason_en %} / <span lang="en" dir="ltr">{{ l.reason_en }}</span>{% endif %}</td></tr>{% endfor %}
+  </tbody>
+</table>
+{% endif %}
+<footer><p>البصمة / <span lang="en" dir="ltr">SHA-256</span>: <span dir="ltr">{{ sha256 }}</span></p></footer>
+</body>
+</html>

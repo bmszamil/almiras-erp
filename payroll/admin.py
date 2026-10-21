@@ -92,3 +92,26 @@ class WpsFileAdmin(PayrollAdmin):
     access_view_permission = "payroll.generate_wps_file"
     list_display = ["entity", "run", "format_code", "generated_at", "employee_count", "total_amount", "sha256"]
     exclude = ["content", "bank_processed_content", "exceptions"]
+
+
+# Slice 3 (§11): read-only. Justifications are one person's pay (codes and amounts): payroll.view_payslip; exports
+# hold MOL-IDs and are never shown (downloads would be a logged service); liability reports show totals only.
+@admin.register(models.MudadJustification)
+class MudadJustificationAdmin(IndividualPayAdmin):
+    list_display = ["run", "employee_code", "entity", "kind", "reason", "status", "mudad_option_ar", "due_date"]
+    list_filter = ["status", "kind", "reason"]
+    exclude = ["payslip"]
+
+
+@admin.register(models.MudadJustificationExport)
+class MudadJustificationExportAdmin(PayrollAdmin):
+    access_view_permission = "payroll.generate_wps_file"
+    list_display = ["entity", "run", "format_code", "generated_at", "row_count", "sha256"]
+    exclude = ["content", "justification_ids"]
+
+
+@admin.register(models.PayrollLiabilityReport)
+class PayrollLiabilityReportAdmin(PayrollAdmin):
+    access_view_permission = "payroll.view_cost_reports"
+    list_display = ["entity", "kind", "as_of", "status", "total_amount", "generated_at"]
+    list_filter = ["kind", "status"]

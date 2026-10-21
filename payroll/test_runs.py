@@ -61,12 +61,12 @@ def test_at2_new_entity_runs_as_data_egypt_and_unactivated_refused(w):
     hr.approve_contract(hr.submit_contract(c, user=hn), user=cn)
     run = services.calculate_run(services.create_run(new, user=pn, period="2027-03"), user=pn)
     assert run.payslips.get().gross == D("4000.00")  # no code change for a new entity (R3)
-    # Slice 2 (§10.8 item 7): Egypt is calculated from its own rows (payroll/test_slice2_egypt.py); its runs are
-    # regular in-country runs only.
+    # Slice 2 (§10.8 item 7): Egypt is calculated from its own rows (payroll/test_slice2_egypt.py); slice 3 (R69):
+    # an Egypt off-cycle run waits for the period's approved regular run (payroll/test_slice3_off_cycle.py).
     assert services.create_run(w.egy, user=w.pe, period="2027-03").status == "draft"
     with pytest.raises(PayrollError) as exc:
         services.create_run(w.egy, user=w.pe, period="2027-03", kind="off_cycle", reason_ar="سبب", employees=[emp])
-    assert exc.value.code == "off_cycle_not_built" and " / " in exc.value.messages[0]
+    assert exc.value.code == "regular_run_open" and " / " in exc.value.messages[0]
     uae = make_entity("UAE", "full", w.alm, country="AE", currency="AED")
     pu, cu = make_user("pu"), make_user("cu")
     member(pu, uae, "payroll_officer")
