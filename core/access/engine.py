@@ -919,6 +919,12 @@ def _step_pending(auth, user, permission):
            {"request": auth.request.pk, "remaining": remaining}, remaining=remaining)
 
 
+def note_en():
+    """The English reason of the ``decide()`` return / reject now running (web.md R8): adapters pass it to module
+    services that take ``reason_en`` (security review 2026-10-21, item 6)."""
+    return _note.get()[1]
+
+
 @contextmanager
 def purpose(name):
     """Mark a module's use of an approval permission that is not an approval (``return``, ``reject``, ``check``):

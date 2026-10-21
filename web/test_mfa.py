@@ -243,6 +243,20 @@ def test_r16_security_page_renews_codes_with_a_code(w, signed_in):
     assert renewed.status_code == 200 and len(re.findall(r"<code>", renewed.content.decode())) == 10
 
 
+def verified(actor):
+    """A verified session of ``actor`` (enrolled here if needed), as a session mapping."""
+    if mfa.device_of(actor) is None:
+        enrol(actor)
+    return {mfa.VERIFIED_KEY: MfaDevice.objects.get(user=actor).pk}
+
+
+def reset(actor, user, reason="Phone lost, ticket 7", **kwargs):
+    session = kwargs.pop("session", None)
+    session = verified(actor) if session is None else session
+    return mfa.reset_device(actor, user, reason=reason, session=session, code=kwargs.pop("code", None)
+                            or next_code(actor))
+
+
 def test_r16_an_enrolled_user_cannot_enrol_again_or_reset_themselves(w, client):
     enrol(w.cfo)
     with pytest.raises(mfa.MfaError) as exc:
@@ -251,34 +265,66 @@ def test_r16_an_enrolled_user_cannot_enrol_again_or_reset_themselves(w, client):
     login(client, w.cfo)
     assert client.post("/mfa/enrol/")["Location"].startswith("/mfa/verify/")
     with pytest.raises(mfa.MfaError) as own:
-        mfa.reset_device(w.cfo, w.cfo, reason="lost phone")
+        reset(w.cfo, w.cfo, reason="lost phone")
     assert own.value.code == "not_allowed"
 
 
-def test_r16_reset_by_the_users_access_admin_or_the_managing_partner_only_and_logged(w, signed_in):
+@pytest.fixture
+def group_mp(w):
+    return person("mp", (w.alm, "managing_partner"))
+
+
+def test_r16_group_managing_partner_resets_an_approver_with_a_verified_session_and_a_code_logged(w, group_mp):
     enrol(w.cfo)
-    other_admin = person("sub_admin", (w.sub, "access_admin"))
-    with pytest.raises(mfa.MfaError):
-        mfa.reset_device(other_admin, w.cfo, reason="x")  # access admin of another entity
     with pytest.raises(mfa.MfaError) as no_reason:
-        mfa.reset_device(person("alm_admin", (w.alm, "access_admin")), w.cfo, reason=" ")
+        reset(group_mp, w.cfo, reason=" ")
     assert no_reason.value.code == "reason_required"
-    admin = person("alm_admin2", (w.alm, "access_admin"))
-    assert mfa.reset_device(admin, w.cfo, reason="Phone lost, ticket 7")
+    with pytest.raises(mfa.MfaError) as unverified:
+        reset(group_mp, w.cfo, session={})  # review item 2: the actor's own session must be verified
+    assert unverified.value.code == "session_not_verified"
+    with pytest.raises(mfa.MfaError) as wrong:
+        reset(group_mp, w.cfo, code="000000")  # and a fresh code (step-up)
+    assert wrong.value.code == "wrong_code" and MfaDevice.objects.filter(user=w.cfo).exists()
+    _clock_wait()
+    assert reset(group_mp, w.cfo)
     row = events("mfa_reset").get()
-    assert row.actor == admin and row.subject_user == w.cfo and row.details["reason"] == "Phone lost, ticket 7"
+    assert row.actor == group_mp and row.subject_user == w.cfo and row.details["reason"] == "Phone lost, ticket 7"
     assert not MfaDevice.objects.filter(user=w.cfo).exists() and not RecoveryCode.objects.filter(user=w.cfo).exists()
-    mp = person("mp", (w.alm, "managing_partner"))
-    enrol(w.cfo)
-    assert mfa.reset_device(mp, w.cfo, reason="new phone")
+    assert AccessLog.objects.filter(event="mfa_verified", actor=group_mp, details__purpose="reset").exists()
     with pytest.raises(mfa.MfaError):
-        mfa.reset_device(mp, w.su, reason="superusers only by the operator command")
+        reset(group_mp, w.su, reason="superusers only by the operator command")
 
 
-def test_r16_a_reset_ends_the_verified_session_at_the_next_request(w, signed_in):
+def _clock_wait():
+    from web.conftest import _CLOCK
+
+    _CLOCK[0].tick(60)
+
+
+def test_r16_access_admins_reset_only_people_without_mfa_roles_wholly_in_their_entities(w, group_mp):
+    admin = person("alm_admin", (w.alm, "access_admin"))
+    hr = w.hr  # hr_officer in ALM: needs MFA through an approval right (OQ-29) but holds no MFA role
+    enrol(hr)
+    assert not mfa.may_reset(admin, w.cfo)  # approver: an MFA role (review item 2)
+    assert not mfa.may_reset(person("sub_admin", (w.sub, "access_admin")), hr)  # another entity's admin
+    assert mfa.may_reset(admin, hr)
+    member(hr, w.sub, "viewer")
+    assert not mfa.may_reset(admin, hr)  # a membership where the actor is not access admin
+    assert mfa.may_reset(group_mp, hr) and mfa.may_reset(group_mp, w.cfo)
+
+
+def test_r16_managing_partner_and_chairman_are_reset_only_by_the_group_managing_partner(w, group_mp):
+    admin = person("alm_admin", (w.alm, "access_admin"))
+    chairman = person("chair", (w.alm, "chairman"))
+    other_mp = person("mp2", (w.alm, "managing_partner"))
+    assert not mfa.may_reset(admin, chairman) and not mfa.may_reset(admin, other_mp)
+    assert mfa.may_reset(group_mp, chairman) and mfa.may_reset(group_mp, other_mp)
+
+
+def test_r16_a_reset_ends_the_verified_session_at_the_next_request(w, signed_in, group_mp):
     client = signed_in(w.cfo)
     assert client.get("/e/ALM/").status_code == 200
-    mfa.reset_device(person("alm_admin", (w.alm, "access_admin")), w.cfo, reason="lost")
+    reset(group_mp, w.cfo, reason="lost")
     response = client.get("/e/ALM/")
     assert response.status_code == 302 and response["Location"].startswith("/mfa/enrol/")
 

@@ -37,6 +37,7 @@ ALLOW = {
                                                  "entities_for over the catalogue, web.md R9)",
     "core/access/services.py:holds_any_role": "reads the user's own memberships (web session timeout, R13); "
                                                "grants nothing",
+    "core/access/services.py:approval_permissions": "pure (catalogue codenames)",
     "core/access/services.py:set_preferred_language": "the signed-in person's own UI language; logged "
                                                        "profile_changed (web.md R27)",
     "invoicing/services.py:listed_customer_name": "pure: masks an individual's name on a row the caller read through "
@@ -138,6 +139,10 @@ ALLOW = {
     "core/access/engine.py:can_decide": "side-effect-free mirror of authorise for the inbox hint; decides nothing",
     "core/access/engine.py:document_of": "reads the document of a request already read in its entity",
     "core/access/engine.py:send_back_action": "pure lookup of the module adapter's return / reject service",
+    "core/access/engine.py:note_en": "pure read of the reason of the decide() call now running (web.md R8)",
+    "invoicing/services.py:approval_amount": "pure: the engine's band measure of a document the engine already holds "
+                                             "(priced lines summed in memory, nothing saved; access R71, R73)",
+    "web/mfa.py:rekey": "web_mfa_rekey operator command only (key rotation, R16); logged mfa_rekeyed",
     "core/access/engine.py:current_version": "reads the document version for the R7 check before engine.decide",
     "core/access/inbox.py:pending": "the scope mechanism of the inbox: one entity's open requests filtered by "
                                     "engine.can_decide (own memberships or delegation, R61, R62)",

@@ -413,6 +413,7 @@ class AccessAlert(models.Model):
         DELEGATION_EXPIRING = "delegation_expiring", bi("Delegation expiring", "قرب انتهاء التفويض")
         REPORT_UNREVIEWED = "report_unreviewed", bi("Governance report not reviewed", "تقرير الحوكمة لم يُراجع")
         REPORT_MISSING_USER = "report_missing_user", bi("Governance report not generated", "لم يُنشأ تقرير الحوكمة")
+        MFA_LOCKED = "mfa_locked", bi("Two-step verification locked again", "قُفل التحقق بخطوتين مرة أخرى")  # web OQ-30
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
     recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="access_alerts")

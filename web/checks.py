@@ -5,7 +5,8 @@
   DEBUG is off: approvers, the Managing Partner, the chairman, CEOs, ZATCA and access admins and superusers would
   sign in with a password only. Since slice 2 MFA is built and on by default, so the check passes unless someone
   switches MFA off.
-* ``web.E002``: no ``WEB_MFA_KEYS`` while DEBUG is off: TOTP secrets could not be encrypted at rest (R16, OQ-2).
+* ``web.E002``: ``WEB_MFA_KEYS`` missing, shorter than 32 characters, with white space or a placeholder, while DEBUG
+  is off: TOTP secrets could not be encrypted at rest (R16, OQ-2).
 
 Both are deploy-only checks, so ``migrate``, scheduled jobs and the test suite are not affected.
 """
@@ -27,10 +28,17 @@ def mfa_enforced(app_configs=None, **kwargs):
 
 @register(Tags.security, deploy=True)
 def mfa_keys_configured(app_configs=None, **kwargs):
-    if settings.DEBUG or getattr(settings, "WEB_MFA_KEYS", None):
+    from .crypto import key_problems
+
+    if settings.DEBUG:
+        return []
+    problems = key_problems()
+    if not problems:
         return []
     return [Error(
-        "WEB_MFA_KEYS is not set: TOTP secrets cannot be encrypted at rest (web.md R16). / لم يُضبط WEB_MFA_KEYS.",
-        hint="Set WEB_MFA_KEYS (WEB_MFA_KEYS_FILE, Docker secret web_mfa_keys, made by deploy/init-secrets.sh).",
+        "WEB_MFA_KEYS is not usable: TOTP secrets cannot be encrypted at rest (web.md R16): " + "; ".join(problems)
+        + ". / مفاتيح WEB_MFA_KEYS غير صالحة.",
+        hint="Set WEB_MFA_KEYS (WEB_MFA_KEYS_FILE, Docker secret web_mfa_keys, made by deploy/init-secrets.sh): "
+             "comma-separated random keys of 32 characters or more.",
         id="web.E002",
     )]

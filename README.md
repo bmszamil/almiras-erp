@@ -21,6 +21,7 @@ In-house ERP for the Almiras group. Python / Django / PostgreSQL, all open sourc
 ## Run it
 ```bash
 pip install -r requirements.txt
+export DJANGO_DEBUG=1                 # local development only: DEBUG is off by default (dev keys, plain-HTTP cookies)
 python manage.py migrate
 python manage.py setup_almiras        # Almiras entity (registration + address from core/setup_data/almiras.json), 66 accounts, 2027 periods
 python manage.py createsuperuser      # technical admin only: no business rights (access.md R24)

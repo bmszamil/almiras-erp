@@ -635,6 +635,22 @@ def listed_customer_name(document, language):
 PRICED_STATUSES = frozenset({SalesDocument.Status.ISSUED, SalesDocument.Status.FINAL, SalesDocument.Status.REJECTED})
 
 
+def approval_amount(document):
+    """The amount the approval engine measures a sales document by (access R71, R73; web inbox): its stored total
+    once issued; before issue, the gross of its priced lines computed in memory exactly as at issue (VAT per
+    category and rate, half-up to the currency's decimals, R9, R93). Nothing is saved: the header totals are
+    still fixed at issue (R57). Lines are priced on the supply / draft date, so a VAT rate change between drafting
+    and issue would change the issued total (the request then refers to the drafted version). Security review
+    2026-10-21: the adapter measured ``total_gross``, which is 0 until issue."""
+    if document.status in PRICED_STATUSES:
+        return document.total_gross
+    lines = list(document.lines.select_related("vat_rate", "vat_exemption_reason"))
+    if not lines:
+        return document.total_gross
+    _breakdown, net, vat, _vat_sar = _sales_breakdown(document, lines)
+    return net + vat
+
+
 def sales_document_detail(entity, pk, *, user):
     """One sales document of ``entity`` for the read-only screen (``invoicing.view``; web.md R3, R4, R24, R40).
 

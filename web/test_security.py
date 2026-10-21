@@ -192,7 +192,7 @@ def test_web_e002_needs_mfa_keys_outside_debug(settings):
     settings.DEBUG, settings.WEB_MFA_KEYS = False, []
     (error,) = mfa_keys_configured()
     assert error.id == "web.E002" and error.is_serious()
-    settings.WEB_MFA_KEYS = ["k"]
+    settings.WEB_MFA_KEYS = ["k" * 40]
     assert mfa_keys_configured() == []
 
 

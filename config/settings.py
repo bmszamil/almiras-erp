@@ -24,7 +24,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-change-me")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
+# Off unless switched on explicitly (security review 2026-10-21, item 8): DJANGO_DEBUG=1 for local runserver only.
+DEBUG = os.environ.get("DJANGO_DEBUG", "0") == "1"
 
 ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
@@ -210,6 +211,8 @@ WEB_MFA_KEYS = [k for k in os.environ.get("WEB_MFA_KEYS", "").split(",") if k]
 # R18: wrong codes double the wait (1, 2, 4, 8 s); 5 in a row lock the device for 15 minutes.
 WEB_MFA_MAX_FAILURES = 5
 WEB_MFA_LOCK_SECONDS = 15 * 60
+# OQ-30 team default: each further lock in a row doubles, at most 24 h; the second alerts the access admins.
+WEB_MFA_LOCK_MAX_SECONDS = 24 * 3600
 # R19: /admin/ is reached only through the web sign-in (throttle, R18) with an OTP-verified session, for every staff
 # user and superuser. Only the test settings switch this off (tests of other modules' admin pages use force_login);
 # web/test_mfa.py tests it on. With DEBUG off, web.E001 refuses a release where it is off.

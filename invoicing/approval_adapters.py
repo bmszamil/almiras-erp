@@ -17,6 +17,13 @@ def _employee_users(*parties):
     return out
 
 
+def _charity_version(recipient):
+    """Inbox version of a charity recipient (web.md R7): its creation and its last (re)activation request."""
+    from core.access.engine import version_text
+
+    return f"{version_text(recipient.created_at)}|{version_text(recipient.reactivation_requested_at or '')}"[:64]
+
+
 def _label(doc, en, ar):
     number = getattr(doc, "number", "") or f"#{doc.pk}"
     return f"{en} {number}", f"{ar} {number}"
@@ -31,7 +38,7 @@ def register():
     engine.register(
         SalesDocument, "invoicing.sales_document", permission="invoicing.approve_sales_document",
         submit_permission="invoicing.submit_sales_document",
-        amount=lambda d: d.total_gross, currency=lambda d: d.currency_id,
+        amount=services.approval_amount, currency=lambda d: d.currency_id,
         beneficiaries=lambda d: _employee_users(d.customer),
         label=lambda d: _label(d, "Sales document", "مستند مبيعات"),
         approve=lambda d, user: services.approve_sales_document(d, user=user),
@@ -65,5 +72,6 @@ def register():
         )
     engine.register(
         CharityRecipient, "invoicing.charity_recipient", permission="invoicing.approve_charity_recipient",
+        version=lambda d: _charity_version(d),
         amount=lambda d: None, label=lambda d: (f"Charity recipient #{d.pk}", f"جهة خيرية رقم {d.pk}"),
     )

@@ -8,7 +8,12 @@ data.
 
 Recovery codes are random (50 bits) and single use, so they are stored as a keyed HMAC-SHA256, not a slow password
 hash: the key is derived from the MFA keys, and a code is checked against its hash under every configured key so a
-key rotation does not invalidate the codes already handed out.
+key rotation does not invalidate the codes already handed out. Each code row records the fingerprint of the key that
+hashed it (``key_id``). A one-way hash cannot be re-hashed under a new key without the code, so after a rotation
+``manage.py web_mfa_rekey`` re-encrypts every secret and lists (or, with ``--expire-old-recovery-codes``, retires)
+the codes still hashed under an older key; their holders renew their codes before the old key is removed.
+
+Stored values without the encryption prefix are refused outside DEBUG (fail closed).
 
 Without keys a development machine (``DEBUG``) derives one from ``SECRET_KEY``; with DEBUG off nothing is encrypted
 and the deploy check ``web.E002`` refuses the release (web/checks.py).
@@ -55,8 +60,40 @@ def encrypt(text):
     return PREFIX + _fernet(_secrets()).encrypt(str(text).encode("utf-8")).decode("ascii")
 
 
+MIN_KEY_LENGTH = 32
+
+
+def key_problems():
+    """What is wrong with the configured ``WEB_MFA_KEYS`` (deploy check web.E002): none set, or a key shorter than
+    32 characters, with white space, or a development placeholder."""
+    keys = tuple(getattr(settings, "WEB_MFA_KEYS", None) or ())
+    if not keys:
+        return ["missing"]
+    problems = []
+    for index, key in enumerate(keys, start=1):
+        if len(key) < MIN_KEY_LENGTH:
+            problems.append(f"key {index}: shorter than {MIN_KEY_LENGTH} characters")
+        if any(ch.isspace() for ch in key):
+            problems.append(f"key {index}: contains white space")
+        if key.startswith("dev-only") or "change-me" in key:
+            problems.append(f"key {index}: a development placeholder")
+    return problems
+
+
+def key_id(secret=None):
+    """A short public fingerprint of a key (which key hashed a recovery code); never the key itself."""
+    secret = secret if secret is not None else _secrets()[0]
+    return hashlib.sha256(_derive(secret, "id")).hexdigest()[:16]
+
+
 def decrypt(value):
-    if value in (None, "") or not str(value).startswith(PREFIX):
+    if value in (None, ""):
+        return value
+    if not str(value).startswith(PREFIX):
+        # Fail closed (security review 2026-10-21, item 4): outside DEBUG a stored secret is always encrypted, so
+        # a plain value is tampering or a broken migration, never something to use.
+        if not settings.DEBUG:
+            raise ImproperlyConfigured("An MFA secret is stored unencrypted (web.md R16); refused.")
         return value
     try:
         return _fernet(_secrets()).decrypt(value[len(PREFIX):].encode("ascii")).decode("utf-8")
@@ -69,8 +106,24 @@ def _hmac(secret, text):
 
 
 def code_hash(text):
-    """The keyed hash of a recovery code under the current key."""
+    """The keyed hash of a recovery code under the current key (stored with :func:`key_id`)."""
     return _hmac(_secrets()[0], text)
+
+
+def is_current(value):
+    """True if ``value`` (stored ciphertext) decrypts with the current first key alone (``web_mfa_rekey``)."""
+    if not value or not str(value).startswith(PREFIX):
+        return False
+    try:
+        Fernet(base64.urlsafe_b64encode(_derive(_secrets()[0], "enc"))).decrypt(value[len(PREFIX):].encode("ascii"))
+    except InvalidToken:
+        return False
+    return True
+
+
+def reencrypt(value):
+    """``value`` (ciphertext under any configured key) encrypted under the current first key."""
+    return encrypt(decrypt(value))
 
 
 def code_hashes(text):

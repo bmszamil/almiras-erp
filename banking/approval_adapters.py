@@ -12,6 +12,7 @@ def register():
                     amount=lambda d: None, label=lambda d: (f"Bank account #{d.pk}", f"حساب بنكي رقم {d.pk}"),
                     approve=lambda d, user: services.approve_bank_account(d, user=user))
     engine.register(BankAccountChange, "banking.bank_account_change", permission="banking.approve_bank_account",
+                    version=lambda d: engine.version_text(getattr(d, "created_at", "")),  # a change request is never edited
                     amount=lambda d: None,
                     label=lambda d: (f"Bank account change #{d.pk}", f"تعديل حساب بنكي رقم {d.pk}"),
                     approve=lambda d, user: services.approve_bank_account_change(d, user=user))

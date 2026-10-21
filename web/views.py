@@ -16,6 +16,7 @@ from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError
 from django.core.paginator import Paginator
+from django.db import transaction
 from django.http import HttpResponseRedirect
 from django.shortcuts import redirect, render
 from django.urls import reverse
@@ -251,6 +252,10 @@ def _with_next(name, next_url):
     return f"{url}?{urlencode({'next': next_url})}" if next_url else url
 
 
+# Views that check an MFA code run outside the request transaction (ATOMIC_REQUESTS): a later error (404, 403, 500)
+# must not roll back the failure count, the lock, the used time step or the mfa_verify_failed row (security review
+# 2026-10-21, item 1). Their writes are in the services' own transactions; business decisions in inbox.decide's.
+
 @never_cache
 @login_required
 @_methods("GET", "HEAD", "POST")
@@ -278,6 +283,7 @@ def _enrol_page(request, form, error, status=200):
     }, status=status)
 
 
+@transaction.non_atomic_requests
 @never_cache
 @require_POST
 @login_required
@@ -308,6 +314,7 @@ def _verify_page(request, error=None, status=200, form=None, recovery_form=None)
     }, status=status)
 
 
+@transaction.non_atomic_requests
 @never_cache
 @csrf_protect
 @login_required
@@ -339,6 +346,7 @@ def mfa_verify(request):
     return HttpResponseRedirect(next_url)
 
 
+@transaction.non_atomic_requests
 @never_cache
 @login_required
 @_methods("GET", "HEAD", "POST")
@@ -454,6 +462,7 @@ def _session_check(request):
     return None
 
 
+@transaction.non_atomic_requests
 @require_POST
 @entity_page
 def inbox_approve(request, entity, pk):
@@ -462,6 +471,7 @@ def inbox_approve(request, entity, pk):
     if refused_response is not None:
         return refused_response
     user, lang = request.user, request.web_lang
+    inbox_services.item(user, entity, pk)  # 404 before any code is checked: nothing to guess against (review item 1)
     step_up = _step_up_needed(user)
     form = ApproveForm(request.POST, lang=lang)
     if not step_up:
@@ -478,6 +488,7 @@ def inbox_approve(request, entity, pk):
     return _decide(request, entity, pk, approve=True, form=form)
 
 
+@transaction.non_atomic_requests
 @require_POST
 @entity_page
 def inbox_send_back(request, entity, pk):
@@ -485,6 +496,7 @@ def inbox_send_back(request, entity, pk):
     refused_response = _session_check(request)
     if refused_response is not None:
         return refused_response
+    inbox_services.item(request.user, entity, pk)  # 404 first, as for approve
     form = SendBackForm(request.POST, lang=request.web_lang)
     if not form.is_valid():
         return _item_page(request, entity, pk, send_back_form=form, status=400)

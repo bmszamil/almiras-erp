@@ -12,15 +12,17 @@
   valid only while that device exists and is confirmed, so a reset ends it at the next request.
 * **Step-up.** Approving in the inbox needs a fresh code on the approve form, on top of the verified session
   (R15; owner instruction 2026-10-21 replaces the OQ-23 session-only default).
-* **Throttle (R18).** Every wrong code doubles the wait before the next try (1, 2, 4, 8 s); 5 wrong codes in a row
-  lock the device for ``WEB_MFA_LOCK_SECONDS`` (15 min). A try during the wait or the lock is refused without
+* **Throttle (R18, OQ-30).** Every wrong code doubles the wait before the next try (1, 2, 4, 8 s); 5 wrong codes in a
+  row lock the device for ``WEB_MFA_LOCK_SECONDS`` (15 min), each further lock in a row twice as long (at most 24 h),
+  and the second lock alerts the person and their access admins. A try during the wait or the lock is refused without
   checking the code. Every refusal is logged ``mfa_verify_failed`` (R26). The device row is locked for the check, so
   concurrent tries are counted one after the other.
 * **Recovery codes.** 10 single-use codes shown once at enrolment (or renewal), stored as keyed hashes
   (``web.crypto``). A recovery code signs in; it is not accepted for a step-up.
-* **Reset (R16, OQ-11 default).** Never by the user themselves: by a holder of ``managing_partner``, or the
-  ``access_admin`` of an entity where the user holds an active membership; superusers only by the operator command
-  ``manage.py web_mfa_reset``. Logged ``mfa_reset`` with the reason.
+* **Reset (R16, OQ-11; security review 2026-10-21).** Never by the user themselves; the actor needs a verified
+  session and a fresh code. The group managing partner may reset anyone else; an access admin only people without an
+  MFA role whose memberships are all in the actor's entities; superusers only by ``manage.py web_mfa_reset``.
+  Logged ``mfa_reset`` with the reason.
 
 Nothing here logs or stores a code, a secret or a recovery code in clear.
 """
@@ -36,7 +38,9 @@ from django.db import transaction
 from django.utils import timezone
 
 from core.access import services as access_services
+from core.access.authority_models import AccessAlert
 from core.access.models import AccessLog, Membership
+from core.models import Entity
 
 from . import crypto
 from . import services as web_services
@@ -54,7 +58,7 @@ _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "0123
 
 class MfaError(Exception):
     """A refused MFA step. ``code``: ``wrong_code``, ``throttled``, ``locked``, ``no_device``, ``already_enrolled``,
-    ``not_allowed``, ``reason_required``, ``no_user``. The web layer shows the matching ``mfa_err_<code>`` text (R28)."""
+    ``not_allowed``, ``reason_required``, ``no_user``, ``expired``, ``session_not_verified``. The web layer shows the matching ``mfa_err_<code>`` text (R28)."""
 
     def __init__(self, code):
         super().__init__(code)
@@ -85,9 +89,21 @@ def device_of(user):
     return MfaDevice.objects.filter(user=user, confirmed=True).first()
 
 
-def pending_device(user):
-    """The user's started but not yet confirmed enrolment, or None."""
+ENROLMENT_TTL = timedelta(minutes=15)  # security review 2026-10-21, item 7
+
+
+def _unconfirmed(user):
     return MfaDevice.objects.filter(user=user, confirmed=False).first()
+
+
+def _expired(device):
+    return device.started_at is None or _now() - device.started_at > ENROLMENT_TTL
+
+
+def pending_device(user):
+    """The user's started, not yet confirmed and not expired enrolment (15 minutes), or None."""
+    device = _unconfirmed(user)
+    return None if device is None or _expired(device) else device
 
 
 def must_verify(user, required=None):
@@ -169,15 +185,49 @@ def _delay(failures):
     return timedelta(seconds=min(2 ** max(failures - 1, 0), lock))
 
 
+def _lock_length(lock_count):
+    """OQ-30 team default (security review 2026-10-21): the first lock lasts ``WEB_MFA_LOCK_SECONDS`` (15 min);
+    each further lock without a right code in between doubles it, at most ``WEB_MFA_LOCK_MAX_SECONDS`` (24 h)."""
+    base = _setting("WEB_MFA_LOCK_SECONDS", 15 * 60)
+    cap = _setting("WEB_MFA_LOCK_MAX_SECONDS", 24 * 3600)
+    return timedelta(seconds=min(base * 2 ** max(lock_count - 1, 0), cap))
+
+
+def _alert_second_lock(device, now):
+    """OQ-30: on the second lock in a row the person and the access admins of every entity where they hold an active
+    membership get a bilingual in-app alert (written once per lock)."""
+    from core.access import engine
+
+    user = device.user
+    entities = {m.entity for m in Membership.objects.active(access_services.now()).filter(user=user)
+                .select_related("entity")}
+    key = f"mfa_locked:{device.pk}:{device.locked_until.isoformat()}"
+    en = (f"Two-step verification of {user.get_username()} was locked again after repeated wrong codes, until "
+          f"{timezone.localtime(device.locked_until):%Y-%m-%d %H:%M}. If this was not the person, reset the device "
+          "and review the account.")
+    ar = (f"قُفل التحقق بخطوتين للمستخدم {user.get_username()} مرة أخرى بعد رموز خاطئة متكررة، حتى "
+          f"{timezone.localtime(device.locked_until):%Y-%m-%d %H:%M}. إن لم يكن ذلك صاحب الحساب فأعد تعيين الجهاز "
+          "وراجع الحساب.")
+    for entity in entities:
+        admins = set(Membership.objects.active(access_services.now()).filter(entity=entity, role__code="access_admin")
+                     .values_list("user_id", flat=True))
+        for uid in admins | {user.pk}:
+            engine.alert(entity, uid, AccessAlert.Kind.MFA_LOCKED, en, ar, key=f"{key}:{entity.pk}:{uid}",
+                         details={"subject_user": user.pk, "lock_count": device.lock_count})
+
+
 def _attempt(device_pk, check, *, purpose, kind="totp"):
     """One throttled check of ``device_pk`` (R18), in its own transaction holding the device row.
 
     Returns ``(device, refusal)``; ``refusal`` is None when ``check(device, now)`` accepted the code. A wrong code is
-    counted and saved before the refusal is reported, so the caller raises outside this transaction."""
+    counted and saved before the refusal is reported, so the caller raises outside this transaction. **The caller
+    must not run inside a transaction that can still roll back** (the web views that check codes are
+    ``non_atomic_requests``, tested): otherwise a later error would undo the count, the lock, the used time step
+    and the ``mfa_verify_failed`` row (security review 2026-10-21, item 1)."""
     now = _now()
     max_failures = _setting("WEB_MFA_MAX_FAILURES", 5)
     with transaction.atomic():
-        device = MfaDevice.objects.select_for_update().get(pk=device_pk)
+        device = MfaDevice.objects.select_for_update().select_related("user").get(pk=device_pk)
         if device.locked_until is not None and device.locked_until <= now:  # a lock that ran out starts again
             device.failures, device.locked_until, device.last_failure_at = 0, None, None
         refusal = None
@@ -187,20 +237,24 @@ def _attempt(device_pk, check, *, purpose, kind="totp"):
             refusal = "throttled"
         else:
             if check(device, now):
-                device.failures, device.last_failure_at, device.locked_until = 0, None, None
-                device.save(update_fields=["last_counter", "failures", "last_failure_at", "locked_until"])
+                device.failures, device.last_failure_at, device.locked_until, device.lock_count = 0, None, None, 0
+                device.save(update_fields=["last_counter", "failures", "last_failure_at", "locked_until",
+                                           "lock_count"])
                 return device, None
             device.failures += 1
             device.last_failure_at = now
             if device.failures >= max_failures:
-                device.locked_until = now + timedelta(seconds=_setting("WEB_MFA_LOCK_SECONDS", 15 * 60))
+                device.lock_count += 1
+                device.locked_until = now + _lock_length(device.lock_count)
                 refusal = "locked"
+                if device.lock_count == 2:
+                    _alert_second_lock(device, now)
             else:
                 refusal = "wrong_code"
-        device.save(update_fields=["failures", "last_failure_at", "locked_until"])
+        device.save(update_fields=["failures", "last_failure_at", "locked_until", "lock_count"])
         access_services.log(AccessLog.Event.MFA_VERIFY_FAILED, actor=device.user, subject_user=device.user,
                             details={"purpose": purpose, "kind": kind, "reason": refusal,
-                                     "failures": device.failures})
+                                     "failures": device.failures, "lock_count": device.lock_count})
     return device, refusal
 
 
@@ -229,6 +283,7 @@ def start_enrolment(user):
             device = MfaDevice(user=user)
         device.secret = pyotp.random_base32(length=32)  # 160 bits (RFC 4226 recommends at least 128)
         device.last_counter, device.failures, device.last_failure_at, device.locked_until = None, 0, None, None
+        device.started_at = _now()
         device.save()
     return device
 
@@ -248,17 +303,20 @@ def _new_recovery_codes(user, now):
     for _ in range(RECOVERY_CODES):
         raw = "".join(secrets.choice(_RECOVERY_ALPHABET) for _ in range(10))
         codes.append(f"{raw[:5]}-{raw[5:]}")
-    RecoveryCode.objects.bulk_create([RecoveryCode(user=user, code_hash=crypto.code_hash(_normalise_recovery(c)))
-                                      for c in codes])
+    current = crypto.key_id()
+    RecoveryCode.objects.bulk_create([RecoveryCode(user=user, code_hash=crypto.code_hash(_normalise_recovery(c)),
+                                                   key_id=current) for c in codes])
     return codes
 
 
 def confirm_enrolment(user, code):
     """Confirm the pending device with a right code (R16): the device becomes the user's, 10 recovery codes are
     made and returned **once** (only their hashes are kept), ``mfa_enrolled`` is logged."""
-    device = pending_device(user)
+    device = _unconfirmed(user)
     if device is None:
         raise MfaError("no_device")
+    if _expired(device):
+        raise MfaError("expired")  # the QR code was shown more than 15 minutes ago: start again
     device, refusal = _attempt(device.pk, lambda d, now: _totp_matches(d, code, now), purpose="enrol")
     if refusal:
         raise MfaError(refusal)
@@ -331,17 +389,35 @@ def renew_recovery_codes(user, code):
 
 # --- reset by another person (R16, OQ-11) -------------------------------------------------------------------------
 
+TOP_ROLES = frozenset({"managing_partner", "chairman"})
+
+
+def _is_group_managing_partner(user, at):
+    return Membership.objects.active(at).filter(
+        user=user, role__code="managing_partner", entity__parent__isnull=True,
+        entity__consolidation=Entity.Consolidation.PARENT).exists()
+
+
 def may_reset(actor, user):
-    """OQ-11 default: never oneself; a ``managing_partner``; or the ``access_admin`` of an entity where ``user`` holds an
-    active membership. A superuser's device is reset only by the operator command."""
+    """Who may reset another person's device (R16; OQ-11 default as tightened by the security review of 2026-10-21,
+    item 2). Never oneself, never a superuser (operator command only), and only:
+
+    * the **group managing partner** (``managing_partner`` on a group parent): anyone else; the only person (besides
+      the operator command) who may reset a ``managing_partner`` or ``chairman``;
+    * an **access admin**: a person who holds none of the MFA roles (``web.services.MFA_ROLES``) and has active
+      memberships only in entities where the actor is ``access_admin``.
+    """
     if not web_services.is_web_user(actor) or user is None or actor.pk == user.pk or user.is_superuser:
         return False
-    now = access_services.now()
-    mine = Membership.objects.active(now).filter(user=actor)
-    if mine.filter(role__code="managing_partner").exists():
+    at = access_services.now()
+    if _is_group_managing_partner(actor, at):
         return True
-    theirs = Membership.objects.active(now).filter(user=user).values_list("entity_id", flat=True)
-    return mine.filter(role__code="access_admin", entity_id__in=list(theirs)).exists()
+    theirs = list(Membership.objects.active(at).filter(user=user).select_related("role"))
+    if not theirs or {m.role.code for m in theirs} & (web_services.MFA_ROLES | TOP_ROLES):
+        return False
+    admin_of = set(Membership.objects.active(at).filter(user=actor, role__code="access_admin")
+                   .values_list("entity_id", flat=True))
+    return {m.entity_id for m in theirs} <= admin_of
 
 
 def _remove(user):
@@ -354,13 +430,18 @@ def _remove(user):
     return had
 
 
-def reset_device(actor, user, *, reason):
+def reset_device(actor, user, *, reason, session, code):
     """Remove ``user``'s device and recovery codes so they enrol again at their next sign-in (R16). Logged
-    ``mfa_reset`` with the reason; refused (``not_allowed``) for oneself or without the right (OQ-11)."""
+    ``mfa_reset`` with the reason. The actor needs an OTP-verified session of their own and a fresh code
+    (step-up, purpose ``reset``); refused ``not_allowed`` under :func:`may_reset`. Like every code check, the caller
+    must not run inside a transaction that can roll back."""
     if not (reason or "").strip():
         raise MfaError("reason_required")
     if not may_reset(actor, user):
         raise MfaError("not_allowed")
+    if not session_verified(actor, session):
+        raise MfaError("session_not_verified")
+    verify(actor, code, purpose="reset")
     had = _remove(user)
     access_services.log(AccessLog.Event.MFA_RESET, actor=actor, subject_user=user,
                         details={"reason": reason.strip()[:500], "had_device": had})
@@ -380,3 +461,29 @@ def reset_device_by_operator(username, *, reason, os_user=""):
     access_services.log(AccessLog.Event.MFA_RESET, subject_user=user, source="command:web_mfa_reset",
                         details={"reason": reason.strip()[:500], "had_device": had, "os_user": os_user[:100]})
     return had
+
+
+def rekey(*, expire_old_recovery_codes=False):
+    """``manage.py web_mfa_rekey`` after a key rotation: re-encrypt every device secret under the current first key
+    and report the unused recovery codes still hashed under an older key (one-way hashes cannot be re-hashed);
+    ``expire_old_recovery_codes`` retires them (their holders renew their codes). Logged in the access log."""
+    current = crypto.key_id()
+    reencrypted = 0
+    with transaction.atomic():
+        for device in MfaDevice.objects.select_for_update().order_by("pk"):
+            raw = MfaDevice.objects.filter(pk=device.pk).values_list("secret", flat=True).first()
+            if crypto.is_current(raw):
+                continue
+            device.secret = device.secret  # decrypted on read; encrypted under the first key on save
+            device.save(update_fields=["secret"])
+            reencrypted += 1
+        old = RecoveryCode.objects.filter(used_at__isnull=True).exclude(key_id=current)
+        users = sorted(set(old.values_list("user__username", flat=True)))
+        old_count = old.count()
+        if expire_old_recovery_codes and old_count:
+            old.update(used_at=_now())
+        access_services.log(AccessLog.Event.MFA_REKEYED, source="command:web_mfa_rekey",
+                            details={"rekey": True, "reencrypted": reencrypted, "old_recovery_codes": old_count,
+                                     "expired": bool(expire_old_recovery_codes and old_count), "key_id": current})
+    return {"reencrypted": reencrypted, "old_recovery_codes": old_count, "users": users,
+            "expired": bool(expire_old_recovery_codes and old_count)}

@@ -32,6 +32,10 @@ MESSAGES = {
         "again.",
         "تغيّر هذا المستند بعد أن فتحته، أو أُغلق طلب اعتماده. أعد تحميله وراجعه مرة أخرى.",
     ),
+    "no_version": (
+        "This document has no version to check, so it cannot be decided from the inbox; its module must supply one.",
+        "لا يوجد إصدار لهذا المستند للتحقق منه، فلا يمكن البت فيه من صندوق الاعتمادات؛ يجب أن توفره وحدته.",
+    ),
     "no_send_back": (
         "This document type cannot be sent back from the inbox yet; approve it or leave it for its preparer.",
         "لا يمكن إعادة هذا النوع من المستندات من صندوق الاعتمادات بعد؛ اعتمده أو اتركه لمُعدّه.",
@@ -154,6 +158,8 @@ def _locked_request(entity, pk, version):
     document = engine.document_of(req)
     if document is None:
         raise Http404("Not found / غير موجود")
+    if not req.document_version or not str(version or ""):
+        raise InboxRefused("no_version")  # web.md R7: nothing to compare, so nothing is decided (review item 5)
     if req.status != ApprovalRequest.Status.OPEN or str(version) != req.document_version \
             or engine.current_version(req, document) != req.document_version:
         raise InboxRefused("document_changed")  # web.md R7: reload and review again

@@ -5,6 +5,14 @@ engine adds that no VAT-return or tax-payment permission is ever self-approved, 
 R80 a and b)."""
 
 
+def _settings_version(settings_row):
+    """Inbox version of the tax settings (web.md R7): a hash of their values, so any change is a new version."""
+    import hashlib
+
+    values = [(f.attname, str(getattr(settings_row, f.attname))) for f in settings_row._meta.concrete_fields]
+    return hashlib.sha256(repr(values).encode("utf-8")).hexdigest()[:32]
+
+
 def register():
     from core.access import engine
 
@@ -15,7 +23,8 @@ def register():
                     submit_permission="tax.prepare_return", amount=lambda d: None,
                     label=lambda d: (f"VAT return #{d.pk}", f"إقرار ضريبة القيمة المضافة رقم {d.pk}"),
                     approve=lambda d, user: services.approve_return(d, user=user),
-                    return_=lambda d, user, note: services.return_to_draft(d, user=user, reason_ar=note or "أعيد"))
+                    return_=lambda d, user, note: services.return_to_draft(d, user=user, reason_ar=note or "أعيد",
+                                                                          reason_en=engine.note_en()))
     for model, en, ar in ((TaxPayment, "Tax payment", "دفعة ضريبية"), (TaxRefund, "Tax refund", "استرداد ضريبي"),
                           (ImportVatRecord, "Import VAT record", "سجل ضريبة استيراد")):
         engine.register(model, "tax.tax_document", permission="tax.approve_payment",
@@ -25,4 +34,5 @@ def register():
                         label=lambda d, en=en, ar=ar: (f"{en} #{d.pk}", f"{ar} رقم {d.pk}"),
                         approve=lambda d, user: services.approve_tax_document(d, user=user))
     engine.register(TaxSettings, "tax.settings", permission="tax.change_settings", amount=lambda d: None,
+                    version=_settings_version,
                     label=lambda d: (f"Tax settings of {d.entity.code}", f"إعدادات الضرائب للكيان {d.entity.code}"))

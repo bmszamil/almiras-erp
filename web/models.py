@@ -85,6 +85,12 @@ class MfaDevice(models.Model):
     failures = models.PositiveIntegerField(bi("Wrong codes in a row", "رموز خاطئة متتالية"), default=0)
     last_failure_at = models.DateTimeField(bi("Last wrong code at", "وقت آخر رمز خاطئ"), null=True, blank=True)
     locked_until = models.DateTimeField(bi("Locked until", "مقفل حتى"), null=True, blank=True)
+    lock_count = models.PositiveIntegerField(bi("Locks in a row", "مرات القفل المتتالية"), default=0,
+                                             help_text=bi("Each further lock doubles, at most 24 h (OQ-30)",
+                                                          "يتضاعف كل قفل لاحق، بحد أقصى 24 ساعة"))
+    started_at = models.DateTimeField(bi("Enrolment started at", "بدء الإعداد"), null=True, blank=True,
+                                      help_text=bi("An unconfirmed enrolment expires after 15 minutes",
+                                                   "ينتهي الإعداد غير المؤكد بعد 15 دقيقة"))
 
     class Meta:
         verbose_name = bi("MFA device", "جهاز المصادقة الثنائية")
@@ -100,6 +106,7 @@ class RecoveryCode(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="web_recovery_codes",
                              verbose_name=bi("User", "المستخدم"))
     code_hash = models.CharField(bi("Code (keyed hash)", "الرمز (تجزئة)"), max_length=64)
+    key_id = models.CharField(bi("Hash key fingerprint", "بصمة مفتاح التجزئة"), max_length=16, blank=True)
     created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
     used_at = models.DateTimeField(bi("Used at", "تاريخ الاستخدام"), null=True, blank=True)
 

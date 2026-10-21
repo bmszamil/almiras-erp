@@ -11,6 +11,7 @@ from core.access import services as access
 from core.access.authority_models import ApprovalDecision, ApprovalRequest
 from core.access.models import AccessLog
 from core.access.testing import make_agent
+from payroll.test_pg_review_2026_10_20c import seeded_db  # noqa: F401  (a fixture: reseeds after the flush)
 from web.conftest import draft_invoice, next_code, person
 
 pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("periods_now")]
@@ -103,7 +104,7 @@ def test_wt6_own_document_is_not_listed_shown_read_only_and_a_forged_approval_is
 
 
 @pytest.mark.django_db(transaction=True, databases=["default", "access_log"])
-def test_wt6_the_refused_self_approval_is_logged_even_though_nothing_changes(w, signed_in):
+def test_wt6_the_refused_self_approval_is_logged_even_though_nothing_changes(seeded_db, w, signed_in):
     """The refusal row is written on the separate access-log connection, so it survives the rollback (access R27)."""
     maker = person("maker", (w.alm, "accountant"), (w.alm, "approver"))
     own = draft_invoice(w.alm, maker, w.customer, price="410.00", submit=True)

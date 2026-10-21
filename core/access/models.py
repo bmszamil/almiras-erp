@@ -505,6 +505,7 @@ class AccessLog(models.Model):
         MFA_RECOVERY_USED = "mfa_recovery_code_used", "MFA recovery code used"
         MFA_RECOVERY_RENEWED = "mfa_recovery_codes_renewed", "MFA recovery codes renewed"
         MFA_RESET = "mfa_reset", "MFA device reset by another person"
+        MFA_REKEYED = "mfa_rekeyed", "MFA secrets re-encrypted under the current key"
 
     at = models.DateTimeField(default=timezone.now)
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
