@@ -23,7 +23,9 @@ DEFAULT_LANGUAGE = "ar"  # caller brief: Arabic (RTL) is the default before a la
 LANGUAGE_COOKIE = "alm_lang"
 
 # R13 (W-D6, OQ-3 default): roles whose holders need MFA. Used in slice 1 for the shorter idle timeout (OQ-8).
-MFA_ROLES = frozenset({"approver", "managing_partner", "chairman", "zatca_admin", "access_admin"})
+# ``ceo`` added 2026-10-21 (access §10, seed V18): the default top authority of every subsidiary holds every non-G
+# approval and may self-approve (R79), so it needs MFA like the approver and the managing partner.
+MFA_ROLES = frozenset({"approver", "managing_partner", "chairman", "zatca_admin", "access_admin", "ceo"})
 
 
 def _setting(name, default):

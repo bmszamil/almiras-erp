@@ -43,7 +43,7 @@ LABELS = {
     "payroll.input": ("payroll inputs", "مدخلات الرواتب"),
     "payroll.final_settlement": ("final settlements", "المخالصات النهائية"),
     "payroll.settlement_correction": ("final settlement corrections", "تصحيحات المخالصات النهائية"),
-    "payroll.loan_write_off": ("loan write-offs", "شطب القروض"),
+    "payroll.loan_write_off": ("loan write-offs", "شطب القروض"),  # bai' ajel closures: payroll.deferred_sale_closure
     "payroll.cost_item": ("employee cost items", "بنود تكاليف الموظفين"),
     "payroll.cost_report": ("secondment cost reports", "تقارير تكلفة الإعارة"),
     "payroll.gosi_fine": ("GOSI late-payment fines", "غرامات تأخير التأمينات"),

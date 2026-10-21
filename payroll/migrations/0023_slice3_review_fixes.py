@@ -5,6 +5,7 @@
   (review 8). PostgreSQL: the content is frozen from approval (only the portal option and the export link while
   approved; nothing but Mudad's answer after submission; review 4).
 - Payslips: ``taxable_irregular`` (Egypt bonuses and one-off earnings, C1).
+- Inputs: ``eosb_regular`` (verification 3: a regular, contractual or customary bonus or commission, Art. 2).
 - Backfill (review 3): inputs paid by approved, non-reversed remuneration payslips before slice 3 recorded them get
   ``taken_run`` = that run, so no later run pays them again.
 """
@@ -29,6 +30,10 @@ BEGIN
     END IF;
     changed := payroll_changed_keys(to_jsonb(OLD), to_jsonb(NEW));
     IF array_length(changed, 1) IS NULL THEN
+        RETURN NEW;
+    END IF;
+    -- Verification 5: the one-time fill of the employee of a row from before payroll.0023 (any status).
+    IF OLD.employee_id IS NULL AND NEW.employee_id IS NOT NULL AND changed <@ ARRAY['employee_id', 'health_flag'] THEN
         RETURN NEW;
     END IF;
     IF OLD.status IN ('accepted', 'rejected', 'withdrawn') THEN
@@ -89,7 +94,10 @@ def fill_rows(apps, schema_editor):
     """Every justification names its employee (from its payslip); imported rows with possible health detail are
     flagged for review (review 8), never refused."""
     Justification = apps.get_model("payroll", "MudadJustification")
-    for j in Justification.objects.filter(employee__isnull=True, payslip__isnull=False).select_related("payslip"):
+    rows = list(Justification.objects.filter(employee__isnull=True, payslip__isnull=False).select_related("payslip"))
+    # Verification 5: runs after this migration's guard, which lets exactly this fill through (a row without an
+    # employee gets one, nothing else changes), final rows included; no trigger is disabled.
+    for j in rows:
         j.employee_id = j.payslip.employee_id
         text = " ".join([j.description_ar or "", j.description_en or "", j.evidence_ref or ""]).lower()
         j.health_flag = j.source == "import" and any(w in text for w in HEALTH)
@@ -131,6 +139,14 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        migrations.AddField(
+            model_name="payrollinput",
+            name="eosb_regular",
+            field=models.BooleanField(
+                default=False,
+                verbose_name="Regular, contractual or customary (Art. 2) / منتظمة أو تعاقدية أو عرفية (المادة 2)",
+            ),
+        ),
         migrations.RemoveField(
             model_name="mudadjustification",
             name="mudad_code",
@@ -267,7 +283,7 @@ class Migration(migrations.Migration):
                 name="payroll_justification_line_or_proactive",
             ),
         ),
+        migrations.RunPython(forwards_guard, backwards_guard),
         migrations.RunPython(fill_rows, migrations.RunPython.noop),
         migrations.RunPython(backfill_taken_inputs, migrations.RunPython.noop),
-        migrations.RunPython(forwards_guard, backwards_guard),
     ]

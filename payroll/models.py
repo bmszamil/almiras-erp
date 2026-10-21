@@ -291,6 +291,10 @@ class PayrollInput(Tracked, ServiceWritten):
                                    blank=True)
     legal_clearance_ref = models.CharField(bi("Written legal clearance", "الإذن القانوني المكتوب"), max_length=200,
                                            blank=True)
+    # Slice 3 verification 3 (Labour Law Art. 2): a bonus or commission that is regular, contractual or customary
+    # joins the end-of-service wage (12-month average); default not.
+    eosb_regular = models.BooleanField(bi("Regular, contractual or customary (Art. 2)", "منتظمة أو تعاقدية أو عرفية "
+                                          "(المادة 2)"), default=False)
     status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.DRAFT)
     approved_by = _user("Approved by", "اعتمده")
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
@@ -948,7 +952,8 @@ class DeferredSaleClosure(Tracked, ServiceWritten):
     """[Reg] Review 4 (2026-10-21, item 5; OQ-33 / OQ-34 defaults): closes the part of a bai' ajel contract that the
     final dues did not cover (installments ``outstanding_after_exit``, on 1240), after the employee's final
     settlement is approved. Two kinds, both prepared by the payroll officer and approved with four eyes under the
-    loan write-off right and matrix row (``payroll.approve_loan_write_off``, ``payroll.loan_write_off``):
+    their own right and matrix activity (``payroll.approve_deferred_sale_closure``, ``payroll.deferred_sale_closure``;
+    access 10.5, 2026-10-21; held and defaulted like the loan write-off):
 
     - ``write_off``: the whole balance; Dr 1241 for the profit not yet recognised on it (the unearned share is
       never income), Dr the write-off expense account (default 5100, as loans) for the rest, Cr 1240.
@@ -980,6 +985,11 @@ class DeferredSaleClosure(Tracked, ServiceWritten):
     amount = _money("Balance closed (1240)", "الرصيد المقفل (1240)")
     # Write-off: the profit not yet recognised on the balance, debited to 1241 (read from invoicing at approval).
     profit_share = _money("Unearned profit reversed (1241)", "الربح غير المحقق المعكوس (1241)", default=ZERO)
+    # Review 5 (2026-10-21, item 5): write-off: the VAT included in the balance written off (it stays on 2200, output
+    # VAT already declared); listed for the tax adviser (bad-debt relief, invoicing OQ-78). 0 for a recovery.
+    vat_share = _money("VAT in the balance written off (stays on 2200)", "ضريبة القيمة المضافة في الرصيد المشطوب (تبقى في 2200)",
+                       default=ZERO)
+    warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
     expense_account = models.ForeignKey("ledger.Account", null=True, blank=True, on_delete=models.PROTECT,
                                         related_name="+", verbose_name=bi("Write-off account", "حساب الشطب"))
     bank_account = models.ForeignKey("ledger.Account", null=True, blank=True, on_delete=models.PROTECT,
@@ -1007,6 +1017,8 @@ class DeferredSaleClosure(Tracked, ServiceWritten):
         constraints = [models.CheckConstraint(condition=Q(amount__gt=0), name="payroll_sale_closure_positive"),
                        models.CheckConstraint(condition=Q(profit_share__gte=0) & Q(profit_share__lte=models.F("amount")),
                                               name="payroll_sale_closure_profit_share"),
+                       models.CheckConstraint(condition=Q(vat_share__gte=0) & Q(vat_share__lte=models.F("amount")),
+                                              name="payroll_sale_closure_vat_share"),
                        models.UniqueConstraint(fields=["contract"], condition=Q(status__in=("draft", "submitted")),
                                                name="payroll_one_open_sale_closure")]
 

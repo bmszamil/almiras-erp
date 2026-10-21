@@ -104,7 +104,11 @@ def test_at64_signature_verifies_over_the_raw_hash_only(live):
     sig = base64.b64decode(text(xml, "//ds:SignatureValue"))
     cert = crypto.load_cert_base64(text(xml, "//ds:X509Certificate"))
     raw = base64.b64decode(einv.invoice_hash)
-    assert sig[0] == 0x30 and 70 <= len(sig) <= 72
+    # A DER ECDSA signature: r and s shrink by a byte when their top byte is zero (about 1 in 128 signatures), so
+    # 70 to 72 bytes is only the usual length. Check the structure instead.
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    r, s = decode_dss_signature(sig)
+    assert sig[0] == 0x30 and len(sig) <= 72 and 0 < r and 0 < s
     assert crypto.verify_hash_signature(cert.public_key(), sig, raw)
     from lxml import etree
 

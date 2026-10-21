@@ -24,18 +24,21 @@ from payroll.models import DeferredSaleContract, PayrollError
 def left_after_exit(settled_with_rejected_rebate):
     w, c, r = settled_with_rejected_rebate
     payroll.discard_deferred_sale_rebate(r, user=w.p)
-    assert books(w) == {"1240": D("69.00"), "1241": D("-60.00"), "4610": D("-60.00"), "2200": D("-198.00")}
+    # review 5 (item 3): the profit held back while the note was pending was caught up when it was rejected, so 1241
+    # holds only the profit on the 69.00 still outstanding (120.00 x 69.00 / 1,518.00)
+    assert books(w) == {"1240": D("69.00"), "1241": D("-5.45"), "4610": D("-114.55"), "2200": D("-198.00")}
     return w, DeferredSaleContract.objects.get(pk=c.pk)
 
 
 def test_item5_write_off_clears_1240_and_the_unearned_profit_on_1241(left_after_exit):
     w, c = left_after_exit
     x = payroll.prepare_deferred_sale_closure(c, user=w.p, kind="write_off", reason_ar="تعذر التحصيل من الموظف السابق")
-    assert x.profit_share == D("60.00")  # read from invoicing: the fixed profit less what was recognised
+    assert x.profit_share == D("5.45")  # read from invoicing: the fixed profit less what was recognised
+    expense = balance(w.alm, "5100")
     x = payroll.approve_deferred_sale_closure(payroll.submit_deferred_sale_closure(x, user=w.p), user=w.mp)
-    assert x.profit_share == D("60.00") and x.journal_entry.status == "posted"
-    assert books(w) == {"1240": D("0.00"), "1241": D("0.00"), "4610": D("-60.00"), "2200": D("-198.00")}
-    assert balance(w.alm, "5100") >= D("9.00")  # the loss: the cost and VAT part of the balance
+    assert x.profit_share == D("5.45") and x.journal_entry.status == "posted"
+    assert books(w) == {"1240": D("0.00"), "1241": D("0.00"), "4610": D("-114.55"), "2200": D("-198.00")}
+    assert balance(w.alm, "5100") - expense == D("63.55")  # the loss: the cost and VAT part of the balance
     assert after_exit(c) == D("0.00") and DeferredSaleContract.objects.get(pk=c.pk).status == "settled"
 
 
@@ -43,12 +46,12 @@ def test_item5_recovery_in_two_parts_collects_1240_and_recognises_the_rest_of_th
     w, c = left_after_exit
     bank = payroll._account(w.alm, "1100")
     first = payroll.prepare_deferred_sale_closure(c, user=w.p, kind="recovery", amount="30.00", reason_ar="سداد جزئي",
-                                                  bank_account=bank, received_on=date(2027, 3, 18))
+                                                  bank_account=bank, received_on=date(2027, 3, 20))
     payroll.approve_deferred_sale_closure(payroll.submit_deferred_sale_closure(first, user=w.p), user=w.mp)
     b = books(w)
-    assert b["1240"] == D("39.00") and -(b["1241"] + b["4610"]) == D("120.00") and b["4610"] < D("-60.00")
+    assert b["1240"] == D("39.00") and -(b["1241"] + b["4610"]) == D("120.00") and b["4610"] < D("-114.55")
     second = payroll.prepare_deferred_sale_closure(c, user=w.p, kind="recovery", amount="39.00", reason_ar="سداد",
-                                                   bank_account=bank, received_on=date(2027, 3, 19))
+                                                   bank_account=bank, received_on=date(2027, 3, 20))
     payroll.approve_deferred_sale_closure(payroll.submit_deferred_sale_closure(second, user=w.p), user=w.mp)
     # the collection completing the receivable releases the rest: the whole fixed profit is income, nothing deferred
     assert books(w) == {"1240": D("0.00"), "1241": D("0.00"), "4610": D("-120.00"), "2200": D("-198.00")}

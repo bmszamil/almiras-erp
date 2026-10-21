@@ -107,7 +107,12 @@ def test_item5_after_exit_installments_move_only_to_written_off_or_recovered(w):
                 "status = 'recovered_after_exit', amount = 10.00, deducted_amount = 10.00, period = '2030-01'"):
         _refused(upd.format(sql), [inst.pk])
     _refused("DELETE FROM payroll_deferredsaleinstallment WHERE id = %s", [inst.pk])
-    _ok(upd.format("status = 'recovered_after_exit', amount = 10.00, deducted_amount = 10.00"), [inst.pk])
+    # review 5 (item 8, payroll.0024): only an approved recovery listing it at that amount moves it
+    _refused(upd.format("status = 'recovered_after_exit', amount = 10.00, deducted_amount = 10.00"), [inst.pk])
+    from payroll.test_review_fixes_2026_10_21 import _recovery
+    services.approve_deferred_sale_closure(_recovery(w, c, "10.00"), user=w.mp)
+    inst.refresh_from_db()
+    assert (inst.status, inst.amount) == ("recovered_after_exit", 10)
     for sql in ("status = 'outstanding_after_exit'", "amount = 9.00, deducted_amount = 9.00", "status = 'written_off'"):
         _refused(upd.format(sql), [inst.pk])  # recovered is final
     _refused("DELETE FROM payroll_deferredsaleinstallment WHERE id = %s", [inst.pk])

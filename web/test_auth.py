@@ -111,6 +111,19 @@ def test_wt17_users_who_need_mfa_have_the_shorter_idle_timeout(w, client):
     assert client.get("/e/ALM/").status_code == 302
 
 
+def test_wt17_a_ceo_needs_mfa_and_has_the_shorter_idle_timeout(w, client):
+    """R13 amended 2026-10-21 (access §10): the ceo, a subsidiary's default top authority, is an MFA role."""
+    from web.conftest import person
+    from web.services import MFA_ROLES, _requires_mfa
+
+    assert "ceo" in MFA_ROLES
+    ceo = person("ceo_user", (w.alm, "ceo"))
+    assert _requires_mfa(ceo)
+    login(client, "ceo_user")
+    _age_session(client, seen=16 * 60)
+    assert client.get("/e/ALM/").status_code == 302
+
+
 def test_wt17_absolute_timeout_ends_an_active_session(w, client):
     login(client, "acc")
     _age_session(client, login=10 * 3600 + 5, seen=10)
