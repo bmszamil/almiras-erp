@@ -64,6 +64,16 @@ INVOICING_ZATCA_PORT = "zatca.port.ZatcaModulePort"
 ZATCA_SECRET_STORE = os.environ.get("ZATCA_SECRET_STORE", "zatca.keystore.OpenBaoSecretStore")
 ZATCA_OPENBAO_ADDRESS = os.environ.get("ZATCA_OPENBAO_ADDRESS", "")
 ZATCA_OPENBAO_AUTH_ROLE = os.environ.get("ZATCA_OPENBAO_AUTH_ROLE", "")
+# D-19 / OQ-34 (f): KV v2 mount and the AppRole credential *files* (Docker secrets, never in the DB or repo) of the
+# signing identity and the separate retirement identity (patches metadata/ only). CA of the internal TLS cert.
+ZATCA_OPENBAO_KV_MOUNT = os.environ.get("ZATCA_OPENBAO_KV_MOUNT", "zatca-kv")
+ZATCA_OPENBAO_CA_FILE = os.environ.get("ZATCA_OPENBAO_CA_FILE", "")
+ZATCA_OPENBAO_ROLE_ID_FILE = os.environ.get("ZATCA_OPENBAO_ROLE_ID_FILE", "")
+ZATCA_OPENBAO_SECRET_ID_FILE = os.environ.get("ZATCA_OPENBAO_SECRET_ID_FILE", "")
+ZATCA_OPENBAO_RETIRE_ROLE_ID_FILE = os.environ.get("ZATCA_OPENBAO_RETIRE_ROLE_ID_FILE", "")
+ZATCA_OPENBAO_RETIRE_SECRET_ID_FILE = os.environ.get("ZATCA_OPENBAO_RETIRE_SECRET_ID_FILE", "")
+# R-60: a version younger than this is never retired as unreferenced (longer than the 1 h OTP validity, R-7).
+ZATCA_RETIRE_GRACE_MINUTES = 120
 # API client (R-29). Base URLs and paths come from ZATCA's Swagger at deployment (OQ-30); empty placeholders.
 ZATCA_CLIENT = "zatca.client.HttpZatcaClient"
 ZATCA_API_BASE_URLS = {"sandbox": os.environ.get("ZATCA_SANDBOX_BASE_URL", ""),

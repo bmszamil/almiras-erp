@@ -11,16 +11,28 @@ valid; an item is always opened under the master-key version that protects it.
 
 Backends:
 
-- :class:`OpenBaoSecretStore`: the interface to the KSA-hosted OpenBao (D-3, D-5). Not deployed yet; every
-  call raises :class:`SecretStoreUnavailable`, so a misconfigured environment fails closed (OQ-34).
+- :class:`OpenBaoSecretStore`: the interface to the KSA-hosted OpenBao (D-3, D-5). Only version retirement is
+  built (KV v2 metadata, OQ-34 (f)); every other call raises :class:`SecretStoreUnavailable`, so a misconfigured
+  environment fails closed (OQ-34).
 - :class:`LocalSecretStore`: in-memory store for tests and local development only. It wraps keys with
   AES-GCM along the hierarchy and can be "sealed" or have one entity's master key made unavailable.
+
+Retired versions (D-19, R-57 to R-60): every store keeps all versions with their data and can mark one version
+**retired**; a retired version is refused for signing, reading and public-key reads (``SecretStoreRefused``,
+code ``secret_version_retired``). No store method deletes, destroys, trims or un-retires a version.
 
 The setting ``ZATCA_SECRET_STORE`` (dotted path) chooses the backend; tests install a local store with
 :func:`override`.
 """
+import json
 import os
+import ssl
 import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from datetime import timezone as dt_timezone
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from django.conf import settings
@@ -39,11 +51,34 @@ class SecretStoreUnavailable(Exception):
 
 
 class SecretStoreRefused(Exception):
-    """The request breaks the key hierarchy (e.g. another entity's master key, R-50 a). Never transient."""
+    """The request breaks the key hierarchy (e.g. another entity's master key, R-50 a) or names a retired version
+    (R-57, ``code="secret_version_retired"``). Never transient."""
 
-    def __init__(self, en, ar):
-        self.en, self.ar = en, ar
+    def __init__(self, en, ar, code=None):
+        self.en, self.ar, self.code = en, ar, code
         super().__init__(f"{en} / {ar}")
+
+
+# R-57: the refusal of a retired key or secret version (en/ar as in the spec).
+RETIRED_EN = "This key or secret version was retired after a certificate renewal and can no longer be used."
+RETIRED_AR = "أُوقف إصدار المفتاح أو السر هذا بعد تجديد الشهادة ولم يعد قابلاً للاستخدام."
+RETIRED_CODE = "secret_version_retired"
+
+
+def retired_refusal():
+    return SecretStoreRefused(RETIRED_EN, RETIRED_AR, code=RETIRED_CODE)
+
+
+def same_entity(path, master_ref):
+    """R-50 a / R-57: an item path belongs to the entity whose master key is named (``zatca/<entity>/...``)."""
+    master_path, _ = parse_ref(master_ref)
+    return path.startswith(master_path.rpartition("/")[0] + "/")
+
+
+def _refuse_other_entity(path, master_ref):
+    if not same_entity(path, master_ref):
+        raise SecretStoreRefused("This key belongs to another entity's master key (R-50).",
+                                 "هذا المفتاح محمي بالمفتاح الرئيسي لكيان آخر.")
 
 
 def make_ref(path, version):
@@ -78,22 +113,189 @@ def secret_path(entity_code, egs_code, kind):
 
 
 class OpenBaoSecretStore:
-    """Interface to OpenBao (D-3). Address and auth role come from settings; no token is stored in the ERP.
+    """Interface to OpenBao (D-3). Address, KV mount and AppRole credential *files* come from settings; no token,
+    role id or secret id is ever stored in the ERP database.
 
-    Not implemented until the OpenBao design is signed off (OQ-3 b, OQ-34): every method raises
-    :class:`SecretStoreUnavailable`, so no environment silently signs without the real store.
+    Built (OQ-34 (f) default, D-19; security sign-off pending): version **retirement** on the KV v2 engine
+    (``ZATCA_OPENBAO_KV_MOUNT``, default ``zatca-kv`` as ``deploy/openbao/bootstrap.sh`` creates it):
+
+    - :meth:`retire_version` writes ``retired_v<n>`` = ``<UTC time>|<reason>`` into the path's ``custom_metadata``
+      with a JSON merge patch (``PATCH <mount>/metadata/<path>``). It never deletes, destroys or trims a version
+      and reads no ``data/``. It runs as the separate **retirement identity** (AppRole ``erp-retire``, policy
+      ``erp-retire-<entity>``: read and patch on ``metadata/`` of its own entity only).
+    - :meth:`list_versions` and :meth:`check_usable` read ``metadata/`` as the signing identity, which may read
+      ``data/`` and ``metadata/`` but never write ``metadata/`` (policy ``erp-signer-<entity>``).
+    - every read of a version (:meth:`sign`, :meth:`public_key_der`, :meth:`read_secret`) names one explicit
+      version and first checks its flag: a retired version is refused with ``SecretStoreRefused``
+      (``secret_version_retired``, R-57) before any data is read.
+
+    Not built until the OpenBao design is signed off (OQ-3 b, OQ-34 a): reading and unwrapping key material,
+    writes and the key hierarchy. Those calls raise :class:`SecretStoreUnavailable` (reads only after the
+    retirement check), so no environment silently signs without the real store. Known limit: KV v2 allows 64
+    ``custom_metadata`` keys per path, i.e. 64 retired versions of one path (a renewal adds one per path).
+
+    ``transport`` (tests): ``callable(method, url, headers, body_bytes) -> (status, dict)``; the default uses
+    urllib with ``ZATCA_OPENBAO_CA_FILE``. Tests never reach a real OpenBao.
     """
 
-    def __init__(self):
-        self.address = getattr(settings, "ZATCA_OPENBAO_ADDRESS", "")
+    IDENTITIES = {
+        "signer": ("ZATCA_OPENBAO_ROLE_ID_FILE", "ZATCA_OPENBAO_SECRET_ID_FILE"),
+        "retire": ("ZATCA_OPENBAO_RETIRE_ROLE_ID_FILE", "ZATCA_OPENBAO_RETIRE_SECRET_ID_FILE"),
+    }
+
+    def __init__(self, transport=None):
+        self.address = getattr(settings, "ZATCA_OPENBAO_ADDRESS", "").rstrip("/")
         self.auth_role = getattr(settings, "ZATCA_OPENBAO_AUTH_ROLE", "")
+        self.kv_mount = getattr(settings, "ZATCA_OPENBAO_KV_MOUNT", "") or "zatca-kv"
+        self.ca_file = getattr(settings, "ZATCA_OPENBAO_CA_FILE", "") or None
+        self._transport = transport or self._http
+        self._tokens = {}  # identity -> (token, monotonic expiry); process memory only, never logged or stored
+        self._lock = threading.Lock()
 
     def _unavailable(self, *args, **kwargs):
         raise SecretStoreUnavailable("The OpenBao client is not deployed yet (zatca OQ-34).",
                                      "لم يُفعَّل الاتصال بمخزن OpenBao بعد.")
 
     create_super_key = create_master_key = rotate_master_key = check = _unavailable
-    write_private_key = sign = public_key_der = write_secret = read_secret = _unavailable
+    write_private_key = write_secret = _unavailable
+
+    # -- transport and login --
+    def _http(self, method, url, headers, body):
+        request = urllib.request.Request(url, data=body, method=method, headers=headers)
+        context = ssl.create_default_context(cafile=self.ca_file)
+        try:
+            with urllib.request.urlopen(request, timeout=10, context=context) as response:  # noqa: S310 (https only)
+                raw = response.read()
+                return response.status, (json.loads(raw) if raw else {})
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read()
+                return exc.code, (json.loads(raw) if raw else {})
+            except ValueError:
+                return exc.code, {}
+        except (urllib.error.URLError, OSError, ValueError):
+            raise SecretStoreUnavailable() from None
+
+    def _call(self, method, api_path, *, identity=None, body=None, content_type="application/json"):
+        if not self.address.startswith("https://"):
+            raise SecretStoreUnavailable("OpenBao is not configured (ZATCA_OPENBAO_ADDRESS, https only).",
+                                         "لم يُضبط عنوان مخزن OpenBao.")
+        headers = {"Content-Type": content_type, "Accept": "application/json"}
+        if identity:
+            headers["X-Vault-Token"] = self._token(identity)
+        data = json.dumps(body).encode() if body is not None else None
+        status, payload = self._transport(method, f"{self.address}/v1/{api_path}", headers, data)
+        if status is None or status >= 500 or status == 429:  # 503 = sealed (R-47)
+            raise SecretStoreUnavailable()
+        if status in (401, 403):
+            if identity:
+                self._tokens.pop(identity, None)
+            raise SecretStoreRefused("OpenBao refused this request for the ERP's identity (policy).",
+                                     "رفض مخزن OpenBao هذا الطلب لهوية النظام (السياسة).", code="openbao_forbidden")
+        return status, payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _read_file(setting):
+        path = getattr(settings, setting, "")
+        if not path:
+            raise SecretStoreUnavailable(f"OpenBao credentials are not configured ({setting}).",
+                                         "لم تُضبط بيانات الدخول إلى مخزن OpenBao.")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError:
+            raise SecretStoreUnavailable(f"OpenBao credentials cannot be read ({setting}).",
+                                         "تعذرت قراءة بيانات الدخول إلى مخزن OpenBao.") from None
+
+    def _token(self, identity):
+        with self._lock:
+            cached = self._tokens.get(identity)
+            if cached and cached[1] > time.monotonic():
+                return cached[0]
+        role_setting, secret_setting = self.IDENTITIES[identity]
+        status, payload = self._call("POST", "auth/approle/login", body={
+            "role_id": self._read_file(role_setting), "secret_id": self._read_file(secret_setting)})
+        auth = payload.get("auth") or {}
+        token = auth.get("client_token")
+        if status != 200 or not token:
+            raise SecretStoreUnavailable("OpenBao login failed.", "تعذر تسجيل الدخول إلى مخزن OpenBao.")
+        lifetime = max(0, int(auth.get("lease_duration") or 0) - 60)
+        with self._lock:
+            self._tokens[identity] = (token, time.monotonic() + lifetime)
+        return token
+
+    # -- KV v2 metadata (R-57 to R-60) --
+    @staticmethod
+    def _flag(version):
+        return f"retired_v{version}"
+
+    @staticmethod
+    def _parse_time(text):
+        if not text:
+            return None
+        head, _, tail = text.rstrip("Z").partition(".")
+        fraction = (tail[:6] if tail else "0").ljust(6, "0")
+        return datetime.fromisoformat(f"{head}.{fraction}+00:00")
+
+    def _metadata(self, path, identity):
+        status, payload = self._call("GET", f"{self.kv_mount}/metadata/{path}", identity=identity)
+        if status == 404:
+            return None
+        if status != 200:
+            raise SecretStoreUnavailable()
+        return payload.get("data") or {}
+
+    def _is_retired(self, metadata, version):
+        info = ((metadata or {}).get("versions") or {}).get(str(version))
+        if info is None or info.get("destroyed"):
+            raise SecretStoreRefused("Unknown secret-store item.", "عنصر غير معروف في مخزن الأسرار.")
+        return self._flag(version) in ((metadata or {}).get("custom_metadata") or {})
+
+    def list_versions(self, path, master_ref):
+        """Every version at ``path`` with its write time and retired flag (R-60); signing identity, metadata only."""
+        _refuse_other_entity(path, master_ref)
+        metadata = self._metadata(path, "signer")
+        if metadata is None:
+            return []
+        flags = metadata.get("custom_metadata") or {}
+        return sorted(({"version": int(v), "created_at": self._parse_time(info.get("created_time")),
+                        "retired": self._flag(v) in flags}
+                       for v, info in (metadata.get("versions") or {}).items() if not info.get("destroyed")),
+                      key=lambda row: row["version"])
+
+    def check_usable(self, ref, master_ref):
+        """Refuse a retired (or unknown) version before anything reads it (R-57)."""
+        path, version = parse_ref(ref)
+        _refuse_other_entity(path, master_ref)
+        if self._is_retired(self._metadata(path, "signer"), version):
+            raise retired_refusal()
+
+    def retire_version(self, ref, master_ref, *, reason, at=None):
+        """Flag one version retired (R-57). Returns False when it already was (idempotent: nothing written)."""
+        path, version = parse_ref(ref)
+        _refuse_other_entity(path, master_ref)
+        if self._is_retired(self._metadata(path, "retire"), version):
+            return False
+        stamp = (at or datetime.now(dt_timezone.utc)).astimezone(dt_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        status, _ = self._call("PATCH", f"{self.kv_mount}/metadata/{path}", identity="retire",
+                               body={"custom_metadata": {self._flag(version): f"{stamp}|{reason}"}},
+                               content_type="application/merge-patch+json")
+        if status not in (200, 204):
+            raise SecretStoreUnavailable()
+        return True
+
+    # -- reads: the retirement check runs first; reading key material is not built (OQ-3 b, OQ-34 a) --
+    def sign(self, key_ref, master_ref, raw_hash):
+        self.check_usable(key_ref, master_ref)
+        self._unavailable()
+
+    def public_key_der(self, key_ref, master_ref):
+        self.check_usable(key_ref, master_ref)
+        self._unavailable()
+
+    def read_secret(self, ref, master_ref):
+        self.check_usable(ref, master_ref)
+        self._unavailable()
 
 
 class LocalSecretStore:
@@ -104,8 +306,12 @@ class LocalSecretStore:
         self._super = {}  # path -> {version: key bytes}
         self._master = {}  # path -> {version: (nonce, wrapped, super_ref)}
         self._items = {}  # path -> {version: (nonce, ciphertext, master_ref)}
+        self._written_at = {}  # path -> {version: datetime (UTC)}
+        self._retired = {}  # path -> {version: (datetime, reason)} (R-57; the data stays in _items)
         self.sealed = False
         self.unavailable_master_paths = set()
+        self.retirement_unavailable = False  # tests: retirement alone fails as "unavailable" (R-58, AT-97)
+        self.clock = lambda: datetime.now(dt_timezone.utc)  # tests may move it
         self.calls = []  # operation names, for tests (never values)
 
     # -- helpers --
@@ -146,6 +352,8 @@ class LocalSecretStore:
             nonce, data, protected_by = self._items[path][version]
         except KeyError:
             raise SecretStoreRefused("Unknown secret-store item.", "عنصر غير معروف في مخزن الأسرار.") from None
+        if version in self._retired.get(path, {}):  # R-57: refused before anything is decrypted
+            raise retired_refusal()
         if parse_ref(protected_by)[0] != master_path:
             raise SecretStoreRefused("This item is protected by another master key.",
                                      "هذا العنصر محمي بمفتاح رئيسي آخر.")
@@ -161,6 +369,7 @@ class LocalSecretStore:
         version = self._next_version(self._items, path)
         self._items.setdefault(path, {})[version] = (nonce, AESGCM(key).encrypt(nonce, value, path.encode()),
                                                        master_ref)
+        self._written_at.setdefault(path, {})[version] = self.clock()
         return make_ref(path, version)
 
     # -- hierarchy --
@@ -258,6 +467,58 @@ class LocalSecretStore:
             self._check_open()
             self.calls.append("read_secret")
             return self._open(ref, master_ref).decode("utf-8")
+
+    # -- retired versions (D-19, R-57 to R-60) --
+    def _item_version(self, ref, master_ref):
+        path, version = parse_ref(ref)
+        _refuse_other_entity(path, master_ref)
+        if version not in self._items.get(path, {}):
+            raise SecretStoreRefused("Unknown secret-store item.", "عنصر غير معروف في مخزن الأسرار.")
+        return path, version
+
+    def check_usable(self, ref, master_ref):
+        """Refuse a retired (or unknown, or another entity's) version before it is used (R-57)."""
+        with self._lock:
+            self._check_open()
+            path, version = self._item_version(ref, master_ref)
+            if version in self._retired.get(path, {}):
+                raise retired_refusal()
+
+    def retire_version(self, ref, master_ref, *, reason, at=None):
+        """Mark one version retired (R-57). Its data stays; returns False when it already was retired."""
+        with self._lock:
+            self._check_open()
+            if self.retirement_unavailable:
+                raise SecretStoreUnavailable()
+            self.calls.append("retire_version")
+            path, version = self._item_version(ref, master_ref)
+            if version in self._retired.get(path, {}):
+                return False
+            self._retired.setdefault(path, {})[version] = (at or self.clock(), reason)
+            return True
+
+    def list_versions(self, path, master_ref):
+        """Every version at ``path``: number, write time, retired flag (R-60). Never values."""
+        with self._lock:
+            self._check_open()
+            _refuse_other_entity(path, master_ref)
+            self.calls.append("list_versions")
+            return [{"version": v, "created_at": self._written_at.get(path, {}).get(v), "retired":
+                     v in self._retired.get(path, {})} for v in sorted(self._items.get(path, {}))]
+
+    # -- test hooks (never values) --
+    def is_retired(self, ref):
+        path, version = parse_ref(ref)
+        return version in self._retired.get(path, {})
+
+    def has_data(self, ref):
+        path, version = parse_ref(ref)
+        return bool(self._items.get(path, {}).get(version, (None, b""))[1])
+
+    def backdate(self, ref, at):
+        """Set when a version was written (R-60 grace tests)."""
+        path, version = parse_ref(ref)
+        self._written_at[path][version] = at
 
 
 _override = None
