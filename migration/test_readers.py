@@ -29,9 +29,9 @@ def test_at1_reads_falcon_journal_with_title_rows_variants_and_reordered_columns
     parsed = readers.read_falcon_journal(data)
     assert len(parsed.rows) == 9
     first = parsed.rows[0]
-    assert first.entry_no == "26000001" and first.account_code == "1201" and first.date == date(2026, 1, 15)
+    assert first.entry_no == "26000001" and first.account_code == "1102" and first.date == date(2026, 1, 15)
     assert first.debit == D("11500.00") and isinstance(first.debit, Decimal) and first.credit == D("0")
-    assert first.account_name == "عملاء تجريبيون" and first.source == "مستخلص عميل" and first.source_no == "501"
+    assert first.account_name == "بنك تجريبي" and first.source == "مستخلص عميل" and first.source_no == "501"
     assert parsed.rows[5].cost_centre == "الإدارة"
     assert first.row == 4  # two title rows, then the header
     assert [p.code for p in parsed.problems] == ["other_sheets"]

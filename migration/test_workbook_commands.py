@@ -1,4 +1,5 @@
 """migration.md §11 W12, W13 (commands with the workbook; AT-21, AT-22). Synthetic workbooks in tmp_path."""
+from decimal import Decimal as D
 from io import StringIO
 
 import pytest
@@ -24,7 +25,7 @@ def wb_file(tmp_path):
     return str(path)
 
 
-def test_at21_map_load_post_and_tie_out_from_the_workbook(w, wb_file):
+def test_at21_map_load_post_and_tie_out_from_the_workbook(w, wb_file, open_items):
     base = ["--entity", "ALM", "--workbook", wb_file]
     assert "no errors" in cmd("migration_workbook_check", "--workbook", wb_file, "--user", "mig.a", "--entity", "ALM")
 
@@ -48,6 +49,10 @@ def test_at21_map_load_post_and_tie_out_from_the_workbook(w, wb_file):
     cmd("migration_load", *base, "--user", "mig.a", "--apply")  # re-run: skipped, not duplicated
     assert ImportedEntry.objects.count() == 1
 
+    with pytest.raises(CommandError):  # R22: no open items loaded yet for 1200, 1210 (SUB), 2100
+        cmd("migration_post", "--entity", "ALM", "--user", "mig.p", "--kind", "opening", "--apply")
+    # the workbook's open items as the R23 loader would load them (receivables 23,000 and SUB 5,000; payables 11,500)
+    open_items["ALM"] = {("1200", ""): D("23000.00"), ("1210", "SUB"): D("5000.00"), ("2100", ""): D("-11500.00")}
     cmd("migration_post", "--entity", "ALM", "--user", "mig.p", "--kind", "opening", "--apply")
     assert "ties out" in cmd("migration_tieout", *base, "--user", "mig.p", "--as-of", "2026-12-31", "--posted-only")
 

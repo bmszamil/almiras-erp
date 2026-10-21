@@ -21,14 +21,13 @@ def test_clean_journal_with_trial_balance_ties_out(w, mapped):
     report = services.validate_journal(w.alm, journal_file(), user=w.a, trial_balance=tb_file(), cutover=CUTOVER)
     assert report.ok, [p.message for p in report.errors]
     assert report.summary["entries"] == 4 and report.summary["rows"] == 9
-    assert report.summary["debit"] == report.summary["credit"] == D("34000.00")
+    assert report.summary["debit"] == report.summary["credit"] == D("23000.00")
     assert report.summary["by_source"] == {"مستخلص عميل": 1, "Journal": 3}
     assert codes(report, "error") == []
-    assert codes(report) == ["control_account", "customer_statements"]  # warning and info only
-    assert {p.account_code for p in report.problems if p.code == "control_account"} == {"1201"}  # 2101 has no movement
+    assert codes(report) == ["customer_statements"]  # info only: the journal touches no control account
     assert all(t["difference"] == 0 for t in report.tie_out) and len(report.tie_out) == 9
     totals = {t["code"]: t for t in report.account_totals}
-    assert totals["1102"]["net"] == D("3500.00") and totals["1102"]["erp_code"] == "1100"
+    assert totals["1102"]["net"] == D("3000.00") and totals["1102"]["erp_code"] == "1100"
     erp = {t["erp_code"]: t for t in report.erp_totals}
     assert erp["1100"]["legacy_codes"] == "1101,1102" and erp["1100"]["net"] == D("500.00")
 
@@ -98,18 +97,18 @@ def test_numbering_gap_year_prefix_and_duplicate_rows_are_warnings(w, mapped):
 
 def test_at8_tie_out_difference_of_one_halala(w, mapped):
     rows = journal_rows()
-    rows[3]["debit"], rows[4]["credit"] = 11500.01, 11500.01  # still balanced, but 1102 and 1201 move by 0.01
+    rows[3]["debit"], rows[4]["credit"] = 500.01, 500.01  # still balanced, but 1101 and 1102 move by 0.01
     report = services.validate_journal(w.alm, journal_file(rows), user=w.a, trial_balance=tb_file())
     diffs = {p.account_code: p for p in report.errors if p.code in ("tie_out", "movement_difference")}
-    assert set(diffs) == {"1102", "1201"}
+    assert set(diffs) == {"1101", "1102"}
     line = next(t for t in report.tie_out if t["code"] == "1102")
-    assert line["difference"] == D("-0.01")
+    assert line["difference"] == D("0.01")
 
 
 def test_tie_out_codes_on_one_side_only(w, mapped):
     balances = dict(BALANCES)
     del balances["5201"]
-    balances["1101"] = ("الصندوق الرئيسي", "13000.00", "0", "3000.00")  # keeps the TB balanced
+    balances["1101"] = ("الصندوق الرئيسي", "13000.00", "500.00", "3000.00")  # keeps the TB balanced
     report = services.validate_journal(w.alm, journal_file(), user=w.a, trial_balance=tb_file(balances))
     assert ("not_in_tb", "5201") in {(p.code, p.account_code) for p in report.errors}
 
@@ -139,7 +138,7 @@ def test_sharia_prohibited_target_needs_a_human_decision(w):
     services.approve_account_map(services.create_account_map(w.alm, user=w.a, rows=rows), user=w.p)
     balances = dict(BALANCES)
     balances["2401"] = ("قرض بنكي", "-1000.00", "0", "0")
-    balances["1101"] = ("الصندوق الرئيسي", "11000.00", "0", "3000.00")
+    balances["1101"] = ("الصندوق الرئيسي", "11000.00", "500.00", "3000.00")
     report = services.validate_trial_balance(w.alm, tb_file(balances), user=w.a, cutover=CUTOVER)
     assert codes(report, "error") == ["sharia_prohibited"]
 
@@ -151,7 +150,23 @@ def test_validation_needs_the_import_right_in_that_entity(w, mapped):
         services.validate_journal(w.alm, journal_file(), user=w.p)
 
 
-def test_control_accounts_are_flagged_for_invoicing_import_documents(w, mapped):
+def test_at23_control_accounts_allowed_in_the_opening_entry_refused_in_replayed_journals(w, mapped):
+    """R8 as amended (M6, M7): opening balances on control accounts are allowed (no warning, gated by R22); a replayed
+    journal line on one is an error naming the entry and the account, and blocks loading."""
     report = services.validate_trial_balance(w.alm, tb_file(), user=w.a, cutover=CUTOVER)
-    assert report.ok
-    assert {p.account_code for p in report.warnings if p.code == "control_account"} == {"1201", "2101"}
+    assert report.ok and not report.warnings
+    info = next(p for p in report.problems if p.code == "control_account_open_items")
+    assert "1201→1200" in info.message and "2101→2100" in info.message and "R22" in info.message
+    assert "حسابات المراقبة" in info.message
+
+    rows = journal_rows() + [t.line(26000005, date(2026, 3, 1), "1201", "عملاء تجريبيون", debit="1150.00",
+                                    source="مستخلص عميل", source_no=502),
+                             t.line(26000005, date(2026, 3, 1), "4101", "إيرادات إيجار", credit="1150.00",
+                                    source="مستخلص عميل", source_no=502)]
+    report = services.validate_journal(w.alm, journal_file(rows), user=w.a, cutover=CUTOVER)
+    errors = [p for p in report.errors if p.code == "control_account"]
+    assert [(p.entry_no, p.account_code) for p in errors] == [("26000005", "1201")]
+    assert "replayed journals cannot post to control accounts" in errors[0].message and "1201→1200" in errors[0].message
+    assert "حسابات المراقبة" in errors[0].message
+    plan = services.load_journal_entries(w.alm, journal_file(rows), user=w.a, cutover=CUTOVER, apply=True)
+    assert not plan.applied and not plan.created  # the whole run is refused, the clean entries too
