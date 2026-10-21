@@ -127,6 +127,13 @@ class ZatcaProfile(Tracked, ServiceWritten):
         return f"{self.entity.code} ({self.environment})"
 
 
+class AttentionReason(models.TextChoices):
+    RENEWAL_KEY_MISMATCH = "renewal_key_mismatch", bi("Renewed CSID is not for the new key",
+                                                      "شهادة التجديد لا تخص المفتاح الجديد")
+    RENEWAL_UNCONFIRMED = "renewal_unconfirmed", bi("Renewed CSID issued but not stored",
+                                                    "صدرت شهادة التجديد ولم تُحفظ")
+
+
 class EgsUnit(Tracked, ServiceWritten):
     class Status(models.TextChoices):
         DRAFT = "draft", bi("Draft", "مسودة")
@@ -157,6 +164,12 @@ class EgsUnit(Tracked, ServiceWritten):
                                          default=INITIAL_PIH)
     private_key_ref = models.CharField(bi("Private key reference", "مرجع المفتاح الخاص"), max_length=300, blank=True)
     csr_pem = models.TextField(bi("CSR (public)", "طلب الشهادة (عام)"), blank=True)
+    # R-10 note (2026-10-21): ZATCA issued a renewed CSID that could not be taken into use (certificate for another
+    # key, or the store failed in between). ZATCA may already have revoked the old CSID, so the unit neither signs
+    # nor submits until a ZATCA admin resolves it (renew again, revoke, or confirm the old CSID with ZATCA).
+    attention_reason = models.CharField(bi("Needs attention because", "يحتاج إلى متابعة بسبب"), max_length=30,
+                                        choices=AttentionReason.choices, blank=True)
+    attention_since = models.DateTimeField(bi("Needs attention since", "يحتاج إلى متابعة منذ"), null=True, blank=True)
 
     class Meta:
         verbose_name = bi("EGS unit", "وحدة إصدار الفواتير")
@@ -453,6 +466,13 @@ class OnboardingEvent(AppendOnly):
         MASTER_KEY_ROTATED = "master_key_rotated", bi("Master key rotated", "دُوِّر المفتاح الرئيسي")
         SUPER_KEY_REGISTERED = "super_key_registered", bi("Group super key registered", "سُجل المفتاح الأعلى")
         PROFILE_ENABLED = "profile_enabled", bi("Profile enabled", "فُعّل الملف")
+        # D-19, R-57 to R-60 (2026-10-21): one event per secret-store version.
+        SECRET_VERSION_RETIRED = "secret_version_retired", bi("Secret version retired", "أُوقف إصدار السر")
+        SECRET_RETIREMENT_FAILED = "secret_retirement_failed", bi("Secret version retirement failed",
+                                                                  "تعذر إيقاف إصدار السر")
+        # R-10 note (2026-10-21): a renewed CSID ZATCA issued could not be taken into use; resolution.
+        RENEWAL_NEEDS_ATTENTION = "renewal_needs_attention", bi("Renewal needs attention", "التجديد يحتاج إلى متابعة")
+        ATTENTION_CLEARED = "attention_cleared", bi("Attention cleared", "انتهت المتابعة")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
     egs_unit = models.ForeignKey(EgsUnit, null=True, blank=True, on_delete=models.PROTECT, related_name="events",

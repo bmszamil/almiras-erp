@@ -211,6 +211,14 @@ LOCAL = {
                                 "بيانات المشتري."),
     "no_egs": ("No active EGS unit of this entity can sign this category of document.",
                "لا توجد وحدة فوترة نشطة لهذا الكيان توقّع هذه الفئة من المستندات."),
+    # zatca R-10 note (2026-10-21): a renewed CSID ZATCA issued could not be taken into use.
+    "egs_needs_attention": (
+        "EGS unit {unit} needs attention: ZATCA issued a renewed certificate that could not be taken into use, and "
+        "ZATCA may already have revoked the old one. Nothing is signed or sent to ZATCA with this unit until a ZATCA "
+        "admin renews it again, revokes it, or confirms with ZATCA that the old certificate is still valid.",
+        "وحدة الفوترة {unit} تحتاج إلى متابعة: أصدرت الهيئة شهادة تجديد تعذر استخدامها، وربما ألغت الهيئة الشهادة "
+        "السابقة. لا يُوقَّع شيء ولا يُرسل إلى الهيئة بهذه الوحدة حتى يجددها مسؤول الربط مرة أخرى أو يلغيها أو يتأكد "
+        "من الهيئة أن الشهادة السابقة ما زالت صالحة."),
 }
 
 

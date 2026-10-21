@@ -7,6 +7,10 @@
 # --- ZATCA e-invoicing (zatca.md) ------------------------------------------------------------------------------
 # R-20..R-27, R-35: stamp, submit, retry, results, deadline checks. "Schedule it every minute."
 *    *    *   *   *     /opt/almiras/bin/run-job.sh zatca_process_queue --timeout 300 -- python manage.py zatca_process_queue
+# D-19, R-58 / R-60: retry failed secret-version retirements (R-24 backoff, 1 min doubling to 1 h) and retire
+# unreferenced versions after ZATCA_RETIRE_GRACE_MINUTES. Every minute (the first retry is due after 1 min);
+# nothing is ever destroyed.
+*    *    *   *   *     /opt/almiras/bin/run-job.sh zatca_retire_secrets --timeout 300 -- python manage.py zatca_retire_secrets
 # R-10 credential renewal/expiry, R-23/R-35 deadline checks. Daily, after the nightly billing run.
 15   1    *   *   *     /opt/almiras/bin/run-job.sh zatca_daily --timeout 1800 -- python manage.py zatca_daily
 # Monitoring watchdog for the 24 h simplified reporting deadline (R-23) and a stuck queue. Exit 1 at risk,

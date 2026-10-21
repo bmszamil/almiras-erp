@@ -43,7 +43,7 @@ class ZatcaProfileAdmin(ReadOnly):
 
 @admin.register(EgsUnit)
 class EgsUnitAdmin(ReadOnly):
-    list_display = ("entity", "code", "name_en", "status", "last_icv")
+    list_display = ("entity", "code", "name_en", "status", "attention_reason", "last_icv")
     exclude = ("csr_pem",)
 
 
