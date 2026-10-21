@@ -71,7 +71,8 @@ def _save(obj):
 
 
 def _direct_roles(user, entity, permission, at):
-    return {m.role.code for m in access._memberships_for(user, entity, permission, at) if m.entity_id == entity.pk}
+    return {m.role.code for m in access._memberships_for(user, entity, permission, at)
+            if m.entity_id == entity.pk and m.delegated_from_id is None}  # never through a legacy R16 delegate
 
 
 def _is_top_authority(user, entity, at):
@@ -114,7 +115,8 @@ def delegate_authority(actor, *, entity, delegate, valid_to, reason_en, reason_a
     if not (reason_en or "").strip() or not (reason_ar or "").strip():
         raise ValidationError("A reason in English and Arabic is required. / السبب بالإنجليزية والعربية مطلوب.")
     valid_from = _check_window(actor, entity, valid_from, valid_to, at)
-    own = list(Membership.objects.active(at).filter(user=delegate, entity=entity).select_related("role"))
+    own = list(Membership.objects.active(at).filter(user=delegate, entity=entity, delegated_from__isnull=True)
+               .select_related("role"))
     working = {m.role.code for m in own if m.role.kind == Kind.HUMAN} - engine.NON_DELEGATE_ROLES
     if access.kind_of(delegate) != Kind.HUMAN or not working:
         _refuse("delegate_not_eligible", actor, entity, DELEGATE, who=delegate.get_username())

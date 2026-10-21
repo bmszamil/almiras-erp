@@ -78,6 +78,10 @@ MESSAGES = {
         "This change is decided by {role} of {entity} (R76).",
         "يقرر هذا التغيير {role_ar} في {entity}.",
     ),
+    "not_proposer": (
+        "Only the person who drafted this matrix version edits or submits it; draft your own version (R76).",
+        "لا يعدّل إصدار المصفوفة أو يقدّمه إلا من أعدّه؛ أعدّ إصدارًا خاصًا بك.",
+    ),
     "rows_changed": (
         "The rows of this version no longer match what was submitted.", "أسطر هذا الإصدار لم تعد تطابق ما قُدّم.",
     ),
@@ -111,6 +115,13 @@ def _require_proposer(user, entity):
     if not {m.role.code for m in ms} & {top, "access_admin"}:
         _refuse("proposer_role", user, entity, PROPOSE)
     return ms
+
+
+def _require_own_draft(user, version):
+    """R76: the version's proposer alone edits and submits it, so the second person never wrote any of it."""
+    _require_proposer(user, version.entity)
+    if version.proposed_by_id != getattr(user, "pk", None):
+        _refuse("not_proposer", user, version.entity, PROPOSE)
 
 
 def _save(obj):
@@ -201,7 +212,7 @@ def add_rule(version, *, user, activity, approver_roles=(), approver_user=None, 
     """Add a row to a draft version (R69 to R74)."""
     version = AuthorityMatrixVersion.objects.select_for_update().get(pk=version.pk)
     entity = version.entity
-    _require_proposer(user, entity)
+    _require_own_draft(user, version)
     if not version.is_draft:
         _refuse("not_draft", user, entity, PROPOSE)
     act = activity if isinstance(activity, ApprovalActivity) else engine.activity_row(activity)
@@ -246,7 +257,7 @@ def add_rule(version, *, user, activity, approver_roles=(), approver_user=None, 
 @transaction.atomic
 def remove_rule(rule, *, user):
     rule = AuthorityRule.objects.select_related("version", "entity").get(pk=rule.pk)
-    _require_proposer(user, rule.entity)
+    _require_own_draft(user, rule.version)
     if not rule.version.is_draft:
         _refuse("not_draft", user, rule.entity, PROPOSE)
     snap = rule.snapshot()
@@ -264,7 +275,7 @@ def submit_version(version, *, user):
     """Freeze the draft and open the four-eyes request (R76): ``payload_hash`` = the rows hash."""
     version = AuthorityMatrixVersion.objects.select_for_update().get(pk=version.pk)
     entity = version.entity
-    _require_proposer(user, entity)
+    _require_own_draft(user, version)
     if not version.is_draft:
         _refuse("not_draft", user, entity, PROPOSE)
     at = access.now()
@@ -294,8 +305,8 @@ def decider_roles(entity, proposer, at=None):
     return frozenset({"chairman"}) if engine.is_group_parent(entity) else frozenset({"board_representative"})
 
 
-def _require_decider(user, entity, proposer_id, at):
-    if proposer_id == getattr(user, "pk", None):  # S!: nobody decides their own change (R15, R19)
+def _require_decider(user, entity, proposer_id, at, makers=()):
+    if getattr(user, "pk", None) in {proposer_id, *makers}:  # S!: nobody decides their own change (R15, R19, R76)
         access.deny(user, entity, APPROVE, "self_approval")
     ms = [m for m in access._evaluate(user, entity, APPROVE, at)[0] if m.entity_id == entity.pk]
     if not ms:
@@ -328,7 +339,10 @@ def decide_version(version, *, user, approve, note=""):
     entity, at = version.entity, access.now()
     if version.status != Status.SUBMITTED:
         _refuse("not_draft", user, entity, APPROVE)
-    ms = _require_decider(user, entity, version.proposed_by_id, at)
+    makers = set(version.rules.values_list("created_by_id", flat=True))
+    if version.dual_control_request_id:
+        makers.add(version.dual_control_request.requested_by_id)  # the submitter
+    ms = _require_decider(user, entity, version.proposed_by_id, at, makers)
     req = version.dual_control_request
     _pending(user, entity, req, at)
     today = timezone.localdate(at)
@@ -356,7 +370,7 @@ def decide_version(version, *, user, approve, note=""):
                         "rows_hash": version.rows_hash, "effective_from": version.effective_from.isoformat(),
                         "note": note[:500], "rows": _snapshot(version)})
     if approve:
-        activate_due_versions(entity=entity, today=today)
+        _activate(entity=entity, today=today)
     return version
 
 
@@ -382,10 +396,17 @@ def withdraw_version(version, *, user, reason):
     return version
 
 
-def activate_due_versions(*, entity=None, today=None):
-    """Job (and called at approval): mark the version in force for each entity, superseding its predecessor, and log
+def activate_due_versions(actor, *, entity=None, today=None):
+    """Daily job: mark the version in force for each entity, superseding its predecessor, and log
     ``authority_matrix_effective`` once per version (R77, R78). Effective dates decide which rules apply whether or
-    not this ran; it records the change of status."""
+    not this ran; it records the change of status. Only the ``governance`` system user runs it (review of 92c35c2,
+    item 12); ``decide_version`` uses the internal ``_activate`` after its own dual-control check."""
+    if actor is None or actor.pk != access.system_user("governance").pk:
+        raise access.AccessUsageError("activate_due_versions is the governance system job (access R77, R20).")
+    return _activate(entity=entity, today=today)
+
+
+def _activate(*, entity=None, today=None):
     today = today or timezone.localdate(access.now())
     entities = [entity] if entity is not None else Entity.objects.filter(authority_versions__isnull=False).distinct()
     changed = []

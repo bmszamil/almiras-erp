@@ -795,6 +795,22 @@ def test_at31_post_revaluation_grants(w):
             services.post_revaluation(run, again)
 
 
+def test_at31_post_revaluation_refuses_a_self_approval_grant(w):
+    """AT-31 (restored, review of 92c35c2): the ledger has no self-approval switch. The group parent's top authority
+    gets a logged self-approval grant for their own revaluation from the engine (access R79), and post_revaluation
+    still refuses it."""
+    f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")
+    member(w.mp, w.alm, "accountant")  # the Managing Partner prepares the run themselves
+    run = services.revalue_period(w.alm, w.alm.periods.get(name="2027-01"), user=w.mp)
+    own = access.require(w.mp, w.alm, "ledger.post_entry", document=run.entry)
+    assert own.self_approval and own.top_authority
+    with pytest.raises(access.AccessDenied) as exc:
+        services.post_revaluation(run, own)
+    assert exc.value.code == "self_approval"
+    assert RevaluationRun.objects.get(pk=run.pk).status == "draft" and JournalEntry.objects.get(pk=run.entry_id).status == "draft"
+
+
 def test_revaluation_draft_is_not_posted_through_post_entry(w):
     run = _jan_run(w)
     with pytest.raises(LedgerError, match="post_revaluation"):

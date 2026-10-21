@@ -23,7 +23,7 @@ the engine a document's activity, amount, currency, version, beneficiaries and a
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from django.db import transaction
 from django.utils import timezone
@@ -336,7 +336,7 @@ def _to_functional(entity, amount, currency, document):
         rate = found.rate if found else None
     if rate is None:
         return None
-    return (amount * Decimal(str(rate))).quantize(Decimal("0.01"))
+    return (amount * Decimal(str(rate))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)  # as ledger/fx.py
 
 
 def _places_of(currency_code):
@@ -431,11 +431,13 @@ def resolve(entity, activity, info, on, *, user=None, permission=""):
 # --- requests ----------------------------------------------------------------------------------------------------
 
 def _drafted_for(entity, document, at):
-    """R81: the principal(s) a personal assistant drafted ``document`` for (active assignment of its creator)."""
+    """R81: the principal(s) a personal assistant drafted ``document`` for: assignments of its creator active when
+    the document was created (its ``created_at``; else ``at``). Ending the assignment later changes nothing."""
     creator = getattr(document, "created_by_id", None)
     if creator is None:
         return []
-    return list(AssistantAssignment.objects.filter(active_window_q(at), entity=entity, assistant_id=creator)
+    when = getattr(document, "created_at", None) or at
+    return list(AssistantAssignment.objects.filter(active_window_q(when), entity=entity, assistant_id=creator)
                 .values_list("principal_id", flat=True))
 
 
@@ -493,10 +495,21 @@ def _open_request(entity, info, user, at, *, submitted_by=None):
     return req
 
 
-def submit(document, user, *, permission=None, entity=None):
+def submit(document, user, *, submit_permission, permission=None, entity=None):
     """Open the approval request when a module submits a document (R61, R77). A gap in the entity's bands is refused
-    here (``no_authority_rule``), inside the module's transaction, so the document stays a draft (R71)."""
+    here (``no_authority_rule``), inside the module's transaction, so the document stays a draft (R71).
+
+    ``submit_permission`` is the module's own submit right (e.g. ``invoicing.submit_sales_document``); the engine
+    checks it again itself, so the request cannot be opened by a caller that skipped its own ``require`` (review of
+    92c35c2, item 12). It must not be an approval permission."""
     entity = entity or document.entity
+    from . import catalogue
+
+    if catalogue.get(submit_permission).is_approval:
+        raise _services().AccessUsageError(f"{submit_permission} is an approval permission, not a submit right.")
+    _memberships, reason = _services()._evaluate(user, entity, submit_permission, _now())
+    if reason:
+        _services()._deny(user, entity, submit_permission, reason)
     permission = permission or _main_permission(document)
     info = describe(document, permission, entity)
     info.document = document
@@ -519,8 +532,10 @@ def _main_permission(document):
 # --- eligibility -------------------------------------------------------------------------------------------------
 
 def _direct_memberships(user, entity, permission, at):
-    """Active memberships giving ``permission`` **in** ``entity`` itself: no group cascade (R64, R90)."""
-    return [m for m in _services()._memberships_for(user, entity, permission, at) if m.entity_id == entity.pk]
+    """Active memberships giving ``permission`` **in** ``entity`` itself: no group cascade (R64, R90). A legacy R16
+    delegate membership (``delegated_from``) never counts: delegation is an ``ApprovalDelegation`` (R62, R88)."""
+    return [m for m in _services()._memberships_for(user, entity, permission, at)
+            if m.entity_id == entity.pk and m.delegated_from_id is None]
 
 
 def _role_codes(memberships):
@@ -653,6 +668,15 @@ def _approvals_by_step(req):
     return done
 
 
+def _person(decision):
+    """The person a decision counts for (R75): the delegator when a delegate decided on their behalf."""
+    return decision.on_behalf_of_id or decision.user_id
+
+
+def _persons(decision):
+    return {decision.user_id, decision.on_behalf_of_id} - {None}
+
+
 def _current_step(req):
     """(step, index) of the first step not yet complete, or (last step, index) when every step is complete."""
     done = _approvals_by_step(req)
@@ -660,7 +684,7 @@ def _current_step(req):
         rows = done.get(step["step_no"], [])
         if any(d.decision == ApprovalDecision.Decision.SKIPPED for d in rows):
             continue
-        if len({d.user_id for d in rows}) < step["min_approvals"]:
+        if len({_person(d) for d in rows}) < step["min_approvals"]:
             return step, i, False
     return req.steps[-1], len(req.steps) - 1, True
 
@@ -672,7 +696,7 @@ def _remaining_after(req, step_index, adding_user):
         rows = done.get(step["step_no"], [])
         if any(d.decision == ApprovalDecision.Decision.SKIPPED for d in rows):
             continue
-        people = {d.user_id for d in rows}
+        people = {_person(d) for d in rows}
         if i == step_index:
             people.add(adding_user)
         remaining += max(0, step["min_approvals"] - len(people))
@@ -745,7 +769,8 @@ def authorise(user, entity, permission, document, *, at):
         req = _open_request(entity, info, user, at)
     elif req.status in (ApprovalRequest.Status.REJECTED, ApprovalRequest.Status.RETURNED):
         req = _open_request(entity, info, user, at)
-    if _purpose.get() == "approve" and user.pk in info.beneficiaries:  # R82: before any step, for every role
+    checking = _purpose.get() in ("approve", "check")
+    if checking and user.pk in info.beneficiaries:  # R82: before any step, for every role
         refuse("beneficiary", user, entity, permission, {"request": req.pk, "activity": info.activity})
     _skip_beneficiary_steps(req, info, permission, at)
     step, index, complete = _current_step(req)
@@ -766,14 +791,26 @@ def authorise(user, entity, permission, document, *, at):
             if not [m for m in held if m.entity_id == entity.pk]:  # only through the group parent: no cascade (R64)
                 _services()._deny(user, entity, permission, "no_membership")
             refuse("not_in_matrix", user, entity, permission, details, activity=name_en, activity_ar=name_ar)
-    decided = {d.step_no for d in req.decisions.filter(user=user, decision=ApprovalDecision.Decision.APPROVED)}
+    deciders = {user.pk} | ({delegation.delegator_id} if delegation is not None else set())
+    decided = {d.step_no for d in req.decisions.filter(decision=ApprovalDecision.Decision.APPROVED)
+               if _persons(d) & deciders}  # R75: as approver or delegate, either side counts as the person
     already = step["step_no"] in decided
     approving = _purpose.get() == "approve"
     if approving and decided - {step["step_no"]}:
         refuse("same_person_two_steps", user, entity, permission, {"request": req.pk, "step_no": step["step_no"]})
     people = document_people(entity, document, at)
+    if req.drafted_for_id:  # R81: the principal recorded when the request opened
+        people.add(req.drafted_for_id)
     if info.adapter.people:
         people |= {uid for uid in info.adapter.people(document) if uid is not None}
+    if delegation is not None:  # a delegate never approves what the delegator could not (R62, R79, R82)
+        if checking and delegation.delegator_id in info.beneficiaries:
+            refuse("beneficiary", user, entity, permission, {"request": req.pk, "activity": info.activity,
+                                                             "on_behalf_of": delegation.delegator_id})
+        if delegation.delegator_id in people:
+            refuse("self_approval", user, entity, permission,
+                   {"activity": info.activity, "request": req.pk, "why": "delegator_is_maker",
+                    "document": [info.label, info.pk]})
     self_approval = user.pk in people
     top = False
     if self_approval:
@@ -790,7 +827,7 @@ def authorise(user, entity, permission, document, *, at):
     return Authorisation(memberships, req, step, rule, delegation, self_approval, top, final, info, already)
 
 
-def record(auth, user, permission, grant_log, at):
+def _record(auth, user, permission, grant_log, at):
     """Write the decision of a granted authorisation (final, or a step inside :func:`decide`) and the R83 log row."""
     req, info = auth.request, auth.info
     purpose = _purpose.get()
@@ -839,7 +876,7 @@ def record(auth, user, permission, grant_log, at):
     return decision
 
 
-def step_pending(auth, user, permission):
+def _step_pending(auth, user, permission):
     """A non-final decision: recorded by :func:`decide`; refused for a direct module call (R61)."""
     if _purpose.get() != "approve":
         return
@@ -892,7 +929,7 @@ def decide(document, user, *, approve=True, note="", permission=None, action=Non
                         req = _open_request(entity, info, actor, _now())
                     auth.request = req
                     at = _now()
-                    record(auth, actor, step.payload["permission"], None, at)
+                    _record(auth, actor, step.payload["permission"], None, at)
                     return Outcome(req, False, "approved", None)
         finally:
             _explicit.reset(token)

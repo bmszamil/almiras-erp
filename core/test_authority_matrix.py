@@ -7,6 +7,7 @@ Fixtures as §10.8: ALM (group parent, top authority ``managing_partner``), SUB 
 (``external_auditor`` SUB, time-limited), BA (``business_analyst`` SUB), BR (``board_representative`` SUB), plus an
 ALM CFO (AF) and ALM accountant (AL). All names, numbers and amounts are made up.
 """
+import dataclasses
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from core.models import Entity
 from invoicing import services as inv
 from invoicing.conftest import make_entity
 from invoicing.models import PurchaseDocument
+from ledger import services as ledger
 from ledger.models import ExchangeRate
 
 pytestmark = pytest.mark.django_db
@@ -398,7 +400,9 @@ def test_at82_versions_are_never_retroactive_and_open_requests_keep_their_rules(
     with pytest.raises(access.AccessDenied):  # v3 names the ceo, but the bill keeps v2's rules (OQ-46)
         inv.approve_purchase_document(b, user=g.ce)
     assert inv.approve_purchase_document(b, user=g.cf).status == "posted"
-    matrix.activate_due_versions(today=date(2027, 4, 2))
+    with pytest.raises(access.AccessUsageError):  # review of 92c35c2, item 12: the job is the system user's only
+        matrix.activate_due_versions(g.mp, today=date(2027, 4, 2))
+    matrix.activate_due_versions(access.system_user("governance"), today=date(2027, 4, 2))
     assert AuthorityMatrixVersion.objects.get(pk=v2b.pk).status == "superseded"
     assert AuthorityMatrixVersion.objects.get(pk=v2b.pk).superseded_by == v3
 
@@ -867,3 +871,167 @@ def test_r83_r85_append_only_engine_records(g):
                                     summary_ar="س", proposed_by=g.aa)
         v2._service_write = True
         v2.save()
+
+
+# --- review of 92c35c2: the reviewer's probes, as refusal tests ---------------------------------------------------
+
+def test_rv_p1_only_the_proposer_edits_and_submits_a_draft(g):
+    """R76 (probe P1): the second person never wrote any of the version."""
+    v = matrix.draft_version(g.sub, user=g.aa, effective_from=timezone.localdate(), summary_en="v", summary_ar="ن",
+                             copy_current=False)
+    with pytest.raises(access.AccessDenied) as exc:
+        matrix.add_rule(v, user=g.ce, activity="invoicing.bill", approver_roles=["ceo"])
+    assert exc.value.code == "not_proposer"
+    rule = matrix.add_rule(v, user=g.aa, activity="invoicing.bill", approver_roles=["ceo"])
+    with pytest.raises(access.AccessDenied) as exc:
+        matrix.remove_rule(rule, user=g.ce)
+    assert exc.value.code == "not_proposer"
+    with pytest.raises(access.AccessDenied) as exc:
+        matrix.submit_version(v, user=g.ce)
+    assert exc.value.code == "not_proposer"
+    matrix.submit_version(v, user=g.aa)
+    assert matrix.decide_version(v, user=g.ce, approve=True).status == "approved"
+
+
+def test_rv_p1b_a_row_author_never_decides_the_version(g):
+    """R76 (probe P1b): the author of any row is barred from deciding, whoever submitted."""
+    v = matrix.draft_version(g.sub, user=g.aa, effective_from=timezone.localdate(), summary_en="v", summary_ar="ن",
+                             copy_current=False)
+    rule = matrix.add_rule(v, user=g.aa, activity="invoicing.bill", approver_roles=["ceo"])
+    rule.created_by = g.ce  # as a row written before the proposer-only rule
+    rule._service_write = True
+    rule.save()
+    matrix.submit_version(v, user=g.aa)
+    with pytest.raises(access.AccessDenied) as exc:
+        matrix.decide_version(v, user=g.ce, approve=True)
+    assert exc.value.code == "self_approval"
+    assert AuthorityMatrixVersion.objects.get(pk=v.pk).status == "submitted"
+
+
+def test_rv_p2_a_delegate_never_approves_the_delegator_s_own_document(g):
+    """R62, R14 (probe P2): the delegator made the bill, so their delegate cannot approve it either."""
+    member(g.cf, g.sub, "accountant")
+    own = bill(g, "1000.00", user=g.cf)
+    delegations.delegate_authority(g.cf, entity=g.sub, delegate=g.ac, valid_to=access.now() + timedelta(days=5),
+                                   reason_en="x", reason_ar="س", activities=["invoicing.bill"])
+    with pytest.raises(access.AccessDenied) as exc:
+        inv.approve_purchase_document(own, user=g.ac)
+    assert exc.value.code == "self_approval"
+    assert PurchaseDocument.objects.get(pk=own.pk).status == "submitted"
+
+
+def _leave_for(g, beneficiary):
+    return SimpleNamespace(pk=99, entity=g.sub, _meta=SimpleNamespace(label_lower="hr.leaverequest"),
+                           created_by_id=g.ac.pk, employee=SimpleNamespace(user_id=beneficiary.pk))
+
+
+def test_rv_p3_a_delegate_never_approves_the_delegator_s_own_benefit(g):
+    """R62, R82 (probe P3)."""
+    delegations.delegate_authority(g.ce, entity=g.sub, delegate=g.cf, valid_to=access.now() + timedelta(days=5),
+                                   reason_en="x", reason_ar="س")
+    approved_matrix(g, g.sub, [dict(activity="hr.leave", approver_roles=["ceo"])])
+    with pytest.raises(access.AccessDenied) as exc:
+        access.require(g.cf, g.sub, "hr.approve_leave", document=_leave_for(g, g.ce))
+    assert exc.value.code == "beneficiary"
+    assert denied(g.cf, "beneficiary")
+
+
+def test_rv_p4_a_check_grant_is_recorded_as_a_check_and_never_posts(g):
+    """Probes P4 and P4b: ``purpose="check"`` checks eligibility only; its grant is not an approval (R31)."""
+    approved_matrix(g, g.sub, [dict(activity="invoicing.bill", approver_roles=["approver"], step_no=1),
+                               dict(activity="invoicing.bill", approver_roles=["ceo"], step_no=2)])
+    b = bill(g, "1000.00", user=make_member(g, "clk", "payables_clerk"))
+    with pytest.raises(access.AccessDenied):
+        access.require(g.cf, g.sub, "invoicing.approve_bill", document=b)
+    grant = access.require(g.cf, g.sub, "invoicing.approve_bill", document=b, purpose="check")
+    assert grant.purpose == "check"
+    assert AccessLog.objects.get(pk=grant.log_id).details["purpose"] == "check"
+    lines = [{"account": "5300", "debit": "10.00"}, {"account": "2100", "credit": "10.00"}]
+    with pytest.raises(access.AccessDenied) as exc:
+        ledger.create_entry(g.sub, date(2027, 3, 15), "Bill", lines, user=g.ac, post=True, document=b, grant=grant)
+    assert exc.value.code == "grant_not_an_approval"
+    forged = dataclasses.replace(grant, purpose="approve")  # the log row still says check (R31)
+    with pytest.raises(access.AccessDenied):
+        ledger.create_entry(g.sub, date(2027, 3, 15), "Bill", lines, user=g.ac, post=True, document=b, grant=forged)
+    assert PurchaseDocument.objects.get(pk=b.pk).status == "submitted"
+
+
+def test_rv_p4_the_beneficiary_rule_applies_to_checks_too(g):
+    """R82 (review item 6): a beneficiary cannot even check their own benefit."""
+    approved_matrix(g, g.sub, [dict(activity="hr.leave", approver_roles=["ceo"])])
+    with pytest.raises(access.AccessDenied) as exc:
+        access.require(g.ce, g.sub, "hr.approve_leave", document=_leave_for(g, g.ce), purpose="check")
+    assert exc.value.code == "beneficiary"
+
+
+def test_rv_p6_p7_the_legacy_entry_point_creates_a_limited_delegation(g):
+    """R62, R87, R88 (probes P6, P7): ``delegate_approval`` makes an ApprovalDelegation with every limit."""
+    clerk = make_member(g, "clk6", "payables_clerk")
+    with pytest.raises(access.AccessDenied) as exc:  # at most 90 days
+        access.delegate_approval(g.cf, g.ac, g.sub, None, access.now() + timedelta(days=200), "leave")
+    assert exc.value.code == "delegation_too_long"
+    with pytest.raises(access.AccessDenied) as exc:  # never to a personal assistant only
+        access.delegate_approval(g.cf, g.pa, g.sub, None, access.now() + timedelta(days=5), "office")
+    assert exc.value.code == "delegate_not_eligible"
+    d = access.delegate_approval(g.cf, g.ac, g.sub, None, access.now() + timedelta(days=5), "leave")
+    assert isinstance(d, ApprovalDelegation) and d.delegator == g.cf
+    assert not Membership.objects.filter(user=g.ac, delegated_from__isnull=False).exists()
+    with pytest.raises(access.AccessDenied):  # the delegate cannot pass the authority on: no chain (R88)
+        delegations.delegate_authority(g.ac, entity=g.sub, delegate=clerk, valid_to=access.now() + timedelta(days=5),
+                                       reason_en="x", reason_ar="س", activities=["invoicing.bill"])
+    assert not ApprovalDelegation.objects.filter(delegate=clerk).exists()
+
+
+def test_rv_p6_a_legacy_delegate_membership_gives_no_approval(g):
+    """R62 (probe P6): a ``delegated_from`` membership left from R16 never counts in the engine or delegations."""
+    maker = make_member(g, "mk6", "payables_clerk")
+    src = Membership.objects.get(user=g.cf, entity=g.sub, role__code="approver")
+    legacy = Membership(user=g.ac, entity=g.sub, role=src.role, valid_from=access.now(), delegated_from=src,
+                        valid_to=access.now() + timedelta(days=10), granted_by=g.cf, reason="old R16")
+    Membership.objects.bulk_create([legacy])  # as left in the database before core.0030 (no clean)
+    b = bill(g, "1000.00", user=maker)
+    with pytest.raises(access.AccessDenied):
+        inv.approve_purchase_document(b, user=g.ac)
+    with pytest.raises(access.AccessDenied):
+        delegations.delegate_authority(g.ac, entity=g.sub, delegate=maker, valid_to=access.now() + timedelta(days=5),
+                                       reason_en="x", reason_ar="س")
+    assert PurchaseDocument.objects.get(pk=b.pk).status == "submitted"
+
+
+def test_rv_p8_ending_the_assignment_does_not_clear_the_principal(g):
+    """R81 (probe P8): the principal recorded when the request opened stays a maker."""
+    a = delegations.assign_assistant(g.cf, entity=g.sub, assistant=g.pa, principal=g.cf,
+                                     valid_to=access.now() + timedelta(days=60), reason="CFO office")
+    b = inv.submit_purchase_document(bill(g, "1000.00", user=g.pa, submit=False), user=g.ac)
+    req = ApprovalRequest.objects.get(document_id=b.pk, document_type="invoicing.purchasedocument")
+    assert req.drafted_for == g.cf
+    delegations.end_assistant_assignment(g.cf, a, "done")
+    with pytest.raises(access.AccessDenied) as exc:
+        inv.approve_purchase_document(b, user=g.cf)
+    assert exc.value.code == "self_approval"
+
+
+def test_rv_r75_a_delegate_and_the_delegator_are_one_person_across_steps(g):
+    """R75 (review item 8): a delegate's decision counts for the delegator too."""
+    approved_matrix(g, g.sub, [dict(activity="invoicing.bill", approver_roles=["approver"], step_no=1),
+                               dict(activity="invoicing.bill", approver_roles=["approver", "ceo"], step_no=2)])
+    delegations.delegate_authority(g.cf, entity=g.sub, delegate=g.ac, valid_to=access.now() + timedelta(days=5),
+                                   reason_en="x", reason_ar="س")
+    b = bill(g, "1000.00", user=make_member(g, "clk8", "payables_clerk"))
+    out = engine.decide(b, g.ac)  # step 1 for the CFO, by the delegate
+    assert out.final is False
+    assert ApprovalDecision.objects.get(request=out.request, step_no=1).on_behalf_of == g.cf
+    with pytest.raises(access.AccessDenied) as exc:
+        engine.decide(b, g.cf)  # the CFO in person on step 2: the same person
+    assert exc.value.code == "same_person_two_steps"
+    assert engine.decide(b, g.ce).final
+
+
+def test_rv_r12_engine_submit_checks_the_submit_right_itself(g):
+    """Review item 12: a caller that skipped its own require cannot open a request."""
+    draft = bill(g, "1000.00", submit=False)
+    with pytest.raises(access.AccessDenied):
+        engine.submit(draft, g.ba, submit_permission="invoicing.submit_bill")
+    with pytest.raises(access.AccessUsageError):
+        engine.submit(draft, g.ac, submit_permission="invoicing.approve_bill")
+    assert not ApprovalRequest.objects.filter(document_id=draft.pk, document_type="invoicing.purchasedocument").exists()

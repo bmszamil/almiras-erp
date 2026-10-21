@@ -307,6 +307,10 @@ class Membership(models.Model):
                 errors.append(ValidationError(
                     f"A {role.code} membership lasts at most {months} months. / "
                     f"لا تتجاوز عضوية {role.name_ar} {months} شهرًا.", code="valid_to_too_long"))
+        if self.delegated_from_id and self.pk is None:  # R16 retired by R62 (access §10)
+            errors.append(ValidationError(
+                "Approval is delegated with an ApprovalDelegation (R62), not a delegated membership. / "
+                "يُفوَّض الاعتماد بتفويض اعتماد، لا بعضوية مفوَّضة.", code="delegated_membership_retired"))
         if self.delegated_from_id:
             src = self.delegated_from
             if self.valid_to is None:

@@ -124,6 +124,10 @@ MESSAGES = {
         "This authorisation has expired; ask for a new one.",
         "انتهت صلاحية هذا التفويض؛ اطلب تفويضًا جديدًا.",
     ),
+    "grant_not_an_approval": (
+        "This authorisation was given to return, reject or check a document, not to approve or post it.",
+        "صدر هذا التفويض لإعادة المستند أو رفضه أو فحصه، لا لاعتماده أو ترحيله.",
+    ),
     "grant_used": (
         "This authorisation has already been used; each one is used once.",
         "استُخدم هذا التفويض من قبل؛ يُستخدم كل تفويض مرة واحدة.",
@@ -212,6 +216,7 @@ class Grant:
     on_behalf_of_id: int | None = None  # the delegator
     rule_source: str = ""  # "matrix" or "default" (R70)
     approval_request_id: int | None = None
+    purpose: str = "approve"  # require(..., purpose=...): only an "approve" grant approves or posts
 
 
 # --- helpers ---------------------------------------------------------------
@@ -515,7 +520,7 @@ def _require_approval(user, entity, permission, perm, document, at):
         _deny(user, entity, permission, reason)
     auth = engine.authorise(user, entity, permission, document, at=at)
     if not auth.final:
-        engine.step_pending(auth, user, permission)
+        engine._step_pending(auth, user, permission)
     ref = _document_ref(document)
     details = {
         "self_approval": auth.self_approval,
@@ -528,18 +533,19 @@ def _require_approval(user, entity, permission, perm, document, at):
         "rule_id": auth.rule.pk if auth.rule else None,
         "matrix_version": auth.request.matrix_version_id,
         "activity": auth.info.activity,
+        "purpose": engine._purpose.get(),
     }
     if auth.delegation is not None:
         details.update(delegation=auth.delegation.pk, on_behalf_of=auth.delegation.delegator_id)
     entry = log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity, permission=permission, at=at,
                 details=details)
-    engine.record(auth, user, permission, entry, at)
+    engine._record(auth, user, permission, entry, at)
     return Grant(
         user=user, entity=entity, permission=permission, membership_ids=tuple(m.pk for m in auth.memberships),
         checked_at=at, log_id=entry.pk, document_ref=ref, self_approval=auth.self_approval,
         top_authority=auth.top_authority, delegation_id=auth.delegation.pk if auth.delegation else None,
         on_behalf_of_id=auth.delegation.delegator_id if auth.delegation else None,
-        rule_source=auth.request.rule_source, approval_request_id=auth.request.pk,
+        rule_source=auth.request.rule_source, approval_request_id=auth.request.pk, purpose=engine._purpose.get(),
     )
 
 
@@ -611,6 +617,8 @@ def _grant_row_matches(grant, row):
             return False
         if details.get("delegation") != grant.delegation_id or details.get("on_behalf_of") != grant.on_behalf_of_id:
             return False
+        if details.get("purpose", "approve") != (grant.purpose or "approve"):
+            return False
         if sorted(details.get("membership_ids") or []) != sorted(grant.membership_ids or ()):
             return False
     elif grant.document_ref is not None:
@@ -645,6 +653,8 @@ def verify_grant(grant, entity, allowed_permissions, *, document=None, allow_sel
     perm = catalogue.get(grant.permission)
     if (perm.posts or perm.is_approval) and document is None:
         raise AccessUsageError(f"{grant.permission}: pass the document the grant is used for (R30).")
+    if perm.is_approval and (grant.purpose or "approve") != "approve":  # a return / reject / check grant never acts
+        _deny(actor, entity, grant.permission, "grant_not_an_approval")
     row = AccessLog.objects.filter(pk=grant.log_id).first() if grant.log_id else None
     if not _grant_row_matches(grant, row):
         _deny(actor, entity, grant.permission, "grant_forged")
@@ -803,58 +813,20 @@ def revoke_membership(actor, membership, reason):
     return m
 
 
-def delegate_approval(actor, delegate, entity, valid_from, valid_to, reason, source=None):
-    """Create a CFO delegate: an approver membership with ``delegated_from`` set (R16).
+def delegate_approval(actor, delegate, entity, valid_from, valid_to, reason, source=None, activities=(),
+                      amount_max=None):
+    """R16 retired by R62 (access §10): a delegation of approval authority is an ``ApprovalDelegation`` with the R87
+    and R88 limits (``valid_to`` required, at most 90 days, never to an assistant, analyst or auditor only, never
+    a system or agent user, never a chain, logged). Kept for existing callers; ``source`` (a membership of the
+    delegator) names the delegator when the entity's top authority creates it. Returns the ``ApprovalDelegation``.
+    No membership with ``delegated_from`` is created any more (migration core.0030 converted the existing ones)."""
+    from .delegations import delegate_authority
 
-    The delegator delegates their own approver membership; a managing_partner
-    may pass ``source`` (or rely on there being exactly one approver membership).
-    ``valid_from`` (None = now) is never in the past and never before the
-    source membership starts: a delegation cannot cover approvals already made.
-    """
-    if valid_to is None:
-        raise ValidationError("A delegation needs an end date. / يجب تحديد تاريخ انتهاء التفويض.")
-    grant = require(actor, entity, "core.delegate_approval")
-    at = now()
-    valid_from = valid_from or at
-    by_mp = not _grantor_is_restricted(grant)
-    own = list(
-        Membership.objects.active(at).filter(
-            user=actor, entity=entity, role__code="approver", role__scope=Role.Scope.ENTITY, delegated_from__isnull=True
-        )
-    )
-    if source is None:
-        if own:
-            source = own[0]
-        elif by_mp:
-            candidates = list(
-                Membership.objects.active(at).filter(entity=entity, role__code="approver", delegated_from__isnull=True)
-            )
-            if len(candidates) != 1:
-                raise ValidationError("Choose which approver membership is delegated. / حدّد عضوية المعتمد المراد تفويضها.")
-            source = candidates[0]
-        else:
-            _deny(actor, entity, "core.delegate_approval", "delegate_cannot_delegate")
-    elif not by_mp and source.pk not in {m.pk for m in own}:
-        _deny(actor, entity, "core.delegate_approval", "delegate_cannot_delegate")
-    if not source.is_active_at(at) or source.delegated_from_id or source.entity_id != entity.pk:
-        _deny(actor, entity, "core.delegate_approval", "delegate_cannot_delegate")
-    if _user_id(delegate) in (actor.pk, source.user_id):
-        _deny(actor, entity, "core.delegate_approval", "self_grant")
-    # A caller's "now" computed a moment earlier is accepted (one minute) and moved to now.
-    if valid_from < at - DELEGATION_START_TOLERANCE or valid_from < source.valid_from:
-        _deny(actor, entity, "core.delegate_approval", "delegation_dates")
-    valid_from = max(valid_from, at)
-    with transaction.atomic():
-        m = Membership(
-            user=delegate, entity=entity, role=source.role, valid_from=valid_from, valid_to=valid_to,
-            granted_by=actor, granted_at=at, reason=reason, delegated_from=source,
-        )
-        m.save()
-        log(
-            AccessLog.Event.DELEGATION_GRANTED, actor=actor, entity=entity, subject_user=delegate, membership=m,
-            role=m.role, permission="core.delegate_approval", details=_membership_details(m),
-        )
-    return m
+    require(actor, entity, "core.delegate_approval")
+    delegator = source.user if source is not None else None
+    return delegate_authority(actor, entity=entity, delegate=delegate, valid_to=valid_to, valid_from=valid_from,
+                              reason_en=reason, reason_ar=reason, delegator=delegator, activities=activities,
+                              amount_max=amount_max)
 
 
 # --- dual control ------------------------------------------------------------

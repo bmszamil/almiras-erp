@@ -21,7 +21,8 @@ from django.db import connection, transaction
 from django.http import Http404
 from django.utils import timezone
 
-from core.access import catalogue, services
+from core.access import catalogue, delegations, services
+from core.access.authority_models import ApprovalDelegation
 from core.access.backends import EntityRoleBackend
 from core.access.checks import no_django_groups_or_user_permissions
 from core.access.models import AccessLog, AppendOnlyError, DualControlRequest, Kind, Membership, Role, RolePermission, UserProfile
@@ -644,15 +645,18 @@ def test_grant_membership_refuses_delegation_shortcut(w):
                                   reason="x", delegated_from=Membership.objects.first())
 
 
-# --- AT-17, R16: CFO delegation -----------------------------------------------------
+# --- AT-17, R16 (retired by R62, access §10): CFO delegation ---------------------------------------------------------
+# R62 / R87 / R88 replace the R16 delegate membership with an ``ApprovalDelegation``: the deputy needs their own
+# working membership, the delegation lasts at most 90 days and is revoked with ``delegations.revoke_delegation``. The
+# scenarios below are the AT-17 ones, rewritten to that model (review of 92c35c2, item 2).
 
 @pytest.fixture
 def cfo_setup(w, clock):
     """A 2027 timeline anchored so that 12 March 2027 09:00 is the real present.
 
-    Revocations are dated by the real clock (R9, R33), so the scenario's
-    revocation moment is now; every other moment is ``c.at(...)`` on the
-    same shifted timeline.
+    Membership revocations are dated by the real clock (R9, R33), so the
+    scenario's revocation moment is now; every other moment is ``c.at(...)``
+    on the same shifted timeline.
     """
     shift = timezone.now() - at(2027, 3, 12, 9)
 
@@ -662,6 +666,7 @@ def cfo_setup(w, clock):
     clock.set(t(2027, 1, 1, 9))
     f, d, clerk = make_user("cfo"), make_user("deputy"), make_user("clerk")
     src = member(f, w.alm, "approver", valid_from=t(2027, 1, 1), valid_to=t(2027, 12, 31))
+    member(d, w.alm, "accountant", valid_from=t(2027, 1, 1))  # R88: a delegate has their own working membership
     clock.set(t(2027, 2, 20, 9))
     dm = services.delegate_approval(f, d, w.alm, t(2027, 3, 1), t(2027, 3, 15), "Annual leave")
     return SimpleNamespace(f=f, d=d, clerk=clerk, src=src, dm=dm, b=bill(w.alm, created_by=clerk, submitted_by=clerk), at=t)
@@ -669,57 +674,76 @@ def cfo_setup(w, clock):
 
 def test_at17_delegate_approves_within_dates(w, clock, cfo_setup):
     c = cfo_setup
-    assert c.dm.delegated_from == c.src and c.dm.granted_by == c.f
-    assert AccessLog.objects.filter(event="delegation_granted", membership=c.dm, actor=c.f).exists()
+    assert isinstance(c.dm, ApprovalDelegation)  # R62: no delegate membership any more
+    assert c.dm.delegator == c.f and c.dm.delegate == c.d and c.dm.created_by == c.f
+    assert not Membership.objects.filter(user=c.d, delegated_from__isnull=False).exists()
+    assert AccessLog.objects.filter(event="delegation_granted", actor=c.f, details__approval_delegation=c.dm.pk).exists()
     clock.set(c.at(2027, 2, 28, 9))
-    assert not services.has(c.d, w.alm, "invoicing.approve_bill")
-    clock.set(c.at(2027, 3, 10, 9))
-    assert services.require(c.d, w.alm, "invoicing.approve_bill", document=c.b)
-    clock.set(c.at(2027, 3, 16, 9))
-    with pytest.raises(services.AccessDenied):
+    with pytest.raises(services.AccessDenied):  # not yet started
         services.require(c.d, w.alm, "invoicing.approve_bill", document=c.b)
+    clock.set(c.at(2027, 3, 16, 9))
+    with pytest.raises(services.AccessDenied):  # ended at valid_to, no job needed (R87)
+        services.require(c.d, w.alm, "invoicing.approve_bill", document=c.b)
+    clock.set(c.at(2027, 3, 10, 9))
+    grant = services.require(c.d, w.alm, "invoicing.approve_bill", document=c.b)
+    assert grant.delegation_id == c.dm.pk and grant.on_behalf_of_id == c.f.pk
 
 
 def test_at17_revoking_delegator_ends_delegation(w, clock, cfo_setup):
     c = cfo_setup
-    clock.set(c.at(2027, 3, 10, 9))
-    assert services.require(c.d, w.alm, "invoicing.approve_bill", document=c.b)
     clock.set(c.at(2027, 3, 12, 9))  # the real present
     services.revoke_membership(w.mp, c.src, "Left the company")
     clock.set(c.at(2027, 3, 12, 10))
-    with pytest.raises(services.AccessDenied):
+    with pytest.raises(services.AccessDenied):  # R62: the delegator no longer holds the right
         services.require(c.d, w.alm, "invoicing.approve_bill", document=c.b)
 
 
 def test_at17_delegation_needs_end_and_cannot_chain_or_outlast(w, clock, cfo_setup):
     c = cfo_setup
+    deputy2 = make_user()
+    member(deputy2, w.alm, "accountant")
     with pytest.raises(ValidationError):
-        services.delegate_approval(c.f, make_user(), w.alm, c.at(2027, 4, 1), None, "no end")
+        services.delegate_approval(c.f, deputy2, w.alm, c.at(2027, 4, 1), None, "no end")
     clock.set(c.at(2027, 3, 10, 9))
-    with pytest.raises(services.AccessDenied) as exc:
-        services.delegate_approval(c.d, make_user(), w.alm, c.at(2027, 3, 11), c.at(2027, 3, 12), "chain")
-    assert exc.value.code == "delegate_cannot_delegate"
-    with pytest.raises(ValidationError, match="outlast"):
-        services.delegate_approval(c.f, make_user(), w.alm, c.at(2027, 12, 1), c.at(2028, 1, 31), "too long")
+    with pytest.raises(services.AccessDenied):  # the delegate holds no delegation right of their own: no chain
+        services.delegate_approval(c.d, deputy2, w.alm, c.at(2027, 3, 11), c.at(2027, 3, 12), "chain")
+    assert not ApprovalDelegation.objects.filter(delegate=deputy2).exists()
+    with pytest.raises(services.AccessDenied) as exc:  # R87 / OQ-45: at most 90 days (was: not past the source)
+        services.delegate_approval(c.f, deputy2, w.alm, c.at(2027, 4, 1), c.at(2027, 7, 15), "too long")
+    assert exc.value.code == "delegation_too_long"
     with pytest.raises(services.AccessDenied):  # S!: no self-delegation
         services.delegate_approval(c.f, c.f, w.alm, c.at(2027, 4, 1), c.at(2027, 4, 2), "me")
+    with pytest.raises(services.AccessDenied) as exc:  # R88: no working membership of their own
+        services.delegate_approval(c.f, make_user(), w.alm, c.at(2027, 4, 1), c.at(2027, 4, 2), "outsider")
+    assert exc.value.code == "delegate_not_eligible"
 
 
 def test_r16_managing_partner_can_create_delegation(w, clock, cfo_setup):
     c = cfo_setup
     clock.set(c.at(2027, 5, 1, 9))
-    dm = services.delegate_approval(w.mp, make_user("deputy2"), w.alm, c.at(2027, 5, 2), c.at(2027, 5, 9), "Cover",
+    deputy2 = make_user("deputy2")
+    member(deputy2, w.alm, "accountant")
+    dm = services.delegate_approval(w.mp, deputy2, w.alm, c.at(2027, 5, 2), c.at(2027, 5, 9), "Cover",
                                     source=c.src)
-    assert dm.delegated_from == c.src and dm.granted_by == w.mp
+    assert dm.delegator == c.f and dm.created_by == w.mp  # R62: the top authority creates it for the delegator
 
 
 def test_r16_delegator_can_revoke_own_delegation(w, clock, cfo_setup):
     c = cfo_setup
-    clock.set(c.at(2027, 3, 12, 9))  # the real present, during the delegation
-    assert services.has(c.d, w.alm, "invoicing.approve_bill")
-    services.revoke_membership(c.f, c.dm, "Back early")
-    assert AccessLog.objects.filter(event="delegation_revoked", membership=c.dm, actor=c.f).exists()
-    assert not services.has(c.d, w.alm, "invoicing.approve_bill")
+    clock.set(c.at(2027, 3, 12, 9))  # during the delegation
+    delegations.revoke_delegation(c.f, c.dm, "Back early")  # R62 (was revoke_membership on the delegate row)
+    assert AccessLog.objects.filter(event="delegation_revoked", actor=c.f, details__approval_delegation=c.dm.pk).exists()
+    with pytest.raises(services.AccessDenied):
+        services.require(c.d, w.alm, "invoicing.approve_bill", document=c.b)
+
+
+def test_r62_legacy_delegate_membership_cannot_be_created(w):
+    """Review of 92c35c2, item 2: no new ``delegated_from`` membership, even written directly."""
+    src = member(make_user("cfo3"), w.alm, "approver")
+    with pytest.raises(ValidationError):
+        Membership.objects.create(user=make_user(), entity=w.alm, role=src.role, valid_from=services.now(),
+                                  valid_to=services.now() + timedelta(days=5), granted_by=w.mp, reason="old R16",
+                                  delegated_from=src)
 
 
 def test_revocation_is_dated_now(w):

@@ -2175,6 +2175,8 @@ def post_revaluation(run, grant):
                     f"حالة إعادة التقييم هذه {run.get_status_display()}؛ تُرحَّل المسودة فقط.", code="run_not_draft")
     if run.entry is None:
         raise error("This revaluation found no differences; nothing to post.", "لم تظهر فروقات في إعادة التقييم؛ لا شيء للترحيل.")
+    if getattr(grant, "self_approval", False):  # AT-31, R14: the preparer never posts the run, not even the top
+        access.deny(grant.user, run.entity, grant.permission, "self_approval")  # authority's logged R79 grant
     user = _authorise_draft_post(run.entry, grant, None)
     with transaction.atomic():
         access.use_grant(grant, target=run.entry)

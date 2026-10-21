@@ -1069,7 +1069,7 @@ def submit_sales_document(document, *, user):
     _bump(doc)
     doc._service_write = True
     doc.save()
-    approval_engine.submit(doc, user)  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
+    approval_engine.submit(doc, user, submit_permission="invoicing.submit_sales_document")  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
     return doc
 
 
@@ -2276,7 +2276,7 @@ def submit_purchase_document(document, *, user):
     _bump(doc)
     doc._service_write = True
     doc.save()
-    approval_engine.submit(doc, user)  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
+    approval_engine.submit(doc, user, submit_permission="invoicing.submit_bill")  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
     return doc
 
 
@@ -2685,7 +2685,7 @@ def submit_vendor_payment(payment, *, user):
     _bump(payment)
     payment._service_write = True
     payment.save()
-    approval_engine.submit(payment, user)  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
+    approval_engine.submit(payment, user, submit_permission="invoicing.submit_vendor_payment")  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
     return payment
 
 
