@@ -159,15 +159,32 @@ def test_item2_a_0_01_usd_payslip_paid_alone_is_fully_withheld_with_no_bank_line
     assert [x["employee_code"] for x in p.wht_uncovered] == [r1.employee_code]
 
 
+def _big_gross_settlement(w):
+    """Test data as ``remuneration_settlement`` with gross 100,000.00 and net 100.00, written once (PostgreSQL locks
+    an approved settlement, so it is not changed afterwards as the reviewer's probe did)."""
+    from hr import services as hr
+    from hr.models import FinalSettlementInput
+
+    r1 = remuneration(w)
+    t = hr.record_termination(r1, user=w.h, kind="end_of_remuneration", last_working_day=date(2027, 3, 15),
+                              reason_ar="انتهاء المهمة")
+    t = hr.approve_termination(hr.submit_termination(t, user=w.h), user=w.c)
+    si = FinalSettlementInput.objects.filter(termination=t).order_by("-pk").first()
+    fs = FinalSettlement(entity=w.alm, employee=r1, termination=t, settlement_input=si, kind=t.kind,
+                         last_working_day=t.last_working_day, period="2027-03", status="approved",
+                         gross=D("100000.00"), total_deductions=D("99900.00"), net=D("100.00"),
+                         number="ALM-FS-TEST-2", created_by=w.p, approved_by=w.c)
+    fs._service_write = True
+    fs.save()
+    return r1, fs
+
+
 def test_item2_a_settlement_paid_in_two_fully_withheld_parts_ties_out_and_is_marked_paid(w):
     """The reviewer's w2: gross 100,000.00, net 100.00; payments of 40.00 and 60.00, each fully withheld (WHT due
     2,000.00 and 3,000.00, capped at the payment); the settlement then becomes paid and the WHT return ties out."""
     from invoicing import services as inv
 
-    r1, fs = remuneration_settlement(w)
-    models.QuerySet.update(FinalSettlement.objects.filter(pk=fs.pk), gross=D("100000.00"),
-                           total_deductions=D("99900.00"), net=D("100.00"))
-    fs.refresh_from_db()
+    r1, fs = _big_gross_settlement(w)
     cat = category()
     paid = []
     for on, amount in ((date(2027, 3, 20), "40.00"), (date(2027, 3, 21), "60.00")):

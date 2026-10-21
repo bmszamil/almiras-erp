@@ -371,13 +371,13 @@ def test_item5_the_balance_changed_between_preparation_and_approval(w, monkeypat
 def test_item5_recovery_in_part_then_in_full_recognises_profit_through_the_port(w):
     n1, c = _after_exit_balance(w)
     x = services.approve_deferred_sale_closure(_recovery(w, c, "30.00"), user=w.mp)
-    assert x.number.startswith("ALM-BRC-") and x.journal_entry.date == date(2027, 3, 18)
+    assert x.number.startswith("ALM-BRC-") and x.journal_entry.date == date(2027, 3, 20)
     assert _lines(x) == [("1100", D("30.00"), D("0")), ("1240", D("0"), D("30.00"))]
     rec = DeferredSaleInstallment.objects.get(pk=x.installment_parts[0]["installment_id"])
     assert (rec.status, rec.amount, rec.deducted_amount) == ("recovered_after_exit", D("30.00"), D("30.00"))
     left = DeferredSaleInstallment.objects.get(contract=c, status="outstanding_after_exit")
     assert (left.amount, left.carried_from_id) == (D("39.00"), rec.pk)
-    assert w.invoicing.recognised[-1][1:4] == (D("30.00"), date(2027, 3, 18),
+    assert w.invoicing.recognised[-1][1:4] == (D("30.00"), date(2027, 3, 20),
                                                 f"payroll.deferredsaleinstallment:{rec.pk}")
     assert w.invoicing.recognised[-1][4] == w.mp.pk
     assert DeferredSaleContract.objects.get(pk=c.pk).status == "sold"
