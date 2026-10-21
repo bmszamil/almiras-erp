@@ -750,25 +750,45 @@ def _grantor_is_restricted(grant):
                    for code, entity_id in rows)
 
 
+def _entity_is_group_parent(entity):
+    from .engine import is_group_parent
+
+    return is_group_parent(entity)
+
+
 # OQ-42 (team default, review of 92c35c2 item 14; for the owner to confirm): the roles that decide or read a
 # subsidiary's top authority's own changes are granted or revoked there only by the group parent's top authority.
 OVERSIGHT_ROLES = frozenset({"board_representative", "internal_auditor"})
 
 
-def _by_group_top_authority(grant, entity):
-    from .engine import governance_of, is_group_parent
+def _is_group_top_authority(actor, entity):
+    """The actor's own active membership of the group parent's top-authority role in the group parent itself
+    (verification review of 49e1abd, item 2: read directly, not through the grant's memberships)."""
+    from .engine import governance_of
 
-    if is_group_parent(entity):
-        return True
     parent = group_parent_of(entity)
-    top = governance_of(parent).top_authority_role
-    return Membership.objects.filter(pk__in=grant.membership_ids, entity=parent, role__code=top).exists()
+    return Membership.objects.active(now()).filter(user_id=_user_id(actor), entity=parent,
+                                                   role__code=governance_of(parent).top_authority_role).exists()
+
+
+def _oversight_grant(actor, entity, role):
+    """OQ-42 team default: outside the group parent, ``board_representative`` and ``internal_auditor`` are granted and
+    revoked only by the group parent's top authority, also in an equity or non-consolidated entity its group
+    membership does not reach: the right is then checked on the group parent. Returns the grant, or None when the
+    normal path applies."""
+    from .engine import is_group_parent
+
+    if role.code not in OVERSIGHT_ROLES or is_group_parent(entity):
+        return None
+    if not _is_group_top_authority(actor, entity):
+        _deny(actor, entity, "core.grant_membership", "role_not_grantable", role=role.code, role_ar=role.name_ar)
+    return require(actor, group_parent_of(entity), "core.grant_membership")
 
 
 def _check_grantable(actor, grant, entity, role):
+    if role.code in OVERSIGHT_ROLES:
+        return  # decided by _oversight_grant (OQ-42)
     if _grantor_is_restricted(grant) and (role.code in ACCESS_ADMIN_CANNOT_GRANT or role.scope == Role.Scope.GROUP):
-        _deny(actor, entity, "core.grant_membership", "role_not_grantable", role=role.code, role_ar=role.name_ar)
-    if role.code in OVERSIGHT_ROLES and not _by_group_top_authority(grant, entity):
         _deny(actor, entity, "core.grant_membership", "role_not_grantable", role=role.code, role_ar=role.name_ar)
 
 
@@ -786,9 +806,12 @@ def grant_membership(actor, user, entity, role, valid_from, valid_to=None, reaso
     """Grant ``role`` to ``user`` in ``entity`` (R8, R9, R11, R27)."""
     if delegated_from is not None:
         raise AccessUsageError("CFO delegations are created with delegate_approval (R16).")
-    grant = require(actor, entity, "core.grant_membership")
+    grant = _oversight_grant(actor, entity, role) or require(actor, entity, "core.grant_membership")
     if _user_id(user) == actor.pk:
         _deny(actor, entity, "core.grant_membership", "self_grant")
+    if role.code in OVERSIGHT_ROLES and _entity_is_group_parent(entity):
+        if _grantor_is_restricted(grant):  # in the group parent: the normal R65 rule
+            _deny(actor, entity, "core.grant_membership", "role_not_grantable", role=role.code, role_ar=role.name_ar)
     _check_grantable(actor, grant, entity, role)
     with transaction.atomic():
         m = Membership(
@@ -815,8 +838,11 @@ def revoke_membership(actor, membership, reason):
         require(actor, entity, "core.delegate_approval")
         permission = "core.delegate_approval"
     else:
-        grant = require(actor, entity, "core.grant_membership")
+        grant = _oversight_grant(actor, entity, membership.role) or require(actor, entity, "core.grant_membership")
         permission = "core.grant_membership"
+        if membership.role.code in OVERSIGHT_ROLES and _entity_is_group_parent(entity) and _grantor_is_restricted(grant):
+            _deny(actor, entity, permission, "role_not_grantable", role=membership.role.code,
+                  role_ar=membership.role.name_ar)
         _check_grantable(actor, grant, entity, membership.role)
     if membership.user_id == actor.pk:
         _deny(actor, entity, permission, "self_grant")
@@ -836,7 +862,7 @@ def revoke_membership(actor, membership, reason):
     return m
 
 
-def delegate_approval(actor, delegate, entity, valid_from, valid_to, reason, source=None, activities=(),
+def delegate_approval(actor, delegate, entity, valid_from, valid_to, reason_en, reason_ar, source=None, activities=(),
                       amount_max=None):
     """R16 retired by R62 (access §10): a delegation of approval authority is an ``ApprovalDelegation`` with the R87
     and R88 limits (``valid_to`` required, at most 90 days, never to an assistant, analyst or auditor only, never
@@ -848,7 +874,7 @@ def delegate_approval(actor, delegate, entity, valid_from, valid_to, reason, sou
     require(actor, entity, "core.delegate_approval")
     delegator = source.user if source is not None else None
     return delegate_authority(actor, entity=entity, delegate=delegate, valid_to=valid_to, valid_from=valid_from,
-                              reason_en=reason, reason_ar=reason, delegator=delegator, activities=activities,
+                              reason_en=reason_en, reason_ar=reason_ar, delegator=delegator, activities=activities,
                               amount_max=amount_max)
 
 

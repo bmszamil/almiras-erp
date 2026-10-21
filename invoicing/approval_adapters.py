@@ -30,6 +30,7 @@ def register():
 
     engine.register(
         SalesDocument, "invoicing.sales_document", permission="invoicing.approve_sales_document",
+        submit_permission="invoicing.submit_sales_document",
         amount=lambda d: d.total_gross, currency=lambda d: d.currency_id,
         beneficiaries=lambda d: _employee_users(d.customer),
         label=lambda d: _label(d, "Sales document", "مستند مبيعات"),
@@ -38,6 +39,7 @@ def register():
     )
     engine.register(
         PurchaseDocument, "invoicing.bill", permission="invoicing.approve_bill",
+        submit_permission="invoicing.submit_bill",
         # Before approval the bill's own totals are not yet computed; the vendor document's total is the measure.
         amount=lambda d: d.vendor_total_gross if d.vendor_total_gross else d.total_gross,
         currency=lambda d: d.currency_id,
@@ -47,6 +49,7 @@ def register():
     )
     engine.register(
         VendorPayment, "invoicing.vendor_payment", permission="invoicing.approve_vendor_payment",
+        submit_permission="invoicing.submit_vendor_payment",
         amount=lambda d: d.amount, currency=lambda d: d.currency_id,
         beneficiaries=lambda d: _employee_users(d.vendor),
         label=lambda d: _label(d, "Vendor payment", "دفعة مورد"),

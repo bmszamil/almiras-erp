@@ -440,6 +440,11 @@ ROLE_SEED_V18 = {
 # have their own approval right, held by the holders of payroll.approve_loan_write_off.
 for _code in [c for c, row in ROLE_SEED_V18.items() if "payroll.approve_loan_write_off" in row[5]]:
     ROLE_SEED_V18[_code] = _plus(ROLE_SEED_V18, _code, "payroll.approve_deferred_sale_closure")
+# billing.submit_contract (verification review of 49e1abd, item 3): every human role that drafts contracts, except the
+# personal assistant (drafts only, R60).
+for _code in [c for c, row in ROLE_SEED_V18.items()
+              if "billing.edit_contract_draft" in row[5] and row[3] == "human" and c != "personal_assistant"]:
+    ROLE_SEED_V18[_code] = _plus(ROLE_SEED_V18, _code, "billing.submit_contract")
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
 ROLE_SEED = ROLE_SEED_V18
 

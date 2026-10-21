@@ -21,11 +21,13 @@ def register():
     def label(kind_en, kind_ar):
         return lambda r: (f"{kind_en} #{r.pk}", f"{kind_ar} رقم {r.pk}")
 
-    engine.register(EmploymentContract, "hr.contract", permission="hr.approve_contract", beneficiaries=_employee_user,
+    engine.register(EmploymentContract, "hr.contract", permission="hr.approve_contract",
+                    submit_permission="hr.submit_contract", beneficiaries=_employee_user,
                     label=label("Employment contract", "عقد عمل"),
                     approve=lambda r, user: services.approve_contract(r, user=user),
                     reject=lambda r, user, note: services.reject_contract(r, user=user, reason_ar=note or "مرفوض"))
-    engine.register(Assignment, "hr.assignment", permission="hr.approve_assignment", beneficiaries=_employee_user,
+    engine.register(Assignment, "hr.assignment", permission="hr.approve_assignment",
+                    submit_permission="hr.manage_assignment", beneficiaries=_employee_user,
                     label=label("Assignment", "تكليف"),
                     approve=lambda r, user: services.approve_assignment(r, user=user))
     engine.register(LeaveRequest, "hr.leave", permission="hr.approve_leave", beneficiaries=_employee_user,
@@ -37,7 +39,8 @@ def register():
                     approve=lambda r, user: services.approve_leave_adjustment(r, user=user),
                     reject=lambda r, user, note: services.reject_leave_adjustment(r, user=user,
                                                                                     reason_ar=note or "مرفوض"))
-    engine.register(Termination, "hr.termination", permission="hr.approve_termination", beneficiaries=_employee_user,
+    engine.register(Termination, "hr.termination", permission="hr.approve_termination",
+                    submit_permission="hr.record_termination", beneficiaries=_employee_user,
                     label=label("Termination", "إنهاء خدمة"),
                     approve=lambda r, user: services.approve_termination(r, user=user))
     engine.register(StatutoryParameter, "hr.statutory_parameter", permission="hr.verify_statutory_parameter",
@@ -45,7 +48,8 @@ def register():
                     approve=lambda r, user: services.verify_statutory_parameter(r, user=user))
     # access R61, R80 f (review of 92c35c2, item 10): the IBAN change's second person under hr.manage_employee (not an
     # A right), routed with require(..., through_engine=True); NSA: never self-approved, the top authority included.
-    engine.register(IbanChangeRequest, "hr.iban_change", permission="hr.manage_employee", beneficiaries=_employee_user,
+    engine.register(IbanChangeRequest, "hr.iban_change", permission="hr.manage_employee",
+                    submit_permission="hr.manage_employee", beneficiaries=_employee_user,
                     amount=lambda r: None, version=lambda r: str(r.pk),
                     label=label("IBAN change", "تغيير آيبان"),
                     approve=lambda r, user: services.approve_iban_change(r, user=user),

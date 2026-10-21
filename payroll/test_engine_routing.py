@@ -204,3 +204,27 @@ def test_r61_a_bai_ajel_closure_is_its_own_engine_activity_and_right(w):
                                          permission="payroll.approve_deferred_sale_closure").first()
     assert grant_row is not None and grant_row.details["activity"] == "payroll.deferred_sale_closure"
     assert ApprovalRequest.objects.get(pk=req.pk).status == "approved"
+
+
+def test_rv93_n4_nobody_approves_an_off_cycle_run_that_pays_them(w):
+    """access R82 (verification review of 49e1abd, item 1, probe N4): every employee an off-cycle run pays is its
+    beneficiary; the hr officer paid by their own leave advance is refused, another hr officer approves."""
+    from hr import services as hr
+    from hr.models import LeaveRequest
+
+    emp = saudi(w, hire_date=date(2025, 1, 1), linked_user=w.h, by=w.h2)
+    adj = hr.record_opening_leave_balance(emp, "ANNUAL", "25", date(2027, 1, 1), user=w.h2)
+    hr.approve_leave_adjustment(adj, user=w.c)
+    req = hr.request_leave(emp, "ANNUAL", user=w.h2, start_date=date(2027, 3, 20), end_date=date(2027, 3, 28))
+    for approver in (w.mp, w.c, w.p2):
+        try:
+            req = hr.approve_leave(LeaveRequest.objects.get(pk=req.pk), user=approver)
+            break
+        except PermissionDenied:
+            continue
+    run = services.submit_run(services.prepare_leave_advance(req, user=w.p)[0], user=w.p)
+    assert run.kind == "off_cycle" and services._run_beneficiaries(run) == {w.h.pk}
+    with pytest.raises(PermissionDenied) as exc:
+        services.approve_run(run, user=w.h)
+    assert exc.value.code == "beneficiary"
+    assert services.approve_run(run, user=w.h2).status == "approved"

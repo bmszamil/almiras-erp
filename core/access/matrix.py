@@ -379,7 +379,10 @@ def withdraw_version(version, *, user, reason):
     """The proposer (or the top authority) withdraws a draft or submitted version; the version in force stays."""
     version = AuthorityMatrixVersion.objects.select_for_update().get(pk=version.pk)
     entity = version.entity
-    _require_proposer(user, entity)
+    top = Membership.objects.active(access.now()).filter(
+        user_id=getattr(user, "pk", None), entity=entity, role__code=engine.governance_of(entity).top_authority_role)
+    if not top.exists():  # verification review of 49e1abd, item 5: another proposer never withdraws it
+        _require_own_draft(user, version)
     if not (reason or "").strip():
         raise ValidationError("A reason is required. / السبب مطلوب.")
     if version.status not in (Status.DRAFT, Status.SUBMITTED):
@@ -503,15 +506,38 @@ def _check_governance_changes(changes):
             raise ValidationError("The top authority is an active human role. / السلطة العليا دور بشري نشط.")
 
 
+GROUP_GOVERNANCE_DECIDERS = frozenset({"chairman", "board_representative"})
+
+
+def _require_governance_decider(user, entity, requester_id, at):
+    """OQ-42 team default (verification review of 49e1abd, item 10; owner to confirm): a change of a subsidiary's
+    top-authority role or self-approval switch is decided in the group parent, by its top authority (the managing
+    partner), its chairman or its board representative, holding ``core.approve_authority_matrix`` there; never by
+    the subsidiary's own top authority whose powers change, nor by the requester. The group parent's own settings
+    keep the R76 decider (the chairman when its top authority asks)."""
+    if engine.is_group_parent(entity):
+        return _require_decider(user, entity, requester_id, at)
+    if getattr(user, "pk", None) == requester_id:
+        access.deny(user, entity, APPROVE, "self_approval")
+    parent = access.group_parent_of(entity)
+    roles = GROUP_GOVERNANCE_DECIDERS | {engine.governance_of(parent).top_authority_role}
+    ms = [m for m in access._evaluate(user, parent, APPROVE, at)[0] if m.entity_id == parent.pk]
+    if not [m for m in ms if m.role.code in roles]:
+        names = list(Role.objects.filter(code__in=roles).values_list("name_en", "name_ar"))
+        _refuse("decider_role", user, entity, APPROVE, role=", ".join(n for n, _ in names),
+                role_ar="، ".join(a for _, a in names))
+    return ms
+
+
 @transaction.atomic
 def decide_governance_change(request, *, user, approve, note=""):
-    """Step 2 of R76: the second person (top authority, or chairman / board representative when the top authority
-    asked) approves or rejects the change; never its requester."""
+    """Step 2 of R76: the second person approves or rejects the change; never its requester. For a subsidiary the
+    decider is in the group parent (:func:`_require_governance_decider`)."""
     req = DualControlRequest.objects.select_for_update().get(pk=request.pk)
     if req.permission != APPROVE or req.target_type != ContentType.objects.get_for_model(EntityGovernance):
         raise ValidationError("Not a governance change request. / ليس طلب تغيير للحوكمة.")
     entity, at = req.entity, access.now()
-    ms = _require_decider(user, entity, req.requested_by_id, at)
+    ms = _require_governance_decider(user, entity, req.requested_by_id, at)
     _pending(user, entity, req, at)
     status = DualControlRequest.Status.APPROVED if approve else DualControlRequest.Status.REJECTED
     DualControlRequest.objects.filter(pk=req.pk, status=DualControlRequest.Status.PENDING)._transition(

@@ -20,6 +20,7 @@ def register():
 
     engine.register(
         Contract, "billing.contract", permission="billing.approve_contract",
+        submit_permission="billing.submit_contract",
         amount=_total, currency=lambda c: c.currency_id, people=_contract_people,
         label=lambda c: (f"Contract {c.number or '#' + str(c.pk)}", f"عقد {c.number or '#' + str(c.pk)}"),
         approve=lambda c, user: services.approve_contract(c, user=user),
@@ -27,6 +28,7 @@ def register():
     )
     engine.register(
         ContractVersion, "billing.version", permission="billing.approve_version",
+        submit_permission="billing.edit_version_draft",
         amount=lambda v: None, currency=lambda v: v.contract.currency_id,
         label=lambda v: (f"Contract version {v.contract.number} v{v.version_no}",
                          f"نسخة العقد {v.contract.number} رقم {v.version_no}"),

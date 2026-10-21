@@ -129,6 +129,8 @@ class Adapter:
     reject: object = None  # callable(doc, user, note) -> doc
     return_: object = None  # callable(doc, user, note) -> doc
     entity_of: object = None  # callable(doc) -> Entity
+    submit_permission: str | None = None  # the module's submit right; engine.submit refuses any other (review of 49e1abd)
+    created_at: object = None  # callable(doc) -> aware datetime: when the document was drafted (R81)
 
 
 _ADAPTERS = {}
@@ -440,15 +442,26 @@ def resolve(entity, activity, info, on, *, user=None, permission=""):
 
 # --- requests ----------------------------------------------------------------------------------------------------
 
+_CREATOR_FIELDS = ("created_by_id", "prepared_by_id", "entered_by_id")
+
+
 def _drafted_for(entity, document, at):
     """R81: the principal(s) a personal assistant drafted ``document`` for: assignments of its creator active when
-    the document was created (its ``created_at``; else ``at``). Ending the assignment later changes nothing."""
-    creator = getattr(document, "created_by_id", None)
+    the document was created. Ending the assignment later changes nothing. The creation time is the adapter's
+    ``created_at`` hook, else the document's ``created_at`` field; it never falls back to now: a document of an
+    assistant without a creation time is refused (verification review of 49e1abd, item 6)."""
+    creator = next((getattr(document, f) for f in _CREATOR_FIELDS if getattr(document, f, None) is not None), None)
     if creator is None:
         return []
-    when = getattr(document, "created_at", None) or at
-    return list(AssistantAssignment.objects.filter(active_window_q(when), entity=entity, assistant_id=creator)
-                .values_list("principal_id", flat=True))
+    assignments = AssistantAssignment.objects.filter(entity=entity, assistant_id=creator)
+    if not assignments.exists():
+        return []
+    adapter = next((a for (label, _), a in _ADAPTERS.items() if label == _label_of(document) and a.created_at), None)
+    when = adapter.created_at(document) if adapter is not None else getattr(document, "created_at", None)
+    if when is None:
+        raise _services().AccessUsageError(
+            f"{_label_of(document)} has no creation time: its adapter must supply created_at (R81).")
+    return list(assignments.filter(active_window_q(when)).values_list("principal_id", flat=True))
 
 
 def activity_row(code):
@@ -522,6 +535,9 @@ def submit(document, user, *, submit_permission, permission=None, entity=None):
         _services()._deny(user, entity, submit_permission, reason)
     permission = permission or _main_permission(document)
     info = describe(document, permission, entity)
+    if info.adapter.submit_permission and submit_permission != info.adapter.submit_permission:
+        raise _services().AccessUsageError(
+            f"{info.activity} is submitted with {info.adapter.submit_permission}, not {submit_permission}.")
     info.document = document
     at = _now()
     existing = find_request(entity, info)

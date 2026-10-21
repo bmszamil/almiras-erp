@@ -806,7 +806,7 @@ Every row becomes an `ApprovalActivity` with an engine adapter. "Default" = the 
 | `invoicing.purification_payout` | (invoicing R54) | `invoicing.approve_purification_payout` | `approver` | Y | rec. |
 | `invoicing.charity_recipient` | `approve_charity_recipient` | `invoicing.approve_charity_recipient` (S!) | MP, with board minute | | Y |
 | `invoicing.recovery_ratio`, `invoicing.art51_true_up`, `invoicing.deferred_release`, `invoicing.deposit_application` | R56 (to build) | `invoicing.approve_*` | `approver` | per R56 | |
-| `billing.contract` | `billing.services.approve_contract` | `billing.approve_contract` | `approver` | | |
+| `billing.contract` | `billing.services.approve_contract` (submitted with `billing.submit_contract`, 2026-10-21) | `billing.approve_contract` | `approver` | | |
 | `billing.version` (amendment, termination, cancellation) | `approve_version` | `billing.approve_version` / `approve_termination` | `approver` | | |
 | `billing.timesheet`, `billing.cost_pool_period` | (A8, go-live; to build) | to be named in billing.md | `approver` (default) | | |
 | `hr.contract` | `hr.services.approve_contract` | `hr.approve_contract` | `approver`, MP (group parent) | | R82 |
@@ -902,7 +902,7 @@ The owner asked for recommendations. Each default below is what the builder impl
 
 | # | Question | Recommended default | Blocks? |
 |---|---|---|---|
-| OQ-42 | Who is the second person for a matrix change when the top authority proposes it? | Almiras: the group's `chairman` (as for Sharia switch-off). Other entities: a new entity role `board_representative` (human; holds only `core.approve_authority_matrix` and `core.view_governance_report`), named by that company's board and granted by its top authority under R8 (never to self). The Almiras MP may hold it in a subsidiary as shareholder representative (A1) through an explicit membership. When someone else proposes: the top authority decides. Team default added 2026-10-21 (review of the build, item 14; owner to confirm): in a subsidiary, `board_representative` and `internal_auditor` are granted and revoked only by the group parent's top authority. | D; GL per entity to name the holder |
+| OQ-42 | Who is the second person for a matrix change when the top authority proposes it? | Almiras: the group's `chairman` (as for Sharia switch-off). Other entities: a new entity role `board_representative` (human; holds only `core.approve_authority_matrix` and `core.view_governance_report`), named by that company's board and granted by its top authority under R8 (never to self). The Almiras MP may hold it in a subsidiary as shareholder representative (A1) through an explicit membership. When someone else proposes: the top authority decides. Team default added 2026-10-21 (review of the build, item 14; owner to confirm): in a subsidiary, `board_representative` and `internal_auditor` are granted and revoked only by the group parent's top authority. Also (2026-10-21, verification review item 10; owner to confirm): a change of a subsidiary's top-authority role or self-approval switch is decided in the group parent by its top authority, chairman or board representative, never by the subsidiary's top authority. | D; GL per entity to name the holder |
 | OQ-43 | Who may draft a matrix version? | Top authority and `access_admin` of the entity; not the CFO (it would set its own limits) | D |
 | OQ-44 | Should code defaults stay forever, or must each entity enter a full matrix before go-live? | Defaults stay, so a new subsidiary works on day one. The governance report shows every default-rule approval, so the gap stays visible. Replaces OQ-30's GL status with "recommended before go-live" | D (was GL) |
 | OQ-45 | Maximum length of an approval delegation (A13; OQ-16 had no maximum) | 90 days, renewable as a new logged delegation; reminder 3 days before expiry | D |
@@ -952,6 +952,17 @@ Arabic labels of new roles, events and report sections are marked [AR-review] fo
     - The governance report's group-level section covers every descendant of the group parent, not only its direct children; the content builder is private.
     - `approver_roles` of a non-draft row are frozen on every database (an `m2m_changed` guard; PostgreSQL also has the core.0030 trigger). The band-overlap guard stays a trigger plus the version row lock taken by `add_rule`: a btree_gist exclusion constraint cannot express "same band allowed for another step of the same activity".
     - OQ-42 (team default, for the owner to confirm): in a subsidiary, the `board_representative` and `internal_auditor` roles are granted and revoked only by the group parent's top authority (the managing partner), never by the subsidiary's own top authority whom they oversee.
+15. Verification review of 49e1abd (2026-10-21), changes as built:
+    - Off-cycle runs (leave advance, remuneration still due, Egypt) register every employee they pay as beneficiary and refuse that employee as approver (`beneficiary`); regular runs keep the narrow R39 set (owner decision on item 5 of the first review, relayed by the coordinator).
+    - Oversight roles (OQ-42 default): the group parent's top authority is checked through their own active membership in the group parent; they grant and revoke `board_representative` and `internal_auditor` in any other entity, equity and non-consolidated ones included (the right is checked on the group parent there).
+    - Submitting a contract is its own right `billing.submit_contract` (seed V18: every human role that drafts contracts except `personal_assistant`). Each adapter declares its submit right (`submit_permission`) and `engine.submit` refuses any other.
+    - Migration `core/0031`: a converted delegation starts no earlier than the migration, lasts at most 90 days from then, covers only the approval activities of the source role, skips delegate memberships whose source had already ended, and logs with the system actor kind and source `migration:core.0031`.
+    - `withdraw_version`: only the version's proposer or the entity's top authority.
+    - R81: the creation time comes from the adapter (`created_at` hook; bank reconciliations use `prepared_at`) or the document's `created_at`; a document drafted by an assistant without a creation time is refused, never dated now.
+    - `core/0029` carries its own frozen copy of the V18 roles, the governance system user and the activity rows; it no longer imports the live seed.
+    - `delegate_approval` takes `reason_en` and `reason_ar`.
+    - `approver_roles` of a frozen row: the relation (add, remove, set, clear) is refused on every database. A direct write to the auto-created through table sends no Django signal, so on SQLite it is not caught; on PostgreSQL the core.0030 trigger refuses it.
+    - OQ-42 (team default, for the owner to confirm): a change of a subsidiary's top-authority role or self-approval switch is decided in the group parent by its top authority (the managing partner), its chairman or its board representative, never by the subsidiary's own top authority whose powers change, nor by the requester.
 
 ## Appendix: existing code that must change
 

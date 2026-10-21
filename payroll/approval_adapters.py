@@ -50,13 +50,15 @@ def register():
         engine.register(PayrollInput, activity, permission=permission, amount=none, beneficiaries=_employee_user,
                         label=_label("Payroll input", "مدخل رواتب"), approve=approve_input,
                         reject=lambda d, user, note: services.reject_input(d, user=user, reason_ar=note or "مرفوض"))
-    engine.register(PayrollRun, "payroll.run", permission="payroll.approve_run", amount=none,
+    engine.register(PayrollRun, "payroll.run", permission="payroll.approve_run",
+                    submit_permission="payroll.submit_run", amount=none,
                     beneficiaries=services._run_beneficiaries,  # access R82, payroll R39 (review of 92c35c2, item 5)
                     version=lambda r: r.stored_hash or r.inputs_hash or "",
                     label=_label("Payroll run", "مسير رواتب"),
                     approve=lambda r, user: services.approve_run(r, user=user),
                     return_=lambda r, user, note: services.return_run(r, user=user, reason_ar=note or "أعيد للاحتساب"))
-    engine.register(EmployeeLoan, "payroll.loan", permission="payroll.approve_loan", amount=lambda d: d.principal,
+    engine.register(EmployeeLoan, "payroll.loan", permission="payroll.approve_loan",
+                    submit_permission="payroll.create_loan", amount=lambda d: d.principal,
                     currency=lambda d: d.entity.base_currency_id, beneficiaries=_employee_user,
                     label=_label("Employee loan", "قرض موظف"),
                     approve=lambda d, user: services.approve_loan(d, user=user))
@@ -68,6 +70,7 @@ def register():
                                           c.first_period, c.consent_ref, c.final_dues_undertaking])[:40]
 
     engine.register(DeferredSaleContract, "payroll.deferred_sale_terms", permission="payroll.approve_deferred_sale_terms",
+                    submit_permission="payroll.create_deferred_sale",
                     amount=none, beneficiaries=_employee_user, version=terms_version,
                     label=_label("Bai' ajel contract", "عقد بيع آجل"),
                     approve=lambda d, user: services.approve_deferred_sale_terms(d, user=user))
@@ -91,6 +94,7 @@ def register():
                     label=_label("Bai' ajel sale or ibra' rebate", "بيع آجل أو إبراء"),
                     approve=lambda d, user: services.approve_deferred_sale(d, user=user))
     engine.register(FinalSettlement, "payroll.final_settlement", permission="payroll.approve_final_settlement",
+                    submit_permission="payroll.prepare_final_settlement",
                     amount=lambda d: d.net, currency=lambda d: d.entity.base_currency_id, beneficiaries=_employee_user,
                     version=lambda d: d.stored_hash or d.inputs_hash or "", people=lambda d: {d.calculated_by_id},
                     label=_label("Final settlement", "مخالصة نهائية"),
@@ -98,13 +102,15 @@ def register():
                     return_=lambda d, user, note: services.return_final_settlement(d, user=user,
                                                                                    reason_ar=note or "أعيدت"))
     engine.register(SettlementCorrection, "payroll.settlement_correction",
-                    permission="payroll.approve_settlement_correction", amount=lambda d: abs(d.net_change),
+                    permission="payroll.approve_settlement_correction",
+                    submit_permission="payroll.prepare_settlement_correction", amount=lambda d: abs(d.net_change),
                     currency=lambda d: d.entity.base_currency_id, beneficiaries=_employee_user,
                     version=lambda d: d.stored_hash or "", label=_label("Settlement correction", "تصحيح مخالصة"),
                     approve=lambda d, user: services.approve_settlement_correction(d, user=user),
                     return_=lambda d, user, note: services.return_settlement_correction(d, user=user,
                                                                                         reason_ar=note or "أعيد"))
     engine.register(LoanWriteOff, "payroll.loan_write_off", permission="payroll.approve_loan_write_off",
+                    submit_permission="payroll.prepare_loan_write_off",
                     amount=lambda d: d.amount, currency=lambda d: d.entity.base_currency_id,
                     beneficiaries=_employee_user, label=_label("Loan write-off", "شطب قرض"),
                     approve=lambda d, user: services.approve_loan_write_off(d, user=user),
@@ -114,11 +120,13 @@ def register():
         fs = p.final_settlement if p.final_settlement_id else None
         return _employee_user(fs) if fs is not None else set()
 
-    engine.register(PayrollPayment, "payroll.payment", permission="payroll.approve_payment", amount=lambda d: d.amount,
+    engine.register(PayrollPayment, "payroll.payment", permission="payroll.approve_payment",
+                    submit_permission="payroll.record_payment", amount=lambda d: d.amount,
                     currency=lambda d: d.currency_id, beneficiaries=payment_beneficiaries,
                     label=_label("Payroll payment", "دفعة رواتب"),
                     approve=lambda d, user: services.approve_payment(d, user=user))
-    engine.register(GosiFine, "payroll.gosi_fine", permission="payroll.approve_gosi_fine", amount=lambda d: d.amount,
+    engine.register(GosiFine, "payroll.gosi_fine", permission="payroll.approve_gosi_fine",
+                    submit_permission="payroll.record_gosi_fine", amount=lambda d: d.amount,
                     currency=lambda d: d.entity.base_currency_id, label=_label("GOSI fine", "غرامة تأمينات"),
                     approve=lambda d, user: services.approve_gosi_fine(d, user=user))
     engine.register(EmployeeCostItem, "payroll.cost_item", permission="payroll.approve_cost_item",
@@ -127,6 +135,7 @@ def register():
                     approve=lambda d, user: services.approve_cost_item(d, user=user),
                     reject=lambda d, user, note: services.reject_cost_item(d, user=user))
     engine.register(SecondmentCostReport, "payroll.secondment_cost_report", permission="payroll.approve_cost_report",
+                    submit_permission="payroll.prepare_cost_report",
                     amount=none, label=_label("Secondment cost report", "تقرير تكلفة إعارة"),
                     approve=lambda d, user: services.approve_cost_report(d, user=user),
                     return_=lambda d, user, note: services.return_cost_report(d, user=user))
@@ -144,7 +153,8 @@ def register():
                     amount=none, beneficiaries=_employee_user, label=_label("Mudad justification", "مبرر مدد"),
                     approve=lambda d, user: services.approve_mudad_justification(d, user=user))
     engine.register(DeferredSaleClosure, "payroll.deferred_sale_closure",
-                    permission="payroll.approve_deferred_sale_closure", amount=lambda d: d.amount,
+                    permission="payroll.approve_deferred_sale_closure",
+                    submit_permission="payroll.prepare_loan_write_off", amount=lambda d: d.amount,
                     currency=lambda d: d.entity.base_currency_id, beneficiaries=_employee_user,
                     label=_label("Bai' ajel closure after exit", "إقفال بيع آجل بعد انتهاء الخدمة"),
                     approve=lambda d, user: services.approve_deferred_sale_closure(d, user=user),

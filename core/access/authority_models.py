@@ -491,7 +491,9 @@ class GovernanceReport(models.Model):
 
 def _freeze_approver_roles(sender, instance, action, reverse, pk_set, **kwargs):
     """R77 (review of 92c35c2, item 13): ``approver_roles`` of a row in a submitted, approved or superseded version
-    never change, on any database (PostgreSQL also refuses it in the core.0030 trigger)."""
+    never change through the relation (add, remove, set, clear), on any database. Direct writes to the auto-created
+    through table send no Django signal (not even pre_save); PostgreSQL's core.0030 trigger refuses them, SQLite
+    does not (verification review of 49e1abd, item 9; recorded in access.md 10.10)."""
     if action not in ("pre_add", "pre_remove", "pre_clear"):
         return
     if reverse:  # from the role's side: every row touched

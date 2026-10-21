@@ -668,7 +668,7 @@ def cfo_setup(w, clock):
     src = member(f, w.alm, "approver", valid_from=t(2027, 1, 1), valid_to=t(2027, 12, 31))
     member(d, w.alm, "accountant", valid_from=t(2027, 1, 1))  # R88: a delegate has their own working membership
     clock.set(t(2027, 2, 20, 9))
-    dm = services.delegate_approval(f, d, w.alm, t(2027, 3, 1), t(2027, 3, 15), "Annual leave")
+    dm = services.delegate_approval(f, d, w.alm, t(2027, 3, 1), t(2027, 3, 15), "Annual leave", "سبب")
     return SimpleNamespace(f=f, d=d, clerk=clerk, src=src, dm=dm, b=bill(w.alm, created_by=clerk, submitted_by=clerk), at=t)
 
 
@@ -703,18 +703,18 @@ def test_at17_delegation_needs_end_and_cannot_chain_or_outlast(w, clock, cfo_set
     deputy2 = make_user()
     member(deputy2, w.alm, "accountant")
     with pytest.raises(ValidationError):
-        services.delegate_approval(c.f, deputy2, w.alm, c.at(2027, 4, 1), None, "no end")
+        services.delegate_approval(c.f, deputy2, w.alm, c.at(2027, 4, 1), None, "no end", "سبب")
     clock.set(c.at(2027, 3, 10, 9))
     with pytest.raises(services.AccessDenied):  # the delegate holds no delegation right of their own: no chain
-        services.delegate_approval(c.d, deputy2, w.alm, c.at(2027, 3, 11), c.at(2027, 3, 12), "chain")
+        services.delegate_approval(c.d, deputy2, w.alm, c.at(2027, 3, 11), c.at(2027, 3, 12), "chain", "سبب")
     assert not ApprovalDelegation.objects.filter(delegate=deputy2).exists()
     with pytest.raises(services.AccessDenied) as exc:  # R87 / OQ-45: at most 90 days (was: not past the source)
-        services.delegate_approval(c.f, deputy2, w.alm, c.at(2027, 4, 1), c.at(2027, 7, 15), "too long")
+        services.delegate_approval(c.f, deputy2, w.alm, c.at(2027, 4, 1), c.at(2027, 7, 15), "too long", "سبب")
     assert exc.value.code == "delegation_too_long"
     with pytest.raises(services.AccessDenied):  # S!: no self-delegation
-        services.delegate_approval(c.f, c.f, w.alm, c.at(2027, 4, 1), c.at(2027, 4, 2), "me")
+        services.delegate_approval(c.f, c.f, w.alm, c.at(2027, 4, 1), c.at(2027, 4, 2), "me", "سبب")
     with pytest.raises(services.AccessDenied) as exc:  # R88: no working membership of their own
-        services.delegate_approval(c.f, make_user(), w.alm, c.at(2027, 4, 1), c.at(2027, 4, 2), "outsider")
+        services.delegate_approval(c.f, make_user(), w.alm, c.at(2027, 4, 1), c.at(2027, 4, 2), "outsider", "سبب")
     assert exc.value.code == "delegate_not_eligible"
 
 
@@ -723,7 +723,7 @@ def test_r16_managing_partner_can_create_delegation(w, clock, cfo_setup):
     clock.set(c.at(2027, 5, 1, 9))
     deputy2 = make_user("deputy2")
     member(deputy2, w.alm, "accountant")
-    dm = services.delegate_approval(w.mp, deputy2, w.alm, c.at(2027, 5, 2), c.at(2027, 5, 9), "Cover",
+    dm = services.delegate_approval(w.mp, deputy2, w.alm, c.at(2027, 5, 2), c.at(2027, 5, 9), "Cover", "سبب",
                                     source=c.src)
     assert dm.delegator == c.f and dm.created_by == w.mp  # R62: the top authority creates it for the delegator
 

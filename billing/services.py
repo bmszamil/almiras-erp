@@ -761,15 +761,15 @@ def add_secondment(contract, *, user, employee_ref, role_title_ar, start_date, r
 def submit_contract(contract, *, user):
     """Draft → submitted for the CFO (status stays ``draft``; event ``submitted_for_approval``). Agents never
     submit (gateway: drafts only)."""
-    c = _draft_contract(contract, user)
-    _refuse_agent(user, c.entity, "billing.edit_contract_draft")
+    c = _draft_contract(contract, user, "billing.submit_contract")  # review of 49e1abd, item 3: not the drafter's
+    _refuse_agent(user, c.entity, "billing.submit_contract")  # right (a personal assistant drafts only)
     problems = _approval_problems(c, c.versions.get(version_no=1))
     if problems:
         raise _problems(problems, "contract_invalid")
     c.submitted_by, c.submitted_at = user, timezone.now()
     _save(c)
     _event(c, Event.SUBMITTED, user)
-    approval_engine.submit(c, user, submit_permission="billing.edit_contract_draft")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
+    approval_engine.submit(c, user, submit_permission="billing.submit_contract")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
     return c
 
 

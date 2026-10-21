@@ -422,12 +422,12 @@ def test_delegation_cannot_start_in_the_past(w):
         member(d, w.alm, "accountant")
     now = services.now()
     with pytest.raises(services.AccessDenied) as exc:
-        services.delegate_approval(cfo, deputy, w.alm, now - timedelta(days=2), now + timedelta(days=5), "Backdated")
+        services.delegate_approval(cfo, deputy, w.alm, now - timedelta(days=2), now + timedelta(days=5), "Backdated", "سبب")
     assert exc.value.code == "delegation_dates"
     assert not ApprovalDelegation.objects.filter(delegate=deputy).exists()  # R62: a delegation, not a membership
-    dm = services.delegate_approval(cfo, deputy, w.alm, None, now + timedelta(days=5), "Leave")  # None = now
+    dm = services.delegate_approval(cfo, deputy, w.alm, None, now + timedelta(days=5), "Leave", "سبب")  # None = now
     assert dm.valid_from >= now
-    later = services.delegate_approval(cfo, deputy2, w.alm, services.now(), now + timedelta(days=5), "Leave")
+    later = services.delegate_approval(cfo, deputy2, w.alm, services.now(), now + timedelta(days=5), "Leave", "سبب")
     assert later.valid_from >= now  # "now" computed a moment earlier is accepted
 
 

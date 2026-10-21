@@ -2646,6 +2646,10 @@ def _approver_checks(run, user, grant=None):
                  for i in (ids or [])]
     inputs = PayrollInput.objects.filter(pk__in=input_ids)
     own = Employee.objects.filter(pk__in=employee_ids, user=user).first()
+    if own is not None and run.kind == PayrollRun.Kind.OFF_CYCLE:  # verification review of 49e1abd, item 1: an
+        from core.access import engine as approval_engine  # off-cycle run pays a few people only
+
+        approval_engine.refuse("beneficiary", user, run.entity, "payroll.approve_run", {"run": run.pk})
     if own is not None and (inputs.filter(employee=own).exists()
                             or PayslipLine.objects.filter(payslip__run=run, payslip__employee=own,
                                                           line_type=LT.RETRO).exists()):
@@ -2657,9 +2661,12 @@ def _approver_checks(run, user, grant=None):
 
 
 def _run_beneficiaries(run):
-    """access R82 for a run: the users of the employees whose own payslip in it has inputs or retro lines (the R39
-    set). Payslips without inputs are not counted: the hr_officer is paid in the runs they approve (R50)."""
+    """access R82 for a run. A regular run: the users of the employees whose own payslip in it has inputs or retro
+    lines (the R39 set; payslips without inputs are not counted: the hr_officer is paid in the runs they approve,
+    R50). An off-cycle run: every employee it pays (verification review of 49e1abd, item 1)."""
     slips = list(Payslip.objects.filter(run=run, refused=False).select_related("employee"))
+    if run.kind == PayrollRun.Kind.OFF_CYCLE:  # leave advance, remuneration still due, Egypt: every payee benefits
+        return {s.employee.user_id for s in slips if s.employee.user_id}
     input_ids = [i for s in slips for i in (s.input_ids or [])]
     with_inputs = set(PayrollInput.objects.filter(pk__in=input_ids).values_list("employee_id", flat=True))
     with_inputs |= set(PayslipLine.objects.filter(payslip__run=run, line_type=LT.RETRO)

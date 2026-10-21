@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError, connection, transaction
+from django.db import DatabaseError, IntegrityError, connection, transaction
 from django.http import Http404
 from django.utils import timezone
 
@@ -454,9 +454,11 @@ def test_at84_nobody_else_self_approves(g):
     assert exc.value.code == "self_approval"
     access.revoke_membership(g.ce, Membership.objects.get(user=ce2, role__code="ceo"), "hand-over done")
     req = matrix.request_governance_change(g.sub, user=g.mp, reason="board decision", self_approval_enabled=False)
-    with pytest.raises(access.AccessDenied):  # R76: never its requester; the MP is not SUB's top authority here
+    with pytest.raises(access.AccessDenied):  # R76: never its requester
         matrix.decide_governance_change(req, user=g.mp, approve=True)
-    matrix.decide_governance_change(req, user=g.ce, approve=True)
+    with pytest.raises(access.AccessDenied):  # OQ-42 default (review of 49e1abd, item 10): never SUB's own ceo
+        matrix.decide_governance_change(req, user=g.ce, approve=True)
+    matrix.decide_governance_change(req, user=g.ch, approve=True)  # the group's chairman
     core_services.change_entity_settings(g.sub, user=g.mp, reason="board decision", dual_control_request=req,
                                          self_approval_enabled=False)
     assert engine.governance_of(g.sub).self_approval_enabled is False
@@ -812,7 +814,10 @@ def test_r90_entity_settings_and_the_top_authority_stay_group_level_under_dual_c
     with pytest.raises(access.AccessDenied):  # only the group parent's settings right asks for it (G)
         matrix.request_governance_change(g.sub, user=g.ce, reason="x", top_authority_role="approver")
     req = matrix.request_governance_change(g.sub, user=g.mp, reason="new GM", top_authority_role="approver")
-    matrix.decide_governance_change(req, user=g.ce, approve=True)
+    for wrong in (g.ce, g.br):  # OQ-42 default (review of 49e1abd, item 10): not SUB's ceo nor SUB's own board rep
+        with pytest.raises(access.AccessDenied):
+            matrix.decide_governance_change(req, user=wrong, approve=True)
+    matrix.decide_governance_change(req, user=g.ch, approve=True)
     with pytest.raises(access.AccessDenied):  # exactly the approved change
         core_services.change_entity_settings(g.sub, user=g.mp, reason="other", dual_control_request=req,
                                              top_authority_role="approver")
@@ -969,12 +974,12 @@ def test_rv_p6_p7_the_legacy_entry_point_creates_a_limited_delegation(g):
     """R62, R87, R88 (probes P6, P7): ``delegate_approval`` makes an ApprovalDelegation with every limit."""
     clerk = make_member(g, "clk6", "payables_clerk")
     with pytest.raises(access.AccessDenied) as exc:  # at most 90 days
-        access.delegate_approval(g.cf, g.ac, g.sub, None, access.now() + timedelta(days=200), "leave")
+        access.delegate_approval(g.cf, g.ac, g.sub, None, access.now() + timedelta(days=200), "leave", "سبب")
     assert exc.value.code == "delegation_too_long"
     with pytest.raises(access.AccessDenied) as exc:  # never to a personal assistant only
-        access.delegate_approval(g.cf, g.pa, g.sub, None, access.now() + timedelta(days=5), "office")
+        access.delegate_approval(g.cf, g.pa, g.sub, None, access.now() + timedelta(days=5), "office", "سبب")
     assert exc.value.code == "delegate_not_eligible"
-    d = access.delegate_approval(g.cf, g.ac, g.sub, None, access.now() + timedelta(days=5), "leave")
+    d = access.delegate_approval(g.cf, g.ac, g.sub, None, access.now() + timedelta(days=5), "leave", "سبب")
     assert isinstance(d, ApprovalDelegation) and d.delegator == g.cf
     assert not Membership.objects.filter(user=g.ac, delegated_from__isnull=False).exists()
     with pytest.raises(access.AccessDenied):  # the delegate cannot pass the authority on: no chain (R88)
@@ -1079,3 +1084,167 @@ def test_rv_oq42_oversight_roles_in_a_subsidiary_come_from_the_group_top_authori
     with pytest.raises(access.AccessDenied):
         access.revoke_membership(g.ce, Membership.objects.get(user=g.br, entity=g.sub), "removed")
     assert Membership.objects.get(user=g.br, entity=g.sub).revoked_at is None
+
+
+def test_rv93_n3_the_group_top_authority_grants_oversight_roles_in_an_equity_entity(g):
+    """OQ-42 team default (verification review of 49e1abd, item 2, probe N3): in an equity entity the managing
+    partner's group membership does not reach, the group parent's top authority still grants and revokes the
+    board representative; the entity's own ceo never does."""
+    assoc = make_entity("ASC", "equity", g.alm)
+    target = make_user("brx")
+    member(target, assoc, "viewer")
+    role = Role.objects.get(code="board_representative")
+    ceo = make_user("ceoasc")
+    member(ceo, assoc, "ceo")
+    with pytest.raises(access.AccessDenied) as exc:
+        access.grant_membership(ceo, target, assoc, role, access.now(), access.now() + timedelta(days=300), "board")
+    assert exc.value.code == "role_not_grantable"
+    m = access.grant_membership(g.mp, target, assoc, role, access.now(), access.now() + timedelta(days=300), "board")
+    assert (m.entity, m.granted_by) == (assoc, g.mp)
+    with pytest.raises(access.AccessDenied):
+        access.revoke_membership(ceo, m, "removed")
+    assert access.revoke_membership(g.mp, m, "term ended").revoked_at is not None
+    with pytest.raises(access.AccessDenied):  # an access admin of the group parent is not its top authority
+        access.grant_membership(make_member(g, "aa_alm", "access_admin", entity=g.alm), make_user("bry"), assoc, role,
+                                access.now(), None, "board")
+
+
+def _apps_at_0030():
+    from django.db.migrations.executor import MigrationExecutor
+
+    return MigrationExecutor(connection).loader.project_state(("core", "0030_authority_matrix_triggers")).apps
+
+
+def test_rv93_n5_migration_0031_converts_only_live_delegations_within_the_limits(g):
+    """Verification review of 49e1abd, item 4 (probe N5): the conversion starts no earlier than now, lasts at most
+    90 days, covers only the source role's approval activities, skips a delegate whose source had ended, and logs
+    with the system actor kind and the migration source."""
+    import importlib
+
+    apps = _apps_at_0030()
+    HM = apps.get_model("core", "Membership")
+    now = timezone.now()
+    approver = apps.get_model("core", "Role").objects.get(code="approver")
+    src = HM.objects.get(user_id=g.cf.pk, entity_id=g.sub.pk, role_id=approver.pk)
+    long_ago = HM.objects.create(user_id=g.ac.pk, entity_id=g.sub.pk, role_id=approver.pk,
+                                 valid_from=now - timedelta(days=200), valid_to=now + timedelta(days=300),
+                                 granted_by_id=g.cf.pk, granted_at=now - timedelta(days=200), reason="old leave",
+                                 delegated_from_id=src.pk)
+    cf2 = make_member(g, "cf2", "approver")
+    src2 = HM.objects.get(user_id=cf2.pk, entity_id=g.sub.pk)
+    dead = HM.objects.create(user_id=g.ba.pk, entity_id=g.sub.pk, role_id=approver.pk,
+                             valid_from=now - timedelta(days=5), valid_to=now + timedelta(days=20), granted_by_id=cf2.pk,
+                             granted_at=now - timedelta(days=5), reason="cover", delegated_from_id=src2.pk)
+    HM.objects.filter(pk=src2.pk).update(revoked_at=now - timedelta(days=1), revoked_by_id=g.ce.pk, revoke_reason="left")
+    importlib.import_module("core.migrations.0031_convert_legacy_delegations").convert(apps, None)
+    d = ApprovalDelegation.objects.get(delegate=g.ac)
+    assert d.delegator == g.cf and d.valid_from >= now and (d.valid_to - d.valid_from) <= timedelta(days=90)
+    codes = set(d.activities.values_list("code", flat=True))
+    assert "invoicing.bill" in codes and "payroll.run" not in codes  # the approver role's approvals only
+    assert Membership.objects.get(pk=long_ago.pk).revoked_at is not None
+    assert not ApprovalDelegation.objects.filter(delegate=g.ba).exists()  # its source had ended: not revived
+    assert Membership.objects.get(pk=dead.pk).revoked_at is None
+    logs = AccessLog.objects.filter(source="migration:core.0031")
+    assert {r.event for r in logs} == {"delegation_granted", "delegation_revoked"}
+    assert {r.actor_kind for r in logs} == {"system"} and all(r.actor_id is None for r in logs)
+
+
+def test_rv93_0029_carries_its_own_frozen_seed():
+    """Verification review of 49e1abd, item 7: the migration does not import the live seed; its frozen copy is V18."""
+    import importlib
+    import inspect
+
+    from core.access.seed import ROLE_SEED_V17, ROLE_SEED_V18
+
+    mod = importlib.import_module("core.migrations.0029_seed_access_v18_authority_matrix")
+    source = inspect.getsource(mod)
+    assert "import ROLE_SEED" not in source and "import authority_defaults" not in source
+    for code, row in ROLE_SEED_V18.items():
+        frozen = mod.ROLES_CHANGED.get(code)
+        expected = (*row[:5], tuple(sorted(set(row[5]))))
+        if frozen is None:
+            assert (*ROLE_SEED_V17[code][:5], tuple(sorted(set(ROLE_SEED_V17[code][5])))) == expected, code
+        else:
+            assert frozen == expected, code
+    assert {a[0] for a in mod.ACTIVITIES} == set(authority_defaults.ACTIVITIES)
+
+
+def test_rv93_n8_only_the_proposer_or_the_top_authority_withdraws_a_version(g):
+    """Verification review of 49e1abd, item 5 (probe N8)."""
+    aa2 = make_member(g, "aa2", "access_admin")
+    v = matrix.draft_version(g.sub, user=g.aa, effective_from=timezone.localdate(), summary_en="v", summary_ar="ن",
+                             copy_current=False)
+    matrix.add_rule(v, user=g.aa, activity="invoicing.bill", approver_roles=["ceo"])
+    matrix.submit_version(v, user=g.aa)
+    with pytest.raises(access.AccessDenied) as exc:
+        matrix.withdraw_version(v, user=aa2, reason="mine now")
+    assert exc.value.code == "not_proposer"
+    assert matrix.withdraw_version(v, user=g.ce, reason="board asked").status == "withdrawn"  # SUB's top authority
+    v2 = matrix.draft_version(g.sub, user=g.aa, effective_from=timezone.localdate(), summary_en="w", summary_ar="ن",
+                              copy_current=False)
+    assert matrix.withdraw_version(v2, user=g.aa, reason="not needed").status == "withdrawn"
+
+
+def test_rv93_r81_an_assistant_s_document_needs_its_creation_time(g):
+    """Verification review of 49e1abd, item 6: no silent fall-back to now; adapters supply the time when the
+    document has no created_at (a bank reconciliation is dated by prepared_at)."""
+    delegations.assign_assistant(g.cf, entity=g.sub, assistant=g.pa, principal=g.cf,
+                                 valid_to=access.now() + timedelta(days=60), reason="CFO office")
+    undated = SimpleNamespace(pk=5, entity=g.sub, _meta=SimpleNamespace(label_lower="invoicing.purchasedocument"),
+                              created_by_id=g.pa.pk)
+    with pytest.raises(access.AccessUsageError):
+        engine.document_people(g.sub, undated, access.now())
+    dated = SimpleNamespace(**vars(undated), created_at=access.now())
+    assert g.cf.pk in engine.document_people(g.sub, dated, access.now())
+    adapter = engine.adapters()[("banking.reconciliation", "banking.reconciliation")]
+    rec = SimpleNamespace(pk=6, entity=g.sub, _meta=SimpleNamespace(label_lower="banking.reconciliation"),
+                          prepared_by_id=g.pa.pk, prepared_at=access.now())
+    assert adapter.created_at(rec) == rec.prepared_at and g.cf.pk in engine.document_people(g.sub, rec, access.now())
+    other = SimpleNamespace(pk=7, entity=g.sub, _meta=SimpleNamespace(label_lower="invoicing.purchasedocument"),
+                            created_by_id=g.ac.pk)  # no assistant: no creation time needed
+    assert engine.document_people(g.sub, other, access.now()) == {g.ac.pk}
+
+
+def test_rv93_delegate_approval_takes_both_reasons(g):
+    """Verification review of 49e1abd, item 8: the bilingual rule (CLAUDE.md) for the legacy entry point."""
+    with pytest.raises(ValidationError):
+        access.delegate_approval(g.cf, g.ac, g.sub, None, access.now() + timedelta(days=5), "Leave", "")
+    d = access.delegate_approval(g.cf, g.ac, g.sub, None, access.now() + timedelta(days=5), "Leave", "إجازة")
+    assert (d.reason_en, d.reason_ar) == ("Leave", "إجازة")
+
+
+def test_rv93_the_through_table_of_a_frozen_row_refuses_direct_writes(g):
+    """Verification review of 49e1abd, item 9."""
+    v = approved_matrix(g, g.sub, [dict(activity="invoicing.bill", approver_roles=["ceo"])])
+    rule = v.rules.get()
+    through = AuthorityRule.approver_roles.through
+    if connection.vendor == "postgresql":  # the core.0030 trigger; SQLite has only the m2m guard (spec 10.10)
+        with pytest.raises(DatabaseError), transaction.atomic():
+            through.objects.create(authorityrule=rule, role=Role.objects.get(code="approver"))
+        with pytest.raises(DatabaseError), transaction.atomic():
+            through.objects.filter(authorityrule=rule).delete()
+    with pytest.raises(AppendOnlyError), transaction.atomic():
+        rule.approver_roles.remove(Role.objects.get(code="ceo"))
+    assert list(rule.approver_roles.values_list("code", flat=True)) == ["ceo"]
+
+
+def test_rv93_a_subsidiary_s_governance_change_is_decided_in_the_group_parent(g):
+    """OQ-42 team default (verification review of 49e1abd, item 10)."""
+    proposer = make_member(g, "settings_admin", "managing_partner", entity=g.alm)
+    req = matrix.request_governance_change(g.sub, user=proposer, reason="x", self_approval_enabled=False)
+    for wrong in (g.ce, g.br, proposer):
+        with pytest.raises(access.AccessDenied):
+            matrix.decide_governance_change(req, user=wrong, approve=True)
+    assert matrix.decide_governance_change(req, user=g.mp, approve=True).status == "approved"  # the group's MP
+
+
+def test_rv93_n1_n2_no_chain_and_no_assistant_delegate_within_90_days(g):
+    """Probes N1 and N2 of the verification review of 49e1abd, inside the 90-day limit."""
+    clerk = make_member(g, "clk_n1", "payables_clerk")
+    access.delegate_approval(g.cf, g.ac, g.sub, None, access.now() + timedelta(days=50), "Leave", "إجازة")
+    with pytest.raises(access.AccessDenied):  # the delegate holds no delegation right: no chain (R88)
+        delegations.delegate_authority(g.ac, entity=g.sub, delegate=clerk, valid_to=access.now() + timedelta(days=5),
+                                       reason_en="x", reason_ar="س", activities=["invoicing.bill"])
+    with pytest.raises(access.AccessDenied) as exc:  # never to a personal assistant only
+        access.delegate_approval(g.cf, g.pa, g.sub, None, access.now() + timedelta(days=50), "Office", "مكتب")
+    assert exc.value.code == "delegate_not_eligible"

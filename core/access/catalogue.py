@@ -174,6 +174,9 @@ _PERMS = [
     _p("invoicing.view_personal_data", "View personal data", "عرض البيانات الشخصية"),
     # billing
     _p("billing.edit_contract_draft", "Edit draft contracts", "تعديل مسودات العقود", AGENT_OK),
+    # Verification review of 49e1abd, item 3: submitting a contract for approval is its own right, so a personal
+    # assistant who drafts contracts never submits them (access R60, R81).
+    _p("billing.submit_contract", "Submit contracts for approval", "تقديم العقود للاعتماد"),
     _p("billing.record_contract_event", "Record contract events", "تسجيل أحداث العقود"),
     _p("billing.approve_contract", "Approve contracts", "اعتماد العقود", APPROVAL),
     _p("billing.approve_termination", "Approve contract terminations", "اعتماد إنهاء العقود", APPROVAL),
