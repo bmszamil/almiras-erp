@@ -162,7 +162,7 @@ def test_hr_oq6_leave_liability_report_posts_nothing_and_shows_rows_only_with_pa
     s1 = saudi(w)
     w.pclock.set(date(2027, 6, 1))
     stored = services.leave_liability_report(w.alm, date(2027, 6, 1), user=w.a)
-    report = services.liability_report_data(stored, user=w.p)
+    report = services.liability_report_data(stored, user=w.c)
     row = report["lines"][0]
     assert row.employee_code == s1.employee_code and report["posted"] is False
     assert row.amount == (row.untaken_days * D("13500.00") / 30).quantize(D("0.01")) == report["total_amount"]

@@ -40,6 +40,14 @@ def test_pg_mudad_justifications_and_exports_are_guarded(w):
     services.suggest_mudad_justifications(run, user=w.p)
     j2 = MudadJustification.objects.exclude(status="withdrawn").get(run=run)
     services.approve_mudad_justification(services.confirm_mudad_justification(j2, user=w.p), user=w.h)
+    # Review 4: approved content is frozen; only the portal option and the export link change.
+    _refused("UPDATE payroll_mudadjustification SET description_ar = 'x' WHERE id = %s", [j2.pk])
+    _refused("UPDATE payroll_mudadjustification SET paid_amount = 1 WHERE id = %s", [j2.pk])
+    _ok("UPDATE payroll_mudadjustification SET mudad_option_ar = 'خيار' WHERE id = %s", [j2.pk])
+    j2 = services.record_justification_submission(MudadJustification.objects.get(pk=j2.pk), user=w.p,
+                                                  submitted_on=date(2027, 4, 14), mudad_reference="M-J2")
+    _refused("UPDATE payroll_mudadjustification SET mudad_option_ar = 'y' WHERE id = %s", [j2.pk])
+    _ok("UPDATE payroll_mudadjustification SET worker_response = 'disputed' WHERE id = %s", [j2.pk])
     export = services.export_mudad_justifications(run, user=w.p)
     _refused("UPDATE payroll_mudadjustificationexport SET sha256 = 'x' WHERE id = %s", [export.pk])
     _refused("DELETE FROM payroll_mudadjustificationexport WHERE id = %s", [export.pk])

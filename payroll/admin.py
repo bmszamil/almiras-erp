@@ -98,7 +98,7 @@ class WpsFileAdmin(PayrollAdmin):
 # hold MOL-IDs and are never shown (downloads would be a logged service); liability reports show totals only.
 @admin.register(models.MudadJustification)
 class MudadJustificationAdmin(IndividualPayAdmin):
-    list_display = ["run", "employee_code", "entity", "kind", "reason", "status", "mudad_code", "due_date"]
+    list_display = ["run", "employee_code", "entity", "kind", "reason", "status", "mudad_option_ar", "due_date"]
     list_filter = ["status", "kind", "reason"]
     exclude = ["payslip"]
 

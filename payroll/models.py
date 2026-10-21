@@ -555,6 +555,9 @@ class Payslip(ServiceWritten):
     # Egypt: the month's taxable salary (after the employee's social insurance share) used by the cumulative salary
     # tax withholding of the year.
     taxable_income = _money("Taxable income of the month", "الدخل الخاضع للضريبة عن الشهر", default=ZERO)
+    # Compliance C1 (slice 3 review): the irregular part of it (bonuses, one-off earnings), taxed once, not annualised.
+    taxable_irregular = _money("Irregular taxable income of the month", "الدخل غير المنتظم الخاضع للضريبة عن الشهر",
+                               default=ZERO)
 
     class Meta:
         base_manager_name = "objects"  # review 6: no unguarded _base_manager bulk writes
@@ -1592,7 +1595,7 @@ class GosiFine(Tracked, ServiceWritten):
 class MudadJustification(Tracked, ServiceWritten):
     """11.3.2: why a KSA employee of an approved in-country run was paid less, nothing or late (R79). Not registered in
     the ledger (it posts nothing). Rows are never deleted: a wrong one is ``withdrawn`` with a reason (R80). The Mudad
-    codes come from ``wps.mudad.justification_codes`` **[verify: Mudad code list]**; the internal reasons (11.6) are
+    portal options come from ``wps.mudad.justification_options`` **[verify: Mudad option list]**; the internal reasons (11.6) are
     payroll's."""
 
     class Kind(models.TextChoices):
@@ -1600,6 +1603,8 @@ class MudadJustification(Tracked, ServiceWritten):
         PARTIAL_PAYMENT = "partial_payment", bi("Partial payment", "صرف جزئي")
         AMOUNT_DIFFERENCE = "amount_difference", bi("Amount difference", "اختلاف المبلغ")
         LATE_PAYMENT = "late_payment", bi("Late payment", "تأخر الصرف")
+        # Compliance C11: a justification entered ahead for 2 to 12 coming months of one worker (no run line yet).
+        PROACTIVE = "proactive", bi("Proactive (months ahead)", "مسبق (لأشهر قادمة)")
 
     class Reason(models.TextChoices):
         # Arabic labels [AR-review]; the likely Mudad category of each is [verify] (11.6).
@@ -1640,18 +1645,39 @@ class MudadJustification(Tracked, ServiceWritten):
         ("submitted", "rejected"), ("suggested", "withdrawn"), ("draft", "withdrawn"), ("approved", "withdrawn"),
     })
     FINAL = ("accepted", "rejected", "withdrawn")
+    LIVE = ("suggested", "draft", "approved", "submitted")
+    # Slice 3 review 4: what may still change in each status (content is frozen from approval; nothing but Mudad's
+    # answer after submission). Suggested and draft rows change freely, except who and what they are about.
+    FIXED = frozenset({"id", "entity_id", "payslip_id", "run_id", "employee_id", "employee_code", "created_by_id",
+                       "created_at", "source"})
+    CHANGEABLE = {
+        "approved": frozenset({"mudad_option_ar", "mudad_option_en", "wps_file_id", "status", "submitted_on",
+                               "worker_response_due", "mudad_reference", "withdrawn_reason_ar", "mudad_notice_date",
+                               "due_date", "modified_by_id", "modified_at"}),
+        "submitted": frozenset({"status", "worker_response", "modified_by_id", "modified_at"}),
+    }
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
-    payslip = models.ForeignKey(Payslip, on_delete=models.PROTECT, related_name="mudad_justifications",
+    employee = models.ForeignKey("hr.Employee", null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Employee", "الموظف"))
+    payslip = models.ForeignKey(Payslip, null=True, blank=True, on_delete=models.PROTECT,
+                                related_name="mudad_justifications",
                                 verbose_name=bi("Payslip (run line)", "القسيمة (بند المسير)"))
-    run = models.ForeignKey(PayrollRun, on_delete=models.PROTECT, related_name="mudad_justifications",
-                            verbose_name=bi("Run", "المسير"))
+    run = models.ForeignKey(PayrollRun, null=True, blank=True, on_delete=models.PROTECT,
+                            related_name="mudad_justifications", verbose_name=bi("Run", "المسير"))
+    from_period = models.CharField(bi("From period (proactive)", "من فترة (مسبق)"), max_length=7, blank=True)
+    to_period = models.CharField(bi("To period (proactive)", "إلى فترة (مسبق)"), max_length=7, blank=True)
     wps_file = models.ForeignKey(WpsFile, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
                                  verbose_name=bi("Exported in WPS file", "صُدّر في ملف حماية الأجور"))
     employee_code = models.CharField(bi("Employee code", "رقم الموظف"), max_length=30)
     kind = models.CharField(bi("Kind", "النوع"), max_length=20, choices=Kind.choices)
     reason = models.CharField(bi("Reason", "السبب"), max_length=30, choices=Reason.choices)
-    mudad_code = models.CharField(bi("Mudad code", "رمز مدد"), max_length=20, null=True, blank=True)
+    # Compliance C3: the Mudad portal's drop-down option, as labelled there (from wps.mudad.justification_options,
+    # [verify]); empty while the parameter is empty.
+    mudad_option_ar = models.CharField(bi("Mudad portal option (Arabic)", "خيار بوابة مدد (بالعربية)"), max_length=200,
+                                       blank=True)
+    mudad_option_en = models.CharField(bi("Mudad portal option (English)", "خيار بوابة مدد (بالإنجليزية)"),
+                                       max_length=200, blank=True)
     expected_amount = _money("Expected (contract wage)", "المتوقع (أجر العقد)")
     paid_amount = _money("Paid", "المدفوع")
     description_ar = models.TextField(bi("Justification (Arabic)", "المبرر (بالعربية)"), max_length=500)
@@ -1671,6 +1697,10 @@ class MudadJustification(Tracked, ServiceWritten):
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)
     mudad_reference = models.CharField(bi("Mudad reference", "مرجع مدد"), max_length=60, blank=True)
     withdrawn_reason_ar = models.TextField(bi("Withdrawal reason (Arabic)", "سبب السحب (بالعربية)"), blank=True)
+    warnings = models.JSONField(bi("Warnings", "تنبيهات"), default=list, blank=True)
+    # Review 8: an imported row whose text or evidence looks like health detail is flagged, not refused.
+    health_flag = models.BooleanField(bi("Possible health detail (review)", "تفصيل صحي محتمل (للمراجعة)"),
+                                      default=False)
 
     class Meta:
         base_manager_name = "objects"
@@ -1682,6 +1712,12 @@ class MudadJustification(Tracked, ServiceWritten):
                                     name="payroll_mudad_justification_once"),
             models.CheckConstraint(condition=Q(expected_amount__gte=0) & Q(paid_amount__gte=0),
                                    name="payroll_mudad_justification_amounts"),
+            models.UniqueConstraint(fields=["employee"],
+                                    condition=Q(kind="proactive", status__in=("suggested", "draft", "approved",
+                                                                              "submitted")),
+                                    name="payroll_one_live_proactive_justification"),
+            models.CheckConstraint(condition=Q(kind="proactive") | Q(payslip__isnull=False),
+                                   name="payroll_justification_line_or_proactive"),
         ]
 
     def save(self, *args, **kwargs):
@@ -1693,6 +1729,13 @@ class MudadJustification(Tracked, ServiceWritten):
             if stored is not None and stored != self.status and (stored, self.status) not in self.TRANSITIONS:
                 raise error(f"A Mudad justification does not move from {stored} to {self.status} (R80).",
                             f"لا ينتقل مبرر مدد من {stored} إلى {self.status}.", code="justification_status")
+            if stored is not None:
+                row = type(self)._base_manager.filter(pk=self.pk).values().get()
+                changed = {f.attname for f in self._meta.concrete_fields if row[f.attname] != getattr(self, f.attname)}
+                allowed = self.CHANGEABLE.get(stored)
+                if changed & self.FIXED or (allowed is not None and changed - allowed):
+                    raise error("This Mudad justification is approved or submitted: its content is frozen (R80).",
+                                "اعتُمد مبرر مدد هذا أو رُفع: محتواه مجمّد.", code="justification_frozen")
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):

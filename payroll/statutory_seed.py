@@ -258,11 +258,27 @@ EG_SLICE2_ROWS = (
 # is empty or unverified the leave liability report shows Egypt's days, not valued.
 MUDAD = "https://mudad.com.sa/"
 SLICE3_SA = {
-    "wps.mudad.justification_codes": ({"codes": {}}, MUDAD,
-                                      "Internal reason to Mudad justification code (payroll §11.6) [verify: Mudad code "
-                                      "list, not in HRSD sources] | seeded empty 2026-10-20 (OQ-56)"),
+    # Compliance C3 (HRSD WPS guide): justifications are chosen from a drop-down on the Mudad portal; this row maps
+    # each internal reason ("reason" or "kind:reason") to the option's label {"ar": ..., "en": ...}.
+    "wps.mudad.justification_options": ({"options": {}}, MUDAD,
+                                        "Internal reason to the Mudad portal drop-down option (payroll §11.6) [verify: "
+                                        "Mudad option list, not in HRSD sources] | seeded empty 2026-10-21 (OQ-56)"),
+    # Compliance C4 (Labour Law Art. 2): the value of in-kind housing in the EOSB wage, months of BASIC a year; 3
+    # (a quarter) is the team's default for the provision and reports [verify: legal].
+    "eosb.in_kind_housing": ({"basic_months_per_year": "3"}, LABOUR_LAW,
+                             "Labour Law Art. 2 (wage includes in-kind benefits); valuation [verify: legal] | seeded "
+                             "2026-10-21"),
+    # Review 8 (PDPL, hr R11): words that suggest a diagnosis or health detail in a justification's text or evidence.
+    "mudad.health_words": ({"words": ["diagnos", "disease", "illness", "surgery", "cancer", "covid", "pregnan",
+                                      "hospital", "medical", "injury", "تشخيص", "عملية جراحية", "جراحة", "سرطان",
+                                      "كورونا", "مستشفى", "ورم", "طبي", "إصابة", "نفسي"]}, MUDAD,
+                           "Team list for the PDPL screen of Mudad justifications (no official source) [verify: DPO] "
+                           "| seeded 2026-10-21"),
 }
 SLICE3_EG = {
+    "si.wage_reference": ({"reference": "monthly", "options": ["monthly", "january"]}, EG_ANDERSEN,
+                          "Law 148/2019: insurable wage of the month or of January of the year [verify: Egypt adviser] "
+                          "(compliance C10) | seeded 2026-10-21"),
     "leave.encashment_basis": ({}, EG_ANDERSEN, "Labour Law 14/2025: cash for untaken leave on exit; which wage and "
                                "divisor [verify: Egypt adviser] (OQ-55) | seeded empty 2026-10-20"),
 }

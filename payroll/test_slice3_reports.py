@@ -110,9 +110,11 @@ def test_at80_pro_rata_future_leave_dates_rights_and_scope(w, monkeypatch):
     viewer = services.liability_report_data(report, user=w.v)
     assert viewer["lines"] == [] and viewer["total_amount"] == D("7132.50") and not viewer["detail"]
     assert not AccessLog.objects.filter(details__action="liability_report_viewed").exists()
-    detail = services.liability_report_data(report, user=w.p2)
+    detail = services.liability_report_data(report, user=w.c)
     assert [x.employee_code for x in detail["lines"]] == [s1.employee_code]
-    assert AccessLog.objects.filter(details__action="liability_report_viewed", actor=w.p2).exists()
+    assert AccessLog.objects.filter(details__action="liability_report_viewed", actor=w.c).exists()
+    with pytest.raises(PermissionDenied):  # review 5 (R75): payslip rights alone never give the totals
+        services.liability_report_data(report, user=w.p2)
     assert services.get_liability_report(w.v, report.pk) == report
     with pytest.raises(Http404):  # another entity's report
         services.get_liability_report(w.hs, report.pk)
@@ -120,9 +122,9 @@ def test_at80_pro_rata_future_leave_dates_rights_and_scope(w, monkeypatch):
         services.liability_report_data(report, user=w.hs)
     with pytest.raises(PermissionDenied):  # R38
         services.leave_liability_report(w.alm, date(2027, 5, 15), user=w.agent)
-    html = services.render_liability_report(report, user=w.p2)
+    html = services.render_liability_report(report, user=w.c)
     assert html.index("النص العربي هو المعتمد") < html.index("The Arabic text prevails")
-    csv_ = services.render_liability_report(report, user=w.p2, format_code="csv")
+    csv_ = services.render_liability_report(report, user=w.c, format_code="csv")
     assert s1.employee_code in csv_ and s1.full_name_en not in csv_ and s1.id_number not in csv_
     assert "7132.50" in services.render_liability_report(report, user=w.v, format_code="csv")
     assert s1.employee_code not in services.render_liability_report(report, user=w.v, format_code="csv")
@@ -170,7 +172,7 @@ def test_r75_reports_are_stored_never_edited_and_superseded(w):
         with connection.cursor() as cursor:
             cursor.execute(sql, [second.pk])
         with pytest.raises(PayrollError) as exc:
-            services.liability_report_data(second, user=w.p)
+            services.liability_report_data(second, user=w.c)
         assert exc.value.code == "report_changed"
 
 
@@ -185,9 +187,10 @@ def test_at81_eosb_report_art84_award_art85_memo_subledger_and_nothing_posted(w)
     l = line(report, s1)
     r = hr.calculate_eosb(s1, date(2027, 3, 31), "employer_termination", user=w.h)
     assert l.art84_full_award == r.full_award == l.amount
-    expected = (D("13500.00") / 2 * 5 + D("13500.00") * (D(90) / D(365))).quantize(D("0.01"))
-    assert abs(l.art84_full_award - expected) <= D("0.50")  # 5 years at 1/2 month + 90 days at a month
-    assert l.art85_resignation_memo == (l.art84_full_award * 2 / 3).quantize(D("0.01"))  # 5 to 10 years: 2/3
+    # Review 9: exactly 5 years at half a month (33,750.00) + 90 days of the sixth year at a month
+    # (13,500.00 x 90 / 365 = 3,328.77).
+    assert l.art84_full_award == D("37078.77")
+    assert l.art85_resignation_memo == D("24719.18")  # more than 5 years, under 10: 2/3
     memo = sum(e.amount for e in EosbProvisionEntry.objects.filter(employee=s1, date__lte=date(2027, 3, 31)))
     assert l.subledger_balance_memo == memo and memo > 0
     assert report.account_2500_memo == memo
@@ -206,7 +209,7 @@ def test_at82_eosb_exclusions_not_valued_egypt_and_supersession(eg, monkeypatch)
     l1 = egyptian(w)
     from payroll.models import FinalSettlement
     real = services._settled
-    monkeypatch.setattr(services, "_settled", lambda emp: emp.pk == s2.pk or real(emp))  # an approved settlement
+    monkeypatch.setattr(services, "_settled", lambda emp, as_of: emp.pk == s2.pk or real(emp, as_of))  # an approved settlement
     real_eosb = hr._compute_eosb
 
     def no_terms(emp, as_of, kind, use, additional_wage=D("0")):
@@ -254,3 +257,41 @@ def test_r75_one_entity_per_report_and_no_rights_no_report(w):
     member(outsider, w.sub, "accountant")
     report = services.leave_liability_report(w.sub, date(2027, 3, 31), user=outsider)
     assert report.entity_id == w.sub.pk and not report.lines.exists()
+
+
+# --- review 6 and compliance C4 ----------------------------------------------------------------------------------
+
+def test_review6_leaver_without_settlement_is_valued_due_and_settled_counts_from_its_last_day(w):
+    from payroll.test_final_settlement import LWD, go_live, leaver, settle, terminate
+    n1 = leaver(w)
+    t = terminate(w, n1)  # employer termination, last working day 2027-03-15
+    w.pclock.set(datetime(2027, 4, 5, 12, 0))
+    report = services.eosb_provision_report(w.alm, date(2027, 3, 31), user=w.a)
+    l = line(report, n1)
+    award = hr.calculate_eosb(n1, LWD, "employer_termination", user=w.h).award
+    assert (l.valuation, l.amount, l.art85_resignation_memo) == ("valued", award, None)
+    assert "settlement pending" in l.reason_en and "معلقة" in l.reason_ar
+    go_live(w)
+    services.approve_final_settlement(settle(w, t), user=w.c)
+    before = services.eosb_provision_report(w.alm, date(2027, 3, 10), user=w.a)  # still employed on that date
+    assert line(before, n1).valuation == "valued" and line(before, n1).reason_en == ""
+    after = services.eosb_provision_report(w.alm, date(2027, 3, 31), user=w.a)
+    assert line(after, n1).valuation == "excluded" and "Final settlement approved" in line(after, n1).reason_en
+
+
+def test_c4_regular_bonuses_and_in_kind_housing_join_the_eosb_and_leave_wage(w):
+    s1 = saudi(w)
+    s4 = saudi(w, id_number="1000000994", components={"BASIC": "8000.00", "TRANSPORT": "500.00"},
+               contract_kwargs={"housing_in_kind": True})
+    w.pclock.set(datetime(2027, 2, 20, 12, 0))
+    inp = services.create_input(s1, user=w.p, kind="bonus", period="2027-02", amount="1200.00", reason_ar="مكافأة")
+    services.approve_input(inp, user=w.p2)
+    feb = approved(w, "2027-02")
+    assert feb.payslips.get(employee=s1).lines.filter(line_type="bonus").exists()
+    w.pclock.set(datetime(2027, 4, 5, 12, 0))
+    report = services.eosb_provision_report(w.alm, date(2027, 3, 31), user=w.a)
+    assert line(report, s1).wage_basis == D("13600.00")  # 13,500.00 + 1,200.00 / 12
+    assert line(report, s4).wage_basis == D("10500.00")  # 8,500.00 + in-kind housing 8,000.00 x 3 / 12
+    ledger_row(s1, "10.00", date(2027, 3, 31))
+    leave = services.leave_liability_report(w.alm, date(2027, 3, 31), user=w.a)
+    assert line(leave, s1).daily_wage == D("453.33")  # 13,600.00 / 30

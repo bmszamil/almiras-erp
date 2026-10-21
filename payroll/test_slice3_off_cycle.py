@@ -277,9 +277,12 @@ def test_at77_egypt_month_at_the_maximum_gets_no_insurance_and_tax_is_cumulative
     assert "si_employee" not in types and "si_employer" not in types and "uhi_employee" not in types
     assert types["martyrs_fund"] == D("1.00")  # 0.05% of this run's gross
     withheld = amount(regular, l2, "salary_tax")
-    ytd = reg.taxable_income + D("2000.00")
-    expected = (_eg_tax(ytd * 12 - D("20000")) / 12).quantize(D("0.01")) - withheld
-    assert types["salary_tax"] == expected and expected > 0
+    # Compliance C1: the regular pay is annualised, the bonus added once and its tax due in full now.
+    annual = reg.taxable_income * 12
+    t_reg, t_all = _eg_tax(annual - D("20000")), _eg_tax(annual + D("2000.00") - D("20000"))
+    expected = (t_reg / 12 + t_all - t_reg).quantize(D("0.01")) - withheld
+    assert types["salary_tax"] == expected == D("400.00")  # the bonus at the 20% band
+    assert ps.taxable_irregular == D("2000.00")
     assert ps.input_ids == [inp.pk]
     # Variant: one EG row back to unverified: calculated with a warning, refused at submission naming the row.
     row = hr.add_statutory_parameter(user=w.h, jurisdiction="EG", code="levy.martyrs_fund",
@@ -339,3 +342,164 @@ def test_r74_egypt_exit_found_after_preparation_refuses_the_payslip(eg, monkeypa
     monkeypatch.setattr(services, "_eg_exit_problem", lambda emp, versions, end: ("Exit test.", "اختبار إنهاء."))
     run = services.calculate_run(run, user=w.pe)
     assert slip(run, l1).refused and "Exit test." in slip(run, l1).refusal
+
+
+# --- slice 3 review and compliance fixes (2026-10-21) -----------------------------------------------------------
+
+def test_review1_a_regular_run_is_not_reversed_after_its_off_cycle_and_never_pays_the_month_twice(w, monkeypatch):
+    r1, r2, regular = march_with_r2_refused(w)
+    off = through(w, off_cycle(w, "2027-03", [r2]))
+    with pytest.raises(PayrollError) as exc:
+        services.reverse_run(PayrollRun.objects.get(pk=regular.pk), user=w.c, reason="test reversal")
+    assert exc.value.code == "off_cycle_approved" and " / " in exc.value.messages[0]
+    # Defence in depth: even if the regular run were reversed, a new one nets the month against the off-cycle run.
+    with monkeypatch.context() as m:
+        m.setattr(services, "_slice3_off_cycle", lambda *a: False)
+        services.reverse_run(PayrollRun.objects.get(pk=regular.pk), user=w.c, reason="test reversal")
+    again = services.calculate_run(services.create_run(w.alm, user=w.p, period="2027-03",
+                                                       payroll_group="out_of_country"), user=w.p)
+    assert amount(again, r2, "earning") == 0 and amount(again, r2, "employer_gosi") == 0
+    assert not again.payslips.filter(employee=r2).exists() or slip(again, r2).net_txn == 0
+    assert amount(again, r1, "earning") == D("18750.00")  # R1's month was reversed with the regular run
+    assert off.status == "approved"
+
+
+def test_review2_c5_no_gosi_on_an_fx_difference_in_a_closed_period(w):
+    rate("USD", "SAR", date(2027, 3, 31), "3.7500")
+    r2 = remuneration(w, id_number="1888888811", gosi_employment_relationship="subordinate",
+                      gosi_relationship_ref="AGREEMENT-R2", **SAUDI_ABROAD)
+    reg = services.calculate_run(services.create_run(w.alm, user=w.p, period="2027-03",
+                                                     payroll_group="out_of_country"), user=w.p)
+    reg = services.approve_run(services.submit_run(reg, user=w.p), user=w.h)
+    assert slip(reg, r2).gosi_wage == D("18750.00")
+    ledger.close_period(FiscalPeriod.objects.get(entity=w.alm, start_date=date(2027, 3, 1)), user=w.c)
+    rate("USD", "SAR", date(2027, 4, 1), "3.7600")
+    services.approve_input(services.create_input(r2, user=w.p, kind="one_off_earning", period="2027-03",
+                                                  amount="200.00", reason_ar="بدل"), user=w.p2)
+    run = services.calculate_run(off_cycle(w, "2027-03", [r2]), user=w.p)
+    ps = slip(run, r2)
+    assert not ps.lines.exclude(gosi_branch="").exists() and ps.gosi_wage == 0  # REMUNERATION fully paid
+    assert amount(run, r2, "one_off_earning") == D("752.00") and amount(run, r2, "earning") == 0
+
+
+def eg_net_month(w, monkeypatch, governorate=None):
+    if governorate:
+        services.configure_settings(w.egy, user=w.ce, work_governorate=governorate)
+    l1 = egyptian(w, {"BASIC": "10000.00"})
+    egyptian(w)
+    egypt_2027(w)
+    regular = eg_regular(w, refuse=l1, monkeypatch=monkeypatch)
+    off = services.calculate_run(off_cycle(w, "2027-04", [l1], entity=w.egy, user=w.pe, group="in_country"),
+                                 user=w.pe)
+    off = services.approve_run(services.submit_run(off, user=w.pe), user=w.he)
+    return l1, regular, off
+
+
+def test_review1_egypt_regular_after_reversal_nets_salary_si_and_the_uhi_minimum(eg, monkeypatch):
+    w = eg
+    l1, regular, off = eg_net_month(w, monkeypatch, governorate="port_said")
+    types = {l.line_type: l.amount for l in slip(off, l1).lines.all()}
+    assert types["uhi_employer"] == D("400.00") and types["uhi_employee"] == D("100.00")  # 4% and 1% of 10,000.00
+    with pytest.raises(PayrollError) as exc:
+        services.reverse_run(PayrollRun.objects.get(pk=regular.pk), user=w.ce, reason="test")
+    assert exc.value.code == "off_cycle_approved"
+    with monkeypatch.context() as m:
+        m.setattr(services, "_slice3_off_cycle", lambda *a: False)
+        services.reverse_run(PayrollRun.objects.get(pk=regular.pk), user=w.ce, reason="test")
+    again = services.calculate_run(services.create_run(w.egy, user=w.pe, period="2027-04"), user=w.pe)
+    for t in ("earning", "si_employee", "si_employer", "uhi_employee", "uhi_employer", "salary_tax"):
+        assert amount(again, l1, t) == 0, t  # nothing left to pay: salary, SI and UHI booked by the off-cycle run
+
+
+def test_r73_uhi_employer_minimum_applies_once_per_month(eg, monkeypatch):
+    """Review 9: a low wage in a UHI-live governorate: the regular run booked the EGP 50 employer minimum; an
+    off-cycle bonus in the same month adds no second minimum."""
+    w = eg
+    services.configure_settings(w.egy, user=w.ce, work_governorate="port_said")
+    low = egyptian(w, {"BASIC": "3000.00"})  # 4% = 120.00
+    # With the seeded limits 4% never falls below EGP 50, so the test sets a higher minimum (EGP 200) to see it bind.
+    hr.add_statutory_parameter(user=w.h, jurisdiction="EG", code="uhi.rates",
+                               value={"employee": "0.01", "employer": "0.04", "employer_min_monthly": "200.00",
+                                      "spouse_not_working": "0.03", "per_dependent_child": "0.01",
+                                      "base": "si_contribution_wage"},
+                               valid_from=date(2027, 1, 1), source_url="https://example.invalid/uhi",
+                               source_reference="test: higher employer minimum")
+    egypt_2027(w)
+    regular = eg_regular(w)
+    assert amount(regular, low, "uhi_employer") == D("200.00")  # the monthly minimum
+    w.pclock.set(datetime(2027, 5, 6, 12, 0))
+    services.approve_input(services.create_input(low, user=w.pe, kind="bonus", period="2027-04", amount="500.00",
+                                                 reason_ar="مكافأة"), user=services_user(w))
+    off = services.calculate_run(off_cycle(w, "2027-04", [low], entity=w.egy, user=w.pe, group="in_country"),
+                                 user=w.pe)
+    assert amount(off, low, "uhi_employer") == 0 and amount(off, low, "si_employer") == 0
+
+
+def test_r73_partial_si_netting_on_a_backdated_raise(eg):
+    w = eg
+    l1 = egyptian(w, {"BASIC": "10000.00"})
+    egypt_2027(w)
+    eg_regular(w)
+    from hr.conftest import contract
+    contract(w, l1, {"BASIC": "12000.00"}, department=w.eg_dept, grade=w.eg_grade, contract_type="fixed",
+             end_date=date(2028, 12, 31), notice_days_employer=90, notice_days_employee=90, qiwa_contract_ref="",
+             currency="EGP", effective_date=date(2027, 4, 1), start_date=l1.hire_date)
+    off = services.calculate_run(off_cycle(w, "2027-04", [l1], entity=w.egy, user=w.pe, group="in_country"),
+                                 user=w.pe)
+    assert amount(off, l1, "earning") == D("2000.00")
+    assert amount(off, l1, "si_employee") == D("220.00") and amount(off, l1, "si_employer") == D("375.00")
+    assert slip(off, l1).gosi_wage == D("2000.00")
+
+
+def test_c1_egypt_january_bonus_is_taxed_once_not_annualised(eg):
+    w = eg
+    l1 = egyptian(w, {"BASIC": "10000.00"})
+    egypt_2027(w)
+    w.pclock.set(datetime(2027, 1, 20, 12, 0))
+    services.approve_input(services.create_input(l1, user=w.pe, kind="bonus", period="2027-01", amount="12000.00",
+                                                 reason_ar="مكافأة سنوية"), user=services_user(w))
+    run = services.calculate_run(services.create_run(w.egy, user=w.pe, period="2027-01"), user=w.pe)
+    ps = slip(run, l1)
+    # Regular 8,900.00 a month annualised: 86,800.00 taxable, 7,110.00 a year; with the bonus 98,800.00: 9,510.00.
+    # January: 7,110.00 / 12 + (9,510.00 - 7,110.00) = 592.50 + 2,400.00.
+    assert amount(run, l1, "salary_tax") == D("2992.50") and ps.taxable_irregular == D("12000.00")
+
+
+def test_c10_egypt_si_on_the_january_wage_when_configured(eg):
+    w = eg
+    l1 = egyptian(w, {"BASIC": "10000.00"})
+    from hr.conftest import contract
+    contract(w, l1, {"BASIC": "12000.00"}, department=w.eg_dept, grade=w.eg_grade, contract_type="fixed",
+             end_date=date(2028, 12, 31), notice_days_employer=90, notice_days_employee=90, qiwa_contract_ref="",
+             currency="EGP", effective_date=date(2027, 3, 1), start_date=l1.hire_date)
+    hr.add_statutory_parameter(user=w.h, jurisdiction="EG", code="si.wage_reference", value={"reference": "january"},
+                               valid_from=date(2027, 1, 1), source_url="https://example.invalid/eg",
+                               source_reference="test: January reference")
+    egypt_2027(w)
+    run = services.calculate_run(services.create_run(w.egy, user=w.pe, period="2027-04"), user=w.pe)
+    assert slip(run, l1).gosi_wage == D("10000.00") and amount(run, l1, "si_employee") == D("1100.00")
+
+
+def test_at78_egypt_approved_termination_is_never_paid_off_cycle(eg, monkeypatch):
+    """hr cannot approve an Egypt termination yet (its Egypt rows, e.g. leave.sick, are not configured, OQ-26), so the
+    approved termination is stood in for at payroll's own lookup."""
+    w = eg
+    egyptian(w)
+    l3 = egyptian(w)
+    egypt_2027(w)
+    eg_regular(w)
+    from types import SimpleNamespace
+    real = services._termination
+    monkeypatch.setattr(services, "_termination", lambda emp: SimpleNamespace(
+        pk=999, last_working_day=date(2027, 4, 20), kind="employer_termination") if emp.pk == l3.pk else real(emp))
+    with pytest.raises(PayrollError) as exc:
+        off_cycle(w, "2027-04", [l3], entity=w.egy, user=w.pe, group="in_country")
+    assert exc.value.code == "eg_final_settlement_not_built"
+
+
+def test_c9_remuneration_contracts_carry_remuneration_only(w):
+    """Compliance C9: commission or profit share on a remuneration contract would need the R65 prior-year average in
+    the GOSI base; hr refuses such a contract (R52)."""
+    with pytest.raises(Exception) as exc:
+        remuneration(w, components={"REMUNERATION": "5000.00", "COMMISSION": "500.00"})
+    assert "REMUNERATION" in str(exc.value)
