@@ -838,7 +838,7 @@ Every row becomes an `ApprovalActivity` with an engine adapter. "Default" = the 
 | `tax.tax_document` (payment, refund, import VAT) | `approve_tax_document` | `tax.approve_payment` | `approver` | Y | rec. |
 | `tax.settings` | tax settings change | `tax.change_settings` | `approver` | | rec. |
 | `tax.box_definition` | `verify_box_definition` (H3) | `tax.maintain_rates` | `approver` verifies the accountant's proposal | | rec. |
-| `migration.account_map` | `migration.services.approve_account_map` | `migration.approve_account_map` | `approver`, MP | | rec. |
+| `migration.account_map` | `migration.services.approve_account_map` (submitted with `submit_account_map`, decided with `decide_account_map`, 2026-10-21; a direct call is refused `approval_request_required`, `engine.deciding()`) | `migration.approve_account_map` | `approver`, MP | | rec. |
 | `core.authority_matrix` (DC) | new (R76) | `core.approve_authority_matrix` | R76 | | Y |
 
 **Shown in the engine inbox but kept as dual-control requests (3.4):** Sharia switch-off (R48) and ZATCA production switch. Steps stay role-bound. The engine adds the inbox and notifications only (OQ-49). **Not approvals (stay in their module, no engine request):** receipt posting by its recorder (A16, OQ-40), WHT data verification (OQ-17), treaty-certificate verification, billing period release, bank match confirmation, non-publication-day verification (G), system-user issue/post after a prior human approval (A6 → A29, R63).
