@@ -1,0 +1,108 @@
+{% extends "web/base.html" %}{% load web_tags %}
+{% block title %}{% t "inbox_item_title" %} | {{ entity.code }}{% endblock %}
+{% block content %}
+<p class="alm-breadcrumb"><a href="{% url 'web:inbox' entity.code %}">{% t "inbox_back" %}</a></p>
+<div class="alm-page-head">
+  <h1 class="alm-title">{% pick req.activity "name" %}</h1>
+  <p class="alm-page-head__entity">{% pick req "label" %}</p>
+</div>
+{% if error or approve_form.errors or send_back_form.errors %}
+<div class="alm-error-summary" role="alert" tabindex="-1" id="alm-errors">
+  <p class="alm-error-summary__title">{% t "error_summary" %}</p>
+  <ul>
+    {% if error %}<li>{{ error }}</li>{% endif %}
+    {% for e in approve_form.code.errors %}<li><a href="#id_code">{{ approve_form.code.label }}: {{ e }}</a></li>{% endfor %}
+    {% for e in approve_form.version.errors %}<li>{{ e }}</li>{% endfor %}
+    {% for e in send_back_form.reason_ar.errors %}<li><a href="#id_reason_ar">{{ send_back_form.reason_ar.label }}: {{ e }}</a></li>{% endfor %}
+    {% for e in send_back_form.reason_en.errors %}<li><a href="#id_reason_en">{{ send_back_form.reason_en.label }}: {{ e }}</a></li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% if item.delegator %}<p class="alm-notice" role="note">{% t "inbox_delegate_notice" %} <bdi>{% person item.delegator %}</bdi></p>{% endif %}
+{% if item.eligibility.self_approval %}<p class="alm-notice alm-notice--warn" role="note">{% t "inbox_self_approval_notice" %}</p>{% endif %}
+{% if not item.can_decide %}<p class="alm-notice" role="note">{% t item.why_key %}</p>{% endif %}
+
+<section class="alm-card" aria-labelledby="req-header">
+  <h2 class="alm-card__title" id="req-header">{% t "header" %}</h2>
+  <dl class="alm-dl">
+    <div><dt>{% t "entity_switcher" %}</dt><dd>{% pick entity "name" %} <span class="alm-code">{{ entity.code|ident }}</span></dd></div>
+    <div><dt>{% t "number" %}</dt><dd>{% pick req "label" %}</dd></div>
+    <div><dt>{% t "amount" %}</dt><dd>{% if req.amount is not None %}{% money req.amount req.currency %}{% else %}{% t "no_amount" %}{% endif %}</dd></div>
+    {% if req.functional_amount is not None and req.currency != entity.base_currency_id %}<div><dt>{% t "functional_currency" %}</dt><dd>{% money req.functional_amount entity.base_currency_id %}</dd></div>{% endif %}
+    <div><dt>{% t "submitted_by" %}</dt><dd>{% if req.submitted_by %}<bdi>{% person req.submitted_by %}</bdi>{% endif %}</dd></div>
+    <div><dt>{% t "submitted_at" %}</dt><dd>{% moment req.opened_at %}</dd></div>
+    <div><dt>{% t "inbox_rules" %}</dt><dd>{% half req.get_rule_source_display %}</dd></div>
+    <div><dt>{% t "inbox_step" %}</dt><dd>{% t "inbox_step_of" step=item.eligibility.step_no steps=item.steps_total %}</dd></div>
+  </dl>
+  <p class="alm-muted mt-3">{% t "inbox_pdpl_note" %}</p>
+</section>
+
+<section class="alm-card" aria-labelledby="req-history">
+  <h2 class="alm-card__title" id="req-history">{% t "history" %}</h2>
+  {% if item.decisions %}
+  <div class="table-responsive">
+    <table class="table alm-table alm-table--stack">
+      <caption class="visually-hidden">{% t "history" %}</caption>
+      <thead><tr><th scope="col">{% t "inbox_step" %}</th><th scope="col">{% t "decision" %}</th><th scope="col">{% t "decided_by" %}</th><th scope="col">{% t "date" %}</th><th scope="col">{% t "reason" %}</th></tr></thead>
+      <tbody>
+        {% for d in item.decisions %}
+        <tr>
+          <td data-label="{% t 'inbox_step' %}"><bdi dir="ltr">{{ d.step_no }}</bdi></td>
+          <td data-label="{% t 'decision' %}">{% half d.get_decision_display %}</td>
+          <td data-label="{% t 'decided_by' %}">{% if d.user %}<bdi>{% person d.user %}</bdi>{% endif %}{% if d.on_behalf_of %} <span class="alm-badge">{% t "inbox_on_behalf_of" %} <bdi>{% person d.on_behalf_of %}</bdi></span>{% endif %}</td>
+          <td data-label="{% t 'date' %}">{% moment d.at %}</td>
+          <td data-label="{% t 'reason' %}">{% if d.note %}<span lang="ar" dir="rtl">{{ d.note }}</span>{% endif %}{% if d.note_en %}<br><span lang="en" dir="ltr">{{ d.note_en }}</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="alm-muted">{% t "history_empty" %}</p>
+  {% endif %}
+</section>
+
+{% if item.can_decide %}
+<div class="row g-4 mt-1">
+  <section class="col-12 col-lg-6" aria-labelledby="act-approve">
+    <div class="alm-card h-100">
+      <h2 class="alm-card__title" id="act-approve">{% t "inbox_approve_title" %}</h2>
+      <form method="post" action="{% url 'web:inbox_approve' entity.code req.pk %}" novalidate>
+        {% csrf_token %}
+        {{ approve_form.version }}
+        {% if step_up %}
+        <p class="alm-muted">{% t "inbox_step_up_intro" %}</p>
+        <div class="mb-3">
+          <label class="form-label" for="{{ approve_form.code.id_for_label }}">{{ approve_form.code.label }}</label>
+          {{ approve_form.code }}
+        </div>
+        {% endif %}
+        <button type="submit" class="btn btn-primary">{% t "inbox_approve" %}</button>
+      </form>
+    </div>
+  </section>
+  {% if item.send_back %}
+  <section class="col-12 col-lg-6" aria-labelledby="act-back">
+    <div class="alm-card h-100">
+      <h2 class="alm-card__title" id="act-back">{% if item.send_back == "return" %}{% t "inbox_return_title" %}{% else %}{% t "inbox_reject_title" %}{% endif %}</h2>
+      <form method="post" action="{% url 'web:inbox_send_back' entity.code req.pk %}" novalidate>
+        {% csrf_token %}
+        {{ send_back_form.version }}
+        <div class="mb-3">
+          <label class="form-label" for="{{ send_back_form.reason_ar.id_for_label }}">{{ send_back_form.reason_ar.label }}</label>
+          {{ send_back_form.reason_ar }}
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="{{ send_back_form.reason_en.id_for_label }}">{{ send_back_form.reason_en.label }}</label>
+          {{ send_back_form.reason_en }}
+        </div>
+        <button type="submit" class="btn btn-outline-primary">{% if item.send_back == "return" %}{% t "inbox_return" %}{% else %}{% t "inbox_reject" %}{% endif %}</button>
+      </form>
+    </div>
+  </section>
+  {% else %}
+  <section class="col-12 col-lg-6"><div class="alm-card h-100"><p class="alm-muted">{% t "inbox_no_send_back" %}</p></div></section>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}

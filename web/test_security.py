@@ -114,7 +114,7 @@ def test_r22_signed_in_responses_are_not_cached(w, signed_in):
 # --- R1 / R2 / WT-37: thin views, scanned -------------------------------------------------------------------------
 
 THIN_MODULES = ["views.py", "forms.py", "middleware.py", "context_processors.py", "urls.py",
-                "templatetags/web_tags.py"]
+                "templatetags/web_tags.py", "management/commands/web_mfa_reset.py"]
 FORBIDDEN_ATTRS = {"objects", "_base_manager", "_default_manager", "raw", "extra", "update", "save", "delete",
                    "bulk_create", "bulk_update", "get_or_create", "update_or_create", "create", "execute", "cursor"}
 ACCESS_ALLOWED = {"has", "entities_for", "AccessDenied"}
@@ -150,12 +150,12 @@ def test_r1_views_use_only_public_services_and_has_from_access():
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in aliases:
             used.setdefault(aliases[node.value.id], set()).add(node.attr)
     assert used["core.access.services"] <= ACCESS_ALLOWED
-    for module in ("ledger.services", "invoicing.services", "web.services"):
+    for module in ("ledger.services", "invoicing.services", "web.services", "web.mfa", "core.access.inbox"):
         assert all(not attr.startswith("_") for attr in used[module]), module
 
 
 def test_r2_web_never_uses_system_users():
-    for name in [*THIN_MODULES, "services.py"]:
+    for name in [*THIN_MODULES, "services.py", "mfa.py"]:
         assert "system_user" not in (WEB / name).read_text(encoding="utf-8"), name
 
 
@@ -170,26 +170,47 @@ def test_r34_no_float_in_the_web_code_path():
         assert "floatformat" not in path.read_text(encoding="utf-8"), path
 
 
-# --- review item 3: no MFA yet, so a production deploy check refuses password-only sign-in ----------------------
+# --- web.E001 / web.E002 (slice 2): MFA is built and on; the deploy check fails only if it is switched off ---------
 
-def test_web_e001_deploy_check_refuses_password_only_login_outside_debug(settings):
-    from web.checks import password_only_login
+def test_web_e001_passes_with_mfa_enforced_and_fails_when_it_is_switched_off(settings):
+    from web.checks import mfa_enforced
 
-    settings.DEBUG, settings.WEB_ALLOW_PASSWORD_ONLY_LOGIN = False, False
-    (error,) = password_only_login()
+    settings.DEBUG, settings.WEB_MFA_ENFORCED, settings.WEB_ADMIN_REQUIRE_MFA = False, True, True
+    assert mfa_enforced() == []  # the default production settings pass
+    settings.WEB_MFA_ENFORCED = False
+    (error,) = mfa_enforced()
     assert error.id == "web.E001" and error.is_serious()
-    settings.WEB_ALLOW_PASSWORD_ONLY_LOGIN = True  # explicit opt-in (CI deploy-check only)
-    assert password_only_login() == []
-    settings.DEBUG, settings.WEB_ALLOW_PASSWORD_ONLY_LOGIN = True, False
-    assert password_only_login() == []
+    settings.WEB_MFA_ENFORCED, settings.WEB_ADMIN_REQUIRE_MFA = True, False  # the admin gate off: also refused
+    assert mfa_enforced()[0].id == "web.E001"
+    settings.DEBUG = True
+    assert mfa_enforced() == []
 
 
-def test_web_e001_is_a_deploy_check_only_and_off_by_default():
+def test_web_e002_needs_mfa_keys_outside_debug(settings):
+    from web.checks import mfa_keys_configured
+
+    settings.DEBUG, settings.WEB_MFA_KEYS = False, []
+    (error,) = mfa_keys_configured()
+    assert error.id == "web.E002" and error.is_serious()
+    settings.WEB_MFA_KEYS = ["k" * 40]
+    assert mfa_keys_configured() == []
+
+
+def test_web_deploy_checks_are_deploy_only_and_mfa_is_on_by_default():
     from django.core.checks import registry
 
-    assert "password_only_login" in {c.__name__ for c in registry.registry.get_checks(include_deployment_checks=True)}
-    assert "password_only_login" not in {c.__name__ for c in registry.registry.get_checks()}  # migrate, jobs: no
+    deploy = {c.__name__ for c in registry.registry.get_checks(include_deployment_checks=True)}
+    plain = {c.__name__ for c in registry.registry.get_checks()}
+    assert {"mfa_enforced", "mfa_keys_configured"} <= deploy
+    assert not {"mfa_enforced", "mfa_keys_configured"} & plain  # migrate, jobs, tests: unaffected
     settings_py = (WEB.parent / "config/settings.py").read_text(encoding="utf-8")
-    assert 'os.environ.get("DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN", "0") == "1"' in settings_py
+    assert 'os.environ.get("DJANGO_WEB_MFA_ENFORCED", "1") == "1"' in settings_py
+    assert "WEB_ALLOW_PASSWORD_ONLY_LOGIN" not in settings_py
     compose = (WEB.parent / "deploy/docker-compose.yml").read_text(encoding="utf-8")
-    assert "DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN: ${DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN:-0}" in compose
+    assert "DJANGO_WEB_MFA_ENFORCED: ${DJANGO_WEB_MFA_ENFORCED:-1}" in compose
+    assert "WEB_MFA_KEYS_FILE: /run/secrets/web_mfa_keys" in compose
+    assert "PASSWORD_ONLY" not in compose
+    workflow = (WEB.parent / ".github/workflows/deploy-check.yml").read_text(encoding="utf-8")
+    assert "PASSWORD_ONLY" not in workflow
+    assert "web_mfa_keys" in (WEB.parent / "deploy/init-secrets.sh").read_text(encoding="utf-8")
+    assert "WEB_MFA_KEYS" in (WEB.parent / "deploy/bin/entrypoint.sh").read_text(encoding="utf-8")

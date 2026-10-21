@@ -19,7 +19,7 @@ random() {  # 64 random bytes, URL-safe base64 (no padding): ~86 characters
 
 generated=(django_secret_key db_superuser_password db_owner_password db_app_password db_backup_password
            db_monitor_password hr_personal_data_keys hr_personal_data_hash_key banking_data_keys
-           grafana_admin_password)
+           web_mfa_keys grafana_admin_password)
 provided=(smtp_password backup-recipients.txt tls/erp.crt tls/erp.key openbao-tls/server.crt
           openbao-tls/server.key openbao-tls/ca.crt)
 from_bootstrap=(openbao_backup_token openbao_erp_role_id openbao_erp_secret_id openbao_retire_role_id
@@ -53,5 +53,5 @@ done
 for f in "${provided[@]}"; do
     [[ -s "${dir}/${f}" ]] || echo "TO PROVIDE: secrets/${f}"
 done
-echo "Copy secrets/hr_personal_data_*, banking_data_keys and django_secret_key to the offline key envelope too:"
-echo "without them encrypted HR and banking data in any backup cannot be read (README 'Key ceremony')."
+echo "Copy secrets/hr_personal_data_*, banking_data_keys, web_mfa_keys and django_secret_key to the offline key"
+echo "envelope too: without them encrypted HR, banking and MFA data in any backup cannot be read (README 'Key ceremony')."

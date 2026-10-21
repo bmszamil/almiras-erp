@@ -15,3 +15,7 @@ HR_REQUIRE_VERIFIED_PARAMETERS = False
 HR_PERSONAL_DATA_KEYS = ["test-only-hr-personal-data-key-not-secret"]
 # A made-up key for banking test data only (never a real key).
 BANKING_DATA_KEYS = ["test-only-banking-data-key-not-secret"]
+# A made-up key for MFA test secrets only (never a real key).
+WEB_MFA_KEYS = ["test-only-web-mfa-key-not-secret"]
+# web.md R19: other modules' tests open /admin/ with force_login; the admin MFA gate is tested on in web/test_mfa.py.
+WEB_ADMIN_REQUIRE_MFA = False

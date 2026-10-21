@@ -1,22 +1,44 @@
-"""Deploy check web.E001: the web UI has no MFA yet (web.md R13 to R16), so a production deployment must not
-silently let approvers, the Managing Partner, ZATCA and access admins and superusers sign in with a password only.
+"""Deploy checks of the web UI (``manage.py check --deploy``, run by ``release-check`` in deploy/bin/entrypoint.sh).
 
-Registered as a deploy check (``manage.py check --deploy``, run by ``release-check`` in deploy/bin/entrypoint.sh),
-so ``migrate``, scheduled jobs and the test suite are not affected. While DEBUG is off it is an Error unless
-``WEB_ALLOW_PASSWORD_ONLY_LOGIN`` (``DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN=1``) is set explicitly: a go-live blocker.
+* ``web.E001``: MFA (web.md R13 to R16, R19) is switched off (``WEB_MFA_ENFORCED`` / ``DJANGO_WEB_MFA_ENFORCED=0``, or
+  the admin gate ``WEB_ADMIN_REQUIRE_MFA``) while
+  DEBUG is off: approvers, the Managing Partner, the chairman, CEOs, ZATCA and access admins and superusers would
+  sign in with a password only. Since slice 2 MFA is built and on by default, so the check passes unless someone
+  switches MFA off.
+* ``web.E002``: ``WEB_MFA_KEYS`` missing, shorter than 32 characters, with white space or a placeholder, while DEBUG
+  is off: TOTP secrets could not be encrypted at rest (R16, OQ-2).
+
+Both are deploy-only checks, so ``migrate``, scheduled jobs and the test suite are not affected.
 """
 from django.conf import settings
 from django.core.checks import Error, Tags, register
 
 
 @register(Tags.security, deploy=True)
-def password_only_login(app_configs=None, **kwargs):
-    if settings.DEBUG or getattr(settings, "WEB_ALLOW_PASSWORD_ONLY_LOGIN", False):
+def mfa_enforced(app_configs=None, **kwargs):
+    if settings.DEBUG or (getattr(settings, "WEB_MFA_ENFORCED", True) and getattr(settings, "WEB_ADMIN_REQUIRE_MFA", True)):
         return []
     return [Error(
-        "The web UI has no MFA yet: holders of MFA roles and superusers would sign in with a password only "
-        "(web.md R13 to R16). / لا توجد مصادقة متعددة العوامل بعد في واجهة الويب.",
-        hint="Go-live blocker. Ship the MFA slice, or set DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN=1 explicitly "
-             "(test and CI stacks only).",
+        "MFA is switched off: holders of MFA roles and superusers would sign in to the web UI with a password only "
+        "(web.md R13 to R16). / المصادقة متعددة العوامل معطلة في واجهة الويب.",
+        hint="Go-live blocker. Remove DJANGO_WEB_MFA_ENFORCED=0 (MFA is on by default).",
         id="web.E001",
+    )]
+
+
+@register(Tags.security, deploy=True)
+def mfa_keys_configured(app_configs=None, **kwargs):
+    from .crypto import key_problems
+
+    if settings.DEBUG:
+        return []
+    problems = key_problems()
+    if not problems:
+        return []
+    return [Error(
+        "WEB_MFA_KEYS is not usable: TOTP secrets cannot be encrypted at rest (web.md R16): " + "; ".join(problems)
+        + ". / مفاتيح WEB_MFA_KEYS غير صالحة.",
+        hint="Set WEB_MFA_KEYS (WEB_MFA_KEYS_FILE, Docker secret web_mfa_keys, made by deploy/init-secrets.sh): "
+             "comma-separated random keys of 32 characters or more.",
+        id="web.E002",
     )]

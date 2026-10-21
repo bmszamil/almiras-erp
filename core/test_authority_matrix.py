@@ -1248,3 +1248,36 @@ def test_rv93_n1_n2_no_chain_and_no_assistant_delegate_within_90_days(g):
     with pytest.raises(access.AccessDenied) as exc:  # never to a personal assistant only
         access.delegate_approval(g.cf, g.pa, g.sub, None, access.now() + timedelta(days=50), "Office", "مكتب")
     assert exc.value.code == "delegate_not_eligible"
+
+
+# --- security review 2026-10-21: a draft sales document is measured by its priced lines, not by 0 ---------------
+
+def _sales_draft(g, price):
+    from invoicing.conftest import ADDRESS
+
+    customer = getattr(g, "_customer", None) or inv.create_customer(
+        g.sub, user=g.ac, code="SC01", name_en="Band Buyer LLC", name_ar="مشتري الشرائح", is_vat_registered=True,
+        vat_number="310000000200003", **ADDRESS)
+    g._customer = customer
+    doc = inv.create_sales_document(g.sub, user=g.ac, customer=customer, issue_date=date(2027, 3, 15),
+                                    supply_date=date(2027, 3, 15))
+    inv.add_sales_line(doc, user=g.ac, income_type="rent_commercial", quantity="1", unit_price=price,
+                       description_ar="بند", description_en="Line")
+    return doc
+
+
+def test_a_band_row_applies_to_a_draft_sales_invoice_amount(g):
+    approved_matrix(g, g.sub, [dict(activity="invoicing.sales_document", approver_roles=["approver"],
+                                    amount_from="1000.00", amount_to="2000.00")])
+    doc = _sales_draft(g, "1000.00")
+    assert doc.total_gross == 0  # header totals are still fixed only at issue
+    assert inv.approval_amount(doc) == Decimal("1150.00")  # 1,000.00 + 15 % VAT, in memory
+    inv.submit_sales_document(doc, user=g.ac)
+    req = ApprovalRequest.objects.get(document_type="invoicing.salesdocument", document_id=doc.pk)
+    assert req.rule_source == "matrix" and req.amount == Decimal("1150.00") and req.rule_ids
+    doc.refresh_from_db()
+    assert doc.total_gross == 0  # nothing persisted before issue
+    small = _sales_draft(g, "100.00")  # 115.00: below every band row, so a gap (R71), not a 0 that slips through
+    with pytest.raises(access.AccessDenied) as exc:
+        inv.submit_sales_document(small, user=g.ac)
+    assert exc.value.code == "no_authority_rule"

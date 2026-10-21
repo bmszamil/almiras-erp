@@ -9,4 +9,4 @@ class WebConfig(AppConfig):
     verbose_name = "Web interface / واجهة الويب"
 
     def ready(self):
-        from . import checks  # noqa: F401  (registers the deploy check web.E001)
+        from . import checks  # noqa: F401  (registers the deploy checks web.E001, web.E002)

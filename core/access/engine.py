@@ -90,6 +90,7 @@ MESSAGES = {
 
 _explicit = ContextVar("approval_engine_decide", default=None)
 _purpose = ContextVar("approval_engine_purpose", default="approve")
+_note = ContextVar("approval_engine_note", default=("", ""))  # (reason, reason_en) of a decide() return/reject
 
 
 class StepRecorded(Exception):
@@ -859,12 +860,17 @@ def _record(auth, user, permission, grant_log, at):
     purpose = _purpose.get()
     if purpose in ("return", "reject") and req.status == ApprovalRequest.Status.OPEN:
         status = ApprovalRequest.Status.RETURNED if purpose == "return" else ApprovalRequest.Status.REJECTED
+        note, note_en = _note.get()
         _save(ApprovalDecision(request=req, entity=req.entity, step_no=auth.step["step_no"], decision=status, user=user,
-                               rule_source=req.rule_source, permission=permission, grant_log=grant_log, at=at))
+                               rule_source=req.rule_source, permission=permission, grant_log=grant_log, at=at,
+                               note=note[:500], note_en=note_en[:500]))
         req.status, req.closed_at = status, at
         _save(req)
+        details = {"request": req.pk, "step_no": auth.step["step_no"], "decision": status}
+        if note or note_en:
+            details.update(note=note[:500], note_en=note_en[:500])
         _services().log(AccessLog.Event.APPROVAL_DECIDED, actor=user, entity=req.entity, permission=permission, at=at,
-                        details={"request": req.pk, "step_no": auth.step["step_no"], "decision": status})
+                        details=details)
         return None
     if purpose != "approve":
         return None
@@ -913,6 +919,12 @@ def _step_pending(auth, user, permission):
            {"request": auth.request.pk, "remaining": remaining}, remaining=remaining)
 
 
+def note_en():
+    """The English reason of the ``decide()`` return / reject now running (web.md R8): adapters pass it to module
+    services that take ``reason_en`` (security review 2026-10-21, item 6)."""
+    return _note.get()[1]
+
+
 @contextmanager
 def purpose(name):
     """Mark a module's use of an approval permission that is not an approval (``return``, ``reject``, ``check``):
@@ -926,12 +938,14 @@ def purpose(name):
 
 # --- the engine inbox: decide ------------------------------------------------------------------------------------
 
-def decide(document, user, *, approve=True, note="", permission=None, action=None):
+def decide(document, user, *, approve=True, note="", permission=None, action=None, note_en=""):
     """Decide the current step of ``document``'s approval as ``user`` (the engine inbox, R61).
 
     ``approve=True`` calls the module's approval service through its adapter: a decision that completes the request
     lets the module approve (and post) with the grant; an earlier step is recorded and the module does nothing.
     ``approve=False`` returns (``action="return"``, default) or rejects (``action="reject"``) through the module.
+    ``note`` is the reason the module receives (its ``reason_ar``); ``note_en`` an optional English reason (web.md
+    R8). Both are stored on the engine's decision row.
     """
     permission = permission or _main_permission(document)
     entity = document.entity
@@ -965,6 +979,14 @@ def decide(document, user, *, approve=True, note="", permission=None, action=Non
         return Outcome(req, True, "approved", result)
     action = action or "return"
     hook = adapter.return_ if action == "return" else adapter.reject
+    note_token = _note.set((note or "", note_en or ""))
+    try:
+        return _send_back(document, user, entity, info, permission, hook, action, note or "", note_en or "")
+    finally:
+        _note.reset(note_token)
+
+
+def _send_back(document, user, entity, info, permission, hook, action, note, note_en):
     with transaction.atomic():
         result = None
         if hook is not None:
@@ -976,11 +998,12 @@ def decide(document, user, *, approve=True, note="", permission=None, action=Non
             status = ApprovalRequest.Status.RETURNED if action == "return" else ApprovalRequest.Status.REJECTED
             _save(ApprovalDecision(request=req, entity=entity, step_no=_current_step(req)[0]["step_no"],
                                    decision=status, user=user, rule_source=req.rule_source, permission=permission,
-                                   note=note[:500]))
+                                   note=note[:500], note_en=note_en[:500]))
             req.status, req.closed_at = status, _now()
             _save(req)
             _services().log(AccessLog.Event.APPROVAL_DECIDED, actor=user, entity=entity, permission=permission,
-                            details={"request": req.pk, "decision": status, "note": note[:500]})
+                            details={"request": req.pk, "decision": status, "note": note[:500],
+                                     "note_en": note_en[:500]})
         return Outcome(req, False, action, result)
 
 
@@ -996,6 +1019,100 @@ def inbox(user, *, at=None):
         if _eligible_by_rules(user, req.entity, permission, step, req.rule_source, req.activity.code, at)[0]:
             out.append(req)
     return out
+
+
+@dataclass(frozen=True)
+class Eligibility:
+    """Whether a user may decide a request's current step now, without deciding it (:func:`can_decide`)."""
+
+    ok: bool
+    why: str = ""
+    delegation: ApprovalDelegation | None = None
+    step_no: int = 1
+    self_approval: bool = False
+
+
+def can_decide(user, request, document, *, at=None):
+    """Side-effect-free mirror of :func:`authorise` for the engine inbox (web.md R39): may ``user`` decide the current
+    step of ``request`` (a request of ``document``) now? Nothing is written or logged, so listing an inbox leaves no
+    ``permission_denied`` rows. The decision itself still goes through :func:`authorise`, which applies every rule
+    again and is the guard (web.md R6: the inbox is a hint).
+
+    ``why`` names the first rule that stops the user: ``closed``, ``stale`` (the document changed since the request
+    opened, web.md R7), ``beneficiary`` (R82), ``not_eligible`` (no own membership the rules name and no usable
+    delegation, R62, R64, R74), ``same_person_two_steps`` (R75) or ``self_approval`` (R79 to R81).
+    """
+    at = at or _now()
+    if request.status != ApprovalRequest.Status.OPEN:
+        return Eligibility(False, "closed")
+    entity = request.entity
+    permission = request.activity.permission
+    if permission not in catalogue.CATALOGUE:
+        return Eligibility(False, "not_eligible")
+    info = describe(document, permission, entity)
+    if info.version != request.document_version or info.activity != request.activity.code:
+        return Eligibility(False, "stale")
+    if user.pk in info.beneficiaries:
+        return Eligibility(False, "beneficiary")
+    step, _index, _complete = _current_step(request)
+    step_no = step["step_no"]
+    memberships, _rule = _eligible_by_rules(user, entity, permission, step, request.rule_source, info.activity, at)
+    delegation = None
+    if not memberships:
+        delegation, memberships, _rule, _why = _delegation_eligibility(user, entity, permission, step,
+                                                                       request.rule_source, info, at)
+        if delegation is None:
+            return Eligibility(False, "not_eligible", step_no=step_no)
+        if delegation.delegator_id in info.beneficiaries:
+            return Eligibility(False, "beneficiary", delegation, step_no)
+    deciders = {user.pk} | ({delegation.delegator_id} if delegation is not None else set())
+    decided = {d.step_no for d in request.decisions.filter(decision=ApprovalDecision.Decision.APPROVED)
+               if _persons(d) & deciders}
+    if decided:  # R75: another step decided by this person, or this step already decided by them
+        return Eligibility(False, "same_person_two_steps", delegation, step_no)
+    people = document_people(entity, document, at)
+    if request.drafted_for_id:
+        people.add(request.drafted_for_id)
+    if info.adapter.people:
+        people |= {uid for uid in info.adapter.people(document) if uid is not None}
+    if delegation is not None and (delegation.delegator_id in people or user.pk in people):
+        return Eligibility(False, "self_approval", delegation, step_no)
+    if user.pk in people:
+        ok, _reason = _top_authority_ok(user, entity, permission, memberships, at)
+        if not ok:
+            return Eligibility(False, "self_approval", None, step_no)
+        return Eligibility(True, "", None, step_no, True)
+    return Eligibility(True, "", delegation, step_no)
+
+
+def document_of(request):
+    """The document an approval request is about, read in the request's own entity (None if it is not there)."""
+    from django.apps import apps
+
+    try:
+        model = apps.get_model(request.document_type)
+    except (LookupError, ValueError):
+        return None
+    filters = {"pk": request.document_id}
+    if any(getattr(f, "name", "") == "entity" for f in model._meta.get_fields()):
+        filters["entity_id"] = request.entity_id
+    return model._default_manager.filter(**filters).first()
+
+
+def send_back_action(request, document):
+    """What the module lets an approver do instead of approving: ``return``, ``reject`` or None (no module service
+    to send it back yet: web.md 4.1, OQ-12)."""
+    adapter = describe(document, request.activity.permission, request.entity).adapter
+    if adapter.return_ is not None:
+        return "return"
+    if adapter.reject is not None:
+        return "reject"
+    return None
+
+
+def current_version(request, document):
+    """The document's version as the engine reads it now (compared with the request's, web.md R7)."""
+    return describe(document, request.activity.permission, request.entity).version
 
 
 # --- module seams --------------------------------------------------------------------------------------------------

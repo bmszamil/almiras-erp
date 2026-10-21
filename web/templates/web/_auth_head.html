@@ -1,0 +1,14 @@
+{% load static web_tags %}<div class="alm-auth__top">
+      <form method="post" action="{% url 'web:logout' %}" class="alm-auth__signout">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-sm btn-outline-primary">{% t "sign_out" %}</button>
+      </form>
+      {% include "web/_language_switch.html" %}
+    </div>
+    <div class="alm-auth__logo">
+      {% if ui.lang == "ar" %}
+      <img src="{% static 'web/brand/almiras-logo-ar.svg' %}" alt="{% t 'brand_name' %}" width="220" height="48">
+      {% else %}
+      <img src="{% static 'web/brand/almiras-logo-en.svg' %}" alt="{% t 'brand_name' %}" width="220" height="45">
+      {% endif %}
+    </div>

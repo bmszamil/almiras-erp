@@ -1,0 +1,52 @@
+{% extends "web/base.html" %}{% load web_tags %}
+{% block title %}{% t "mfa_enrol_title" %}{% endblock %}
+{% block shell %}
+<div class="alm-auth">
+  <main class="alm-auth__card alm-auth__card--wide" id="main" tabindex="-1">
+    {% include "web/_auth_head.html" %}
+    <h1 class="alm-title">{% t "mfa_enrol_title" %}</h1>
+    <p>{% if required %}{% t "mfa_enrol_required" %}{% else %}{% t "mfa_enrol_optional" %}{% endif %}</p>
+    {% if error or form.errors %}
+    <div class="alm-error-summary" role="alert" tabindex="-1" id="alm-errors">
+      <p class="alm-error-summary__title">{% t "error_summary" %}</p>
+      <ul>
+        {% if error %}<li><a href="#id_code">{{ error }}</a></li>{% endif %}
+        {% for e in form.code.errors %}<li><a href="#id_code">{{ form.code.label }}: {{ e }}</a></li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+    {% if pending %}
+    <ol class="alm-steps">
+      <li>{% t "mfa_enrol_step_app" %}</li>
+      <li>{% t "mfa_enrol_step_scan" %}</li>
+    </ol>
+    <figure class="alm-qr">
+      <img src="{{ setup.qr_data_uri }}" alt="{% t 'mfa_qr_alt' %}" width="245" height="245">
+      <figcaption class="alm-muted">{% t "mfa_manual_key" %} <bdi dir="ltr" class="alm-secret">{% for g in setup.secret_groups %}{{ g }}{% if not forloop.last %} {% endif %}{% endfor %}</bdi></figcaption>
+    </figure>
+    <p>{% t "mfa_enrol_step_code" %}</p>
+    <form method="post" action="{% url 'web:mfa_enrol_confirm' %}" novalidate>
+      {% csrf_token %}
+      <input type="hidden" name="next" value="{{ next }}">
+      <div class="mb-3">
+        <label class="form-label" for="{{ form.code.id_for_label }}">{{ form.code.label }}</label>
+        {{ form.code }}
+      </div>
+      <button type="submit" class="btn btn-primary w-100">{% t "mfa_confirm" %}</button>
+    </form>
+    <form method="post" action="{% url 'web:mfa_enrol' %}" class="alm-auth__secondary">
+      {% csrf_token %}
+      <input type="hidden" name="next" value="{{ next }}">
+      <button type="submit" class="btn btn-sm btn-outline-primary">{% t "mfa_new_secret" %}</button>
+    </form>
+    {% else %}
+    <p class="alm-muted">{% t "mfa_enrol_intro" %}</p>
+    <form method="post" action="{% url 'web:mfa_enrol' %}">
+      {% csrf_token %}
+      <input type="hidden" name="next" value="{{ next }}">
+      <button type="submit" class="btn btn-primary w-100">{% t "mfa_start" %}</button>
+    </form>
+    {% endif %}
+  </main>
+</div>
+{% endblock %}

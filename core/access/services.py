@@ -1126,12 +1126,21 @@ def visible_entities(user):
     return Entity.objects.filter(pk__in=ids).order_by("code")
 
 
-def holds_any_role(user, role_codes):
+def holds_any_role(user, role_codes, *, or_approval_right=False):
     """True if ``user`` holds an active membership in any entity in one of the roles ``role_codes`` (e.g. the MFA
-    roles of web.md R13). Reads the user's own memberships; grants nothing."""
+    roles of web.md R13) or, with ``or_approval_right``, a role holding any approval (**A**) permission of the
+    catalogue (web.md OQ-29, team decision 2026-10-21). One query over the user's own memberships; grants nothing."""
     if not _is_active_human(user):
         return False
-    return Membership.objects.active(now()).filter(user=user, role__code__in=list(role_codes)).exists()
+    condition = Q(role__code__in=list(role_codes))
+    if or_approval_right:
+        condition |= Q(role__permission_rows__codename__in=approval_permissions())
+    return Membership.objects.active(now()).filter(condition, user=user, role__kind=Kind.HUMAN).exists()
+
+
+def approval_permissions():
+    """The codenames of every approval (**A**) permission in the catalogue."""
+    return sorted(code for code, perm in catalogue.CATALOGUE.items() if perm.is_approval)
 
 
 def set_preferred_language(user, language):

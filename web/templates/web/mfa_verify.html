@@ -1,0 +1,43 @@
+{% extends "web/base.html" %}{% load web_tags %}
+{% block title %}{% t "mfa_verify_title" %}{% endblock %}
+{% block shell %}
+<div class="alm-auth">
+  <main class="alm-auth__card" id="main" tabindex="-1">
+    {% include "web/_auth_head.html" %}
+    <h1 class="alm-title">{% t "mfa_verify_title" %}</h1>
+    <p class="alm-muted">{% t "mfa_verify_intro" %}</p>
+    {% if error or form.errors or recovery_form.errors %}
+    <div class="alm-error-summary" role="alert" tabindex="-1" id="alm-errors">
+      <p class="alm-error-summary__title">{% t "error_summary" %}</p>
+      <ul>
+        {% if error %}<li><a href="#id_code">{{ error }}</a></li>{% endif %}
+        {% for e in form.code.errors %}<li><a href="#id_code">{{ form.code.label }}: {{ e }}</a></li>{% endfor %}
+        {% for e in recovery_form.recovery_code.errors %}<li><a href="#id_recovery_code">{{ recovery_form.recovery_code.label }}: {{ e }}</a></li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+    <form method="post" action="{% url 'web:mfa_verify' %}" novalidate>
+      {% csrf_token %}
+      <input type="hidden" name="next" value="{{ next }}">
+      <div class="mb-3">
+        <label class="form-label" for="{{ form.code.id_for_label }}">{{ form.code.label }}</label>
+        {{ form.code }}
+      </div>
+      <button type="submit" class="btn btn-primary w-100">{% t "mfa_verify" %}</button>
+    </form>
+    <details class="alm-auth__secondary">
+      <summary>{% t "mfa_use_recovery" %}</summary>
+      <form method="post" action="{% url 'web:mfa_verify' %}" novalidate>
+        {% csrf_token %}
+        <input type="hidden" name="next" value="{{ next }}">
+        <div class="mb-3">
+          <label class="form-label" for="{{ recovery_form.recovery_code.id_for_label }}">{{ recovery_form.recovery_code.label }}</label>
+          {{ recovery_form.recovery_code }}
+        </div>
+        <button type="submit" class="btn btn-outline-primary w-100">{% t "mfa_verify_recovery" %}</button>
+      </form>
+      <p class="alm-muted">{% t "mfa_lost_device" %}</p>
+    </details>
+  </main>
+</div>
+{% endblock %}

@@ -34,6 +34,7 @@ x-app: &app
     HR_PERSONAL_DATA_HASH_KEY_FILE: /run/secrets/hr_personal_data_hash_key
     HR_REQUIRE_VERIFIED_PARAMETERS: "1"
     BANKING_DATA_KEYS_FILE: /run/secrets/banking_data_keys
+    WEB_MFA_KEYS_FILE: /run/secrets/web_mfa_keys
     ZATCA_SECRET_STORE: zatca.keystore.OpenBaoSecretStore
     ZATCA_OPENBAO_ADDRESS: https://openbao:8200
     ZATCA_OPENBAO_AUTH_ROLE: erp-zatca
@@ -46,9 +47,9 @@ x-app: &app
     ZATCA_PRODUCTION_BASE_URL: ${ZATCA_PRODUCTION_BASE_URL:-}
     ZATCA_PRODUCTION_ALLOWED: ${ZATCA_PRODUCTION_ALLOWED:-0}
     ACCESS_GRANT_MAX_AGE_SECONDS: ${ACCESS_GRANT_MAX_AGE_SECONDS:-900}
-    # Web UI without MFA (web.md R13 to R16 not built): release-check fails (web.E001) unless this is "1".
-    # Go-live blocker: leave it 0 in production until the MFA slice ships.
-    DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN: ${DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN:-0}
+    # Web UI MFA (web.md R13 to R16, slice 2): on unless explicitly switched off; release-check fails (web.E001)
+    # when it is off. Never switch it off in production.
+    DJANGO_WEB_MFA_ENFORCED: ${DJANGO_WEB_MFA_ENFORCED:-1}
     # KSA-hosted mail server (placeholder values in .env; password is a secret file).
     DJANGO_EMAIL_HOST: ${DJANGO_EMAIL_HOST:?set DJANGO_EMAIL_HOST in deploy/.env}
     DJANGO_EMAIL_PORT: ${DJANGO_EMAIL_PORT:-587}
@@ -61,6 +62,7 @@ x-app: &app
     - hr_personal_data_keys
     - hr_personal_data_hash_key
     - banking_data_keys
+    - web_mfa_keys
     - openbao_ca
     - openbao_erp_role_id
     - openbao_erp_secret_id
@@ -126,6 +128,7 @@ services:
       - hr_personal_data_keys
       - hr_personal_data_hash_key
       - banking_data_keys
+      - web_mfa_keys
       - openbao_ca
       - openbao_erp_role_id
       - openbao_erp_secret_id
@@ -160,6 +163,7 @@ services:
       - hr_personal_data_keys
       - hr_personal_data_hash_key
       - banking_data_keys
+      - web_mfa_keys
       - smtp_password
     networks: [backend]
     depends_on:
@@ -436,6 +440,7 @@ secrets:
   hr_personal_data_keys: {file: ./secrets/hr_personal_data_keys}
   hr_personal_data_hash_key: {file: ./secrets/hr_personal_data_hash_key}
   banking_data_keys: {file: ./secrets/banking_data_keys}
+  web_mfa_keys: {file: ./secrets/web_mfa_keys}
   backup_recipients: {file: ./secrets/backup-recipients.txt}
   openbao_ca: {file: ./secrets/openbao-tls/ca.crt}
   openbao_backup_token: {file: ./secrets/openbao_backup_token}

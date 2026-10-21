@@ -24,7 +24,8 @@ def register():
         amount=_total, currency=lambda c: c.currency_id, people=_contract_people,
         label=lambda c: (f"Contract {c.number or '#' + str(c.pk)}", f"عقد {c.number or '#' + str(c.pk)}"),
         approve=lambda c, user: services.approve_contract(c, user=user),
-        return_=lambda c, user, note: services.return_contract(c, user=user, reason_ar=note or "أعيد للتعديل"),
+        return_=lambda c, user, note: services.return_contract(c, user=user, reason_ar=note or "أعيد للتعديل",
+                                                                  reason_en=engine.note_en()),
     )
     engine.register(
         ContractVersion, "billing.version", permission="billing.approve_version",
@@ -33,5 +34,6 @@ def register():
         label=lambda v: (f"Contract version {v.contract.number} v{v.version_no}",
                          f"نسخة العقد {v.contract.number} رقم {v.version_no}"),
         approve=lambda v, user: services.approve_version(v, user=user),
-        reject=lambda v, user, note: services.reject_version(v, user=user, reason_ar=note or "مرفوض"),
+        reject=lambda v, user, note: services.reject_version(v, user=user, reason_ar=note or "مرفوض",
+                                                                reason_en=engine.note_en()),
     )

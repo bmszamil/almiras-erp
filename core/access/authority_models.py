@@ -385,7 +385,8 @@ class ApprovalDecision(models.Model):
     top_authority = models.BooleanField(default=False)
     permission = models.CharField(max_length=100)
     grant_log = models.ForeignKey(AccessLog, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
-    note = models.CharField(max_length=500, blank=True)
+    note = models.CharField(max_length=500, blank=True, help_text="Reason (Arabic, or as given)")
+    note_en = models.CharField(max_length=500, blank=True, help_text="Reason in English, optional (web.md R8)")
     at = models.DateTimeField(default=timezone.now)
 
     objects = ServiceWrittenQuerySet.as_manager()
@@ -412,6 +413,7 @@ class AccessAlert(models.Model):
         DELEGATION_EXPIRING = "delegation_expiring", bi("Delegation expiring", "قرب انتهاء التفويض")
         REPORT_UNREVIEWED = "report_unreviewed", bi("Governance report not reviewed", "تقرير الحوكمة لم يُراجع")
         REPORT_MISSING_USER = "report_missing_user", bi("Governance report not generated", "لم يُنشأ تقرير الحوكمة")
+        MFA_LOCKED = "mfa_locked", bi("Two-step verification locked again", "قُفل التحقق بخطوتين مرة أخرى")  # web OQ-30
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+")
     recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="access_alerts")

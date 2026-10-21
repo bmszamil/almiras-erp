@@ -25,7 +25,8 @@ def register():
                     submit_permission="hr.submit_contract", beneficiaries=_employee_user,
                     label=label("Employment contract", "عقد عمل"),
                     approve=lambda r, user: services.approve_contract(r, user=user),
-                    reject=lambda r, user, note: services.reject_contract(r, user=user, reason_ar=note or "مرفوض"))
+                    reject=lambda r, user, note: services.reject_contract(r, user=user, reason_ar=note or "مرفوض",
+                                                                                    reason_en=engine.note_en()))
     engine.register(Assignment, "hr.assignment", permission="hr.approve_assignment",
                     submit_permission="hr.manage_assignment", beneficiaries=_employee_user,
                     label=label("Assignment", "تكليف"),
@@ -44,6 +45,7 @@ def register():
                     label=label("Termination", "إنهاء خدمة"),
                     approve=lambda r, user: services.approve_termination(r, user=user))
     engine.register(StatutoryParameter, "hr.statutory_parameter", permission="hr.verify_statutory_parameter",
+                    version=lambda r: engine.version_text(getattr(r, "created_at", "")),  # a parameter row is never edited
                     label=label("Statutory parameter", "معيار نظامي"),
                     approve=lambda r, user: services.verify_statutory_parameter(r, user=user))
     # access R61, R80 f (review of 92c35c2, item 10): the IBAN change's second person under hr.manage_employee (not an

@@ -43,9 +43,10 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python manage.py makemigrations --check --dry-run
+      # DEBUG is off by default (security review 2026-10-21); the dev settings checks run with it on, as locally.
+      - run: DJANGO_DEBUG=1 python manage.py makemigrations --check --dry-run
       - run: DJANGO_SETTINGS_MODULE=config.settings_test python manage.py makemigrations --check --dry-run
-      - run: python manage.py check
+      - run: DJANGO_DEBUG=1 python manage.py check
       # pytest-xdist: one worker per CPU, each with its own test database (pytest-django adds _gw<N>).
       - run: python -m pytest -q -rs -n auto
 
@@ -58,8 +59,9 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python manage.py makemigrations --check --dry-run
+      # DEBUG is off by default (security review 2026-10-21); the dev settings checks run with it on, as locally.
+      - run: DJANGO_DEBUG=1 python manage.py makemigrations --check --dry-run
       - run: DJANGO_SETTINGS_MODULE=config.settings_test python manage.py makemigrations --check --dry-run
-      - run: python manage.py check
+      - run: DJANGO_DEBUG=1 python manage.py check
       # pytest-xdist: one worker per CPU, each with its own test database (pytest-django adds _gw<N>).
       - run: python -m pytest -q -rs -n auto

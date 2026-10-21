@@ -122,15 +122,18 @@ def is_web_user(user):
 
 
 def _requires_mfa(user):
-    """R13 (W-D6 list, OQ-3 default): superusers and holders of an active MFA role membership in any entity."""
+    """R13: superusers, holders of an active MFA-role membership in any entity, and (OQ-29, team decision
+    2026-10-21) holders of any approval (**A**) permission in any entity, e.g. ``hr_officer``, ``department_head``,
+    ``payroll_officer``. Derived from the catalogue, so a new role needs no code (one query)."""
     if not is_web_user(user):
         return False
-    return user.is_superuser or access_services.holds_any_role(user, MFA_ROLES)
+    return user.is_superuser or access_services.holds_any_role(user, MFA_ROLES, or_approval_right=True)
 
 
-def idle_timeout(user):
-    """OQ-8 default: 15 minutes for users who need MFA, 30 minutes for the others."""
-    if _requires_mfa(user):
+def idle_timeout(user, required=None):
+    """OQ-8 default: 15 minutes for users who need MFA, 30 minutes for the others. ``required``: the value the caller
+    already read in this request (one membership query per request)."""
+    if (_requires_mfa(user) if required is None else required):
         return timedelta(seconds=_setting("WEB_SESSION_IDLE_MFA_SECONDS", 15 * 60))
     return timedelta(seconds=_setting("WEB_SESSION_IDLE_SECONDS", 30 * 60))
 
