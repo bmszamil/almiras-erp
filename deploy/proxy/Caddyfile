@@ -48,6 +48,9 @@
 			# Always set by the proxy, never passed through from the client (DJANGO_BEHIND_TLS_PROXY=1).
 			header_up X-Forwarded-Proto https
 			header_up X-Forwarded-Host {host}
+			# The client address for the sign-in lockout (web.md OQ-27): set here, overwriting any value the
+			# client sent. The app never reads X-Forwarded-For.
+			header_up X-Real-IP {remote_host}
 		}
 	}
 

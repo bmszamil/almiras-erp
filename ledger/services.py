@@ -23,6 +23,7 @@ from django.utils import timezone
 
 from core import access
 from core.access import catalogue
+from core.access import engine as approval_engine
 from core.access.models import AccessLog, Kind
 from core.access import services as access_services
 from core.access.services import kind_of
@@ -512,8 +513,9 @@ def _authorise_document_post(entity, grant, posted_by, document, created_by):
     if creator_id is None:  # nobody recorded as creator: segregation could not keep the creator out (R35)
         access.deny(user, entity, grant.permission, "document_no_creator")
     if user.pk in access_services._document_people(stored) | {creator_id} and not (
-        grant.permission != CLEARANCE_PERMISSION and doc_type.self_post_allowed(stored)
-    ):  # access R46: only a type's own creator_may_post (customer receipts) lets its makers post it
+        grant.permission != CLEARANCE_PERMISSION and (doc_type.self_post_allowed(stored) or grant.top_authority)
+    ):  # access R46: only a type's own creator_may_post (customer receipts) lets its makers post it; access R58 /
+        # R79: or the approval engine's top-authority self-approval (verified against its log row above, R31)
         access.deny(user, entity, grant.permission, "self_approval")
     if _document_booked(entity, stored):
         raise _document_booked_error((doc_type.label, stored.pk))
@@ -1056,6 +1058,7 @@ def submit_entry(entry, *, user):
         entry.submitted_by = user
         entry.submitted_at = timezone.now()
         entry.save(update_fields=["submitted_by", "submitted_at"])
+        approval_engine.submit(entry, user, submit_permission="ledger.create_entry")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
     return entry
 
 
@@ -2174,6 +2177,8 @@ def post_revaluation(run, grant):
                     f"حالة إعادة التقييم هذه {run.get_status_display()}؛ تُرحَّل المسودة فقط.", code="run_not_draft")
     if run.entry is None:
         raise error("This revaluation found no differences; nothing to post.", "لم تظهر فروقات في إعادة التقييم؛ لا شيء للترحيل.")
+    if getattr(grant, "self_approval", False):  # AT-31, R14: the preparer never posts the run, not even the top
+        access.deny(grant.user, run.entity, grant.permission, "self_approval")  # authority's logged R79 grant
     user = _authorise_draft_post(run.entry, grant, None)
     with transaction.atomic():
         access.use_grant(grant, target=run.entry)
@@ -2277,3 +2282,61 @@ def set_functional_currency(entity, currency, *, user):
             details={"before": {"base_currency": before}, "after": {"base_currency": entity.base_currency_id}},
         )
     return entity
+
+
+# --- read-only lists for the web UI (web.md R3, R37, R38; slice 1) ------------------------------------------
+
+def journal_entries(entity, *, user, status=None, source=None, date_from=None, date_to=None, number=None):
+    """Journal entries of ``entity`` for ``user`` (``ledger.view`` there; access R2), newest first.
+
+    A user without ``ledger.view`` in ``entity`` is refused (AccessDenied, logged); the rows are also passed through
+    :func:`core.access.scope`, so nothing of another entity can appear. Filters are the enumerated values and
+    dates the list offers (web.md R23). Each row carries ``debit_total`` (functional currency) and ``lines_total``
+    computed in the same query, so a page costs the same whatever its length (R37).
+    """
+    access.require(user, entity, "ledger.view")
+    qs = access.scope(JournalEntry.objects.all(), user, "ledger.view").filter(entity=entity)
+    if status:
+        qs = qs.filter(status=status)
+    if source:
+        qs = qs.filter(source=source)
+    if date_from:
+        qs = qs.filter(date__gte=date_from)
+    if date_to:
+        qs = qs.filter(date__lte=date_to)
+    if number:
+        qs = qs.filter(number__icontains=number)
+    return (
+        qs.select_related("entity", "entity__base_currency", "period")
+        .annotate(debit_total=Sum("lines__debit"), lines_total=models.Count("lines"))
+        .order_by("-date", "-id")
+    )
+
+
+def journal_entry(entity, pk, *, user):
+    """One journal entry of ``entity`` with its lines, for ``user`` (``ledger.view``).
+
+    An entry of another entity, or one the user may not see, is "not found" (Http404), never 403, so its existence
+    is not revealed (access R2, web.md R3, R4).
+    """
+    access.require(user, entity, "ledger.view")
+    lines = JournalLine.objects.select_related("account", "currency", "counterparty_entity").order_by("id")
+    qs = (
+        JournalEntry.objects.filter(entity=entity)
+        .select_related("entity", "entity__base_currency", "period", "reversal_of", "reversed_by",
+                        "created_by__access_profile", "posted_by__access_profile")
+        .prefetch_related(models.Prefetch("lines", queryset=lines))
+    )
+    return access.get_scoped_or_404(qs, user, "ledger.view", pk=pk)
+
+
+def entry_counts(entity, *, user):
+    """``{status: count}`` of ``entity``'s journal entries, for the dashboard card (``ledger.view``; web.md R38)."""
+    access.require(user, entity, "ledger.view")
+    rows = (
+        access.scope(JournalEntry.objects.all(), user, "ledger.view").filter(entity=entity)
+        .values("status").annotate(n=models.Count("id")).order_by()
+    )
+    counts = {s: 0 for s in JournalEntry.Status.values}
+    counts.update({r["status"]: r["n"] for r in rows})
+    return counts

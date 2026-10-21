@@ -114,3 +114,7 @@ class InvoicingConfig(AppConfig):
         for code in (services.DEFERRED_PROFIT, services.SALE_PROFIT_INCOME):
             restricted.allow(code, document_type="invoicing.deferredprofitrelease",
                              predicate=services._deferred_profit_entry_allowed)
+
+        from . import approval_adapters
+
+        approval_adapters.register()  # access R61: the module's documents go through the one approval engine

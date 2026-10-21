@@ -773,9 +773,8 @@ def test_at31_post_revaluation_grants(w):
     with pytest.raises(access.AccessDenied) as exc:
         access.require(w.clerk, w.alm, "ledger.post_entry", document=run.entry)
     assert exc.value.code == "self_approval"
-    own = access.require(w.clerk, w.alm, "ledger.post_entry", document=run.entry, allow_self_approval=True)
-    with pytest.raises(access.AccessDenied) as exc:  # the ledger has no self-approval switch
-        services.post_revaluation(run, own)
+    with pytest.raises(access.AccessDenied) as exc:  # access R14 amended / R79: no caller switch, only the engine's
+        access.require(w.clerk, w.alm, "ledger.post_entry", document=run.entry, allow_self_approval=True)  # top authority
     assert exc.value.code == "self_approval"
     other = draft(w, w.alm, date(2027, 1, 20), [{"account": "1100", "debit": 1}, {"account": "3100", "credit": 1}])
     with pytest.raises(access.AccessDenied) as exc:
@@ -794,6 +793,22 @@ def test_at31_post_revaluation_grants(w):
     for again in (grant, access.require(w.mp, w.alm, "ledger.post_entry", document=run.entry)):
         with pytest.raises(LedgerError, match="only a draft run"):
             services.post_revaluation(run, again)
+
+
+def test_at31_post_revaluation_refuses_a_self_approval_grant(w):
+    """AT-31 (restored, review of 92c35c2): the ledger has no self-approval switch. The group parent's top authority
+    gets a logged self-approval grant for their own revaluation from the engine (access R79), and post_revaluation
+    still refuses it."""
+    f1_invoice(w)
+    rate("EUR", "SAR", date(2027, 1, 31), "4.0800")
+    member(w.mp, w.alm, "accountant")  # the Managing Partner prepares the run themselves
+    run = services.revalue_period(w.alm, w.alm.periods.get(name="2027-01"), user=w.mp)
+    own = access.require(w.mp, w.alm, "ledger.post_entry", document=run.entry)
+    assert own.self_approval and own.top_authority
+    with pytest.raises(access.AccessDenied) as exc:
+        services.post_revaluation(run, own)
+    assert exc.value.code == "self_approval"
+    assert RevaluationRun.objects.get(pk=run.pk).status == "draft" and JournalEntry.objects.get(pk=run.entry_id).status == "draft"
 
 
 def test_revaluation_draft_is_not_posted_through_post_entry(w):
@@ -1261,7 +1276,11 @@ def test_at33_no_posting_to_translation_reserve(w, entity_name):
     entity = getattr(w, entity_name)
     lines = [{"account": "1100", "debit": "10.00"}, {"account": "3400", "credit": "10.00"}]
     entry = draft(w, entity, date(2027, 1, 10), lines)  # drafted by the accountant
-    for approver in (w.cfo, w.mp):  # the CFO and the Managing Partner alike
+    top = w.mp  # access R70 / R64 (§10): outside the group parent the MP approves nothing; EGY's top authority does
+    if entity_name == "egy":
+        top = make_user("egy_ceo")
+        member(top, entity, "ceo")
+    for approver in (w.cfo, top):  # the CFO and the entity's top authority alike
         with pytest.raises(LedgerError) as exc:
             post(w, entry, approver=approver)
         text = problems_text(exc)
@@ -1273,5 +1292,5 @@ def test_at33_no_posting_to_translation_reserve(w, entity_name):
     before = JournalEntry.objects.count()
     with pytest.raises(LedgerError, match="3400"):  # nor through a sub-ledger document's posting
         services.create_entry(entity, date(2027, 1, 10), "Bill", lines, user=w.clerk, post=True, document=bill,
-                              grant=access.require(w.mp, entity, "invoicing.approve_bill", document=bill))
+                              grant=access.require(top, entity, "invoicing.approve_bill", document=bill))
     assert JournalEntry.objects.count() == before

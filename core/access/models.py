@@ -27,6 +27,7 @@ class SystemCode(models.TextChoices):
     ZATCA_QUEUE = "zatca_queue", "ZATCA queue"
     FX_IMPORT = "fx_import", "FX import"
     DEFERRED_SALE = "deferred_sale", "Bai' ajel sales"  # invoicing R112: the sale invoice and its profit recognition
+    GOVERNANCE = "governance", "Governance report"  # access R84: the monthly governance report job
 
 
 class AppendOnlyError(ValidationError):
@@ -175,6 +176,19 @@ def active_q(at, prefix=""):
     )
 
 
+# Roles whose memberships must end, and their longest length in months (R60, R89; OQ-36 amended: 12 months).
+TIME_LIMITED_ROLES = {"external_auditor": 12}
+
+
+def add_months(value, months):
+    """``value`` (date or datetime) plus whole calendar months, clamped to the month's last day."""
+    import calendar
+
+    month = value.month - 1 + months
+    year, month = value.year + month // 12, month % 12 + 1
+    return value.replace(year=year, month=month, day=min(value.day, calendar.monthrange(year, month)[1]))
+
+
 # Roles of which at most one membership per entity is active at any time (R47: the group's chairman).
 # Also enforced on PostgreSQL by the trigger of migration core.0012.
 SINGLE_HOLDER_ROLES = frozenset({"chairman"})
@@ -283,6 +297,20 @@ class Membership(models.Model):
             )
         elif kind == Kind.SYSTEM and role.system_code != profile.system_code:
             errors.append("This system role belongs to another system user. / دور النظام هذا لمستخدم نظام آخر.")
+        if role.code in TIME_LIMITED_ROLES:  # R60, R89 (OQ-36 amended): external auditors are time-limited
+            months = TIME_LIMITED_ROLES[role.code]
+            if self.valid_to is None:
+                errors.append(ValidationError(
+                    f"A {role.code} membership needs an end date (valid_to). / عضوية {role.name_ar} تحتاج تاريخ انتهاء.",
+                    code="valid_to_required"))
+            elif self.valid_to > add_months(self.valid_from, months):
+                errors.append(ValidationError(
+                    f"A {role.code} membership lasts at most {months} months. / "
+                    f"لا تتجاوز عضوية {role.name_ar} {months} شهرًا.", code="valid_to_too_long"))
+        if self.delegated_from_id and self.pk is None:  # R16 retired by R62 (access §10)
+            errors.append(ValidationError(
+                "Approval is delegated with an ApprovalDelegation (R62), not a delegated membership. / "
+                "يُفوَّض الاعتماد بتفويض اعتماد، لا بعضوية مفوَّضة.", code="delegated_membership_retired"))
         if self.delegated_from_id:
             src = self.delegated_from
             if self.valid_to is None:
@@ -448,6 +476,28 @@ class AccessLog(models.Model):
         USER_ACTIVE_CHANGED = "user_active_changed", "User activated or deactivated"
         PERSONAL_DATA_VIEWED = "personal_data_viewed", "Personal data viewed"  # hr R10, access R29
         PERSONAL_DATA_EXPORTED = "personal_data_exported", "Personal data exported"  # hr R12
+        # access §10 (R78, R83 to R87): authority matrix, approvals, self-approval, governance report.
+        MATRIX_DRAFTED = "authority_matrix_drafted", "Authority matrix version drafted"
+        MATRIX_ROW_ADDED = "authority_matrix_row_added", "Authority matrix row added"
+        MATRIX_ROW_REMOVED = "authority_matrix_row_removed", "Authority matrix row removed"
+        MATRIX_SUBMITTED = "authority_matrix_submitted", "Authority matrix version submitted"
+        MATRIX_APPROVED = "authority_matrix_approved", "Authority matrix version approved"
+        MATRIX_REJECTED = "authority_matrix_rejected", "Authority matrix version rejected"
+        MATRIX_WITHDRAWN = "authority_matrix_withdrawn", "Authority matrix version withdrawn"
+        MATRIX_EFFECTIVE = "authority_matrix_effective", "Authority matrix version took effect"
+        GOVERNANCE_CHANGE_REQUESTED = "governance_change_requested", "Top authority change requested"
+        APPROVAL_SUBMITTED = "approval_submitted", "Approval request opened"
+        APPROVAL_DECIDED = "approval_decided", "Approval step decided"
+        SELF_APPROVAL = "self_approval", "Top-authority self-approval"
+        ASSISTANT_ASSIGNED = "assistant_assigned", "Personal assistant assigned"
+        ASSISTANT_REVOKED = "assistant_revoked", "Personal assistant assignment ended"
+        REPORT_GENERATED = "governance_report_generated", "Governance report generated"
+        REPORT_VIEWED = "governance_report_viewed", "Governance report viewed"
+        REPORT_EXPORTED = "governance_report_exported", "Governance report exported"
+        REPORT_REVIEWED = "governance_report_reviewed", "Governance report reviewed"
+        ALERT_SENT = "access_alert_sent", "Access alert sent"
+        LOGIN_SUCCEEDED = "login_succeeded", "Signed in to the web UI"  # web.md 3.4, R26
+        LOGOUT = "logout", "Signed out of the web UI"  # web.md 3.4, R26
 
     at = models.DateTimeField(default=timezone.now)
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
@@ -511,3 +561,10 @@ class GrantUse(models.Model):
 
     def __str__(self):
         return f"grant {self.log_id} used {self.used_at:%Y-%m-%d %H:%M}"
+
+
+# access §10: authority matrix, approval engine, delegation, assistants and the governance report (same app).
+from .authority_models import (  # noqa: E402,F401
+    AccessAlert, ApprovalActivity, ApprovalDecision, ApprovalDelegation, ApprovalRequest, AssistantAssignment,
+    AuthorityMatrixVersion, AuthorityRule, EntityGovernance, GovernanceReport,
+)

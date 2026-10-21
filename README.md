@@ -27,8 +27,11 @@ python manage.py createsuperuser      # technical admin only: no business rights
 python manage.py access_bootstrap --username <user> --entity ALM --reason "Initial setup"  # first managing partner
 python manage.py runserver            # admin at /admin
 python -m pytest -q                   # tests (config.settings_test adds the test-only testdocs app)
+python -m pytest -q -n auto           # same tests in parallel (pytest-xdist; one worker per CPU)
 ```
-Set `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST` (and `POSTGRES_PORT`) to use PostgreSQL; the PostgreSQL-only tests (triggers, row locks) are skipped on SQLite. CI (`.github/workflows/tests.yml`) runs the migration check, `manage.py check` and the tests on PostgreSQL 16 and on SQLite.
+Set `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST` (and `POSTGRES_PORT`) to use PostgreSQL; the PostgreSQL-only tests (triggers, row locks) are skipped on SQLite. CI (`.github/workflows/tests.yml`) runs the migration check, `manage.py check` and the tests on PostgreSQL 16 and on SQLite, in parallel with `-n auto`.
+
+Parallel runs: `-n auto` starts one pytest-xdist worker per CPU (`-n 4` for a fixed number); plain `python -m pytest -q` stays serial. Each worker gets its own test database (pytest-django names it `test_<NAME>_gw<N>` on PostgreSQL; SQLite uses one in-memory database per worker), so tests must not share files or directories outside `tmp_path`, and must not depend on test order or on state another test left behind. On PostgreSQL the role needs `CREATEDB` and room for one database per worker.
 
 ## Build agents
 Six Claude Code agents in `.claude/agents/` (spec-writer, module-builder, test-engineer, code-reviewer, compliance-checker, migration-agent). Shared rules in `CLAUDE.md`. Future in-ERP AI agents: `docs/ai-agent-gateway.md`.

@@ -28,7 +28,10 @@ DELEGATION_START_TOLERANCE = timedelta(minutes=1)
 
 # OQ-2 default: an access_admin grants every entity role except these. hr_officer and payroll_officer: granted by
 # the managing partner only (A21, R52).
-ACCESS_ADMIN_CANNOT_GRANT = frozenset({"access_admin", "approver", "zatca_admin", "hr_officer", "payroll_officer"})
+ACCESS_ADMIN_CANNOT_GRANT = frozenset({"access_admin", "approver", "zatca_admin", "hr_officer", "payroll_officer",
+                                       # OQ-2 amended (R65, access §10): nor the CEO, the external auditor, or the
+                                       # roles that decide or read the top authority's own changes (OQ-42, OQ-33)
+                                       "ceo", "external_auditor", "board_representative", "internal_auditor"})
 
 
 def now():
@@ -121,6 +124,10 @@ MESSAGES = {
         "This authorisation has expired; ask for a new one.",
         "انتهت صلاحية هذا التفويض؛ اطلب تفويضًا جديدًا.",
     ),
+    "grant_not_an_approval": (
+        "This authorisation was given to return, reject or check a document, not to approve or post it.",
+        "صدر هذا التفويض لإعادة المستند أو رفضه أو فحصه، لا لاعتماده أو ترحيله.",
+    ),
     "grant_used": (
         "This authorisation has already been used; each one is used once.",
         "استُخدم هذا التفويض من قبل؛ يُستخدم كل تفويض مرة واحدة.",
@@ -203,6 +210,13 @@ class Grant:
     log_id: int | None = None
     document_ref: tuple | None = None  # (app_label.model, pk) for A / S! checks
     self_approval: bool = False
+    # access §10 (R58, R62, R79): set by the approval engine for A permissions.
+    top_authority: bool = False  # a self-approval by the entity's top authority (R79), logged (R83)
+    delegation_id: int | None = None  # the ApprovalDelegation the user acted under (R62)
+    on_behalf_of_id: int | None = None  # the delegator
+    rule_source: str = ""  # "matrix" or "default" (R70)
+    approval_request_id: int | None = None
+    purpose: str = "approve"  # require(..., purpose=...): only an "approve" grant approves or posts
 
 
 # --- helpers ---------------------------------------------------------------
@@ -382,7 +396,7 @@ def _memberships_for(user, entity, permission, at):
     forced into the database on the wrong role grants nothing.
     """
     kind = kind_of(user)
-    chain = covering_entities(entity)
+    chain = [entity] if permission in catalogue.NO_CASCADE else covering_entities(entity)  # R90: no cascade
     qs = (
         Membership.objects.active(at)
         .filter(user=user, role__permission_rows__codename=permission, role__kind=kind)
@@ -421,7 +435,8 @@ def _evaluate(user, entity, permission, at, *, reactivation=False):
 
 # --- checking rights --------------------------------------------------------
 
-def require(user, entity, permission, *, document=None, allow_self_approval=False, reactivation=False):
+def require(user, entity, permission, *, document=None, allow_self_approval=False, reactivation=False,
+            purpose="approve", through_engine=False):
     """Return a Grant if ``user`` may use ``permission`` in ``entity`` now; else log and raise AccessDenied.
 
     Superuser, staff, Django groups and user_permissions give nothing (R3, R24).
@@ -429,8 +444,14 @@ def require(user, entity, permission, *, document=None, allow_self_approval=Fals
     (R38); only a caller that then allows nothing but reactivation passes it
     (core.services._require_settings_right). Without it an inactive entity
     refuses every permission that is not a view permission.
+
+    ``through_engine=True`` sends a non-**A** permission that a module uses as a second-person approval (the hr IBAN
+    change under ``hr.manage_employee``, activity ``hr.iban_change``) through the approval engine like an **A** one:
+    matrix or code default, makers, beneficiary and NSA rules, decision record (R61; review of 92c35c2, item 10).
     """
     perm = catalogue.get(permission)
+    if through_engine and document is None:
+        raise AccessUsageError(f"{permission} through the engine needs the document (R61).")
     if perm.is_approval and document is None:
         raise AccessUsageError(f"{permission} is an approval permission; pass the document (R14).")
     if perm.posts and _document_ref(document) is None:
@@ -438,6 +459,13 @@ def require(user, entity, permission, *, document=None, allow_self_approval=Fals
     if perm.is_dual_control:
         raise AccessUsageError(f"{permission} needs dual control; use require_dual_control (R19).")
     at = now()
+    if perm.is_approval or through_engine:  # R61: every approval goes through the one approval engine (access §10)
+        if purpose not in APPROVAL_PURPOSES:
+            raise AccessUsageError(f"purpose must be one of {APPROVAL_PURPOSES}.")
+        from . import engine
+
+        with engine.purpose(purpose):
+            return _require_approval(user, entity, permission, perm, document, at)
     memberships, reason = _evaluate(user, entity, permission, at, reactivation=reactivation)
     if reason:
         _deny(user, entity, permission, reason)
@@ -478,6 +506,55 @@ def require(user, entity, permission, *, document=None, allow_self_approval=Fals
     )
 
 
+# What a module uses an approval permission for (access §10): ``approve`` records the engine decision; ``return`` and
+# ``reject`` (an approver sends the document back or refuses it) close the open request; ``check`` (e.g. an approver
+# closing a record, or a reviewer step) checks eligibility only. Every purpose applies the same eligibility rules.
+APPROVAL_PURPOSES = ("approve", "return", "reject", "check")
+
+
+def _require_approval(user, entity, permission, perm, document, at):
+    """``require`` for an **A** permission: the approval engine decides (R57 to R62, R69 to R83).
+
+    The user's own memberships are not required up front: a recorded delegate acts on the delegator's authority
+    (R62). ``allow_self_approval`` is not taken from callers any more (R14 amended): only the engine's
+    top-authority path accepts a creator, submitter, modifier or ``drafted_for`` principal (R79).
+    """
+    from . import engine
+
+    memberships, reason = _evaluate(user, entity, permission, at)
+    if reason and reason != "no_membership":
+        _deny(user, entity, permission, reason)
+    auth = engine.authorise(user, entity, permission, document, at=at)
+    if not auth.final:
+        engine._step_pending(auth, user, permission)
+    ref = _document_ref(document)
+    details = {
+        "self_approval": auth.self_approval,
+        "top_authority": auth.top_authority,
+        "document": list(ref) if ref else None,
+        "membership_ids": [m.pk for m in auth.memberships],
+        "approval_request": auth.request.pk,
+        "step_no": auth.step["step_no"],
+        "rule_source": auth.request.rule_source,
+        "rule_id": auth.rule.pk if auth.rule else None,
+        "matrix_version": auth.request.matrix_version_id,
+        "activity": auth.info.activity,
+        "purpose": engine._purpose.get(),
+    }
+    if auth.delegation is not None:
+        details.update(delegation=auth.delegation.pk, on_behalf_of=auth.delegation.delegator_id)
+    entry = log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=entity, permission=permission, at=at,
+                details=details)
+    engine._record(auth, user, permission, entry, at)
+    return Grant(
+        user=user, entity=entity, permission=permission, membership_ids=tuple(m.pk for m in auth.memberships),
+        checked_at=at, log_id=entry.pk, document_ref=ref, self_approval=auth.self_approval,
+        top_authority=auth.top_authority, delegation_id=auth.delegation.pk if auth.delegation else None,
+        on_behalf_of_id=auth.delegation.delegator_id if auth.delegation else None,
+        rule_source=auth.request.rule_source, approval_request_id=auth.request.pk, purpose=engine._purpose.get(),
+    )
+
+
 def has(user, entity, permission):
     """True if ``user`` currently holds ``permission`` in ``entity``. No logging, no segregation check."""
     memberships, reason = _evaluate(user, entity, permission, now())
@@ -497,7 +574,9 @@ def entities_for(user, permission):
         if catalogue.role_may_hold(m.role.kind, m.role.scope, m.role.system_code, perm):
             continue
         if m.role.scope == Role.Scope.GROUP:
-            if m.entity.consolidation == Entity.Consolidation.PARENT:
+            if m.entity.consolidation == Entity.Consolidation.PARENT and permission in catalogue.NO_CASCADE:
+                ids.add(m.entity_id)  # R90: access §10 rights act only on the entity granted
+            elif m.entity.consolidation == Entity.Consolidation.PARENT:
                 ids.update(e.pk for e in _covered_by_group(m.entity))
         else:
             ids.add(m.entity_id)
@@ -540,6 +619,12 @@ def _grant_row_matches(grant, row):
         expected = list(grant.document_ref) if grant.document_ref else None
         if details.get("document") != expected or bool(details.get("self_approval")) != bool(grant.self_approval):
             return False
+        if bool(details.get("top_authority")) != bool(grant.top_authority):  # R79: only the engine sets it
+            return False
+        if details.get("delegation") != grant.delegation_id or details.get("on_behalf_of") != grant.on_behalf_of_id:
+            return False
+        if details.get("purpose", "approve") != (grant.purpose or "approve"):
+            return False
         if sorted(details.get("membership_ids") or []) != sorted(grant.membership_ids or ()):
             return False
     elif grant.document_ref is not None:
@@ -574,6 +659,8 @@ def verify_grant(grant, entity, allowed_permissions, *, document=None, allow_sel
     perm = catalogue.get(grant.permission)
     if (perm.posts or perm.is_approval) and document is None:
         raise AccessUsageError(f"{grant.permission}: pass the document the grant is used for (R30).")
+    if perm.is_approval and (grant.purpose or "approve") != "approve":  # a return / reject / check grant never acts
+        _deny(actor, entity, grant.permission, "grant_not_an_approval")
     row = AccessLog.objects.filter(pk=grant.log_id).first() if grant.log_id else None
     if not _grant_row_matches(grant, row):
         _deny(actor, entity, grant.permission, "grant_forged")
@@ -582,18 +669,33 @@ def verify_grant(grant, entity, allowed_permissions, *, document=None, allow_sel
     if GrantUse.objects.filter(log_id=row.pk).exists():
         _deny(actor, entity, grant.permission, "grant_used")
     _, reason = _evaluate(user, entity, grant.permission, now())
+    if reason == "no_membership" and grant.delegation_id is not None:
+        reason = _delegation_still_valid(grant, entity)  # R62, R87: a delegate acts while the delegation lasts
     if reason:
         _deny(actor, entity, grant.permission, reason)
     if document is not None:
         if grant.document_ref is None or grant.document_ref != _document_ref(document):
             _deny(actor, entity, grant.permission, "grant_wrong_document")
         if (perm.is_approval or perm.is_segregated) and user.pk in _document_people(document) and not (
-            allow_self_approval and grant.self_approval and not perm.is_segregated
-        ):
+            grant.self_approval and not perm.is_segregated and (allow_self_approval or grant.top_authority)
+        ):  # R79: the engine's top-authority grant (its log row says so, R31) is the only self-approval accepted
             _deny(actor, entity, grant.permission, "self_approval")
     if use:
         use_grant(grant, target=target if target is not None else document)
     return user
+
+
+def _delegation_still_valid(grant, entity):
+    """None if the grant's delegation is still active and its delegator still holds the right in ``entity``."""
+    from .authority_models import ApprovalDelegation, active_window_q
+
+    at = now()
+    d = ApprovalDelegation.objects.filter(active_window_q(at), pk=grant.delegation_id, entity=entity,
+                                          delegate_id=_user_id(grant.user)).first()
+    if d is None or d.delegator_id != grant.on_behalf_of_id:
+        return "no_membership"
+    _, reason = _evaluate(d.delegator, entity, grant.permission, at)
+    return reason
 
 
 def use_grant(grant, *, target=None):
@@ -638,12 +740,54 @@ def recorded_approvers(entity, permission, document, *, used=False, since=None, 
 # --- memberships -------------------------------------------------------------
 
 def _grantor_is_restricted(grant):
-    """True when the grant to manage access comes only from access_admin, not managing_partner (OQ-2)."""
-    codes = set(Membership.objects.filter(pk__in=grant.membership_ids).values_list("role__code", flat=True))
-    return "managing_partner" not in codes
+    """True when the grant to manage access comes only from access_admin, not managing_partner (OQ-2) nor, in that
+    entity, the entity's top-authority role (R65 / OQ-2 amended: the CEO grants in its own company)."""
+    from .engine import governance_of
+
+    rows = Membership.objects.filter(pk__in=grant.membership_ids).values_list("role__code", "entity_id")
+    top = governance_of(grant.entity).top_authority_role
+    return not any(code == "managing_partner" or (code == top and entity_id == grant.entity.pk)
+                   for code, entity_id in rows)
+
+
+def _entity_is_group_parent(entity):
+    from .engine import is_group_parent
+
+    return is_group_parent(entity)
+
+
+# OQ-42 (team default, review of 92c35c2 item 14; for the owner to confirm): the roles that decide or read a
+# subsidiary's top authority's own changes are granted or revoked there only by the group parent's top authority.
+OVERSIGHT_ROLES = frozenset({"board_representative", "internal_auditor"})
+
+
+def _is_group_top_authority(actor, entity):
+    """The actor's own active membership of the group parent's top-authority role in the group parent itself
+    (verification review of 49e1abd, item 2: read directly, not through the grant's memberships)."""
+    from .engine import governance_of
+
+    parent = group_parent_of(entity)
+    return Membership.objects.active(now()).filter(user_id=_user_id(actor), entity=parent,
+                                                   role__code=governance_of(parent).top_authority_role).exists()
+
+
+def _oversight_grant(actor, entity, role):
+    """OQ-42 team default: outside the group parent, ``board_representative`` and ``internal_auditor`` are granted and
+    revoked only by the group parent's top authority, also in an equity or non-consolidated entity its group
+    membership does not reach: the right is then checked on the group parent. Returns the grant, or None when the
+    normal path applies."""
+    from .engine import is_group_parent
+
+    if role.code not in OVERSIGHT_ROLES or is_group_parent(entity):
+        return None
+    if not _is_group_top_authority(actor, entity):
+        _deny(actor, entity, "core.grant_membership", "role_not_grantable", role=role.code, role_ar=role.name_ar)
+    return require(actor, group_parent_of(entity), "core.grant_membership")
 
 
 def _check_grantable(actor, grant, entity, role):
+    if role.code in OVERSIGHT_ROLES:
+        return  # decided by _oversight_grant (OQ-42)
     if _grantor_is_restricted(grant) and (role.code in ACCESS_ADMIN_CANNOT_GRANT or role.scope == Role.Scope.GROUP):
         _deny(actor, entity, "core.grant_membership", "role_not_grantable", role=role.code, role_ar=role.name_ar)
 
@@ -662,9 +806,12 @@ def grant_membership(actor, user, entity, role, valid_from, valid_to=None, reaso
     """Grant ``role`` to ``user`` in ``entity`` (R8, R9, R11, R27)."""
     if delegated_from is not None:
         raise AccessUsageError("CFO delegations are created with delegate_approval (R16).")
-    grant = require(actor, entity, "core.grant_membership")
+    grant = _oversight_grant(actor, entity, role) or require(actor, entity, "core.grant_membership")
     if _user_id(user) == actor.pk:
         _deny(actor, entity, "core.grant_membership", "self_grant")
+    if role.code in OVERSIGHT_ROLES and _entity_is_group_parent(entity):
+        if _grantor_is_restricted(grant):  # in the group parent: the normal R65 rule
+            _deny(actor, entity, "core.grant_membership", "role_not_grantable", role=role.code, role_ar=role.name_ar)
     _check_grantable(actor, grant, entity, role)
     with transaction.atomic():
         m = Membership(
@@ -691,8 +838,11 @@ def revoke_membership(actor, membership, reason):
         require(actor, entity, "core.delegate_approval")
         permission = "core.delegate_approval"
     else:
-        grant = require(actor, entity, "core.grant_membership")
+        grant = _oversight_grant(actor, entity, membership.role) or require(actor, entity, "core.grant_membership")
         permission = "core.grant_membership"
+        if membership.role.code in OVERSIGHT_ROLES and _entity_is_group_parent(entity) and _grantor_is_restricted(grant):
+            _deny(actor, entity, permission, "role_not_grantable", role=membership.role.code,
+                  role_ar=membership.role.name_ar)
         _check_grantable(actor, grant, entity, membership.role)
     if membership.user_id == actor.pk:
         _deny(actor, entity, permission, "self_grant")
@@ -712,58 +862,20 @@ def revoke_membership(actor, membership, reason):
     return m
 
 
-def delegate_approval(actor, delegate, entity, valid_from, valid_to, reason, source=None):
-    """Create a CFO delegate: an approver membership with ``delegated_from`` set (R16).
+def delegate_approval(actor, delegate, entity, valid_from, valid_to, reason_en, reason_ar, source=None, activities=(),
+                      amount_max=None):
+    """R16 retired by R62 (access §10): a delegation of approval authority is an ``ApprovalDelegation`` with the R87
+    and R88 limits (``valid_to`` required, at most 90 days, never to an assistant, analyst or auditor only, never
+    a system or agent user, never a chain, logged). Kept for existing callers; ``source`` (a membership of the
+    delegator) names the delegator when the entity's top authority creates it. Returns the ``ApprovalDelegation``.
+    No membership with ``delegated_from`` is created any more (migration core.0031 converted the existing ones)."""
+    from .delegations import delegate_authority
 
-    The delegator delegates their own approver membership; a managing_partner
-    may pass ``source`` (or rely on there being exactly one approver membership).
-    ``valid_from`` (None = now) is never in the past and never before the
-    source membership starts: a delegation cannot cover approvals already made.
-    """
-    if valid_to is None:
-        raise ValidationError("A delegation needs an end date. / يجب تحديد تاريخ انتهاء التفويض.")
-    grant = require(actor, entity, "core.delegate_approval")
-    at = now()
-    valid_from = valid_from or at
-    by_mp = not _grantor_is_restricted(grant)
-    own = list(
-        Membership.objects.active(at).filter(
-            user=actor, entity=entity, role__code="approver", role__scope=Role.Scope.ENTITY, delegated_from__isnull=True
-        )
-    )
-    if source is None:
-        if own:
-            source = own[0]
-        elif by_mp:
-            candidates = list(
-                Membership.objects.active(at).filter(entity=entity, role__code="approver", delegated_from__isnull=True)
-            )
-            if len(candidates) != 1:
-                raise ValidationError("Choose which approver membership is delegated. / حدّد عضوية المعتمد المراد تفويضها.")
-            source = candidates[0]
-        else:
-            _deny(actor, entity, "core.delegate_approval", "delegate_cannot_delegate")
-    elif not by_mp and source.pk not in {m.pk for m in own}:
-        _deny(actor, entity, "core.delegate_approval", "delegate_cannot_delegate")
-    if not source.is_active_at(at) or source.delegated_from_id or source.entity_id != entity.pk:
-        _deny(actor, entity, "core.delegate_approval", "delegate_cannot_delegate")
-    if _user_id(delegate) in (actor.pk, source.user_id):
-        _deny(actor, entity, "core.delegate_approval", "self_grant")
-    # A caller's "now" computed a moment earlier is accepted (one minute) and moved to now.
-    if valid_from < at - DELEGATION_START_TOLERANCE or valid_from < source.valid_from:
-        _deny(actor, entity, "core.delegate_approval", "delegation_dates")
-    valid_from = max(valid_from, at)
-    with transaction.atomic():
-        m = Membership(
-            user=delegate, entity=entity, role=source.role, valid_from=valid_from, valid_to=valid_to,
-            granted_by=actor, granted_at=at, reason=reason, delegated_from=source,
-        )
-        m.save()
-        log(
-            AccessLog.Event.DELEGATION_GRANTED, actor=actor, entity=entity, subject_user=delegate, membership=m,
-            role=m.role, permission="core.delegate_approval", details=_membership_details(m),
-        )
-    return m
+    require(actor, entity, "core.delegate_approval")
+    delegator = source.user if source is not None else None
+    return delegate_authority(actor, entity=entity, delegate=delegate, valid_to=valid_to, valid_from=valid_from,
+                              reason_en=reason_en, reason_ar=reason_ar, delegator=delegator, activities=activities,
+                              amount_max=amount_max)
 
 
 # --- dual control ------------------------------------------------------------
@@ -975,3 +1087,72 @@ def set_user_active(actor, user, active, reason):
             )
     user.is_active = stored.is_active
     return stored
+
+
+# --- web UI support (web.md R9, R10, R27; web.md appendix B) ------------------------------------------
+
+def _is_active_human(user):
+    return bool(user is not None and getattr(user, "pk", None) and user.is_active and kind_of(user) == Kind.HUMAN)
+
+
+def visible_entities(user):
+    """Entities where ``user`` holds at least one active, membership-backed catalogue permission (web.md R9).
+
+    The union of :func:`entities_for` over the whole catalogue, computed from the user's memberships in one pass
+    instead of once per permission (same coverage rules: entity roles on their entity, group roles on a group parent
+    and the descendants :func:`entities_for` gives them, R6 as built). Inactive entities are included, because their
+    view permissions still work (R38); the caller marks them. A superuser without memberships sees none (R24).
+    Agent and system users see none: they never use the web UI (R20, R21).
+    """
+    if not _is_active_human(user):
+        return Entity.objects.none()
+    ids = set()
+    memberships = (
+        Membership.objects.active(now())
+        .filter(user=user, role__kind=Kind.HUMAN)
+        .select_related("role", "entity")
+        .prefetch_related("role__permission_rows")
+    )
+    for m in memberships:
+        perms = (catalogue.CATALOGUE.get(row.codename) for row in m.role.permission_rows.all())
+        if not any(p is not None and catalogue.role_may_hold(m.role.kind, m.role.scope, m.role.system_code, p) is None
+                   for p in perms):
+            continue
+        if m.role.scope == Role.Scope.GROUP:
+            if m.entity.consolidation == Entity.Consolidation.PARENT:
+                ids.update(e.pk for e in _covered_by_group(m.entity))
+        else:
+            ids.add(m.entity_id)
+    return Entity.objects.filter(pk__in=ids).order_by("code")
+
+
+def holds_any_role(user, role_codes):
+    """True if ``user`` holds an active membership in any entity in one of the roles ``role_codes`` (e.g. the MFA
+    roles of web.md R13). Reads the user's own memberships; grants nothing."""
+    if not _is_active_human(user):
+        return False
+    return Membership.objects.active(now()).filter(user=user, role__code__in=list(role_codes)).exists()
+
+
+def set_preferred_language(user, language):
+    """Change ``user``'s own UI and message language (web.md R27), logged as ``profile_changed`` (R27).
+
+    Only the person themselves changes it, and only people have a UI language. Returns the stored language.
+    """
+    if language not in UserProfile.Language.values:
+        raise ValidationError("Unknown language. / لغة غير معروفة.")
+    if not _is_active_human(user):
+        raise ValidationError("Only an active person has a language setting. / إعداد اللغة للأشخاص النشطين فقط.")
+    with transaction.atomic():
+        profile = UserProfile.objects.select_for_update().get(user=user)
+        before = profile.preferred_language
+        if before != language:
+            profile.preferred_language = language
+            profile.save(update_fields=["preferred_language"])
+            log(
+                AccessLog.Event.PROFILE_CHANGED, actor=user, subject_user=user,
+                details={"field": "preferred_language", "before": before, "after": language},
+            )
+    if hasattr(user, "_state") and "access_profile" in user._state.fields_cache:
+        user.access_profile.preferred_language = language
+    return language

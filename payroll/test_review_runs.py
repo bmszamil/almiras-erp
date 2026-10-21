@@ -103,11 +103,13 @@ def test_review2_off_cycle_takes_only_new_inputs(w):
     assert amount(apr, s1, "one_off_earning") == 0  # taken once
 
 
-def test_review2_off_cycle_runs_for_remuneration_are_refused_until_built(w):
+def test_review2_off_cycle_runs_for_remuneration_wait_for_the_regular_run(w):
+    """Slice 3 (R69) builds them: refused until the period's regular out-of-country run is approved
+    (payroll/test_slice3_off_cycle.py)."""
     with pytest.raises(PayrollError) as exc:
         services.create_run(w.alm, user=w.p, period="2027-03", kind="off_cycle", reason_ar="سبب",
                             payroll_group="out_of_country", employees=[saudi(w)])
-    assert exc.value.code == "off_cycle_not_built"
+    assert exc.value.code == "regular_run_open"
 
 
 def test_c_a2_refused_payslip_does_not_block_the_run_and_is_paid_off_cycle(w):

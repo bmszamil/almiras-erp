@@ -61,8 +61,9 @@ def test_at34_salary_bank_must_be_listed_and_bank_format_waits_for_the_bank(w):
         services.generate_wps_file(run, user=w.p)
     assert "wps.format.alrajhi" in exc.value.messages[0]
     out = approved(w, payroll_group="out_of_country")
-    f = services.generate_wps_file(out, user=w.p, format_code="generic_csv")
-    assert f.employee_count == 0 and f.exceptions == []  # remuneration staff are outside WPS (R51)
+    with pytest.raises(PayrollError) as exc:  # remuneration staff are outside WPS (R51; slice 3 R72: refused)
+        services.generate_wps_file(out, user=w.p, format_code="generic_csv")
+    assert exc.value.code == "wps_not_applicable"
 
 
 def test_at21_payslip_bilingual_masked_and_logged(w):

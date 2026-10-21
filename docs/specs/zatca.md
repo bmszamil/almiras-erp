@@ -394,7 +394,7 @@ Role names are provisional (no role model exists yet; OQ-14). All grants are **p
 | *Added 2026-10-17 (D-12, R-50):* create / rotate an entity master key; hold the group super key | Managing Partner only | No | No | No | No | No |
 | *Added 2026-10-17:* grant / revoke `master_key` custody for one entity (replaces `unseal`) | Managing Partner only | No | No | No | No | No |
 | *Added 2026-10-21 (D-19, R-57 to R-60):* retire secret versions | No (automatic) | No | No | No | Yes (only: the ZATCA system user, after commit and in the retirement job) | No |
-| *Added 2026-10-21:* view `secret_version_retired` / `secret_retirement_failed` events and pending retirements (as built: permission `zatca.view_key_events`, seed V17) | Yes | No | No | Yes (read-only) | — | No |
+| *Added 2026-10-21:* view `secret_version_retired` / `secret_retirement_failed` events and pending retirements (as built: permission `zatca.view_key_events`, seed V19, migration core.0032; also the internal and external auditors) | Yes | No | No | Yes (read-only) | — | No |
 | *Added 2026-10-21 (R-10 note, as built):* clear "needs attention" on a unit (`clear_egs_attention`) | Only with an active `onboard_renew` delegation (R-41) | No | No | No | No | No |
 | *Added 2026-10-21:* un-retire or destroy a secret version | No ERP service exists for anyone (R-57); outside the ERP: OQ-34 (f) | No | No | No | No | No |
 

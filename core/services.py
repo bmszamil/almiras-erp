@@ -242,7 +242,10 @@ def change_entity_settings(entity, *, user, reason, dual_control_request=None, *
     stays a single step by the managing partner (R49).
     """
     from core.access import services as access
+    from core.access.matrix import GOVERNANCE_FIELDS
 
+    if set(changes) & set(GOVERNANCE_FIELDS):
+        return _change_entity_governance(entity, user, reason, dual_control_request, changes)
     unknown = set(changes) - set(SENSITIVE_ENTITY_FIELDS) - {VAT_FREQUENCY_FIELD}
     if "base_currency" in unknown:
         raise ValidationError(
@@ -303,6 +306,36 @@ def change_entity_settings(entity, *, user, reason, dual_control_request=None, *
                                         sharia_off_payload(locked, reason), target=locked)
             return _change_entity_settings(locked, user, reason, changes, dual_control_request=dual_control_request)
         return _change_entity_settings(locked, user, reason, changes)
+
+
+def _change_entity_governance(entity, user, reason, dual_control_request, changes):
+    """R67, R76 (access §10): the entity's top-authority role and self-approval switch change only with an approved,
+    unused four-eyes request for exactly these changes (``core.access.matrix.request_governance_change`` and
+    ``decide_governance_change``), applied by a holder of ``core.change_entity_settings`` on the group parent, alone
+    in the call. Logged as ``entity_settings_changed`` with before and after values."""
+    from core.access import services as access
+    from core.access.matrix import GOVERNANCE_FIELDS, _apply_governance, _check_governance_changes, use_governance_request
+    from core.access.models import AccessLog
+
+    if set(changes) - set(GOVERNANCE_FIELDS):
+        raise ValidationError(
+            "The top authority and the self-approval switch change on their own, without other settings (R76). / "
+            "تتغير السلطة العليا ومفتاح الاعتماد الذاتي وحدهما دون إعدادات أخرى.", code="governance_alone")
+    _check_governance_changes(changes)
+    _reason_required(reason)
+    entity = Entity.objects.get(pk=entity.pk)
+    group = access.group_parent_of(entity)
+    _require_settings_right(access, user, group, changes)
+    if dual_control_request is None:
+        access.deny(user, entity, "core.approve_authority_matrix", "dual_control")
+    with transaction.atomic():
+        row = use_governance_request(user, entity, dual_control_request, changes, reason)
+        before, after = _apply_governance(row, changes)
+        access.log(AccessLog.Event.ENTITY_SETTINGS_CHANGED, actor=user, entity=entity,
+                   permission=ENTITY_SETTINGS_PERMISSION,
+                   details={"before": before, "after": after, "reason": reason, "governance": True,
+                            "dual_control_request": dual_control_request.pk})
+    return entity
 
 
 _BOOLEAN_ENTITY_FIELDS = frozenset(
@@ -450,6 +483,9 @@ def _create_entity(entity, user, reason, dual_control_request=None):
 
     entity.full_clean()
     entity.save()
+    from core.access.engine import ensure_governance
+
+    ensure_governance(entity)  # R67: managing_partner for a top-level group parent, ceo for every other entity
     log(
         AccessLog.Event.ENTITY_SETTINGS_CHANGED, actor=user, entity=entity, permission=ENTITY_SETTINGS_PERMISSION,
         details={"created": True, "before": None, "reason": reason, "after": {

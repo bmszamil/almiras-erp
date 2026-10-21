@@ -182,7 +182,9 @@ def test_f4_the_authority_matrix_is_checked_again(w, monkeypatch):
     r = rebate(w, c)
     ref = f"payroll.deferredsalerebate:{r.pk}"
     with approval_marker(w, r, w.mp):
-        monkeypatch.setitem(approvals.SEED_ROWS, "payroll.deferred_sale", ("nobody",))  # test: matrix without MP
+        # test: a default without the MP. access §10 (R70): the code defaults live in core/access/authority_defaults.py
+        # and payroll's seam reads them through approvals.allowed_roles.
+        monkeypatch.setattr(approvals, "allowed_roles", lambda entity, activity: ("nobody",))
         assert invoicing_port.rebate_problems(c, source_ref=ref, amount=r.amount, approver=w.mp)
         monkeypatch.undo()
         assert invoicing_port.rebate_problems(c, source_ref=ref, amount=r.amount, approver=w.mp) == []
@@ -197,9 +199,20 @@ def test_f4_four_eyes_against_the_last_modifier_as_the_approval(w):
     services._save(row)
     with approval_marker(w, row, w.mp):
         assert invoicing_port.rebate_problems(c, source_ref=ref, amount=r.amount, approver=w.mp)
+    # Amended by access R79 / payroll R84 (§10): the last modifier is refused unless they are the entity's single top
+    # authority, whose self-approval is allowed and logged. With a second managing partner (OQ-47) it is refused.
+    from core.access import services as access_services
+    from core.access.models import AccessLog, Membership
+    from core.access.testing import make_user, member
+
+    mp2 = make_user("mp2")
+    member(mp2, w.alm, "managing_partner")
     with pytest.raises(PermissionDenied):
         services.approve_deferred_sale_rebate(row, user=w.mp)
     assert not w.invoicing.rebates
+    access_services.revoke_membership(w.mp, Membership.objects.get(user=mp2), "hand-over done")
+    services.approve_deferred_sale_rebate(row, user=w.mp)
+    assert AccessLog.objects.filter(event="self_approval", actor=w.mp, details__activity="payroll.deferred_sale").exists()
 
 
 # --- finding 6 and item 7: WHT ----------------------------------------------------------------------------------------

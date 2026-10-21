@@ -877,3 +877,28 @@ def test_review3_only_the_scheduler_holds_the_retirement_credential():
     bootstrap = (REPO / "deploy" / "openbao" / "bootstrap.sh").read_text()
     assert 'if [[ ! -s "${secrets_dir}/openbao_retire_role_id" ]]' not in bootstrap  # review item 12: every run
     assert "auth/approle/role/erp-retire/secret-id | write_secret_file openbao_retire_secret_id" in bootstrap
+
+
+def test_core_0032_carries_its_own_frozen_v19_seed_for_view_key_events():
+    """§7 / seed V19: zatca.view_key_events for the ZATCA admin, the viewer and both auditors only; migration
+    core.0032 does not import the live seed (as 0029) and its frozen rows equal V19 (and V18 for reversal)."""
+    import importlib
+    import inspect
+
+    from core.access import catalogue
+    from core.access.seed import ROLE_SEED, ROLE_SEED_V18, ROLE_SEED_V19
+
+    assert ROLE_SEED is ROLE_SEED_V19 and "zatca.view_key_events" in catalogue.CATALOGUE
+    holders = {code for code, row in ROLE_SEED_V19.items() if "zatca.view_key_events" in row[5]}
+    assert holders == {"zatca_admin", "viewer", "internal_auditor", "external_auditor"}
+    assert not catalogue.CATALOGUE["zatca.view_key_events"].is_approval  # not routed through the authority engine
+    mod = importlib.import_module("core.migrations.0032_seed_access_v19_zatca_key_events")
+    assert "import ROLE_SEED" not in inspect.getsource(mod)
+    for code, row in ROLE_SEED_V19.items():
+        expected = (*row[:5], tuple(sorted(set(row[5]))))
+        if code in mod.ROLES_CHANGED:
+            assert mod.ROLES_CHANGED[code] == expected, code
+            old = ROLE_SEED_V18[code]
+            assert mod.ROLES_V18[code] == (*old[:5], tuple(sorted(set(old[5])))), code
+        else:
+            assert (*ROLE_SEED_V18[code][:5], tuple(sorted(set(ROLE_SEED_V18[code][5])))) == expected, code

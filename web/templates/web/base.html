@@ -1,0 +1,85 @@
+{% load static web_tags %}<!doctype html>
+<html lang="{{ ui.lang }}" dir="{{ ui.dir }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="same-origin">
+  <title>{% block title %}{% endblock %} | {% t "app_name" %}</title>
+  <link rel="icon" type="image/svg+xml" href="{% static 'web/brand/almiras-symbol.svg' %}">
+  {% if ui.dir == "rtl" %}
+  <link rel="stylesheet" href="{% static 'web/vendor/bootstrap-5.3.8/css/bootstrap.rtl.min.css' %}">
+  {% else %}
+  <link rel="stylesheet" href="{% static 'web/vendor/bootstrap-5.3.8/css/bootstrap.min.css' %}">
+  {% endif %}
+  <link rel="stylesheet" href="{% static 'web/css/fonts.css' %}">
+  <link rel="stylesheet" href="{% static 'web/css/almiras.css' %}">
+  <script src="{% static 'web/js/app.js' %}" defer></script>
+</head>
+<body class="alm-body alm-lang-{{ ui.lang }}">
+  <a class="alm-skip" href="#main">{% t "skip_to_content" %}</a>
+  {% block shell %}
+  <div class="alm-shell">
+    <header class="alm-sidebar">
+      <div class="alm-brand">
+        <a class="alm-brand__link" href="{% url 'web:home' %}">
+          {% if ui.lang == "ar" %}
+          <img class="alm-logo alm-logo--full" src="{% static 'web/brand/almiras-logo-ar-on-navy.svg' %}" alt="{% t 'brand_name' %}" width="176" height="38">
+          {% else %}
+          <img class="alm-logo alm-logo--full" src="{% static 'web/brand/almiras-logo-en-on-navy.svg' %}" alt="{% t 'brand_name' %}" width="176" height="36">
+          {% endif %}
+          <img class="alm-logo alm-logo--symbol" src="{% static 'web/brand/almiras-symbol.svg' %}" alt="{% t 'brand_name' %}" width="44" height="32">
+        </a>
+        <button type="button" class="alm-nav-toggle" data-alm-nav-toggle aria-controls="alm-nav" aria-expanded="false" hidden>
+          <span class="alm-nav-toggle__bars" aria-hidden="true"></span>{% t "menu" %}
+        </button>
+      </div>
+      <div class="alm-nav-panel" id="alm-nav">
+        {% if entities %}
+        <form class="alm-switcher" method="post" action="{% url 'web:switch_entity' %}">
+          {% csrf_token %}
+          <label class="alm-switcher__label" for="alm-entity">{% t "entity_switcher" %}</label>
+          <div class="alm-switcher__row">
+            <select class="form-select form-select-sm" id="alm-entity" name="entity">
+              {% for e in entities %}
+              <option value="{{ e.code }}"{% if entity and e.pk == entity.pk %} selected{% endif %}>{% pick e "name" %} ({{ e.code }}){% if not e.is_active %} | {% t "inactive" %}{% endif %}</option>
+              {% endfor %}
+            </select>
+            <button type="submit" class="btn btn-sm alm-btn-on-navy">{% t "switch_entity" %}</button>
+          </div>
+        </form>
+        {% endif %}
+        {% if entity %}
+        <nav class="alm-nav" aria-label="{% t 'nav_label' %}">
+          <ul class="alm-nav__list">
+            <li><a class="alm-nav__link{% if active == 'dashboard' %} is-active{% endif %}" href="{% url 'web:dashboard' entity.code %}"{% if active == 'dashboard' %} aria-current="page"{% endif %}>{% t "nav_dashboard" %}</a></li>
+            {% if nav.ledger %}
+            <li class="alm-nav__section">{% t "nav_section_accounting" %}</li>
+            <li><a class="alm-nav__link{% if active == 'ledger' %} is-active{% endif %}" href="{% url 'web:journal_entries' entity.code %}"{% if active == 'ledger' %} aria-current="page"{% endif %}>{% t "nav_journal_entries" %}</a></li>
+            {% endif %}
+            {% if nav.sales %}
+            <li class="alm-nav__section">{% t "nav_section_sales" %}</li>
+            <li><a class="alm-nav__link{% if active == 'sales' %} is-active{% endif %}" href="{% url 'web:sales_documents' entity.code %}"{% if active == 'sales' %} aria-current="page"{% endif %}>{% t "nav_sales_documents" %}</a></li>
+            {% endif %}
+          </ul>
+        </nav>
+        {% endif %}
+        <div class="alm-account">
+          <p class="alm-account__who"><span class="alm-account__label">{% t "signed_in_as" %}</span> <bdi>{% person user %}</bdi></p>
+          {% include "web/_language_switch.html" with on_navy=True %}
+          <form method="post" action="{% url 'web:logout' %}">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-sm alm-btn-on-navy">{% t "sign_out" %}</button>
+          </form>
+        </div>
+      </div>
+    </header>
+    <main class="alm-main" id="main" tabindex="-1">
+      {% if entity and not entity.is_active %}
+      <p class="alm-notice" role="status"><span class="alm-status alm-status--inactive"><span class="alm-status__shape" aria-hidden="true">◌</span>{% t "inactive" %}</span> {% t "inactive_notice" %}</p>
+      {% endif %}
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+  {% endblock %}
+</body>
+</html>

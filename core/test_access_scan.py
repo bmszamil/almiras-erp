@@ -33,6 +33,28 @@ ALLOW = {
     "core/access/services.py:group_parent_of": "helper (walks parent links)",
     "core/access/services.py:recorded_approvers": "reads the access log for a ledger check that already verified a grant",
     "core/access/services.py:visible_access_log": "the scope mechanism for access-log rows (entities_for + group parent)",
+    "core/access/services.py:visible_entities": "the scope mechanism of the web entity switcher (union of "
+                                                 "entities_for over the catalogue, web.md R9)",
+    "core/access/services.py:holds_any_role": "reads the user's own memberships (web session timeout, R13); "
+                                               "grants nothing",
+    "core/access/services.py:set_preferred_language": "the signed-in person's own UI language; logged "
+                                                       "profile_changed (web.md R27)",
+    "invoicing/services.py:listed_customer_name": "pure: masks an individual's name on a row the caller read through "
+                                             "list_sales_documents (checked); never unmasks (web.md R24, R51)",
+    # web/services.py: UI preferences, sessions and the sign-in throttle (web.md §1); no business data.
+    "web/services.py:language_for": "pure: picks the UI language from the profile, cookie or header (R27)",
+    "web/services.py:set_language": "the signed-in person's own language through set_preferred_language (R27)",
+    "web/services.py:switcher_entities": "the entities the user may see (visible_entities, R9)",
+    "web/services.py:entity_from": "pure: picks the URL's entity among the visible ones, else 404 (R4, R10)",
+    "web/services.py:start_entity": "the user's own remembered entity, only among the visible ones (R10)",
+    "web/services.py:remember_entity": "the user's own UI preference, only for a visible entity (R10, R11)",
+    "web/services.py:is_web_user": "helper: active human users only (R12)",
+    "web/services.py:idle_timeout": "session timeout setting (OQ-8)",
+    "web/services.py:absolute_timeout": "session timeout setting (OQ-8)",
+    "web/services.py:log_login": "writes the access log (R26)",
+    "web/services.py:log_logout": "writes the access log (R26)",
+    "web/services.py:client_ip": "pure: the client address for the sign-in throttle (OQ-27)",
+    "web/services.py:sign_in": "the password check itself, under the sign-in throttle (R12, R18)",
     "ledger/services.py:counterparty_choices": "choice list for admin; posting checks every line",
     "invoicing/services.py:party_problems": "pure check of a party record the caller passes (model clean, services)",
     "invoicing/services.py:deferred_sale_of": "payroll invoicing port only: the live bai' ajel sale of a contract payroll "
@@ -47,6 +69,8 @@ ALLOW = {
     "payroll/services.py:runs": "the scope mechanism for payroll runs (access.scope with payroll.view, payroll R2)",
     "payroll/services.py:get_run": "the scope mechanism for one run (get_scoped_or_404 with payroll.view, R2)",
     "payroll/services.py:get_payslip": "the scope mechanism for one payslip (get_scoped_or_404, payroll.view_payslip)",
+    "payroll/services.py:get_liability_report": "the scope mechanism for one liability report (get_scoped_or_404 with "
+                                                "payroll.view, R75); the data needs view_cost_reports / view_payslip",
     "payroll/services.py:setup_entity": "payroll_setup_entity command only (operator setup of a new entity, R3)",
     "payroll/services.py:send_alerts": "payroll_alerts job only (R10, R22, R53; retention nomination)",
     "payroll/services.py:skip_installment": "always refuses (R27: a skip needs a new approved schedule)",
@@ -83,15 +107,59 @@ ALLOW = {
     "ledger/fx.py:convert": "pure helper",
     "ledger/fx.py:inverse": "pure helper",
     "ledger/fx.py:implied_rate": "pure helper",
+    # access §10: the approval engine is the mechanism that require() itself calls for every A permission (R61);
+    # its helpers read the matrix and governance data for a check that require() is making.
+    "core/access/engine.py:register": "called once per type from the owning app's AppConfig.ready(); no user action",
+    "core/access/engine.py:version_text": "pure (document version as text)",
+    "core/access/engine.py:adapters": "read-only view of the code registry",
+    "core/access/engine.py:adapter_for": "pure lookup in the code registry",
+    "core/access/engine.py:activity_row": "the catalogue row of a code activity (global data, like roles)",
+    "core/access/engine.py:describe": "reads the document a check is being made for (inside require)",
+    "core/access/engine.py:document_people": "helper of the R14 / R81 check inside require",
+    "core/access/engine.py:effective_version": "helper of the rule resolution inside require (R77)",
+    "core/access/engine.py:resolve": "rule resolution inside require / submit (R69 to R73); refuses gaps",
+    "core/access/engine.py:find_request": "helper of authorise (inside require)",
+    "core/access/engine.py:eligible_users": "helper of the R72 alert and R82 step skipping inside require",
+    "core/access/engine.py:refuse": "logs a permission_denied row and raises, like deny",
+    "core/access/engine.py:purpose": "context manager used by require(purpose=...)",
+    "core/access/engine.py:inbox": "the scope mechanism for the inbox: requests the user is eligible to decide",
+    "core/access/engine.py:alert": "writes an in-app alert from a check or job that already ran",
+    "core/access/engine.py:governance_of": "reads an entity's governance settings for a check (R67, R79)",
+    "core/access/engine.py:ensure_governance": "called by create_entity / request_governance_change after their checks",
+    "core/access/engine.py:default_top_authority": "pure (R67 default)",
+    "core/access/engine.py:is_group_parent": "pure",
+    "core/access/engine.py:check_amount_places": "pure (CLAUDE.md rule 7)",
+    "core/access/engine.py:grant_rule_source": "pure read of a grant",
+    "core/access/engine.py:top_authority_holders": "helper of the alert jobs",
+    "core/access/matrix.py:versions": "the scope mechanism for matrix versions (entities_for, no cascade, R90)",
+    "core/access/matrix.py:get_version": "the scope mechanism for one version (404 outside, R2)",
+    "core/access/matrix.py:rules": "the scope mechanism for a version's rows (404 outside, R2)",
+    "core/access/matrix.py:entities_reading": "the scope mechanism itself (entities_for of the §10 rights)",
+    "core/access/matrix.py:activate_due_versions": "matrix job (and called by decide_version); records effective dates",
+    "core/access/matrix.py:decider_roles": "pure (R76, OQ-42)",
+    "core/access/matrix.py:rows_hash": "pure (R76 payload hash)",
+    "core/access/matrix.py:governance_payload": "pure (R76 payload)",
+    "core/access/delegations.py:delegations": "the scope mechanism for delegations (no cascade, R90)",
+    "core/access/delegations.py:get_delegation": "the scope mechanism for one delegation (404 outside, R2)",
+    "core/access/delegations.py:assistant_assignments": "the scope mechanism for assistant assignments (R90)",
+    "core/access/delegations.py:send_delegation_reminders": "daily reminder job (R87); alerts only",
+    "core/access/reports.py:reports": "the scope mechanism for governance reports (reader roles, R86, R90)",
+    "core/access/reports.py:get_report": "the scope mechanism for one report (404 outside, R2)",
+    "core/access/reports.py:send_unreviewed_alerts": "daily alert job (R86)",
+    "core/access/reports.py:month_start": "pure",
+    "core/access/reports.py:previous_month": "pure",
 }
 
 # Modules with public functions that are not called services.py but act like them.
-EXTRA_MODULES = ("ledger/services_setup.py", "ledger/fx.py")
+EXTRA_MODULES = ("ledger/services_setup.py", "ledger/fx.py", "core/access/engine.py", "core/access/matrix.py",
+                 "core/access/delegations.py", "core/access/reports.py")
 
 
 def service_modules():
     extra = [REPO / name for name in EXTRA_MODULES]
     for path in sorted(REPO.glob("*/services.py")) + sorted(REPO.glob("*/*/services.py")) + extra:
+        # Parts relative to the repository: a checkout inside a dot-folder (e.g. a git worktree under .claude/)
+        # must not make the scan skip every module.
         if any(part.startswith(".") or part in {"venv", ".venv"} for part in path.relative_to(REPO).parts):
             continue
         yield path

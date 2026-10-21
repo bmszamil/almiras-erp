@@ -31,6 +31,7 @@ from django.utils.module_loading import import_string
 from core import access
 from core.access.models import AccessLog, Kind
 from core.access import services as access_services
+from core.access import engine as approval_engine
 from core.access.services import kind_of
 from core.models import Entity
 from ledger import restricted
@@ -1287,6 +1288,7 @@ def submit_for_review(vat_return, *, user):
         ret.returned_reason_en = ret.returned_reason_ar = ""
         ret._service_write = True
         ret.save()
+        approval_engine.submit(ret, user, submit_permission="tax.prepare_return")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
         return ret
 
 
@@ -1294,7 +1296,8 @@ def return_to_draft(vat_return, *, user, reason_ar, reason_en=""):
     """in_review or reviewed -> draft with a reason (R7), by a reviewer or approver."""
     ret = VatReturn.objects.select_related("entity").get(pk=vat_return.pk)
     permission = "tax.review_return" if access.has(user, ret.entity, "tax.review_return") else "tax.approve_return"
-    access.require(user, ret.entity, permission, **({"document": ret} if permission == "tax.approve_return" else {}))
+    access.require(user, ret.entity, permission,
+                   **({"document": ret, "purpose": "return"} if permission == "tax.approve_return" else {}))
     _human(user, ret.entity, permission)
     if not (reason_ar or "").strip():
         raise error("An Arabic reason is required.", "السبب بالعربية مطلوب.", code="reason_required")
@@ -1977,6 +1980,7 @@ def submit_tax_document(document, *, user):
         doc.status, doc.submitted_by, doc.submitted_at = DocStatus.SUBMITTED, user, _now()
         doc._service_write = True
         doc.save()
+        approval_engine.submit(doc, user, submit_permission="tax.prepare_return")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
         return doc
 
 

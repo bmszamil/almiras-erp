@@ -22,6 +22,7 @@ from django.utils import timezone
 
 from core import access
 from core.access import services as access_services
+from core.access import engine as approval_engine
 from core.access.models import AccessLog, Kind, Membership
 from core.models import Currency, Entity
 from ledger.models import Account, FiscalPeriod
@@ -760,14 +761,15 @@ def add_secondment(contract, *, user, employee_ref, role_title_ar, start_date, r
 def submit_contract(contract, *, user):
     """Draft → submitted for the CFO (status stays ``draft``; event ``submitted_for_approval``). Agents never
     submit (gateway: drafts only)."""
-    c = _draft_contract(contract, user)
-    _refuse_agent(user, c.entity, "billing.edit_contract_draft")
+    c = _draft_contract(contract, user, "billing.submit_contract")  # review of 49e1abd, item 3: not the drafter's
+    _refuse_agent(user, c.entity, "billing.submit_contract")  # right (a personal assistant drafts only)
     problems = _approval_problems(c, c.versions.get(version_no=1))
     if problems:
         raise _problems(problems, "contract_invalid")
     c.submitted_by, c.submitted_at = user, timezone.now()
     _save(c)
     _event(c, Event.SUBMITTED, user)
+    approval_engine.submit(c, user, submit_permission="billing.submit_contract")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
     return c
 
 
@@ -775,7 +777,7 @@ def submit_contract(contract, *, user):
 def return_contract(contract, *, user, reason_ar, reason_en=""):
     """The CFO sends a submitted draft back (event ``returned``)."""
     c = Contract.objects.select_for_update(of=("self",)).select_related("entity").get(pk=contract.pk)
-    access.require(user, c.entity, "billing.approve_contract", document=c)
+    access.require(user, c.entity, "billing.approve_contract", document=c, purpose="return")
     if c.status != CStatus.DRAFT or c.submitted_at is None:
         _fail("Only submitted draft contracts are returned.", "تُعاد مسودات العقود المقدمة فقط.", "not_submitted")
     if not (reason_ar or "").strip():
@@ -823,7 +825,8 @@ def approve_contract(contract, *, user):
     c = Contract.objects.select_related("entity", "customer", "currency", "advance_terms").get(pk=contract.pk)
     v1 = c.versions.get(version_no=1)
     grant = access.require(user, c.entity, "billing.approve_contract", document=c)
-    if user.pk in (v1.created_by_id, v1.modified_by_id, c.created_by_id, c.modified_by_id, c.submitted_by_id):
+    if user.pk in (v1.created_by_id, v1.modified_by_id, c.created_by_id, c.modified_by_id, c.submitted_by_id) and \
+            not grant.top_authority:  # access R79: the engine's top-authority self-approval passes (it counts v1's makers)
         access.deny(user, c.entity, "billing.approve_contract", "self_approval")
     with transaction.atomic():
         c = Contract.objects.select_for_update(of=("self",)).select_related(
@@ -1064,13 +1067,14 @@ def submit_version(version, *, user):
     v.status, v.submitted_by, v.submitted_at = VStatus.SUBMITTED, user, timezone.now()
     _save(v)
     _event(v.contract, Event.VERSION_SUBMITTED, user, version=v.version_no, kind=v.kind)
+    approval_engine.submit(v, user, submit_permission="billing.edit_version_draft")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
     return v
 
 
 @transaction.atomic
 def reject_version(version, *, user, reason_ar, reason_en=""):
     v = ContractVersion.objects.select_for_update(of=("self",)).select_related("contract__entity").get(pk=version.pk)
-    access.require(user, v.entity, "billing.approve_version", document=v)
+    access.require(user, v.entity, "billing.approve_version", document=v, purpose="reject")
     if v.status != VStatus.SUBMITTED:
         _fail("Only submitted versions are rejected.", "تُرفض النسخ المقدمة فقط.", "version_not_submitted")
     if not (reason_ar or "").strip():

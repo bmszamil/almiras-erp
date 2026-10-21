@@ -83,6 +83,7 @@ deploy/
 | `GUNICORN_WORKERS` | 3 | ~2 × vCPU |
 | `ZATCA_SANDBOX_BASE_URL`, `ZATCA_SIMULATION_BASE_URL`, `ZATCA_PRODUCTION_BASE_URL` | empty | From ZATCA's portal / Swagger at deployment (zatca OQ-30) |
 | `ZATCA_PRODUCTION_ALLOWED` | `0` | `1` only at go-live (R-29) |
+| `DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN` | `0` | Web UI sign-in without MFA (web.md R13 to R16 not built). While `0`, `release-check` fails with `web.E001`. **Go-live blocker:** keep `0` in production until the MFA slice ships; CI's deploy-check sets `1` |
 | `ALMIRAS_ALERT_WEBHOOK_URL` | empty | Optional KSA-hosted webhook for job failures |
 
 Variables the containers receive (set by `docker-compose.yml`): `DJANGO_DEBUG=0`, `DJANGO_BEHIND_TLS_PROXY=1`,

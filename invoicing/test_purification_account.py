@@ -123,7 +123,14 @@ def test_at103_recipients_are_entity_separated(w):
     sub_acc, sub_cfo = sub_people(w)
     with pytest.raises(access.AccessDenied):  # ALM's accountant has no rights in SUB
         recipient(w, w.sub, approve=False)
-    sub_rec = recipient(w, w.sub, adder=sub_acc)  # same IBAN in another entity is another recipient
+    # access R70 / R64 (§10): the MP's group membership approves nothing in SUB (no cascade); SUB's top authority,
+    # its ceo, records the board's approval there.
+    sub_ceo = make_user("sub_ceo")
+    member(sub_ceo, w.sub, "ceo")
+    sub_rec = recipient(w, w.sub, adder=sub_acc, approve=False)  # same IBAN in another entity is another recipient
+    with pytest.raises(access.AccessDenied):
+        board_approve(w, sub_rec, user=managing_partner(w))
+    sub_rec = board_approve(w, sub_rec, user=sub_ceo)
     _, alm_rec = ready(w)
     refused("purification_recipient_not_approved", payout, w, "100.00", sub_rec)  # SUB's recipient, ALM's payout
     assert payout(w, "100.00", alm_rec).recipient == alm_rec

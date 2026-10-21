@@ -55,14 +55,16 @@ def test_chairman_role_and_permission_are_seeded():
     role = Role.objects.get(code="chairman")
     assert (role.scope, role.kind, role.name_en, role.name_ar, role.is_seeded) == (
         "group", "human", "Chairman", "رئيس مجلس الإدارة", True)
-    assert role.permission_codes == {"core.disable_sharia_enforcement"}  # nothing else (OQ-24 default)
+    # Nothing else (OQ-24 default), except deciding the group parent's authority matrix changes that its top
+    # authority proposes (access R76, OQ-42 default; seed V17).
+    assert role.permission_codes == {"core.disable_sharia_enforcement", "core.approve_authority_matrix"}
     assert "core.disable_sharia_enforcement" in Role.objects.get(code="managing_partner").permission_codes
     perm = catalogue.get("core.disable_sharia_enforcement")
     assert perm.is_dual_control and perm.is_segregated and perm.is_group_only and perm.label_ar
     assert catalogue.dual_control_roles(perm.codename, "request") == {"managing_partner"}
     assert catalogue.dual_control_roles(perm.codename, "decide") == {"chairman"}
     assert catalogue.dual_control_roles("zatca.switch_to_production", "decide") is None  # unbound: any holder
-    assert ROLE_SEED["chairman"][5] == ("core.disable_sharia_enforcement",)
+    assert ROLE_SEED["chairman"][5] == ("core.disable_sharia_enforcement", "core.approve_authority_matrix")  # R76
     with pytest.raises(services.AccessUsageError):  # DC: never through require()
         services.require(make_user("x"), Entity.objects.create(code="P", name_en="P", name_ar="ب",
                                                                  consolidation="parent"),

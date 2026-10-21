@@ -18,6 +18,7 @@ from django.db import DatabaseError, connection, connections, transaction
 
 from core import services as core_services
 from core.access import services
+from core.access.authority_models import ApprovalDelegation
 from core.access.models import (
     AccessLog,
     AppendOnlyError,
@@ -415,16 +416,18 @@ def test_dual_control_request_for_egs1_cannot_be_used_on_egs2(w):
 # --- R16: delegation dates -------------------------------------------------------------------------
 
 def test_delegation_cannot_start_in_the_past(w):
-    cfo, deputy = make_user("cfo"), make_user("deputy")
+    cfo, deputy, deputy2 = make_user("cfo"), make_user("deputy"), make_user("deputy2")
     member(cfo, w.alm, "approver", valid_from=services.now() - timedelta(days=30))
+    for d in (deputy, deputy2):  # R88 (access §10): a delegate has their own working membership
+        member(d, w.alm, "accountant")
     now = services.now()
     with pytest.raises(services.AccessDenied) as exc:
-        services.delegate_approval(cfo, deputy, w.alm, now - timedelta(days=2), now + timedelta(days=5), "Backdated")
+        services.delegate_approval(cfo, deputy, w.alm, now - timedelta(days=2), now + timedelta(days=5), "Backdated", "سبب")
     assert exc.value.code == "delegation_dates"
-    assert not Membership.objects.filter(user=deputy).exists()
-    dm = services.delegate_approval(cfo, deputy, w.alm, None, now + timedelta(days=5), "Leave")  # None = now
+    assert not ApprovalDelegation.objects.filter(delegate=deputy).exists()  # R62: a delegation, not a membership
+    dm = services.delegate_approval(cfo, deputy, w.alm, None, now + timedelta(days=5), "Leave", "سبب")  # None = now
     assert dm.valid_from >= now
-    later = services.delegate_approval(cfo, make_user("deputy2"), w.alm, services.now(), now + timedelta(days=5), "Leave")
+    later = services.delegate_approval(cfo, deputy2, w.alm, services.now(), now + timedelta(days=5), "Leave", "سبب")
     assert later.valid_from >= now  # "now" computed a moment earlier is accepted
 
 

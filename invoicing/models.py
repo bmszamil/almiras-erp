@@ -2243,7 +2243,12 @@ class DeferredProfitRelease(_DeferredSaleWritten):
         constraints = [
             models.UniqueConstraint(fields=["deferred_sale", "source_ref"], condition=models.Q(status="posted"),
                                     name="deferred_profit_one_per_collection"),
-            models.CheckConstraint(condition=models.Q(collected_amount__gt=0), name="deferred_profit_collected_positive"),
+            # Payroll review 5 (item 3): a catch-up after a rejected rebate note recognises held-back profit on what
+            # was already collected, with no new collection (0).
+            models.CheckConstraint(condition=models.Q(collected_amount__gt=0) | (
+                models.Q(collected_amount=0) & models.Q(source_ref__startswith="payroll.deferredsalerebate:")
+                & models.Q(source_ref__contains=":catch_up")),
+                name="deferred_profit_collected_positive"),
             models.CheckConstraint(condition=models.Q(profit_amount__gte=0), name="deferred_profit_not_negative"),
         ]
 

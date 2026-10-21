@@ -32,6 +32,7 @@ from hijridate import Gregorian, Hijri
 
 from core import access
 from core.access import services as access_services
+from core.access import engine as approval_engine
 from core.access.models import AccessLog, Kind, Membership
 from core.models import Currency, Entity
 from ledger import fx
@@ -856,6 +857,7 @@ def request_iban_change(employee, *, user, iban, reason_ar, bank_name=""):
                                  "request": req.pk, "iban_before": _last4(emp.iban or ""), "iban_after": _last4(iban),
                                  "message_en": "Employee IBAN change requested",
                                  "message_ar": "طُلب تغيير آيبان الموظف"})
+    approval_engine.submit(req, user, submit_permission="hr.manage_employee")  # access R61: the request opens now
     return req
 
 
@@ -865,7 +867,8 @@ def approve_iban_change(request, *, user):
     IBAN change, which then replaces the employee's IBAN and bank. Payroll lists a payslip calculated on the old IBAN
     as a WPS exception. Logged."""
     req = _lock(IbanChangeRequest, request.pk)
-    access.require(user, req.entity, "hr.manage_employee")
+    # access R61, R80 f (review of 92c35c2, item 10): the second person is decided by the engine (hr.iban_change)
+    access.require(user, req.entity, "hr.manage_employee", document=req, through_engine=True)
     emp = _lock(Employee, req.employee_id)
     if user.pk == req.created_by_id:
         access.deny(user, req.entity, "hr.manage_employee", "self_approval")
@@ -887,7 +890,7 @@ def approve_iban_change(request, *, user):
 @transaction.atomic
 def reject_iban_change(request, *, user, reason_ar):
     req = _lock(IbanChangeRequest, request.pk)
-    access.require(user, req.entity, "hr.manage_employee")
+    access.require(user, req.entity, "hr.manage_employee", document=req, through_engine=True, purpose="reject")
     if req.status != IbanChangeRequest.Status.PENDING or not (reason_ar or "").strip():
         raise error("Only a pending IBAN change is rejected, with a reason in Arabic.",
                     "يُرفض طلب تغيير الآيبان المعلق فقط مع سبب بالعربية.", code="iban_change_status")
@@ -1527,7 +1530,9 @@ def submit_contract(contract, *, user):
         raise _problems(problems, "contract_invalid")
     c.status, c.submitted_by, c.warnings = CStatus.SUBMITTED, user, warnings
     c.modified_by, c.modified_at = user, timezone.now()
-    return _save(c)
+    _save(c)
+    approval_engine.submit(c, user, submit_permission="hr.submit_contract")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
+    return c
 
 
 @transaction.atomic
@@ -1560,7 +1565,7 @@ def approve_contract(contract, *, user):
 @transaction.atomic
 def reject_contract(contract, *, user, reason_ar, reason_en=""):
     c = _lock(EmploymentContract, contract.pk)
-    access.require(user, c.entity, "hr.approve_contract", document=c)
+    access.require(user, c.entity, "hr.approve_contract", document=c, purpose="reject")
     if c.status != CStatus.SUBMITTED or not reason_ar:
         raise error("A submitted version is rejected with an Arabic reason.", "تُرفض النسخة المقدمة مع ذكر السبب بالعربية.",
                     code="reject")
@@ -1755,7 +1760,9 @@ def submit_assignment(assignment, *, user):
     if problems:
         raise _problems(problems, "assignment_invalid")
     a.status, a.submitted_by = ASt.SUBMITTED, user
-    return _save(a)
+    _save(a)
+    approval_engine.submit(a, user, submit_permission="hr.manage_assignment")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
+    return a
 
 
 @transaction.atomic
@@ -2318,7 +2325,7 @@ def approve_leave(leave_request, *, user):
 @transaction.atomic
 def reject_leave(leave_request, *, user, reason_ar=""):
     req = _lock(LeaveRequest, leave_request.pk)
-    access.require(user, req.entity, "hr.approve_leave", document=req)
+    access.require(user, req.entity, "hr.approve_leave", document=req, purpose="reject")
     if req.status != LR.SUBMITTED:
         raise error("Only submitted requests are rejected.", "تُرفض الطلبات المقدمة فقط.", code="not_submitted")
     req.status = LR.REJECTED
@@ -2428,7 +2435,7 @@ def reject_leave_adjustment(adjustment, *, user, reason_ar):
     """R29: the approver refuses a draft adjustment or opening balance (Arabic reason required); nothing is written
     to the ledger."""
     adj = _lock(LeaveAdjustment, adjustment.pk)
-    access.require(user, adj.entity, "hr.adjust_leave_balance", document=adj)
+    access.require(user, adj.entity, "hr.adjust_leave_balance", document=adj, purpose="reject")
     if adj.status != LeaveAdjustment.Status.DRAFT or not reason_ar:
         raise error("A draft adjustment is rejected with an Arabic reason.", "تُرفض التسوية المسودة مع ذكر السبب بالعربية.",
                     code="reject")
@@ -3051,7 +3058,9 @@ def submit_termination(termination, *, user):
     if t.status != TS.DRAFT:
         raise error("Only drafts are submitted.", "تُقدَّم المسودات فقط.", code="not_draft")
     t.status, t.submitted_by = TS.SUBMITTED, user
-    return _save(t)
+    _save(t)
+    approval_engine.submit(t, user, submit_permission="hr.record_termination")  # access R61, R71, R77: the request opens now; a gap in the bands is refused
+    return t
 
 
 @dataclass(frozen=True)
@@ -3113,7 +3122,12 @@ def _compute_eosb(employee, as_of, kind, use, additional_wage=ZERO):
     years = _years_between(start, as_of + timedelta(days=1 - excluded), terms.calendar_basis, year_days)
     components = {c.component.code: c.monthly_amount for c in terms.components.select_related("component")
                   if c.component.counts_for_eosb}
-    # R39: payroll's regular additions (payroll_port.AdditionalWage), or a plain amount from a preview caller.
+    # R39: payroll's regular additions (payroll_port.AdditionalWage), or a plain amount from a preview caller. The
+    # parameter rows they used are read through this ParamUse (R7); their warnings go with the calculation.
+    for row in getattr(additional_wage, "rows", None) or ():
+        use._take(row)
+    for text in getattr(additional_wage, "warnings", None) or ():
+        use.warn(text)
     extra_parts = dict(getattr(additional_wage, "parts", None) or {})
     extra = _decimal(getattr(additional_wage, "amount", additional_wage), "additional_wage")
     wage = sum(components.values(), ZERO) + extra
@@ -3177,7 +3191,12 @@ def _settlement_input(term, eosb, user, use):
         # balance at the last working day.
         balance = _balance(emp, lt) if lt else ZERO
         divisor = int(use.get(jurisdiction, "leave.encashment", term.last_working_day)["day_divisor"])
-        wage = _actual_wage(terms)
+        # Payroll slice 3 (verification 2; R34, payroll R76): leave encashment and notice pay use the same wage as the
+        # EOSB award: the components counting for EOSB plus payroll's Art. 2 regular additions.
+        extra = payroll_port.get_port().eosb_additional_wage(emp, term.last_working_day)
+        for row in getattr(extra, "rows", None) or ():
+            use._take(row)
+        wage = _actual_wage(terms) + _decimal(getattr(extra, "amount", ZERO), "additional_wage")
         daily = _round(Decimal(wage) / divisor)
         encash = _frac_round(Fraction(max(balance, ZERO)) * Fraction(wage) / divisor)
         # Payroll re-review 9: wage x shortfall days / divisor as one fraction, rounded once (Art. 76).
@@ -3376,7 +3395,7 @@ def postpone_resignation(termination, *, user, postponed_until, reason_ar, reaso
     may postpone accepting a resignation by up to the parameter's days after day 30, with a written reason; the last
     working day becomes the end of the postponement. Postponed again only within the same limit."""
     t = _lock(Termination, termination.pk)
-    access.require(user, t.entity, "hr.approve_termination", document=t)
+    access.require(user, t.entity, "hr.approve_termination", document=t, purpose="check")
     _deny_own(user, t.entity, "hr.approve_termination", t.employee)
     if t.kind != TKind.RESIGNATION or t.status not in (TS.DRAFT, TS.SUBMITTED) or t.submitted_on is None:
         raise error("Only an open resignation is postponed.", "لا يُؤجَّل إلا قبول استقالة قائمة.", code="postpone")
@@ -3493,7 +3512,7 @@ def withdraw_termination(termination, *, user, reason_ar):
         if t.kind == TKind.RESIGNATION:
             t.withdrawn_on = _today()  # Art. 79 bis statutory withdrawal
         return _save(t), []
-    access.require(user, t.entity, "hr.approve_termination", document=t)
+    access.require(user, t.entity, "hr.approve_termination", document=t, purpose="check")
     if t.status != TS.APPROVED:
         raise error("This termination cannot be withdrawn.", "لا يمكن سحب إنهاء الخدمة هذا.", code="withdraw")
     if t.kind == TKind.RESIGNATION:

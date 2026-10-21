@@ -351,17 +351,111 @@ ROLE_SEED_V16 = {
                               "payroll.approve_loan_write_off"),
     "accountant": _plus(ROLE_SEED_V15, "accountant", "payroll.prepare_profit_recognition"),
 }
-# V17 (migration core.0026, zatca.md §7 as amended 2026-10-21, D-19): ``zatca.view_key_events`` (secret-version
-# retirement events and pending retirements) for the ZATCA admin and the viewer / auditor (read-only); not the
-# accountant, not agents. Retiring itself has no permission: only the ZATCA system user does it, after commit and
-# in the retirement job (zatca R-57 to R-60).
+# V17 (migration core.0027, payroll slice 3, payroll.md §11.7): the payroll officer and the accountant generate the
+# leave and EOSB liability reports (nothing is posted); the payroll officer records Mudad justifications; the
+# hr_officer approves them (matrix activity payroll.mudad_justification, code default hr_officer); the managing
+# partner holds the approval as fallback like every A permission (OQ-1; payroll's matrix seam refuses it for this
+# activity). No right goes to an agent or system user (R38). The parallel approval-engine build may add its own
+# seed version; the two are renumbered at merge.
 ROLE_SEED_V17 = {
     **ROLE_SEED_V16,
-    "zatca_admin": _plus(ROLE_SEED_V16, "zatca_admin", "zatca.view_key_events"),
-    "viewer": _plus(ROLE_SEED_V16, "viewer", "zatca.view_key_events"),
+    "payroll_officer": _plus(ROLE_SEED_V16, "payroll_officer", "payroll.prepare_liability_report",
+                             "payroll.record_mudad_justification"),
+    "accountant": _plus(ROLE_SEED_V16, "accountant", "payroll.prepare_liability_report"),
+    "hr_officer": _plus(ROLE_SEED_V16, "hr_officer", "payroll.approve_mudad_justification"),
+    "managing_partner": _plus(ROLE_SEED_V16, "managing_partner", "payroll.approve_mudad_justification"),
+}
+# V18 (migration core.0029, access §10, on top of V17 (payroll slice 3); A24 to A32, R60, R76, R89; OQ-42, OQ-43, OQ-50, OQ-53 defaults):
+# - ceo (entity; default top authority of every entity but the group parent, R67): the accountant's create and
+#   submit rights, every approval (A) and posting (P) right the CFO or the managing partner holds outside G, and the
+#   access §10 rights (grant memberships, delegate, propose and approve matrix versions, read the governance report,
+#   assign personal assistants). Which approvals it gives in an entity is set by that entity's matrix or the code
+#   default (R70; OQ-41: parallel to the CFO).
+# - internal_auditor (OQ-53: the code is kept): read-only on every module of the entity (each view permission,
+#   personal data logged), the access log, and the governance report, which it alone reviews (R86, OQ-50). It has
+#   no create, submit, approve, post, reverse or export right (R89).
+# - external_auditor: read-only, personal data masked (no view_personal_data, view_iban, view_payslip or
+#   view_employee_ref), no exports; reads the governance report while its time-limited membership lasts (R89).
+# - business_analyst: views and reports of the ledger, invoicing and billing, no personal data (OQ-37).
+# - personal_assistant: drafts only (bills, contract drafts); never submits, approves or posts (R60, R81).
+# - board_representative (OQ-42): the second person for a matrix change proposed by a subsidiary's top authority;
+#   reads the governance report; nothing else.
+# - managing_partner, chairman, access_admin, approver: the §10 rights of 10.3 / 10.7.
+# - system_governance (Sys:governance): generates the monthly governance report in each entity it is a member of.
+_VIEW_ALL = (
+    "core.view_access", "invoicing.view", "invoicing.view_personal_data", "billing.view", "billing.view_employee_ref",
+    "zatca.view", "zatca.view_status", "ledger.view", "ledger.view_rates", "ledger.view_translation", "hr.view",
+    "hr.view_counts", "hr.view_personal_data", "payroll.view", "payroll.view_payslip", "payroll.view_cost_reports",
+    "banking.view", "banking.view_iban", "migration.view", "tax.view",
+)
+_PERSONAL_DATA_VIEWS = ("invoicing.view_personal_data", "billing.view_employee_ref", "hr.view_personal_data",
+                        "payroll.view_payslip", "banking.view_iban")
+_MATRIX = ("core.propose_authority_matrix", "core.approve_authority_matrix")
+_GOVERNANCE = ("core.view_governance_report",)
+# G rights stay with the group parent's roles (G8): the ceo never holds them.
+_NOT_FOR_CEO = frozenset({"core.change_entity_settings", "core.manage_users", "core.disable_sharia_enforcement",
+                          "zatca.grant_key_delegation", "ledger.change_functional_currency",
+                          "hr.verify_statutory_parameter", "ledger.maintain_global_rate", "hr.set_overtime_route"})
+
+
+def _ceo_permissions(seed):
+    from .catalogue import CATALOGUE
+
+    perms = set(seed["accountant"][5]) | set(seed["approver"][5])
+    perms |= {p for p in seed["managing_partner"][5] if CATALOGUE[p].is_approval or CATALOGUE[p].posts}
+    perms |= set(_PAYROLL_APPROVALS) | {"payroll.approve_run", "payroll.approve_loan_write_off",
+                                        *_PAYROLL_SLICE2_APPROVALS}
+    perms |= set(_VIEW_ALL) | {"core.grant_membership", "core.delegate_approval", *_MATRIX, *_GOVERNANCE,
+                               "core.manage_assistant_assignment"}
+    return tuple(sorted(perms - _NOT_FOR_CEO))
+
+
+ROLE_SEED_V18 = {
+    **ROLE_SEED_V17,
+    "ceo": ("Chief executive officer / General manager", "الرئيس التنفيذي / المدير العام", "entity", "human", None,
+            _ceo_permissions(ROLE_SEED_V17)),
+    "internal_auditor": ("Internal auditor", "المدقق الداخلي", "entity", "human", None,
+                         (*_VIEW_ALL, *_GOVERNANCE, "core.review_governance_report")),
+    "external_auditor": ("External auditor", "المدقق الخارجي", "entity", "human", None,
+                         (*(p for p in _VIEW_ALL if p not in _PERSONAL_DATA_VIEWS and p != "core.view_access"),
+                          *_GOVERNANCE)),
+    "business_analyst": ("Business analyst", "محلل أعمال", "entity", "human", None,
+                         ("ledger.view", "ledger.view_rates", "ledger.view_translation", "invoicing.view",
+                          "billing.view", "payroll.view_cost_reports")),
+    "personal_assistant": ("Personal assistant", "مساعد شخصي", "entity", "human", None,
+                           ("invoicing.create_bill", "billing.edit_contract_draft")),
+    "board_representative": ("Board representative", "ممثل مجلس الإدارة", "entity", "human", None,
+                             ("core.approve_authority_matrix", *_GOVERNANCE)),
+    "managing_partner": _plus(ROLE_SEED_V17, "managing_partner", *_MATRIX, *_GOVERNANCE,
+                              "core.manage_assistant_assignment"),
+    "chairman": _plus(ROLE_SEED_V17, "chairman", "core.approve_authority_matrix"),
+    "access_admin": _plus(ROLE_SEED_V17, "access_admin", "core.propose_authority_matrix"),
+    # payroll.approve_overtime lets an entity's matrix name the CFO for overtime (AT-87); under the code default
+    # payroll's hr route (managing partner or department head) still decides (R70, payroll R45).
+    "approver": _plus(ROLE_SEED_V17, "approver", "core.manage_assistant_assignment", "payroll.approve_overtime"),
+    "system_governance": ("Governance report system user", "مستخدم نظام تقرير الحوكمة", "entity", "system",
+                          "governance", ("core.generate_governance_report",)),
+}
+# payroll.deferred_sale_closure (access 10.5, coordinator 2026-10-21): bai' ajel write-offs and recoveries after exit
+# have their own approval right, held by the holders of payroll.approve_loan_write_off.
+for _code in [c for c, row in ROLE_SEED_V18.items() if "payroll.approve_loan_write_off" in row[5]]:
+    ROLE_SEED_V18[_code] = _plus(ROLE_SEED_V18, _code, "payroll.approve_deferred_sale_closure")
+# billing.submit_contract (verification review of 49e1abd, item 3): every human role that drafts contracts, except the
+# personal assistant (drafts only, R60).
+for _code in [c for c, row in ROLE_SEED_V18.items()
+              if "billing.edit_contract_draft" in row[5] and row[3] == "human" and c != "personal_assistant"]:
+    ROLE_SEED_V18[_code] = _plus(ROLE_SEED_V18, _code, "billing.submit_contract")
+# V19 (migration core.0032, zatca.md §7 as amended 2026-10-21, D-19): ``zatca.view_key_events`` (secret-version
+# retirement events and pending retirements) for the ZATCA admin and, read-only, the viewer and the internal and
+# external auditors (§7 "Viewer / auditor"); not the accountant, the ceo or agents. Retiring itself has no
+# permission: only the ZATCA system user does it, in the retirement job (zatca R-57 to R-60).
+ZATCA_KEY_EVENT_ROLES = ("zatca_admin", "viewer", "internal_auditor", "external_auditor")
+ROLE_SEED_V19 = {
+    **ROLE_SEED_V18,
+    **{code: _plus(ROLE_SEED_V18, code, "zatca.view_key_events") for code in ZATCA_KEY_EVENT_ROLES},
 }
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V17
+ROLE_SEED = ROLE_SEED_V19
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
@@ -374,8 +468,13 @@ SYSTEM_USERS_V2 = {
     **SYSTEM_USERS_V1,
     "deferred_sale": ("system.deferred_sale", "Bai' ajel system user", "مستخدم نظام البيع الآجل"),
 }
+# V3 (migration core.0029, access R84): the governance report system user.
+SYSTEM_USERS_V3 = {
+    **SYSTEM_USERS_V2,
+    "governance": ("system.governance", "Governance report system user", "مستخدم نظام تقرير الحوكمة"),
+}
 # The current system users: what a fresh (or flushed test) database is seeded with.
-SYSTEM_USERS = SYSTEM_USERS_V2
+SYSTEM_USERS = SYSTEM_USERS_V3
 
 
 def apply_seed(Role, RolePermission, roles=ROLE_SEED):

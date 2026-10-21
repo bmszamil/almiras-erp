@@ -115,10 +115,15 @@ def test_creator_cannot_post_own_manual_journal_even_with_self_approval_grant(w)
     entry = draft(w, w.alm)
     with pytest.raises(access.AccessDenied):
         access.require(w.clerk, w.alm, "ledger.post_entry", document=entry)
-    grant = access.require(w.clerk, w.alm, "ledger.post_entry", document=entry, allow_self_approval=True)
-    with pytest.raises(access.AccessDenied) as exc:  # the ledger has no self-approval switch
-        services.post_entry(entry, grant)
+    with pytest.raises(access.AccessDenied) as exc:  # access R14 amended / R79: no caller switch; only the engine's
+        access.require(w.clerk, w.alm, "ledger.post_entry", document=entry, allow_self_approval=True)  # top authority
     assert exc.value.code == "self_approval" and status(entry) == "draft"
+    forged = access.Grant(user=w.clerk, entity=w.alm, permission="ledger.post_entry", membership_ids=(),
+                          checked_at=access.services.now(), log_id=None, document_ref=("ledger.journalentry", entry.pk),
+                          self_approval=True, top_authority=True)
+    with pytest.raises(access.AccessDenied) as exc:  # a grant claiming top authority without its log row (R31)
+        services.post_entry(entry, forged)
+    assert exc.value.code == "grant_forged" and status(entry) == "draft"
 
 
 def test_accountant_cannot_post_manual_journals(w):  # OQ-5 default

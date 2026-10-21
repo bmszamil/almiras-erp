@@ -23,13 +23,14 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 from zoneinfo import ZoneInfo
 
 from django.db import IntegrityError, transaction
-from django.db.models import Q, Sum
+from django.db.models import Case, Count, F, Q, Sum, Value, When
 from django.utils import timezone
 
 from core import access
+from core.access import engine as approval_engine
 from core.access import services as access_services
 from core.access.models import AccessLog, Kind, Membership
-from core.models import Currency, Entity, validate_country_code, validate_vat_number
+from core.models import Currency, Entity, label_part, validate_country_code, validate_vat_number
 from core.services import entity_ready_to_issue
 from ledger import fx
 from ledger import restricted as ledger_restricted
@@ -568,6 +569,105 @@ def purchase_documents(user, entity=None):
     return qs.filter(entity=entity) if entity is not None else qs
 
 
+# --- read-only lists for the web UI (web.md R3, R24, R37, R38; slice 1) ------------------------------------------
+
+def _not_personal():
+    """Customers whose name is not personal data: neither an individual nor an employee's own record (R51)."""
+    return ~Q(customer__customer_kind=Customer.Kind.INDIVIDUAL) & Q(customer__employee__isnull=True)
+
+
+def _without_personal_data(qs):
+    """Never load personal data a screen does not show (web.md R24 "never prefetched"): the buyer snapshot and the
+    customer's personal fields are deferred; business and government names come as annotations."""
+    return (
+        qs.defer(*BUYER_FIELDS, *(f"customer__{name}" for name in PERSONAL_PARTY_FIELDS))
+        .annotate(
+            customer_public_name_en=Case(When(_not_personal(), then=F("customer__name_en")), default=Value("")),
+            customer_public_name_ar=Case(When(_not_personal(), then=F("customer__name_ar")), default=Value("")),
+        )
+    )
+
+
+def list_sales_documents(entity, *, user, doc_type=None, status=None, zatca_status=None, date_from=None, date_to=None,
+                         number=None):
+    """Sales documents of ``entity`` for ``user`` (``invoicing.view`` there), newest first.
+
+    Refused (AccessDenied, logged) without ``invoicing.view`` in ``entity``; rows also pass through
+    :func:`sales_documents` (access.scope). Filters are enumerated values, dates and document numbers (web.md R23).
+    Customers are selected in the same query (R37), without their personal fields or the buyer snapshot (R24);
+    show the customer with :func:`listed_customer_name`, which masks individuals (R24, R51, R86).
+    """
+    access.require(user, entity, "invoicing.view")
+    qs = sales_documents(user, entity)
+    if doc_type:
+        qs = qs.filter(doc_type=doc_type)
+    if status:
+        qs = qs.filter(status=status)
+    if zatca_status:
+        qs = qs.filter(zatca_status=zatca_status)
+    if date_from:
+        qs = qs.filter(issue_date__gte=date_from)
+    if date_to:
+        qs = qs.filter(issue_date__lte=date_to)
+    if number:
+        qs = qs.filter(number__icontains=number)
+    return _without_personal_data(qs.select_related("entity", "customer", "currency")).order_by("-issue_date", "-id")
+
+
+def listed_customer_name(document, language):
+    """The customer's name on a row of :func:`list_sales_documents`, in ``language`` (``en``/``ar``).
+
+    An individual's name is personal data and is never loaded or shown here (web.md R24, invoicing R51, R86): the
+    active half of the mask instead. Business and government names are shown, the other language filling an
+    empty one, else the customer code.
+    """
+    en, ar = document.customer_public_name_en, document.customer_public_name_ar
+    if not en and not ar:
+        individual = (document.customer.customer_kind == Customer.Kind.INDIVIDUAL
+                      or document.customer.employee_id is not None)
+        return label_part(MASK, language) if individual else document.customer.code
+    first, other = (ar, en) if language == "ar" else (en, ar)
+    return first or other
+
+
+# Header totals, SAR amounts and the buyer snapshot are set when a document is issued (approve_sales_document);
+# before that only the lines are priced, so screens say "calculated at issue" instead of showing zero totals.
+PRICED_STATUSES = frozenset({SalesDocument.Status.ISSUED, SalesDocument.Status.FINAL, SalesDocument.Status.REJECTED})
+
+
+def sales_document_detail(entity, pk, *, user):
+    """One sales document of ``entity`` for the read-only screen (``invoicing.view``; web.md R3, R4, R24, R40).
+
+    Returns ``{"document", "lines", "buyer", "masked", "totals_ready"}``. A document of another entity, or one the
+    user may not see, is "not found" (Http404), never 403. An individual buyer's snapshot is **masked** for
+    everybody here and is not even read from the database, and no personal-data row is written: unmasking is an
+    explicit, logged action (R24, R51), not part of a GET page. A business buyer's snapshot is read in one query.
+    """
+    access.require(user, entity, "invoicing.view")
+    qs = _without_personal_data(
+        sales_documents(user, entity).select_related("entity", "customer", "currency", "original_document",
+                                                     "journal_entry")
+    )
+    doc = access.get_scoped_or_404(qs, user, "invoicing.view", pk=pk)
+    lines = list(doc.lines.select_related("income_type", "vat_rate").order_by("line_no"))
+    masked = doc.customer.customer_kind == Customer.Kind.INDIVIDUAL or doc.customer.employee_id is not None
+    if masked:
+        buyer = {name: MASK for name in BUYER_FIELDS}
+    else:
+        buyer = SalesDocument.objects.filter(pk=doc.pk).values(*BUYER_FIELDS).get()
+    return {"document": doc, "lines": lines, "buyer": buyer, "masked": masked,
+            "totals_ready": doc.status in PRICED_STATUSES}
+
+
+def sales_document_counts(entity, *, user):
+    """``{status: count}`` of ``entity``'s sales documents, for the dashboard card (``invoicing.view``; R38)."""
+    access.require(user, entity, "invoicing.view")
+    rows = sales_documents(user, entity).values("status").annotate(n=Count("id")).order_by()
+    counts = {s: 0 for s in SalesDocument.Status.values}
+    counts.update({r["status"]: r["n"] for r in rows})
+    return counts
+
+
 def _same_entity(entity, obj, what_en, what_ar):
     if obj is None or obj.entity_id != entity.pk:
         raise error(f"The {what_en} belongs to another entity.", f"{what_ar} يخص كيانًا آخر.", code="entity_mismatch")
@@ -969,6 +1069,7 @@ def submit_sales_document(document, *, user):
     _bump(doc)
     doc._service_write = True
     doc.save()
+    approval_engine.submit(doc, user, submit_permission="invoicing.submit_sales_document")  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
     return doc
 
 
@@ -977,7 +1078,7 @@ def return_to_draft(document, *, user):
     """submitted -> draft for edits (R57): by staff who submit, or by the approver."""
     doc = SalesDocument.objects.select_for_update(of=("self",)).select_related("entity").get(pk=document.pk)
     if not access.has(user, doc.entity, "invoicing.submit_sales_document"):
-        access.require(user, doc.entity, "invoicing.approve_sales_document", document=doc)
+        access.require(user, doc.entity, "invoicing.approve_sales_document", document=doc, purpose="return")
     if doc.status != Status.SUBMITTED:
         raise error("Only submitted documents return to draft.", "تعود المستندات المقدمة فقط إلى مسودة.",
                     code="not_submitted")
@@ -2175,6 +2276,7 @@ def submit_purchase_document(document, *, user):
     _bump(doc)
     doc._service_write = True
     doc.save()
+    approval_engine.submit(doc, user, submit_permission="invoicing.submit_bill")  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
     return doc
 
 
@@ -2583,6 +2685,7 @@ def submit_vendor_payment(payment, *, user):
     _bump(payment)
     payment._service_write = True
     payment.save()
+    approval_engine.submit(payment, user, submit_permission="invoicing.submit_vendor_payment")  # access R61, R71, R77: rules resolved now; a gap in the bands is refused
     return payment
 
 
@@ -5226,6 +5329,67 @@ def recognise_deferred_profit(source, *, user, collected_amount, collected_on, s
             release.journal_entry = entry
             release._service_write = True
             release.save(update_fields=["journal_entry"])
+    return release
+
+
+def catch_up_deferred_profit(source, *, source_ref, on, approver):
+    """Payroll review 5 (2026-10-21, item 3; payroll OQ-33): when ZATCA rejects the credit note of a bai' ajel
+    rebate, nothing was waived, so the profit held back while it was pending (prudence, :func:`_profit_figures`) is
+    recognised at once on what is already collected: Dr 1241 / Cr 4610 for ``profit x collected to date /
+    receivable`` (full figures) less what was recognised, dated ``on``, by the deferred-sale system user through the
+    ledger registry (a recognition with no new collection, ``collected_amount`` 0). Then the profit not yet recognised
+    is exactly the profit on what is still outstanding, whatever happens to the balance next (collection, recovery or
+    write-off after exit).
+
+    Accepted only inside payroll's marker for that rejected rebate (``payroll.invoicing_port.catching_up``;
+    ``source_ref`` = ``payroll.deferredsalerebate:<pk>:catch_up:<credit note>``); otherwise
+    ``collection_not_from_payroll``. ``approver`` (the rebate's payroll approver, recorded as ``created_by``) is
+    never the poster. Idempotent per reference; returns None when nothing was held back."""
+    from payroll import invoicing_port as payroll_port
+
+    entity = Entity.objects.get(pk=source.entity_id)
+    system = access.system_user(DEFERRED_SALE_SYSTEM)
+    ref = str(source_ref or "").strip()[:100]
+    if not isinstance(on, date_type):
+        raise error("The catch-up needs its date.", "يحتاج التحقق اللاحق إلى تاريخه.", code="collection_required")
+    problems = payroll_port.catch_up_problems(source, source_ref=ref, approver=approver)
+    if problems:
+        access_services.log_denial(actor=system, entity=entity, permission="invoicing.post_deferred_profit",
+                                   details={"reason": "collection_not_from_payroll", "source_ref": ref})
+        raise _problems_error(problems, "collection_not_from_payroll")
+    with transaction.atomic():
+        sale = _live_deferred_sale(entity, source, lock=True)
+        if sale is None:
+            return None
+        posted = DeferredProfitRelease.objects.filter(deferred_sale=sale, status=DeferredProfitRelease.Status.POSTED)
+        existing = posted.filter(source_ref=ref).first()
+        if existing is not None:
+            return existing
+        doc = sale.sales_document
+        if doc.status != Status.FINAL or doc.journal_entry_id is None:
+            return None
+        collected = Decimal(posted.aggregate(t=Sum("collected_amount"))["t"] or ZERO).quantize(CENT)
+        profit_before = Decimal(posted.aggregate(t=Sum("profit_amount"))["t"] or ZERO).quantize(CENT)
+        if collected <= ZERO:
+            return None
+        amount = _profit_figures(sale, collected, profit_before)
+        if amount <= ZERO:
+            return None
+        release = DeferredProfitRelease(
+            entity=entity, deferred_sale=sale, source_ref=ref, date=on, collected_amount=ZERO,
+            collected_to_date=collected, profit_amount=amount, created_by=approver,
+        )
+        release._service_write = True
+        release.save()
+        grant = access.require(system, entity, "invoicing.post_deferred_profit", document=release)
+        with _posting_as(system):
+            entry = ledger.create_entry(
+                entity, on, f"Bai' ajel profit catch-up {doc.number} / تحقق لاحق لأرباح البيع الآجل {doc.number}", None,
+                user=system, reference=doc.number, post=True, grant=grant, document=release,
+            )
+        release.journal_entry = entry
+        release._service_write = True
+        release.save(update_fields=["journal_entry"])
     return release
 
 

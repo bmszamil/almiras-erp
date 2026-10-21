@@ -1,0 +1,35 @@
+{% load static %}<!doctype html>
+<html lang="{% if lang == 'en' %}en{% else %}ar{% endif %}" dir="{% if lang == 'en' %}ltr{% else %}rtl{% endif %}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ code }} | {% if lang == 'en' %}{{ title.0 }}{% else %}{{ title.1 }}{% endif %}</title>
+  {% if lang == 'en' %}
+  <link rel="stylesheet" href="{% static 'web/vendor/bootstrap-5.3.8/css/bootstrap.min.css' %}">
+  {% else %}
+  <link rel="stylesheet" href="{% static 'web/vendor/bootstrap-5.3.8/css/bootstrap.rtl.min.css' %}">
+  {% endif %}
+  <link rel="stylesheet" href="{% static 'web/css/fonts.css' %}">
+  <link rel="stylesheet" href="{% static 'web/css/almiras.css' %}">
+</head>
+<body class="alm-body">
+<div class="alm-auth">
+  <main class="alm-auth__card alm-error" id="main">
+    <p class="alm-error__code"><bdi dir="ltr">{{ code }}</bdi></p>
+    <section lang="ar" dir="rtl" class="alm-error__half">
+      <h1 class="alm-title">{{ title.1 }}</h1>
+      <p>{{ body.1 }}</p>
+      {% if detail %}<p class="alm-error__detail">{{ detail.1 }}</p>{% endif %}
+    </section>
+    <section lang="en" dir="ltr" class="alm-error__half">
+      <h2 class="alm-title">{{ title.0 }}</h2>
+      <p>{{ body.0 }}</p>
+      {% if detail %}<p class="alm-error__detail">{{ detail.0 }}</p>{% endif %}
+    </section>
+    {% if not bare %}
+    <p class="alm-error__home"><a href="{% url 'web:home' %}" lang="ar">{{ home.1 }}</a> <a href="{% url 'web:home' %}" lang="en">{{ home.0 }}</a></p>
+    {% endif %}
+  </main>
+</div>
+</body>
+</html>

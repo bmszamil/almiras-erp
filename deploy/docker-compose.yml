@@ -46,6 +46,9 @@ x-app: &app
     ZATCA_PRODUCTION_BASE_URL: ${ZATCA_PRODUCTION_BASE_URL:-}
     ZATCA_PRODUCTION_ALLOWED: ${ZATCA_PRODUCTION_ALLOWED:-0}
     ACCESS_GRANT_MAX_AGE_SECONDS: ${ACCESS_GRANT_MAX_AGE_SECONDS:-900}
+    # Web UI without MFA (web.md R13 to R16 not built): release-check fails (web.E001) unless this is "1".
+    # Go-live blocker: leave it 0 in production until the MFA slice ships.
+    DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN: ${DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN:-0}
     # KSA-hosted mail server (placeholder values in .env; password is a secret file).
     DJANGO_EMAIL_HOST: ${DJANGO_EMAIL_HOST:?set DJANGO_EMAIL_HOST in deploy/.env}
     DJANGO_EMAIL_PORT: ${DJANGO_EMAIL_PORT:-587}

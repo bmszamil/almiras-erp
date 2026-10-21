@@ -48,14 +48,17 @@ def get_port():
 # its reversal are refused outside it (``collection_problems``).
 _collecting = ContextVar("payroll_collecting", default=None)
 COLLECTING_DOCUMENTS = {"payroll.payrollrun": "payroll.approve_run",
-                        "payroll.finalsettlement": "payroll.approve_final_settlement"}
+                        "payroll.finalsettlement": "payroll.approve_final_settlement",
+                        # Review 4 (2026-10-21, item 5): a balance after exit recovered from the former employee.
+                        "payroll.deferredsaleclosure": "payroll.approve_deferred_sale_closure"}
 _REF = re.compile(r"^payroll\.deferredsaleinstallment:(\d+)$")
 
 
 @contextmanager
 def collecting(document, user, mode="collect"):
-    """Set by ``payroll.services`` around the effects of ``approve_run`` / ``approve_final_settlement`` (``collect``)
-    and around ``reverse_run``'s profit reversals (``reverse``)."""
+    """Set by ``payroll.services`` around the effects of ``approve_run`` / ``approve_final_settlement`` /
+    ``approve_deferred_sale_closure`` (a recovery; ``collect``) and around ``reverse_run``'s profit reversals
+    (``reverse``)."""
     token = _collecting.set((document._meta.label_lower, document.pk, getattr(user, "pk", None), mode))
     try:
         yield
@@ -66,9 +69,10 @@ def collecting(document, user, mode="collect"):
 def collection_problems(contract, *, source_ref, amount=None, user, mode="collect"):
     """Why invoicing may not recognise (``collect``) or reverse (``reverse``) the bai' ajel profit of ``source_ref``
     for ``contract`` now: [] when the call comes from the payroll approval that collected it, ``source_ref`` names a
-    deducted (run) or settled (final settlement) installment of that very contract and ``amount`` is what was
-    collected on it. Returns (problems, permission the user must hold)."""
-    from .models import DeferredSaleInstallment, FinalSettlement
+    deducted (run) or settled (final settlement) installment of that very contract, or one recovered after exit by
+    an approved recovery (``DeferredSaleClosure``, review 4), and ``amount`` is what was collected on it. Returns
+    (problems, permission the user must hold)."""
+    from .models import DeferredSaleClosure, DeferredSaleInstallment, FinalSettlement
 
     marker = _collecting.get()
     if marker is None or marker[3] != mode or marker[2] != getattr(user, "pk", None) \
@@ -89,6 +93,13 @@ def collection_problems(contract, *, source_ref, amount=None, user, mode="collec
         return wrong, permission
     if label == "payroll.payrollrun":
         ok = inst.status == DeferredSaleInstallment.Status.DEDUCTED and inst.run_id == doc_pk
+    elif label == "payroll.deferredsaleclosure":
+        closure = DeferredSaleClosure.objects.filter(pk=doc_pk, contract_id=contract.pk, entity_id=contract.entity_id,
+                                                     kind=DeferredSaleClosure.Kind.RECOVERY,
+                                                     status=DeferredSaleClosure.Status.APPROVED).first()
+        ok = (mode == "collect" and closure is not None
+              and inst.status == DeferredSaleInstallment.Status.RECOVERED_AFTER_EXIT
+              and any(part.get("installment_id") == inst.pk for part in closure.installment_parts or []))
     else:
         fs = FinalSettlement.objects.filter(pk=doc_pk).first()
         ok = (mode == "collect" and fs is not None and fs.employee_id == contract.employee_id
@@ -150,8 +161,11 @@ def rebate_problems(contract, *, source_ref, amount, approver):
         return refused
     r = DeferredSaleRebate.objects.filter(pk=marker[0], contract_id=contract.pk,
                                           entity_id=contract.entity_id).first()  # read again (the approval locks it)
+    makers_refused = approver_pk in {r.created_by_id, r.modified_by_id} if r is not None else True
+    if makers_refused and getattr(marker[3], "top_authority", False):  # access R79 / payroll R84: as the approval
+        makers_refused = False  # (the grant's log row says top_authority; verify_grant below checks it, R31)
     if r is None or r.status not in (DeferredSaleRebate.Status.DRAFT, DeferredSaleRebate.Status.REJECTED) \
-            or r.amount != amount or approver_pk in {r.created_by_id, r.modified_by_id} \
+            or r.amount != amount or makers_refused \
             or not hmac.compare_digest(r.approval_token or "", marker[2]):
         return refused
     emp_user = Employee.objects.filter(pk=contract.employee_id).values_list("user_id", flat=True).first()
@@ -167,3 +181,45 @@ def rebate_problems(contract, *, source_ref, amount, approver):
     except PermissionDenied:
         return refused
     return []
+
+
+# --- review 5 (2026-10-21, item 3; OQ-33): the profit held back while a rebate note was pending, caught up ----------
+
+# (rebate pk, contract pk, source ref) while ``payroll.services._refresh_rebates`` handles a rebate whose credit note
+# ZATCA rejected. Invoicing's ``catch_up_deferred_profit`` is refused outside it (``catch_up_problems``).
+_catching_up = ContextVar("payroll_catching_up", default=None)
+_CATCH_UP_REF = re.compile(r"^payroll\.deferredsalerebate:(\d+):catch_up:(.*)$")
+
+
+def catch_up_ref(rebate):
+    return f"payroll.deferredsalerebate:{rebate.pk}:catch_up:{rebate.credit_note_ref or ''}"[:100]
+
+
+@contextmanager
+def catching_up(rebate):
+    token = _catching_up.set((rebate.pk, rebate.contract_id, catch_up_ref(rebate)))
+    try:
+        yield
+    finally:
+        _catching_up.reset(token)
+
+
+def catch_up_problems(contract, *, source_ref, approver=None):
+    """Why invoicing may not catch up the bai' ajel profit held back for ``contract`` now: [] only inside payroll's
+    handling of that very rebate (``catching_up``), of that contract and entity, whose credit note ZATCA rejected;
+    ``approver`` is that rebate's approver."""
+    from .models import DeferredSaleRebate
+
+    refused = ["Held-back bai' ajel profit is caught up only by payroll when ZATCA rejects that rebate's credit note "
+               "(R128, OQ-33). / لا يتحقق ربح البيع الآجل المؤجل لاحقًا إلا من الرواتب عند رفض الهيئة للإشعار الدائن "
+               "لذلك الإبراء."]
+    marker = _catching_up.get()
+    match = _CATCH_UP_REF.match(str(source_ref or ""))
+    if marker is None or match is None or marker[2] != source_ref or int(match.group(1)) != marker[0] \
+            or marker[1] != contract.pk:
+        return refused
+    ok = DeferredSaleRebate.objects.filter(pk=marker[0], contract_id=contract.pk, entity_id=contract.entity_id,
+                                           status=DeferredSaleRebate.Status.REJECTED,
+                                           credit_note_status="rejected",
+                                           approved_by_id=getattr(approver, "pk", -1)).exists()
+    return [] if ok else refused
