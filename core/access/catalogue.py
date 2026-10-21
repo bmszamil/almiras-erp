@@ -284,6 +284,10 @@ _PERMS = [
     _p("payroll.prepare_loan_write_off", "Prepare loan write-offs on exit", "إعداد شطب القروض عند انتهاء الخدمة"),
     _p("payroll.approve_loan_write_off", "Approve and post loan write-offs", "اعتماد شطب القروض وترحيله", APPROVAL,
        POSTS),
+    # access 10.5 (coordinator 2026-10-21): bai' ajel balances after exit written off or recovered (DeferredSaleClosure)
+    # have their own approval, held like payroll.approve_loan_write_off.
+    _p("payroll.approve_deferred_sale_closure", "Approve and post bai' ajel write-offs and recoveries after exit",
+       "اعتماد شطب البيع الآجل واسترداده بعد انتهاء الخدمة وترحيلهما", APPROVAL, POSTS),
     _p("payroll.manage_cost_items", "Enter employee cost items", "إدخال بنود تكاليف الموظفين"),
     _p("payroll.approve_cost_item", "Approve employee cost items", "اعتماد بنود تكاليف الموظفين", APPROVAL),
     _p("payroll.prepare_cost_report", "Prepare secondment cost reports", "إعداد تقارير تكلفة الإعارة"),
@@ -297,6 +301,11 @@ _PERMS = [
        APPROVAL),
     _p("payroll.generate_wps_file", "Generate salary (WPS) files", "إنشاء ملفات الرواتب (حماية الأجور)"),
     _p("payroll.record_mudad_submission", "Record Mudad submissions", "تسجيل الرفع على منصة مدد"),
+    # Payroll slice 3 (payroll.md §11.7): liability reports (nothing posted) and Mudad justifications.
+    _p("payroll.prepare_liability_report", "Generate leave and EOSB liability reports",
+       "إعداد تقارير التزامات الإجازات ومكافأة نهاية الخدمة"),
+    _p("payroll.record_mudad_justification", "Record Mudad justifications", "تسجيل مبررات مدد"),
+    _p("payroll.approve_mudad_justification", "Approve Mudad justifications", "اعتماد مبررات مدد", APPROVAL),
     # banking (banking.md §7). Agents may view (masked), suggest matches and draft bank transactions only (R43).
     _p("banking.view", "View banking (account numbers masked)", "عرض البيانات البنكية (أرقام الحسابات مخفية)", AGENT_OK),
     _p("banking.view_iban", "View full IBANs and account numbers", "عرض أرقام الآيبان والحسابات كاملة"),

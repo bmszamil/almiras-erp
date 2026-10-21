@@ -27,7 +27,7 @@ def convert(apps, schema_editor):
             entity_id=m.entity_id, delegator_id=m.delegated_from.user_id, delegate_id=m.user_id, valid_from=start,
             valid_to=end, reason_en=m.reason or "Converted R16 delegation", reason_ar=m.reason or "تفويض محوَّل",
             created_by_id=m.granted_by_id or m.delegated_from.user_id, created_at=now)
-        reason = "Converted to an approval delegation (access R62, core.0030) / حُوِّل إلى تفويض اعتماد"
+        reason = "Converted to an approval delegation (access R62, core.0031) / حُوِّل إلى تفويض اعتماد"
         Membership.objects.filter(pk=m.pk).update(revoked_at=timezone.now(), revoked_by_id=d.created_by_id,
                                                   revoke_reason=reason)
         for event, details in (("delegation_granted", {"approval_delegation": d.pk, "converted_from": m.pk}),
@@ -38,6 +38,6 @@ def convert(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-    dependencies = [("core", "0029_authority_matrix_triggers")]
+    dependencies = [("core", "0030_authority_matrix_triggers")]
 
     operations = [migrations.RunPython(convert, migrations.RunPython.noop)]

@@ -842,7 +842,7 @@ def delegate_approval(actor, delegate, entity, valid_from, valid_to, reason, sou
     and R88 limits (``valid_to`` required, at most 90 days, never to an assistant, analyst or auditor only, never
     a system or agent user, never a chain, logged). Kept for existing callers; ``source`` (a membership of the
     delegator) names the delegator when the entity's top authority creates it. Returns the ``ApprovalDelegation``.
-    No membership with ``delegated_from`` is created any more (migration core.0030 converted the existing ones)."""
+    No membership with ``delegated_from`` is created any more (migration core.0031 converted the existing ones)."""
     from .delegations import delegate_authority
 
     require(actor, entity, "core.delegate_approval")

@@ -6,8 +6,9 @@ employee who benefits (access R82: never approved by that employee, whatever the
 document number and period only (no names, no individual pay; payroll R36). Payroll's own checks stay in
 ``payroll.services`` and run on every decision (fingerprints, own inputs, the 3 x BASIC loan cap). Payroll never
 passes ``allow_self_approval``: only the engine's top-authority path lets the entity's top authority approve a payroll
-document they made (access R79, payroll R84). Slice 3's new documents (off-cycle runs reuse ``PayrollRun``; Mudad
-justifications) register their own adapters when they are built.
+document they made (access R79, payroll R84). Slice 3: off-cycle runs reuse the ``PayrollRun`` adapter; Mudad
+justifications and bai' ajel closures after exit have their own (merged 2026-10-21). Liability reports approve
+nothing (generated and kept read-only).
 """
 
 
@@ -134,3 +135,18 @@ def register():
 
     engine.register(MaternityGosiCase, "payroll.maternity_clearance", permission="payroll.approve_maternity_clearance",
                     amount=none, beneficiaries=_employee_user, label=_label("Maternity case", "حالة أمومة"))
+    # Payroll slice 3 (merged 2026-10-21): Mudad justifications (activity payroll.mudad_justification, code default
+    # hr_officer, the employee as beneficiary) and bai' ajel write-offs / recoveries after exit (their own activity
+    # payroll.deferred_sale_closure, defaulted like the loan write-off).
+    from .models import DeferredSaleClosure, MudadJustification
+
+    engine.register(MudadJustification, "payroll.mudad_justification", permission="payroll.approve_mudad_justification",
+                    amount=none, beneficiaries=_employee_user, label=_label("Mudad justification", "مبرر مدد"),
+                    approve=lambda d, user: services.approve_mudad_justification(d, user=user))
+    engine.register(DeferredSaleClosure, "payroll.deferred_sale_closure",
+                    permission="payroll.approve_deferred_sale_closure", amount=lambda d: d.amount,
+                    currency=lambda d: d.entity.base_currency_id, beneficiaries=_employee_user,
+                    label=_label("Bai' ajel closure after exit", "إقفال بيع آجل بعد انتهاء الخدمة"),
+                    approve=lambda d, user: services.approve_deferred_sale_closure(d, user=user),
+                    reject=lambda d, user, note: services.reject_deferred_sale_closure(d, user=user,
+                                                                                        reason_ar=note or "مرفوض"))

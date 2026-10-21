@@ -10,7 +10,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("core", "0026_alter_accesslog_event"),
+        ("core", "0027_seed_access_v17_payroll_slice3"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

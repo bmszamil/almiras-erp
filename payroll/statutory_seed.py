@@ -252,6 +252,36 @@ EG_SLICE2_ROWS = (
      "Labour Law 14/2025: no statutory end-of-service gratuity for resignation or expiry; compensation only on a "
      "termination event (research §2.1, §4 item 12) (M)"),
 )
+# Slice 3 (§11.3.4): seeded empty and unverified. The Mudad justification codes are not in the HRSD sources
+# [verify: Mudad code list]; the internal reasons (§11.6) are exported with an empty code and a warning until a person
+# fills and verifies this row. Egypt's untaken-leave valuation basis waits for the Egyptian adviser (OQ-55): while it
+# is empty or unverified the leave liability report shows Egypt's days, not valued.
+MUDAD = "https://mudad.com.sa/"
+SLICE3_SA = {
+    # Compliance C3 (HRSD WPS guide): justifications are chosen from a drop-down on the Mudad portal; this row maps
+    # each internal reason ("reason" or "kind:reason") to the option's label {"ar": ..., "en": ...}.
+    "wps.mudad.justification_options": ({"options": {}}, MUDAD,
+                                        "Internal reason to the Mudad portal drop-down option (payroll §11.6) [verify: "
+                                        "Mudad option list, not in HRSD sources] | seeded empty 2026-10-21 (OQ-56)"),
+    # Compliance C4 (Labour Law Art. 2): the value of in-kind housing in the EOSB wage, months of BASIC a year; 3
+    # (a quarter) is the team's default for the provision and reports [verify: legal].
+    "eosb.in_kind_housing": ({"basic_months_per_year": "3"}, LABOUR_LAW,
+                             "Labour Law Art. 2 (wage includes in-kind benefits); valuation [verify: legal] | seeded "
+                             "2026-10-21"),
+    # Review 8 (PDPL, hr R11): words that suggest a diagnosis or health detail in a justification's text or evidence.
+    "mudad.health_words": ({"words": ["diagnos", "disease", "illness", "surgery", "cancer", "covid", "pregnan",
+                                      "hospital", "medical", "injury", "تشخيص", "عملية جراحية", "جراحة", "سرطان",
+                                      "كورونا", "مستشفى", "ورم", "طبي", "إصابة", "نفسي"]}, MUDAD,
+                           "Team list for the PDPL screen of Mudad justifications (no official source) [verify: DPO] "
+                           "| seeded 2026-10-21"),
+}
+SLICE3_EG = {
+    "si.wage_reference": ({"reference": "monthly", "options": ["monthly", "january"]}, EG_ANDERSEN,
+                          "Law 148/2019: insurable wage of the month or of January of the year [verify: Egypt adviser] "
+                          "(compliance C10) | seeded 2026-10-21"),
+    "leave.encashment_basis": ({}, EG_ANDERSEN, "Labour Law 14/2025: cash for untaken leave on exit; which wage and "
+                               "divisor [verify: Egypt adviser] (OQ-55) | seeded empty 2026-10-20"),
+}
 EG_NOTE = " | Research 2026-10-18 from search-engine extracts, not the Gazette; Egyptian adviser to confirm (OQ-28)"
 
 
@@ -271,3 +301,6 @@ def apply(StatutoryParameter):
         apply_rows(StatutoryParameter, {"jurisdiction.active": row}, jurisdiction=jurisdiction, valid_from=ACTIVE_FROM)
     for code, valid_from, value, url, ref in EG_ROWS + EG_SLICE2_ROWS:
         apply_rows(StatutoryParameter, {code: (value, url, ref + EG_NOTE)}, jurisdiction="EG", valid_from=valid_from)
+    apply_rows(StatutoryParameter, SLICE3_SA, valid_from=WPS_FROM)
+    apply_rows(StatutoryParameter, {code: (value, url, ref + EG_NOTE) for code, (value, url, ref) in SLICE3_EG.items()},
+               jurisdiction="EG", valid_from="2025-09-01")

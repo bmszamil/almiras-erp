@@ -18,6 +18,10 @@ Interface (every method runs inside the caller's transaction; refusals raise ``I
   the collection completing the receivable releases the rest). Idempotent per ``source_ref``. Codes:
   ``sale_not_posted``, ``over_collected``, ``collection_changed``, ``no_deferred_sale``; a closed period of ``on`` is
   refused by the ledger.
+- ``unearned_bai_ajel_profit(contract) -> Decimal | None`` (payroll review 4, item 5): the fixed profit less final
+  rebate adjustments less the recognitions posted, i.e. what is still on 1241 for the sale; payroll's write-off of a
+  balance left after exit debits it back to 1241. A recovery after exit is recognised like any collection, by
+  ``recognise_bai_ajel_profit`` inside payroll's ``collecting`` marker of the approved recovery.
 - ``reverse_bai_ajel_profit(contract, *, source_ref, user, on=None, reason="") -> ProfitResult``: a reversed run gives
   the collection back; ``user`` holds ``payroll.reverse_run``. Code: ``nothing_to_reverse``.
 - Review fix 4: both profit calls are accepted only inside payroll's ``invoicing_port.collecting`` marker (the run or
@@ -119,6 +123,16 @@ class PayrollInvoicingPort:
             return None
         return RebateResult(document_ref=adj.credit_note.number, net_amount=adj.net_amount, vat_amount=adj.vat_amount,
                             status=adj.credit_note.status)
+
+    def unearned_bai_ajel_profit(self, contract):
+        """Payroll review 4 (item 5): the fixed profit not yet recognised on the live sale (on 1241): the profit less
+        final rebate adjustments less the recognitions posted; payroll writes it back to 1241 with a balance left
+        after exit. None without a sale. Read only."""
+        sale = services.deferred_sale_of(contract)
+        if sale is None:
+            return None
+        recognised = sum((r.profit_amount for r in sale.releases.filter(status="posted")), Decimal("0.00"))
+        return services._sale_figures(sale)[0] - recognised
 
     def reverse_bai_ajel_profit(self, contract, *, source_ref, user, on=None, reason=""):
         return _result(services.reverse_deferred_profit(contract, user=user, source_ref=source_ref, date=on,

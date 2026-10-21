@@ -12,7 +12,9 @@ LIST_MAX, DASHBOARD_MAX = 15, 25
 def count(client, url):
     with CaptureQueriesContext(connection) as ctx:
         assert client.get(url).status_code == 200
-    return len(ctx.captured_queries)
+    # PostgreSQL wraps each request in a transaction (ATOMIC_REQUESTS); inside the test transaction that is a
+    # SAVEPOINT pair the view does not issue, so it is not counted.
+    return sum(1 for q in ctx.captured_queries if not q["sql"].startswith(("SAVEPOINT", "RELEASE SAVEPOINT")))
 
 
 def test_wt14_list_and_dashboard_queries_are_flat_and_within_limits(w, signed_in, monkeypatch):

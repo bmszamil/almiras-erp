@@ -181,3 +181,26 @@ def test_r71_a_band_gap_is_refused_when_payroll_submits(ws):
     assert exc.value.code == "no_authority_rule"
     assert EmployeeLoan.objects.get(pk=big.pk).status == "draft"
     assert not ApprovalRequest.objects.filter(document_type="payroll.employeeloan", document_id=big.pk).exists()
+
+
+def test_r61_a_bai_ajel_closure_is_its_own_engine_activity_and_right(w):
+    """access 10.5 (2026-10-21): DeferredSaleClosure approvals use payroll.approve_deferred_sale_closure, activity
+    payroll.deferred_sale_closure, opened at submission; its holders are the loan write-off's (seed V18)."""
+    from core.access.seed import ROLE_SEED_V18
+    from payroll.test_review_fixes_2026_10_21 import _after_exit_balance, _recovery
+
+    holders = {perm: {c for c, row in ROLE_SEED_V18.items() if perm in row[5]}
+               for perm in ("payroll.approve_loan_write_off", "payroll.approve_deferred_sale_closure")}
+    assert holders["payroll.approve_deferred_sale_closure"] == holders["payroll.approve_loan_write_off"]
+    _, c = _after_exit_balance(w)
+    x = _recovery(w, c, "30.00")
+    req = ApprovalRequest.objects.get(document_type="payroll.deferredsaleclosure", document_id=x.pk)
+    assert (req.activity.code, req.status, req.submitted_by) == ("payroll.deferred_sale_closure", "open", w.p)
+    with pytest.raises(PermissionDenied):  # its preparer
+        services.approve_deferred_sale_closure(x, user=w.p)
+    done = services.approve_deferred_sale_closure(x, user=w.mp)
+    assert done.status == "approved"
+    grant_row = AccessLog.objects.filter(event="permission_granted", actor=w.mp,
+                                         permission="payroll.approve_deferred_sale_closure").first()
+    assert grant_row is not None and grant_row.details["activity"] == "payroll.deferred_sale_closure"
+    assert ApprovalRequest.objects.get(pk=req.pk).status == "approved"

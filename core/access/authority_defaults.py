@@ -145,6 +145,9 @@ _ACTIVITIES = [
        "payroll.approve_settlement_correction", basis=AMOUNT, default=_APPROVER),
     _a("payroll.loan_write_off", "Loan write-offs", "شطب القروض", "payroll.approve_loan_write_off", basis=AMOUNT,
        default=TOP),
+    _a("payroll.deferred_sale_closure", "Bai' ajel write-offs and recoveries after exit",
+       "شطب البيع الآجل واسترداده بعد انتهاء الخدمة", "payroll.approve_deferred_sale_closure", basis=AMOUNT,
+       default=TOP),  # as payroll.loan_write_off (coordinator 2026-10-21)
     _a("payroll.payment", "Payroll payments", "مدفوعات الرواتب", "payroll.approve_payment", basis=AMOUNT,
        default=_APPROVER),
     _a("payroll.payment_reversal", "Payroll payment reversals", "عكس مدفوعات الرواتب", "payroll.reverse_payment",
@@ -158,7 +161,7 @@ _ACTIVITIES = [
     _a("payroll.profit_recognition", "Bai' ajel profit recognition", "إثبات أرباح البيع الآجل",
        "payroll.approve_profit_recognition", basis=AMOUNT, default=_APPROVER),
     _a("payroll.mudad_justification", "Mudad justifications", "مبررات منصة مدد", "payroll.approve_mudad_justification",
-       basis=NONE, default=Default(roles=("hr_officer",)), pending=True),
+       basis=NONE, default=Default(roles=("hr_officer",))),
     # banking
     _a("banking.bank_account", "Bank accounts", "الحسابات البنكية", "banking.approve_bank_account", basis=NONE),
     _a("banking.bank_account_change", "Bank account changes", "تعديلات الحسابات البنكية", "banking.approve_bank_account",

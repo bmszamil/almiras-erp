@@ -989,7 +989,7 @@ def test_rv_p6_a_legacy_delegate_membership_gives_no_approval(g):
     src = Membership.objects.get(user=g.cf, entity=g.sub, role__code="approver")
     legacy = Membership(user=g.ac, entity=g.sub, role=src.role, valid_from=access.now(), delegated_from=src,
                         valid_to=access.now() + timedelta(days=10), granted_by=g.cf, reason="old R16")
-    Membership.objects.bulk_create([legacy])  # as left in the database before core.0030 (no clean)
+    Membership.objects.bulk_create([legacy])  # as left in the database before core.0031 (no clean)
     b = bill(g, "1000.00", user=maker)
     with pytest.raises(access.AccessDenied):
         inv.approve_purchase_document(b, user=g.ac)
@@ -1050,7 +1050,7 @@ def test_rv_r84_group_actions_cover_every_descendant_of_the_group_parent(g):
 
 
 def test_rv_r77_approver_roles_of_a_frozen_version_never_change(g):
-    """Review item 13: also on SQLite (m2m_changed); PostgreSQL adds the core.0029 trigger."""
+    """Review item 13: also on SQLite (m2m_changed); PostgreSQL adds the core.0030 trigger."""
     v = approved_matrix(g, g.sub, [dict(activity="invoicing.bill", approver_roles=["ceo"])])
     rule = v.rules.get()
     approver = Role.objects.get(code="approver")

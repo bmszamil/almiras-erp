@@ -49,6 +49,9 @@ LABELS = {
     "payroll.gosi_fine": ("GOSI late-payment fines", "غرامات تأخير التأمينات"),
     "payroll.payment_reversal": ("payroll payment reversals", "عكس مدفوعات الرواتب"),
     "payroll.profit_recognition": ("bai' ajel profit recognition", "إثبات أرباح البيع الآجل"),
+    "payroll.mudad_justification": ("Mudad justifications", "مبررات مدد"),
+    "payroll.deferred_sale_closure": ("bai' ajel write-offs and recoveries after exit",
+                                      "شطب البيع الآجل واسترداده بعد انتهاء الخدمة"),
 }
 
 

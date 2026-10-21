@@ -23,6 +23,8 @@ the engine a document's activity, amount, currency, version, beneficiaries and a
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime
+from datetime import timezone as dt_timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from django.db import transaction
@@ -295,6 +297,14 @@ class DocInfo:
     label_ar: str = ""
 
 
+def version_text(value):
+    """A document version as text. An aware datetime is written in UTC, so the value set in memory before submission
+    and the one read back from the database give the same version (they differ only in time zone)."""
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        value = value.astimezone(dt_timezone.utc)
+    return str(value.isoformat() if hasattr(value, "isoformat") else value)
+
+
 def describe(document, permission, entity):
     """What the engine needs to know about ``document`` (through its adapter, else generic attributes)."""
     adapter = adapter_for(permission, document)
@@ -315,7 +325,7 @@ def describe(document, permission, entity):
         value = getattr(document, "version", None)
         if not isinstance(value, int):
             value = getattr(document, "submitted_at", None) or getattr(document, "modified_at", None) or ""
-        version = str(value.isoformat() if hasattr(value, "isoformat") else value)
+        version = version_text(value)
     people = frozenset(adapter.beneficiaries(document) or ()) if adapter.beneficiaries else frozenset()
     en = ar = ""
     if adapter.label:
@@ -443,7 +453,7 @@ def _drafted_for(entity, document, at):
 
 def activity_row(code):
     """The ``ApprovalActivity`` row of ``code``; created from the code catalogue if a flushed test database lacks it
-    (the rows mirror core/access/authority_defaults.py; migration core.0028 seeds them)."""
+    (the rows mirror core/access/authority_defaults.py; migration core.0029 seeds them)."""
     row = ApprovalActivity.objects.filter(code=code).first()
     if row is None:
         spec = authority_defaults.get(code)

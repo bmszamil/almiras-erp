@@ -351,7 +351,21 @@ ROLE_SEED_V16 = {
                               "payroll.approve_loan_write_off"),
     "accountant": _plus(ROLE_SEED_V15, "accountant", "payroll.prepare_profit_recognition"),
 }
-# V17 (migration core.0028, access §10, A24 to A32, R60, R76, R89; OQ-42, OQ-43, OQ-50, OQ-53 defaults):
+# V17 (migration core.0027, payroll slice 3, payroll.md §11.7): the payroll officer and the accountant generate the
+# leave and EOSB liability reports (nothing is posted); the payroll officer records Mudad justifications; the
+# hr_officer approves them (matrix activity payroll.mudad_justification, code default hr_officer); the managing
+# partner holds the approval as fallback like every A permission (OQ-1; payroll's matrix seam refuses it for this
+# activity). No right goes to an agent or system user (R38). The parallel approval-engine build may add its own
+# seed version; the two are renumbered at merge.
+ROLE_SEED_V17 = {
+    **ROLE_SEED_V16,
+    "payroll_officer": _plus(ROLE_SEED_V16, "payroll_officer", "payroll.prepare_liability_report",
+                             "payroll.record_mudad_justification"),
+    "accountant": _plus(ROLE_SEED_V16, "accountant", "payroll.prepare_liability_report"),
+    "hr_officer": _plus(ROLE_SEED_V16, "hr_officer", "payroll.approve_mudad_justification"),
+    "managing_partner": _plus(ROLE_SEED_V16, "managing_partner", "payroll.approve_mudad_justification"),
+}
+# V18 (migration core.0029, access §10, on top of V17 (payroll slice 3); A24 to A32, R60, R76, R89; OQ-42, OQ-43, OQ-50, OQ-53 defaults):
 # - ceo (entity; default top authority of every entity but the group parent, R67): the accountant's create and
 #   submit rights, every approval (A) and posting (P) right the CFO or the managing partner holds outside G, and the
 #   access §10 rights (grant memberships, delegate, propose and approve matrix versions, read the governance report,
@@ -396,10 +410,10 @@ def _ceo_permissions(seed):
     return tuple(sorted(perms - _NOT_FOR_CEO))
 
 
-ROLE_SEED_V17 = {
-    **ROLE_SEED_V16,
+ROLE_SEED_V18 = {
+    **ROLE_SEED_V17,
     "ceo": ("Chief executive officer / General manager", "الرئيس التنفيذي / المدير العام", "entity", "human", None,
-            _ceo_permissions(ROLE_SEED_V16)),
+            _ceo_permissions(ROLE_SEED_V17)),
     "internal_auditor": ("Internal auditor", "المدقق الداخلي", "entity", "human", None,
                          (*_VIEW_ALL, *_GOVERNANCE, "core.review_governance_report")),
     "external_auditor": ("External auditor", "المدقق الخارجي", "entity", "human", None,
@@ -412,18 +426,22 @@ ROLE_SEED_V17 = {
                            ("invoicing.create_bill", "billing.edit_contract_draft")),
     "board_representative": ("Board representative", "ممثل مجلس الإدارة", "entity", "human", None,
                              ("core.approve_authority_matrix", *_GOVERNANCE)),
-    "managing_partner": _plus(ROLE_SEED_V16, "managing_partner", *_MATRIX, *_GOVERNANCE,
+    "managing_partner": _plus(ROLE_SEED_V17, "managing_partner", *_MATRIX, *_GOVERNANCE,
                               "core.manage_assistant_assignment"),
-    "chairman": _plus(ROLE_SEED_V16, "chairman", "core.approve_authority_matrix"),
-    "access_admin": _plus(ROLE_SEED_V16, "access_admin", "core.propose_authority_matrix"),
+    "chairman": _plus(ROLE_SEED_V17, "chairman", "core.approve_authority_matrix"),
+    "access_admin": _plus(ROLE_SEED_V17, "access_admin", "core.propose_authority_matrix"),
     # payroll.approve_overtime lets an entity's matrix name the CFO for overtime (AT-87); under the code default
     # payroll's hr route (managing partner or department head) still decides (R70, payroll R45).
-    "approver": _plus(ROLE_SEED_V16, "approver", "core.manage_assistant_assignment", "payroll.approve_overtime"),
+    "approver": _plus(ROLE_SEED_V17, "approver", "core.manage_assistant_assignment", "payroll.approve_overtime"),
     "system_governance": ("Governance report system user", "مستخدم نظام تقرير الحوكمة", "entity", "system",
                           "governance", ("core.generate_governance_report",)),
 }
+# payroll.deferred_sale_closure (access 10.5, coordinator 2026-10-21): bai' ajel write-offs and recoveries after exit
+# have their own approval right, held by the holders of payroll.approve_loan_write_off.
+for _code in [c for c, row in ROLE_SEED_V18.items() if "payroll.approve_loan_write_off" in row[5]]:
+    ROLE_SEED_V18[_code] = _plus(ROLE_SEED_V18, _code, "payroll.approve_deferred_sale_closure")
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V17
+ROLE_SEED = ROLE_SEED_V18
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
@@ -436,7 +454,7 @@ SYSTEM_USERS_V2 = {
     **SYSTEM_USERS_V1,
     "deferred_sale": ("system.deferred_sale", "Bai' ajel system user", "مستخدم نظام البيع الآجل"),
 }
-# V3 (migration core.0028, access R84): the governance report system user.
+# V3 (migration core.0029, access R84): the governance report system user.
 SYSTEM_USERS_V3 = {
     **SYSTEM_USERS_V2,
     "governance": ("system.governance", "Governance report system user", "مستخدم نظام تقرير الحوكمة"),

@@ -32,7 +32,7 @@ def test_r6_seeded_parameters_are_unverified_sa_rows(db):
 
     rows = StatutoryParameter.objects.filter(jurisdiction="SA")
     payroll_codes = (set(payroll_seed.SA_PAYROLL) | set(payroll_seed.SA_GOSI)
-                     | {"gosi.rates.annuities", "jurisdiction.active", "wps.bank_codes"})
+                     | set(payroll_seed.SLICE3_SA) | {"gosi.rates.annuities", "jurisdiction.active", "wps.bank_codes"})
     assert set(rows.values_list("code", flat=True)) == set(statutory_seed.ALL_CODES) | payroll_codes
     assert set(StatutoryParameter.objects.values_list("status", flat=True)) == {"unverified"}
     assert all(r.source_url and r.source_reference for r in StatutoryParameter.objects.all())

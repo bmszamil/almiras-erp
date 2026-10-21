@@ -48,14 +48,17 @@ def get_port():
 # its reversal are refused outside it (``collection_problems``).
 _collecting = ContextVar("payroll_collecting", default=None)
 COLLECTING_DOCUMENTS = {"payroll.payrollrun": "payroll.approve_run",
-                        "payroll.finalsettlement": "payroll.approve_final_settlement"}
+                        "payroll.finalsettlement": "payroll.approve_final_settlement",
+                        # Review 4 (2026-10-21, item 5): a balance after exit recovered from the former employee.
+                        "payroll.deferredsaleclosure": "payroll.approve_deferred_sale_closure"}
 _REF = re.compile(r"^payroll\.deferredsaleinstallment:(\d+)$")
 
 
 @contextmanager
 def collecting(document, user, mode="collect"):
-    """Set by ``payroll.services`` around the effects of ``approve_run`` / ``approve_final_settlement`` (``collect``)
-    and around ``reverse_run``'s profit reversals (``reverse``)."""
+    """Set by ``payroll.services`` around the effects of ``approve_run`` / ``approve_final_settlement`` /
+    ``approve_deferred_sale_closure`` (a recovery; ``collect``) and around ``reverse_run``'s profit reversals
+    (``reverse``)."""
     token = _collecting.set((document._meta.label_lower, document.pk, getattr(user, "pk", None), mode))
     try:
         yield
@@ -66,9 +69,10 @@ def collecting(document, user, mode="collect"):
 def collection_problems(contract, *, source_ref, amount=None, user, mode="collect"):
     """Why invoicing may not recognise (``collect``) or reverse (``reverse``) the bai' ajel profit of ``source_ref``
     for ``contract`` now: [] when the call comes from the payroll approval that collected it, ``source_ref`` names a
-    deducted (run) or settled (final settlement) installment of that very contract and ``amount`` is what was
-    collected on it. Returns (problems, permission the user must hold)."""
-    from .models import DeferredSaleInstallment, FinalSettlement
+    deducted (run) or settled (final settlement) installment of that very contract, or one recovered after exit by
+    an approved recovery (``DeferredSaleClosure``, review 4), and ``amount`` is what was collected on it. Returns
+    (problems, permission the user must hold)."""
+    from .models import DeferredSaleClosure, DeferredSaleInstallment, FinalSettlement
 
     marker = _collecting.get()
     if marker is None or marker[3] != mode or marker[2] != getattr(user, "pk", None) \
@@ -89,6 +93,13 @@ def collection_problems(contract, *, source_ref, amount=None, user, mode="collec
         return wrong, permission
     if label == "payroll.payrollrun":
         ok = inst.status == DeferredSaleInstallment.Status.DEDUCTED and inst.run_id == doc_pk
+    elif label == "payroll.deferredsaleclosure":
+        closure = DeferredSaleClosure.objects.filter(pk=doc_pk, contract_id=contract.pk, entity_id=contract.entity_id,
+                                                     kind=DeferredSaleClosure.Kind.RECOVERY,
+                                                     status=DeferredSaleClosure.Status.APPROVED).first()
+        ok = (mode == "collect" and closure is not None
+              and inst.status == DeferredSaleInstallment.Status.RECOVERED_AFTER_EXIT
+              and any(part.get("installment_id") == inst.pk for part in closure.installment_parts or []))
     else:
         fs = FinalSettlement.objects.filter(pk=doc_pk).first()
         ok = (mode == "collect" and fs is not None and fs.employee_id == contract.employee_id

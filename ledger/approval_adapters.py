@@ -21,7 +21,7 @@ def register():
     from .models import JournalEntry
 
     engine.register(JournalEntry, "ledger.manual_entry", permission="ledger.post_entry", amount=lambda d: None,
-                    version=lambda d: d.modified_at.isoformat() if d.modified_at else "",
+                    version=lambda d: engine.version_text(d.modified_at) if d.modified_at else "",
                     label=lambda d: (f"Journal entry {d.number or '#' + str(d.pk)}",
                                      f"قيد يومية {d.number or '#' + str(d.pk)}"),
                     approve=_approve)

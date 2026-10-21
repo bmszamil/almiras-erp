@@ -157,12 +157,17 @@ def test_regs_18_3_hourly_contract_gosi_refused_until_the_rule_is_configured(w):
 # --- leave liability (hr OQ-6 default) --------------------------------------------------------------------------------
 
 def test_hr_oq6_leave_liability_report_posts_nothing_and_shows_rows_only_with_payslip_rights(w):
+    # Slice 3 (R75): the report is a stored snapshot generated with payroll.prepare_liability_report and read with
+    # liability_report_data (payroll/test_slice3_reports.py).
     s1 = saudi(w)
-    report = services.leave_liability_report(w.alm, date(2027, 6, 1), user=w.c)
-    row = report["rows"][0]
-    assert row["employee_code"] == s1.employee_code and report["posted"] is False
-    assert row["value"] == (row["days"] * D("13500.00") / 30).quantize(D("0.01")) == report["total"]
-    viewer = services.leave_liability_report(w.alm, date(2027, 6, 1), user=w.v)
-    assert viewer["rows"] == [] and viewer["total"] == report["total"] and viewer["employees"] == 1
+    w.pclock.set(date(2027, 6, 1))
+    stored = services.leave_liability_report(w.alm, date(2027, 6, 1), user=w.a)
+    report = services.liability_report_data(stored, user=w.c)
+    row = report["lines"][0]
+    assert row.employee_code == s1.employee_code and report["posted"] is False
+    assert row.amount == (row.untaken_days * D("13500.00") / 30).quantize(D("0.01")) == report["total_amount"]
+    viewer = services.liability_report_data(stored, user=w.v)
+    assert viewer["lines"] == [] and viewer["total_amount"] == report["total_amount"]
+    assert viewer["counts"]["valued"] == 1
     from ledger.models import JournalEntry
     assert not JournalEntry.objects.filter(entity=w.alm).exists()

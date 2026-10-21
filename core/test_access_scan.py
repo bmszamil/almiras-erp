@@ -69,6 +69,8 @@ ALLOW = {
     "payroll/services.py:runs": "the scope mechanism for payroll runs (access.scope with payroll.view, payroll R2)",
     "payroll/services.py:get_run": "the scope mechanism for one run (get_scoped_or_404 with payroll.view, R2)",
     "payroll/services.py:get_payslip": "the scope mechanism for one payslip (get_scoped_or_404, payroll.view_payslip)",
+    "payroll/services.py:get_liability_report": "the scope mechanism for one liability report (get_scoped_or_404 with "
+                                                "payroll.view, R75); the data needs view_cost_reports / view_payslip",
     "payroll/services.py:setup_entity": "payroll_setup_entity command only (operator setup of a new entity, R3)",
     "payroll/services.py:send_alerts": "payroll_alerts job only (R10, R22, R53; retention nomination)",
     "payroll/services.py:skip_installment": "always refuses (R27: a skip needs a new approved schedule)",
@@ -108,6 +110,7 @@ ALLOW = {
     # access §10: the approval engine is the mechanism that require() itself calls for every A permission (R61);
     # its helpers read the matrix and governance data for a check that require() is making.
     "core/access/engine.py:register": "called once per type from the owning app's AppConfig.ready(); no user action",
+    "core/access/engine.py:version_text": "pure (document version as text)",
     "core/access/engine.py:adapters": "read-only view of the code registry",
     "core/access/engine.py:adapter_for": "pure lookup in the code registry",
     "core/access/engine.py:activity_row": "the catalogue row of a code activity (global data, like roles)",

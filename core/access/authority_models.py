@@ -3,7 +3,7 @@
 Loaded by ``core.access.models`` so they belong to the ``core`` app. Every model has an ``entity`` FK except the
 global ``ApprovalActivity`` catalogue (like ``Role``). Records are append-only except where a docstring says which
 single write is allowed; writes go through ``core.access`` services (``_service_write``). On PostgreSQL, migration
-``core.0029`` adds triggers freezing non-draft matrix versions and their rows (R77) and generated reports (R85).
+``core.0030`` adds triggers freezing non-draft matrix versions and their rows (R77) and generated reports (R85).
 """
 import hashlib
 import json
@@ -491,7 +491,7 @@ class GovernanceReport(models.Model):
 
 def _freeze_approver_roles(sender, instance, action, reverse, pk_set, **kwargs):
     """R77 (review of 92c35c2, item 13): ``approver_roles`` of a row in a submitted, approved or superseded version
-    never change, on any database (PostgreSQL also refuses it in the core.0029 trigger)."""
+    never change, on any database (PostgreSQL also refuses it in the core.0030 trigger)."""
     if action not in ("pre_add", "pre_remove", "pre_clear"):
         return
     if reverse:  # from the role's side: every row touched

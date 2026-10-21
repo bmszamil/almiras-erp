@@ -145,6 +145,6 @@ def backwards(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-    dependencies = [("core", "0028_seed_access_v17_authority_matrix")]
+    dependencies = [("core", "0029_seed_access_v18_authority_matrix")]
 
     operations = [migrations.RunPython(forwards, backwards)]
