@@ -1343,7 +1343,7 @@ def pending_secret_retirements(user, entity):
     return _pending_retirements(entity)
 
 
-def hide_key_events(queryset, user, *, field):
+def _hide_key_events(queryset, user, *, field):
     """§7 for list views (admin): rows of the retirement kinds in ``field`` are shown only for entities where
     ``user`` holds ``zatca.view_key_events``."""
     kinds = RETIREMENT_ACTIONS if field == "action" else RETIREMENT_ALERT_KINDS

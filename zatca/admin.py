@@ -80,7 +80,7 @@ class HidesKeyEvents(ReadOnly):
     key_event_field = None
 
     def get_queryset(self, request):
-        return services.hide_key_events(super().get_queryset(request), request.user, field=self.key_event_field)
+        return services._hide_key_events(super().get_queryset(request), request.user, field=self.key_event_field)
 
     def has_view_permission(self, request, obj=None):
         if obj is not None and getattr(obj, self.key_event_field) in self.key_event_kinds() and not access.has(

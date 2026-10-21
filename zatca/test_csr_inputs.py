@@ -106,7 +106,7 @@ def test_at79_every_bad_field_is_listed_once(zw):
 def test_at79_arabic_and_ordinary_punctuation_accepted(zw):
     _ready(zw)
     egs = _create(zw, branch_name_en="", branch_name_ar="فرع جدة (الرئيسي)", industry="عقارات - تأجير، إدارة",
-                  location="RRRD2929 / Jeddah", code="EGS-1.A")
+                  location="RRRD2929 / Jeddah", code="EGS-1A")  # EGS codes: [A-Za-z0-9_-] (review 2026-10-21 item 10)
     egs = services.generate_csr(egs, user=zw.admin1)
     assert egs.status == "csr_ready"
 
