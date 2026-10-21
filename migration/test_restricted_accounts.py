@@ -19,7 +19,7 @@ CHART_1140 = {**CHART, "1103": ("حساب التطهير", "1140")}
 @pytest.fixture
 def mapped_1140(w):
     amap = services.create_account_map(w.alm, user=w.a, rows=map_rows(CHART_1140))
-    return services.approve_account_map(amap, user=w.p)
+    return t.approve_map(amap, approver=w.p)
 
 
 def test_opening_entry_may_carry_the_purification_account_balance(w, mapped_1140, loaded):

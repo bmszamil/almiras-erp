@@ -4,7 +4,8 @@ Two invented entities shaped like a Falcon migration at the cut-over date 2026-1
 
 - ``DRYH``, a holding company that enforces Sharia: banks (SAR, USD and the purification account), customers and
   vendors with open items (one in USD, one unapplied advance, one credit note), an intercompany receivable from DRYS,
-  employees' end-of-service provisions, fixed assets, bai' ajel balances (1240, 1241, 4610), VAT, equity and P&L.
+  employees' end-of-service provisions and leave, fixed assets, two bai' ajel contracts behind 1240 / 1241 (and the
+  4610 profit of the year), VAT, equity and P&L.
 - ``DRYS``, a subsidiary that does **not** enforce Sharia: a bank, one customer, the intercompany payable to DRYH and
   a conventional loan with its interest (2410, 5610: Sharia-prohibited accounts, allowed only because DRYS does not
   enforce Sharia).
@@ -92,6 +93,14 @@ EXPECTED_ERP = {
     },
 }
 EXPECTED_TOTAL_DEBIT = {HOLDING: D("695580.73"), SUBSIDIARY: D("92000.10")}
+
+# DRYH's bai' ajel contracts (W14), worked by hand: receivable = price + VAT; recognised before the cut-over = profit
+# x paid / receivable (half-up); the instalment = receivable / instalments; the instalments left = open / instalment.
+# contract: (receivable, paid, open on 1240, recognised, deferred on 1241, instalment, instalments left)
+BAI_AJEL = {
+    "BAJ-F-01": (D("41400.00"), D("17250.00"), D("24150.00"), D("1250.00"), D("1750.00"), D("1725.00"), 14),
+    "BAJ-F-02": (D("11500.00"), D("1150.00"), D("10350.00"), D("125.00"), D("1125.00"), D("1150.00"), 9),
+}  # open 34,500.00 = TB 1251 (1240); deferred 2,875.00 = - TB 1252 (1241)
 
 # DRYH's Falcon general journal for December 2026 (entry number = yy + 6-digit sequence), the movement of the TB below
 # from its opening at 30 November to its closing at the cut-over. Lines: (code, debit, credit, بيان).
@@ -191,6 +200,11 @@ def workbook_rows():
         "location": "مقر وهمي", "acquisition_date": date(2023, 1, 1), "available_for_use_date": date(2023, 1, 1),
         "cost": D(cost), "accumulated_depreciation": D(accum), "method": "straight_line", "useful_life_months": life,
         "remaining_life_months": remaining, "cost_code": cost_code, "accum_code": "1591"}
+    contract = lambda e, no, employee_no, ar, price, profit, vat, instalments, paid: {  # noqa: E731
+        "entity": e, "contract_no": no, "employee_no": employee_no, "asset_description_ar": ar,
+        "asset_description_en": None, "sale_date": date(2025, 12, 15), "sale_price": D(price),
+        "profit_amount": D(profit), "vat_amount": D(vat), "instalments": instalments, "paid_to_date": D(paid),
+        "next_instalment_period": "2027-01", "consent_ref": f"CONSENT-{no}"}
     H, S = HOLDING, SUBSIDIARY
     return {
         "entities": [entity(H, "Fictional holding (dry run)", "شركة قابضة وهمية", None, "yes"),
@@ -233,8 +247,14 @@ def workbook_rows():
                  "61000.00")],
         "employees": [
             employee(H, "F-001", "موظف وهمي أول", "Fictional Employee One", "SA", "national_id", "1999999971",
-                     "45678.90", gosi_cohort="legacy_m33"),
+                     "45678.90", gosi_cohort="legacy_m33", leave_balance_days=D("12.5")),
             employee(H, "F-002", "موظف وهمي ثان", "Fictional Employee Two", "EG", "iqama", "2999999972", "12321.10")],
+        # W14: the two contracts behind DRYH's 1240 34,500.00 and 1241 -2,875.00 (worked by hand, BAI_AJEL below).
+        "bai_ajel_contracts": [
+            contract(H, "BAJ-F-01", "F-001", "سيارة وهمية مبيعة لموظف", "36000.00", "3000.00", "5400.00", 24,
+                     "17250.00"),
+            contract(H, "BAJ-F-02", "F-002", "أجهزة وهمية مبيعة لموظف", "10000.00", "1250.00", "1500.00", 10,
+                     "1150.00")],
         "fixed_assets": [
             asset(H, "FA-F-01", "سيارة وهمية أولى", "vehicle", "150000.00", "60000.00", "1501", 60, 36),
             asset(H, "FA-F-02", "سيارة وهمية ثانية", "vehicle", "90000.00", "31500.00", "1501", 60, 39),

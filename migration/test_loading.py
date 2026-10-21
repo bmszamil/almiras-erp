@@ -181,7 +181,7 @@ def test_intercompany_code_posts_with_its_counterparty(w):
     # 1220 (loans to group entities) is intercompany but not a control account, so a replayed journal may post to it
     rows = map_rows() + [{"legacy_code": "1301", "legacy_name": "قرض لشركة تابعة", "erp_code": "1220",
                           "counterparty": "SUB"}]
-    services.approve_account_map(services.create_account_map(w.alm, user=w.a, rows=rows), user=w.p)
+    t.approve_map(services.create_account_map(w.alm, user=w.a, rows=rows), approver=w.p)
     journal = journal_file([t.line(26000010, date(2026, 3, 5), "1301", "قرض لشركة تابعة", debit="500.00"),
                             t.line(26000010, date(2026, 3, 5), "1102", "بنك تجريبي", credit="500.00")])
     services.load_journal_entries(w.alm, journal, user=w.a, apply=True)
@@ -236,7 +236,7 @@ def test_r22_opening_entry_waits_for_the_open_items_when_none_are_loaded(w, mapp
 def test_at24_opening_entry_posts_only_when_each_control_account_ties_to_the_open_items(w, open_items):
     rows = map_rows() + [{"legacy_code": "1301", "legacy_name": "مستحق من شركة تابعة", "erp_code": "1210",
                           "counterparty": "SUB"}]
-    services.approve_account_map(services.create_account_map(w.alm, user=w.a, rows=rows), user=w.p)
+    t.approve_map(services.create_account_map(w.alm, user=w.a, rows=rows), approver=w.p)
     balances = {**BALANCES, "1201": ("عملاء تجريبيون", "50000.00", "0", "0"),
                 "1301": ("مستحق من شركة تابعة", "20000.00", "0", "0"),
                 "2501": ("رأس المال", "-110000.00", "0", "0")}

@@ -37,6 +37,7 @@ def test_at19_coherent_workbook_has_no_problem_and_every_tie_out_is_zero():
         ("ALM", "fixed_assets_accumulated", "1591"): (D("30000.00"), D("30000.00"), 0),
         ("SUB", "open_payables", "2110/ALM"): (D("5000.00"), D("5000.00"), 0),
         ("SUB", "bank_accounts", "1101"): (D("55000.00"), D("55000.00"), 0),
+        ("ALM", "intercompany_mirror", "ALM/SUB"): (D("5000.00"), D("5000.00"), 0),  # W17
     }
     assert report.summary["ALM"]["tb_debit"] == report.summary["ALM"]["tb_credit"] == D("209500.00")
     assert report.chart_source == {"ALM": "template", "SUB": "template"}
@@ -103,7 +104,7 @@ def m_asset_register_missing(rows):
 
 def m_intercompany_without_counterparty(rows):
     find(rows, "account_map", entity="ALM", legacy_code="1202")["counterparty"] = None
-    return {"counterparty_missing", "tie_out"}
+    return {"counterparty_missing", "tie_out", "intercompany_mirror"}  # SUB's 2110 (ALM) has no mirror left (W17)
 
 
 def m_counterparty_on_ordinary_account(rows):
@@ -287,3 +288,89 @@ def test_an_entity_chart_replaces_the_template():
     report = check(charts={"ALM": chart})
     assert codes(report) == {"unknown_account"}  # 1501's ERP account is not in this entity's chart
     assert report.chart_source["ALM"] == "erp"
+
+
+# --- W15 to W17 (dry run 2026-10-21 gaps 7 to 9) --------------------------------------------------------------------
+
+def _add_code(rows, entity, code, name, typ, erp, debit=None, credit=None, counterparty=None):
+    """A Falcon code with a balance, on the chart, TB and map; retained earnings (2602) keep the ALM TB balanced."""
+    rows["falcon_chart"].append({"entity": entity, "code": code, "name_ar": name, "name_en": None, "type": typ,
+                                 "parent": None, "postable": "yes"})
+    rows["trial_balance"].append({"entity": entity, "code": code, "name": name, "debit": debit, "credit": credit})
+    rows["account_map"].append({"entity": entity, "legacy_code": code, "legacy_name": name, "erp_code": erp,
+                                "counterparty": counterparty, "note": None})
+    if entity == "ALM":
+        _tb(rows, "ALM", "2602")["credit"] += (debit or D("0")) - (credit or D("0"))
+
+
+def _purification(rows, held, payable):
+    _add_code(rows, "ALM", "1103", "حساب تطهير اختبار", "asset", "1140", debit=D(held))
+    _add_code(rows, "ALM", "2701", "مستحق للتطهير", "liability", "2600", credit=D(payable))
+    rows["bank_accounts"].append({**find(rows, "bank_accounts", code="ALM-RJ-SAR"), "code": "ALM-PUR",
+                                  "iban": t._wb_iban("80", "100009"), "falcon_code": "1103", "book_balance": D(held),
+                                  "book_balance_sar": D(held), "statement_balance": D(held), "is_purification": "yes"})
+
+
+def test_w16_purification_account_ties_to_the_charity_payable():
+    rows = t.workbook_rows()
+    _purification(rows, "1234.56", "1234.56")
+    report = check(rows)
+    assert report.ok and not {p.code for p in report.warnings} & {"purification_to_fund", "purification_over_funded"}
+    tie = next(x for x in report.ties if x["check"] == "purification")
+    assert (tie["account"], tie["subledger"], tie["ledger"], tie["difference"]) == ("1140/2600", D("1234.56"),
+                                                                                    D("1234.56"), 0)
+
+
+def test_w16_more_on_the_purification_account_than_owed_to_charity_is_an_error():
+    rows = t.workbook_rows()
+    _purification(rows, "1500.00", "1234.56")
+    report = check(rows)
+    (problem,) = [p for p in report.errors if p.code == "purification_over_funded"]
+    assert problem.account_code == "1140" and "265.44" in problem.message and "التطهير" in problem.message
+
+
+def test_w16_less_on_the_purification_account_is_a_warning_to_fund():
+    rows = t.workbook_rows()
+    _purification(rows, "1000.00", "1234.56")
+    report = check(rows)
+    assert report.ok
+    (warning,) = [p for p in report.warnings if p.code == "purification_to_fund"]
+    assert "234.56" in warning.message and " / " in warning.message
+
+
+def test_w15_vat_and_withholding_tax_balances_are_agreed_to_the_last_returns():
+    rows = t.workbook_rows()
+    _add_code(rows, "ALM", "2201", "ضريبة القيمة المضافة", "liability", "2200", credit=D("1500.00"))
+    _add_code(rows, "ALM", "2221", "ضريبة الاستقطاع", "liability", "2220", credit=D("300.00"))
+    report = check(rows)
+    assert report.ok
+    assert sorted(p.account_code for p in report.warnings if p.code == "tax_balance_evidence") == ["2200", "2220"]
+
+
+def test_w17_intercompany_balances_mirror_each_other_across_entities():
+    report = check()
+    tie = next(x for x in report.ties if x["check"] == "intercompany_mirror")
+    assert (tie["account"], tie["subledger"], tie["ledger"], tie["difference"]) == ("ALM/SUB", D("5000.00"),
+                                                                                    D("5000.00"), 0)
+    rows = t.workbook_rows()
+    _tb(rows, "ALM", "1202")["debit"] = D("5000.01")  # ALM says SUB owes 5,000.01; SUB says it owes 5,000.00
+    _tb(rows, "ALM", "2602")["credit"] += D("0.01")
+    find(rows, "open_receivables", document_no="INV-1003").update(amount=D("5000.01"), sar_amount=D("5000.01"))
+    report = check(rows)
+    (problem,) = report.errors
+    assert problem.code == "intercompany_mirror" and "0.01" in problem.message and "بين الشركات" in problem.message
+    report = check(rows, entities=["ALM"])  # SUB not in this run: not compared, and said so
+    assert report.ok and "intercompany_mirror_not_checked" in {p.code for p in report.warnings}
+
+
+def test_w17_the_erp_sharia_flag_governs_the_workbook_flag():
+    rows = t.workbook_rows()
+    _add_code(rows, "SUB", "2401", "قرض تقليدي", "liability", "2410", credit=D("1000.00"))
+    find(rows, "trial_balance", entity="SUB", code="1101")["debit"] += D("1000.00")
+    find(rows, "bank_accounts", code="SUB-RJ-SAR").update(book_balance=D("56000.00"), book_balance_sar=D("56000.00"))
+    assert ("sharia_prohibited", "SUB") in {(p.code, p.entity) for p in check(rows).errors}  # the sheet says yes
+    report = check(rows, erp_entities={"ALM": True, "SUB": False})  # the ERP says SUB does not enforce Sharia
+    assert [(p.code, p.entity) for p in report.errors] == [("sharia_flag_mismatch", "SUB")]
+    assert "the ERP setting governs" in report.errors[0].message
+    rows["entities"][1]["sharia_enforced"] = "no"  # the workbook corrected: the loan is a legitimate SUB balance
+    assert check(rows, erp_entities={"ALM": True, "SUB": False}).ok

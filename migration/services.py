@@ -16,9 +16,11 @@ from django.db.models import Max, Q, Sum
 from django.utils import timezone
 
 from core import access
+from core.access import engine
 from core.access.models import Kind
 from core.access.services import kind_of
 from core.models import Entity
+from ledger import control_accounts
 from ledger import services as ledger
 from ledger.models import Account, FiscalPeriod, JournalEntry, JournalLine
 
@@ -37,10 +39,11 @@ CLASS_TYPES = {
     "5": {Account.Type.EXPENSE},
 }
 PL_DIGITS = ("4", "5")
-# invoicing R97 (policy A, decision pack D32(a); specified, not built yet): control accounts are posted only by
-# invoicing documents, never by a manual journal, so opening and replayed lines on them will be refused once the
-# ledger enforces it (OQ-11). An ``is_control`` flag on the account, when the ledger adds it, is honoured too.
-CONTROL_CODES = frozenset({"1200", "2100", "1210", "2110", "2310", "2320"})
+# invoicing R97 (policy A, decision pack D32(a)): the sub-ledger control accounts, from the one list
+# (``ledger.control_accounts``, read from the chart template; 2310 and 2320 are not in the chart). Only the opening
+# entry may carry them (M6), tied out to the open items loaded (R22); replayed journals never (R8). An ``is_control``
+# flag on the account, when the ledger adds it, is honoured too.
+CONTROL_CODES = control_accounts.SUBLEDGER_CONTROL_CODES
 CUSTOMER_STATEMENT = "مستخلص عميل"
 
 
@@ -49,42 +52,55 @@ def _is_control(account):
 
 
 # --- open items loaded into the sub-ledgers (R22, R23) ---------------------------------------------------------------
-# R23: open receivables and payables are loaded into invoicing as ``source="import"`` documents (no journal entry) by
-# the loader of OQ-12, which registers a source here. A source is ``fn(entity) -> {(control code, counterparty entity
-# code or ""): Decimal}``: the signed SAR balance (debit positive, so payables are negative) of the open items loaded
-# for that entity, per control account and counterparty. Until a source is registered nothing is loaded, and an
-# opening entry with a control-account balance cannot be posted (R22).
+# R23: the sub-ledger detail behind the opening entry's balances is loaded into its module (open receivables and
+# payables into invoicing as migrated open items, end-of-service provisions into payroll, bai' ajel contracts into
+# payroll and invoicing) by ``migration.subledgers``; each module's balances are registered here as a *source*:
+# ``fn(entity) -> {(account code, counterparty entity code or ""): Decimal}``, the signed SAR balance (debit positive,
+# so payables and provisions are negative) of what is loaded for that entity, for the account codes the source
+# answers for (``codes``; the control accounts by default). The R22 posting gate ties the opening entry's lines on
+# those codes to them. The real sources are registered in ``MigrationConfig.ready``; tests may add stand-ins.
 _OPEN_ITEM_SOURCES = []
 
 
-def register_open_items_source(fn):
-    """Register a sub-ledger's open-item balances for the R22 posting gate (idempotent)."""
-    if fn not in _OPEN_ITEM_SOURCES:
-        _OPEN_ITEM_SOURCES.append(fn)
+def register_open_items_source(fn, codes=None):
+    """Register a sub-ledger's balances for the R22 posting gate (idempotent); ``codes``: the accounts it answers for
+    (default: the control accounts 1200, 1210, 2100, 2110)."""
+    if all(f is not fn for f, _ in _OPEN_ITEM_SOURCES):
+        _OPEN_ITEM_SOURCES.append((fn, frozenset(codes or CONTROL_CODES)))
 
 
 def unregister_open_items_source(fn):
-    if fn in _OPEN_ITEM_SOURCES:
-        _OPEN_ITEM_SOURCES.remove(fn)
+    _OPEN_ITEM_SOURCES[:] = [(f, c) for f, c in _OPEN_ITEM_SOURCES if f is not fn]
+
+
+def _gated_codes():
+    """The accounts the R22 gate ties out: the control accounts always, and every account a registered source
+    answers for (e.g. 2500 end of service, 1240 / 1241 bai' ajel)."""
+    out = set(CONTROL_CODES)
+    for _fn, codes in _OPEN_ITEM_SOURCES:
+        out |= codes
+    return frozenset(out)
 
 
 def _open_item_balances(entity):
-    """The open items loaded into the sub-ledgers of ``entity`` per (control code, counterparty code or ""), signed
-    (debit positive); ``None`` when no sub-ledger has registered a source yet (R23 not built)."""
+    """What is loaded into the sub-ledgers of ``entity`` per (account code, counterparty code or ""), signed (debit
+    positive); ``None`` when no sub-ledger has registered a source."""
     if not _OPEN_ITEM_SOURCES:
         return None
     out = defaultdict(lambda: ZERO)
-    for fn in _OPEN_ITEM_SOURCES:
+    for fn, codes in _OPEN_ITEM_SOURCES:
         for (code, counterparty), amount in (fn(entity) or {}).items():
-            out[(str(code), counterparty or "")] += Decimal(amount)
+            if str(code) in codes:
+                out[(str(code), counterparty or "")] += Decimal(amount)
     return dict(out)
 
 
-def _control_balances(entry):
-    """The entry's net per (control code, counterparty code or ""), debit positive."""
+def _control_balances(entry, codes=None):
+    """The entry's net per (account code, counterparty code or ""), debit positive, on the control accounts (or on
+    ``codes``)."""
     out = defaultdict(lambda: ZERO)
     for line in JournalLine.objects.filter(entry=entry).select_related("account", "counterparty_entity"):
-        if _is_control(line.account):
+        if (line.account.code in codes) if codes is not None else _is_control(line.account):
             key = (line.account.code, line.counterparty_entity.code if line.counterparty_entity_id else "")
             out[key] += line.debit - line.credit
     return dict(out)
@@ -95,12 +111,14 @@ def _label(code, counterparty):
 
 
 def _open_item_tie_out(entry):
-    """R22: the opening entry's control-account balances against the open items loaded into the sub-ledgers.
-    Returns (rows, problems); rows have account, counterparty, ledger, open_items, difference; problems are bilingual
-    texts (one per difference, or one when no open items can be loaded yet)."""
-    ledger_side = _control_balances(entry)
+    """R22: the opening entry's balances on the gated accounts (control accounts, and the accounts of the other
+    registered sub-ledgers) against what is loaded into the sub-ledgers. Returns (rows, problems); rows have account,
+    counterparty, ledger, open_items, difference; problems are bilingual texts (one per difference, or one when
+    nothing is loaded for the entity yet)."""
+    gated = _gated_codes()
+    ledger_side = _control_balances(entry, gated)
     loaded = _open_item_balances(entry.entity)
-    if loaded is None:
+    if not loaded or not any(loaded.values()):
         if not any(ledger_side.values()):
             return [], []
         shown = ", ".join(f"{_label(*k)} {v}" for k, v in sorted(ledger_side.items()) if v)
@@ -109,7 +127,7 @@ def _open_item_tie_out(entry):
                        f"في القيد الافتتاحي أرصدة على حسابات المراقبة ({shown}) ولم تُحمَّل البنود المفتوحة في الفوترة "
                        "بعد؛ لا يُرحَّل إلا بعد مطابقتها.")]
     rows, problems = [], []
-    keys = set(ledger_side) | {k for k in loaded if k[0] in CONTROL_CODES}
+    keys = set(ledger_side) | {k for k in loaded if k[0] in gated}
     for code, cp in sorted(keys):
         book = ledger_side.get((code, cp), ZERO).quantize(CENT)
         items = loaded.get((code, cp), ZERO).quantize(CENT)
@@ -117,10 +135,17 @@ def _open_item_tie_out(entry):
             continue
         diff = book - items
         rows.append({"account": code, "counterparty": cp, "ledger": book, "open_items": items, "difference": diff})
-        if diff:
+        if not diff:
+            continue
+        if code in CONTROL_CODES:
             problems.append(bi(f"Control account {_label(code, cp)}: opening entry {book}, open items loaded {items}, "
                                f"difference {diff}.",
                                f"حساب المراقبة {_label(code, cp)}: القيد الافتتاحي {book}، البنود المفتوحة المحمّلة "
+                               f"{items}، الفرق {diff}."))
+        else:
+            problems.append(bi(f"Sub-ledger account {_label(code, cp)}: opening entry {book}, sub-ledger loaded {items}, "
+                               f"difference {diff}.",
+                               f"حساب السجل الفرعي {_label(code, cp)}: القيد الافتتاحي {book}، المحمّل في السجل الفرعي "
                                f"{items}، الفرق {diff}."))
     return rows, problems
 
@@ -148,9 +173,9 @@ def _prefix(source_system):
 
 # --- access ------------------------------------------------------------------------------------------------------
 
-def _require_person(user, entity, permission, document=None):
+def _require_person(user, entity, permission, document=None, **kwargs):
     """``require`` plus R19: imports, approvals and postings are done by people, never agents or system users."""
-    grant = access.require(user, entity, permission, document=document)
+    grant = access.require(user, entity, permission, document=document, **kwargs)
     if kind_of(user) != Kind.HUMAN:
         _fail("Legacy data is imported, approved and posted by a person only.",
               "يستورد بيانات النظام السابق ويعتمدها ويرحّلها شخص فقط.", "person_only")
@@ -280,8 +305,10 @@ def _editable(account_map, user):
 
 
 def _touch(amap, user):
+    """The user becomes the last modifier; a submitted map is changed, so it must be submitted again (R13)."""
     amap.modified_by, amap.modified_at = user, timezone.now()
-    amap.save(update_fields=["modified_by", "modified_at"])
+    amap.submitted_by = amap.submitted_at = None
+    amap.save(update_fields=["modified_by", "modified_at", "submitted_by", "submitted_at"])
 
 
 @transaction.atomic
@@ -313,23 +340,71 @@ def discard_account_map(account_map, *, user):
     amap.delete()
 
 
-def approve_account_map(account_map, *, user):
-    """R13: approve a draft map. ``migration.approve_account_map`` (A): not its creator or last modifier. The previous
-    approved version becomes superseded."""
+def _map_problems(amap):
+    if not amap.rows.exists():
+        _fail("The account map has no rows.", "خريطة الحسابات بلا بنود.", "map_empty")
+    bad = []
+    for row in amap.rows.select_related("account", "counterparty"):
+        bad += [bi(f"{row.legacy_code}: {en}", f"{row.legacy_code}: {ar}")
+                for _, en, ar in _row_problems(amap.entity, row.account, row.legacy_code, row.counterparty)]
+    if bad:
+        raise MigrationError(bad)
+
+
+@transaction.atomic
+def submit_account_map(account_map, *, user):
+    """R13 as amended (M7): the preparer submits a draft map for approval. Its approval request opens now in the one
+    approval engine (activity ``migration.account_map``; the entity's matrix rows or the code default). A change to
+    the map afterwards clears the submission; the map is then submitted again (a new request)."""
+    amap = _editable(account_map, user)
+    _map_problems(amap)
+    amap = AccountMap.objects.select_for_update().get(pk=amap.pk)
+    amap.submitted_by, amap.submitted_at = user, timezone.now()
+    amap.save(update_fields=["submitted_by", "submitted_at"])
+    engine.submit(amap, user, submit_permission="migration.manage_account_map")
+    return amap
+
+
+def return_account_map(account_map, *, user, note=""):
+    """The approver returns a submitted map to its preparer (engine inbox): it stays a draft, not submitted."""
     amap = AccountMap.objects.select_related("entity").get(pk=account_map.pk)
+    _require_person(user, amap.entity, "migration.approve_account_map", document=amap, purpose="return")
+    with transaction.atomic():
+        amap = AccountMap.objects.select_for_update().get(pk=amap.pk)
+        if amap.status != AccountMap.Status.DRAFT:
+            _fail("Only a draft account map can be returned.", "تُعاد مسودة خريطة الحسابات فقط.", "map_not_draft")
+        amap.submitted_by = amap.submitted_at = None
+        amap.save(update_fields=["submitted_by", "submitted_at"])
+    return amap
+
+
+def decide_account_map(account_map, *, user, approve=True, note=""):
+    """The approver's decision on a submitted map, through the engine inbox (``engine.decide``, R61). Returns the
+    map; it is approved once the request's last step is decided (one step under the code default)."""
+    amap = AccountMap.objects.select_related("entity").get(pk=account_map.pk)
+    _require_person(user, amap.entity, "migration.view")  # a person of the entity; the engine checks the approval
+    engine.decide(amap, user, approve=approve, note=note, permission="migration.approve_account_map")
+    return AccountMap.objects.get(pk=amap.pk)
+
+
+def approve_account_map(account_map, *, user):
+    """R13: approve a submitted draft map. Reached only through the approval engine (``engine.decide`` /
+    :func:`decide_account_map`, R61, AT-25): a direct call is refused ``approval_request_required``. The engine applies
+    the entity's matrix or the code default (``migration.approve_account_map``, A): never its creator, submitter or
+    last modifier, and never self-approved (NSA, access R80 h). The previous approved version becomes superseded."""
+    amap = AccountMap.objects.select_related("entity").get(pk=account_map.pk)
+    if not engine.deciding():
+        engine.refuse("approval_request_required", user, amap.entity, "migration.approve_account_map",
+                      {"document": ["migration.accountmap", amap.pk]}, remaining=1)
     _require_person(user, amap.entity, "migration.approve_account_map", document=amap)
     with transaction.atomic():
         amap = AccountMap.objects.select_for_update().get(pk=amap.pk)
         if amap.status != AccountMap.Status.DRAFT:
             _fail("Only a draft account map can be approved.", "تُعتمد مسودة خريطة الحسابات فقط.", "map_not_draft")
-        if not amap.rows.exists():
-            _fail("The account map has no rows.", "خريطة الحسابات بلا بنود.", "map_empty")
-        bad = []
-        for row in amap.rows.select_related("account", "counterparty"):
-            bad += [bi(f"{row.legacy_code}: {en}", f"{row.legacy_code}: {ar}")
-                    for _, en, ar in _row_problems(amap.entity, row.account, row.legacy_code, row.counterparty)]
-        if bad:
-            raise MigrationError(bad)
+        if amap.submitted_at is None:
+            _fail("The account map is not submitted: its preparer submits it for approval first (R13).",
+                  "لم تُقدَّم خريطة الحسابات: يقدّمها مُعدّها للاعتماد أولًا.", "map_not_submitted")
+        _map_problems(amap)
         for old in AccountMap.objects.filter(entity=amap.entity, source_system=amap.source_system,
                                              status=AccountMap.Status.APPROVED):
             old.status = AccountMap.Status.SUPERSEDED
@@ -834,6 +909,7 @@ def load_opening_balances(entity, trial_balance, *, user, cutover, basis="closin
             journal_entry=entry, account_map=amap, file_sha256=trial_balance.sha256, lines_hash=_entry_lines_hash(entry),
             created_by=user,
         ))
+        ledger.submit_entry(entry, user=user)  # R16 (M7): its ledger.manual_entry approval request opens now
     plan.applied = True
     return plan
 
@@ -897,6 +973,7 @@ def load_journal_entries(entity, journal, *, user, cutover=None, trial_balance=N
                     journal_entry=entry, account_map=amap, file_sha256=journal.sha256,
                     lines_hash=_entry_lines_hash(entry), created_by=user,
                 ))
+                ledger.submit_entry(entry, user=user)  # R16 (M7): the approval request opens now
     except IntegrityError:  # a concurrent run imported one of these entries first (unique legacy key)
         _fail("Another import of these entries ran at the same time; nothing was created. Run again.",
               "جرى استيراد لهذه القيود في الوقت نفسه؛ لم يُنشأ شيء. أعد التشغيل.", "concurrent_import")
@@ -914,14 +991,49 @@ def _imports(entity, source_system, kind, legacy_keys):
     return list(qs)
 
 
+def _import_problems(imp, entry):
+    """What refuses the posting of an import draft, whoever posts it (R16, R22): lines changed since the import; for
+    the opening entry the R22 tie-out of its control accounts to the open items loaded; for a replayed journal any
+    control-account line (M7). Returns (problems, R22 rows); the ledger checks period, balance, Sharia and the
+    poster itself."""
+    problems, rows = [], None
+    if _entry_lines_hash(entry) != imp.lines_hash:
+        problems.append(bi(f"{imp.legacy_key}: the draft changed after the import; discard and import again.",
+                           f"{imp.legacy_key}: تغيّرت المسودة بعد الاستيراد؛ احذفها واستوردها من جديد."))
+    if imp.kind == ImportedEntry.Kind.OPENING:  # R22: control accounts tie out to the open items loaded
+        rows, gate = _open_item_tie_out(entry)
+        problems += [f"{imp.legacy_key}: {p}" for p in gate]
+    else:  # R16 amended (M7): a replayed draft with a control-account line is refused
+        hits = sorted({code for code, _cp in _control_balances(entry)})
+        if hits:
+            problems.append(bi(f"{imp.legacy_key}: replayed journals cannot post to control accounts "
+                               f"({', '.join(hits)}); load open items through the template.",
+                               f"{imp.legacy_key}: لا تُرحَّل القيود المعاد ترحيلها إلى حسابات المراقبة "
+                               f"({', '.join(hits)})؛ حمّل البنود المفتوحة من خلال القالب."))
+    return problems, rows
+
+
+def _ledger_post_check(entry):
+    """Registered with ``ledger.services.register_post_check``: an import draft posts only when
+    :func:`_import_problems` is empty, also when it is posted from the approval engine's inbox (R16, R22)."""
+    imp = ImportedEntry.objects.filter(journal_entry_id=entry.pk).first()
+    if imp is None:
+        return []
+    return _import_problems(imp, entry)[0]
+
+
 def post_imported_entries(entity, *, user, kind, legacy_keys=None, apply=False, source_system=FALCON):
-    """R16: post the import drafts of ``kind`` (``opening`` or ``journal``) through ``ledger.post_entry``, one
-    ``ledger.post_entry`` grant per draft, by ``user`` (never the preparer). A draft whose lines changed since the
-    import is refused. All or nothing: one refusal posts none. Returns {"ready", "problems", "posted"}."""
+    """R16: post the import drafts of ``kind`` (``opening`` or ``journal``) by ``user`` (never the preparer). Each
+    draft was submitted when it was loaded, which opened its approval request (activity ``ledger.manual_entry``); the
+    posting is that request's decision through the one approval engine (``engine.decide``, R61, AT-25), and the
+    ledger adapter posts it with ``ledger.services.post_entry`` and the engine's single-use grant. A draft whose lines
+    changed since the import, or an opening entry that does not tie out (R22), is refused. All or nothing: one
+    refusal posts none. Under a multi-step matrix a decision that is not the last is recorded and the draft waits
+    (``pending``). Returns {"ready", "problems", "posted", "pending", "already_posted", "details", "open_items"}."""
     _require_person(user, entity, "migration.view")
     if not access.has(user, entity, "ledger.post_entry"):  # refused up front, also in a dry run
         access.deny(user, entity, "ledger.post_entry", "no_membership")
-    result = {"ready": [], "problems": [], "posted": [], "already_posted": []}
+    result = {"ready": [], "problems": [], "posted": [], "pending": [], "already_posted": []}
     items = _imports(entity, source_system, kind, legacy_keys)
     periods = _periods(entity)
     for imp in items:
@@ -929,28 +1041,16 @@ def post_imported_entries(entity, *, user, kind, legacy_keys=None, apply=False, 
         if entry.status != JournalEntry.Status.DRAFT:
             result["already_posted"].append(imp.legacy_key)
             continue
-        problems = []
-        if _entry_lines_hash(entry) != imp.lines_hash:
-            problems.append(bi(f"{imp.legacy_key}: the draft changed after the import; discard and import again.",
-                               f"{imp.legacy_key}: تغيّرت المسودة بعد الاستيراد؛ احذفها واستوردها من جديد."))
+        problems, rows = _import_problems(imp, entry)
+        if rows is not None:
+            result.setdefault("open_items", {})[imp.legacy_key] = rows
         if user.pk in {entry.created_by_id, entry.submitted_by_id, entry.modified_by_id}:
-            problems.append(bi(f"{imp.legacy_key}: you prepared this draft; a second person posts it.",
-                               f"{imp.legacy_key}: أنت من أعدّ هذه المسودة؛ يرحّلها شخص آخر."))
+            problems.insert(0, bi(f"{imp.legacy_key}: you prepared this draft; a second person posts it.",
+                                  f"{imp.legacy_key}: أنت من أعدّ هذه المسودة؛ يرحّلها شخص آخر."))
         period = _period_problem(periods, entry.date)
         if period is not None:
             problems.append(f"{imp.legacy_key}: {period.message}")
         problems += [f"{imp.legacy_key}: {p}" for p in ledger.validate_entry(entry)]
-        if imp.kind == ImportedEntry.Kind.OPENING:  # R22: control accounts tie out to the open items loaded
-            rows, gate = _open_item_tie_out(entry)
-            result.setdefault("open_items", {})[imp.legacy_key] = rows
-            problems += [f"{imp.legacy_key}: {p}" for p in gate]
-        else:  # R16 amended (M7): a replayed draft with a control-account line is refused
-            hits = sorted({code for code, _cp in _control_balances(entry)})
-            if hits:
-                problems.append(bi(f"{imp.legacy_key}: replayed journals cannot post to control accounts "
-                                   f"({', '.join(hits)}); load open items through the template.",
-                                   f"{imp.legacy_key}: لا تُرحَّل القيود المعاد ترحيلها إلى حسابات المراقبة "
-                                   f"({', '.join(hits)})؛ حمّل البنود المفتوحة من خلال القالب."))
         (result["problems"] if problems else result["ready"]).append(imp.legacy_key)
         result.setdefault("details", {})[imp.legacy_key] = problems
     if not apply or result["problems"] or not result["ready"]:
@@ -960,8 +1060,17 @@ def post_imported_entries(entity, *, user, kind, legacy_keys=None, apply=False, 
         for imp in items:
             if imp.legacy_key not in ready:
                 continue
-            grant = _require_person(user, entity, "ledger.post_entry", document=imp.journal_entry)
-            result["posted"].append(ledger.post_entry(imp.journal_entry, grant))
+            outcome = engine.decide(imp.journal_entry, user, permission="ledger.post_entry")
+            entry = JournalEntry.objects.get(pk=imp.journal_entry_id)
+            if entry.status == JournalEntry.Status.POSTED:
+                result["posted"].append(entry)
+            else:  # an earlier step of a multi-step matrix: recorded, the next approver decides (R61)
+                result["pending"].append(imp.legacy_key)
+                result["details"][imp.legacy_key] = [bi(
+                    f"{imp.legacy_key}: your approval is recorded (request {outcome.request.pk}); the next step of the "
+                    "authority matrix posts it.",
+                    f"{imp.legacy_key}: سُجّل اعتمادك (الطلب {outcome.request.pk})؛ تُرحّله المرحلة التالية في مصفوفة "
+                    "الصلاحيات.")]
     return result
 
 

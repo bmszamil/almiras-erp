@@ -103,14 +103,15 @@ OPEN_ITEMS = {("1200", ""): D("20000.00"), ("2100", ""): D("-15000.00")}
 
 @pytest.fixture
 def open_items():
-    """Stands in for the invoicing open-item loader (R23, OQ-12; not built): ``open_items["ALM"] = {(control code,
-    counterparty code or ""): signed SAR}`` is what the R22 posting gate sees as loaded for that entity."""
+    """Stands in for the sub-ledger loads (R23; ``migration.subledgers`` is tested in ``test_subledgers.py``):
+    ``open_items["ALM"] = {(account code, counterparty code or ""): signed SAR}`` is added to what the R22 posting
+    gate sees as loaded for that entity, on the control accounts, 2500 and 1240 / 1241."""
     loaded = {}
 
     def source(entity):
         return loaded.get(entity.code, {})
 
-    services.register_open_items_source(source)
+    services.register_open_items_source(source, codes=services.CONTROL_CODES | {"2500", "1240", "1241"})
     yield loaded
     services.unregister_open_items_source(source)
 
@@ -126,4 +127,4 @@ def loaded(open_items):
 def mapped(w):
     """ALM's Falcon map drafted by A and approved by P."""
     amap = services.create_account_map(w.alm, user=w.a, rows=map_rows())
-    return services.approve_account_map(amap, user=w.p)
+    return t.approve_map(amap, approver=w.p)

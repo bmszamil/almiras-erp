@@ -56,7 +56,7 @@ def test_zero_and_negative_lines(w, mapped):
 
 def test_at4_unmapped_code_is_listed_with_totals_and_blocks_loading(w):
     amap = services.create_account_map(w.alm, user=w.a, rows=[r for r in map_rows() if r["legacy_code"] != "5201"])
-    services.approve_account_map(amap, user=w.p)
+    t.approve_map(amap, approver=w.p)
     report = services.validate_journal(w.alm, journal_file(), user=w.a)
     assert codes(report, "error") == ["unmapped"]
     assert report.unmapped == [{"code": "5201", "name": "مصروف إيجار", "rows": 1, "debit": D("3000.00"), "credit": D("0")}]
@@ -135,7 +135,7 @@ def test_trial_balance_basis_opening_needs_opening_columns(w, mapped):
 
 def test_sharia_prohibited_target_needs_a_human_decision(w):
     rows = map_rows() + [{"legacy_code": "2401", "legacy_name": "قرض بنكي", "erp_code": "2410"}]
-    services.approve_account_map(services.create_account_map(w.alm, user=w.a, rows=rows), user=w.p)
+    t.approve_map(services.create_account_map(w.alm, user=w.a, rows=rows), approver=w.p)
     balances = dict(BALANCES)
     balances["2401"] = ("قرض بنكي", "-1000.00", "0", "0")
     balances["1101"] = ("الصندوق الرئيسي", "11000.00", "500.00", "3000.00")

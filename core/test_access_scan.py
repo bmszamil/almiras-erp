@@ -91,6 +91,15 @@ ALLOW = {
     "migration/services.py:imported_entries": "the scope mechanism for imported entries (access.scope with migration.view)",
     "migration/services.py:register_open_items_source": "app wiring at ready() (R22, R23 open-item source); no user action",
     "migration/services.py:unregister_open_items_source": "app wiring (R22, R23 open-item source); no user action",
+    # Migration sub-ledger loads (2026-10-21, migration R13, R16, R22, R23, W14):
+    "core/access/engine.py:deciding": "a read of the engine's own context (inside engine.decide or not); no data",
+    "ledger/services.py:register_post_check": "app wiring at ready() (a check added to every posting); no user action",
+    "invoicing/services.py:migrated_bai_ajel_balances": "the migration R22 source for 1240 / 1241, called by the "
+                                                        "posting gate of an entry its caller is authorised to post",
+    "payroll/services.py:opening_eosb_balances": "the migration R22 source for 2500, called by the posting gate of an "
+                                                 "entry its caller is authorised to post",
+    "payroll/services.py:migrated_deferred_sale": "a lookup by legacy number for the migration loader, which then calls "
+                                                  "load_migrated_deferred_sale (payroll.create_deferred_sale)",
     "zatca/services.py:einvoices": "the scope mechanism for e-invoices (access.scope with zatca.view, R-3)",
     "zatca/services.py:einvoice_statuses": "the scope mechanism for statuses (access.scope with zatca.view_status, R-34)",
     "zatca/services.py:is_issued": "invoicing port read: may the buyer get this document (R-22, R-23); writes nothing",

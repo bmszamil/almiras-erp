@@ -52,6 +52,11 @@ class AccountMap(models.Model):
     modified_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                     related_name="+", verbose_name=bi("Last modified by", "آخر من عدّلها"))
     modified_at = models.DateTimeField(bi("Last modified at", "تاريخ آخر تعديل"), null=True, blank=True)
+    # R13 as amended (M7, AT-25): the preparer submits the draft, which opens its approval request in the one approval
+    # engine (activity migration.account_map); a change to the draft afterwards clears the submission.
+    submitted_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                     related_name="+", verbose_name=bi("Submitted by", "قدّمها"))
+    submitted_at = models.DateTimeField(bi("Submitted at", "تاريخ التقديم"), null=True, blank=True)
     approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                     related_name="+", verbose_name=bi("Approved by", "اعتمدها"))
     approved_at = models.DateTimeField(bi("Approved at", "تاريخ الاعتماد"), null=True, blank=True)

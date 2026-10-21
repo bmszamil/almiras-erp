@@ -36,6 +36,10 @@ def test_at15_full_command_flow_dry_run_by_default(w, files, loaded):
     assert "dry run" in cmd("migration_map", *base, "--user", "mig.a", "--import", files["map"])
     assert not AccountMap.objects.exists()
     cmd("migration_map", *base, "--user", "mig.a", "--import", files["map"], "--apply")
+    with pytest.raises(CommandError):  # not submitted yet: nothing to approve
+        cmd("migration_map", *base, "--user", "mig.p", "--approve", "1", "--apply")
+    assert "dry run" in cmd("migration_map", *base, "--user", "mig.a", "--submit", "1")
+    assert "submitted v1" in cmd("migration_map", *base, "--user", "mig.a", "--submit", "1", "--apply")
     with pytest.raises(CommandError):  # the preparer cannot approve
         cmd("migration_map", *base, "--user", "mig.a", "--approve", "1", "--apply")
     assert "approved v1" in cmd("migration_map", *base, "--user", "mig.p", "--approve", "1", "--apply")

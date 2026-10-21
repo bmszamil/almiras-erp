@@ -254,3 +254,15 @@ def filled_workbook(rows=None, *, labels=True, keep_examples=False, drop_key_row
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
+
+
+def approve_map(amap, *, approver, submitter=None):
+    """R13 as amended (M7): the preparer submits the draft map (unless already submitted) and ``approver`` decides it
+    through the approval engine. Returns the map as stored."""
+    from .models import AccountMap
+    from . import services
+
+    amap = AccountMap.objects.get(pk=amap.pk)
+    if amap.submitted_at is None:
+        services.submit_account_map(amap, user=submitter or amap.modified_by or amap.created_by)
+    return services.decide_account_map(amap, user=approver)

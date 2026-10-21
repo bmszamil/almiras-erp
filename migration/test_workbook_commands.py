@@ -34,6 +34,7 @@ def test_at21_map_load_post_and_tie_out_from_the_workbook(w, wb_file, open_items
     assert "draft v1: 13 rows" in cmd("migration_map", *base, "--user", "mig.a", "--apply")
     row = AccountMap.objects.get().rows.get(legacy_code="1202")
     assert (row.account.code, row.counterparty.code, row.legacy_name) == ("1210", "SUB", "مستحق من الشركة التابعة")
+    cmd("migration_map", "--entity", "ALM", "--user", "mig.a", "--submit", "1", "--apply")
     cmd("migration_map", "--entity", "ALM", "--user", "mig.p", "--approve", "1", "--apply")
 
     out = cmd("migration_validate", *base, "--user", "mig.a")
@@ -51,8 +52,10 @@ def test_at21_map_load_post_and_tie_out_from_the_workbook(w, wb_file, open_items
 
     with pytest.raises(CommandError):  # R22: no open items loaded yet for 1200, 1210 (SUB), 2100
         cmd("migration_post", "--entity", "ALM", "--user", "mig.p", "--kind", "opening", "--apply")
-    # the workbook's open items as the R23 loader would load them (receivables 23,000 and SUB 5,000; payables 11,500)
-    open_items["ALM"] = {("1200", ""): D("23000.00"), ("1210", "SUB"): D("5000.00"), ("2100", ""): D("-11500.00")}
+    # the workbook's sub-ledgers as the R23 loader loads them (receivables 23,000 and SUB 5,000; payables 11,500; end
+    # of service 8,000; the real loader is exercised in test_subledgers.py and test_dry_run.py)
+    open_items["ALM"] = {("1200", ""): D("23000.00"), ("1210", "SUB"): D("5000.00"), ("2100", ""): D("-11500.00"),
+                         ("2500", ""): D("-8000.00")}
     cmd("migration_post", "--entity", "ALM", "--user", "mig.p", "--kind", "opening", "--apply")
     assert "ties out" in cmd("migration_tieout", *base, "--user", "mig.p", "--as-of", "2026-12-31", "--posted-only")
 
