@@ -181,7 +181,12 @@ def test_w14_bai_ajel_contract_loads_sold_with_its_remaining_instalments(people)
     emp = hr.find_current_employee(w.alm, "1999999911", user=w.h)
     args = dict(user=w.po, legacy_number="BAJ-T-1", asset_description_ar="سيارة اختبار", sale_date=date(2026, 1, 10),
                 sale_price=D("12000.00"), profit_amount=D("1200.00"), vat_amount=D("1800.00"), instalments=12,
-                paid_to_date=D("4600.00"), next_period="2027-01")
+                paid_to_date=D("4600.00"), next_period="2027-01", cutover=CUT, consent_ref="SIGNED-T-1")
+    for change, code in (({"sale_date": date(2027, 1, 2)}, "sale_after_cutover"),
+                         ({"next_period": "2026-12"}, "next_period")):  # the cut-over bounds, in the service too
+        with pytest.raises(Exception) as exc:
+            payroll.load_migrated_deferred_sale(emp, **{**args, **change})
+        assert getattr(exc.value, "code", "") == code
     contract = payroll.load_migrated_deferred_sale(emp, **args)
     # receivable 13,800.00; paid 4,600.00 (4 instalments of 1,150.00); open 9,200.00; recognised 400.00
     planned = list(contract.installments.order_by("period"))
@@ -190,7 +195,8 @@ def test_w14_bai_ajel_contract_loads_sold_with_its_remaining_instalments(people)
     sale = DeferredSale.objects.get(source_id=contract.pk)
     assert (sale.pre_go_live, sale.receivable, sale.profit_amount, sale.vat_amount, sale.reference) == (
         True, D("9200.00"), D("800.00"), D("0"), "MIG-BAJ-T-1")
-    assert sale.is_posted and sale.sales_document_id is None and sale.purchase_bill_id is None
+    assert sale.sales_document_id is None and sale.purchase_bill_id is None
+    assert not sale.is_posted  # not before the entity's opening entry is posted (review of aa856fa, item 4)
     assert invoicing.migrated_bai_ajel_balances(w.alm) == {("1240", ""): D("9200.00"), ("1241", ""): D("-800.00")}
     # each later collection releases its share of the deferred profit (R112): one instalment, 800 x 1,150 / 9,200
     assert invoicing._profit_figures(sale, D("1150.00"), D("0")) == D("100.00")

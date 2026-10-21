@@ -561,6 +561,11 @@ class _Checker:
                 self.error("next_period", f"The first instalment after the cut-over ({r['next_instalment_period']}) "
                            f"must be after {cutover:%Y-%m}.", f"يجب أن يكون أول قسط بعد التحويل "
                            f"({r['next_instalment_period']}) بعد {cutover:%Y-%m}.", **where)
+            if not r["consent_ref"]:  # R49: never invented; the deductions are held until it is recorded
+                self.warning("bai_ajel_consent", f"Contract {r['contract_no']} has no signed consent reference: it "
+                             "loads with its deductions held until payroll records the employee's written consent.",
+                             f"العقد {r['contract_no']} بلا مرجع موافقة موقعة: يُحمَّل مع إيقاف الاستقطاع حتى تسجل "
+                             "الرواتب موافقة الموظف المكتوبة.", **where)
             _receivable, remaining, _recognised, unearned = figures
             if not remaining:
                 self.warning("bai_ajel_settled", "The contract is fully paid: leave it out.", "العقد مسدد بالكامل: احذفه.",

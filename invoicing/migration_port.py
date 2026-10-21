@@ -27,6 +27,7 @@ from core.access import services as access_services
 from core.access.models import Kind
 from core.models import Entity
 from ledger import fx
+from ledger import services as ledger
 
 from . import services
 from .models import Customer, InvoicingError, MigratedOpenItem, Vendor, error
@@ -80,6 +81,16 @@ def ensure_vendor(entity, *, user, code, **fields):
     return _ensure(Vendor, services.create_vendor, entity, user, code, fields)
 
 
+def refuse_after_opening(entity):
+    """Migration R25: what the R22 gate tied out to the opening entry is never added to once the entity's opening
+    entry is posted (the opening rows are locked first, so a concurrent posting waits or is seen)."""
+    if ledger.migration_opening_posted(entity, lock=True):
+        raise error(f"The migration opening entry of {entity.code} is posted; its sub-ledger was tied out to it and is "
+                    "not loaded again (migration R25).",
+                    f"القيد الافتتاحي للترحيل للكيان {entity.code} مرحّل؛ وقد طوبق سجله الفرعي معه ولا يُحمَّل مرة "
+                    "أخرى.", code="opening_posted")
+
+
 def control_of(party, side):
     """(control account, counterparty entity or None) an open item of ``party`` sits on (R39, migration W8)."""
     if side == Side.RECEIVABLE:
@@ -130,6 +141,7 @@ def load_open_item(entity, *, user, side, party, doc_type, legacy_number, docume
     problems = _check(entity, side, party, doc_type, currency, amount, amount_sar, document_date, due_date, cutover)
     if problems:
         raise services._problems_error(problems, "open_item_invalid")
+    refuse_after_opening(entity)
     control, counterparty = control_of(party, side)
     party_field = "customer" if side == Side.RECEIVABLE else "vendor"
     existing = MigratedOpenItem.objects.filter(entity=entity, doc_type=doc_type, legacy_number=legacy_number,
@@ -159,12 +171,15 @@ def load_open_item(entity, *, user, side, party, doc_type, legacy_number, docume
     return item, True
 
 
-def open_item_balances(entity):
+def open_item_balances(entity, source_system=None):
     """The R22 source: {(control account, counterparty entity code or ""): signed SAR, debit positive} of the open
     items loaded for ``entity``. Internal (no access check): the migration posting gate calls it for an entry it is
     already authorised to post."""
     out = {}
-    rows = (MigratedOpenItem.objects.filter(entity=entity).values("control_account", "counterparty__code", "doc_type")
+    items = MigratedOpenItem.objects.filter(entity=entity)
+    if source_system:  # one opening entry per legacy system (migration R22, review of aa856fa item 8)
+        items = items.filter(source_system=source_system)
+    rows = (items.values("control_account", "counterparty__code", "doc_type")
             .annotate(t=Sum("amount_sar")))
     for row in rows:
         key = (row["control_account"], row["counterparty__code"] or "")

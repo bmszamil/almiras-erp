@@ -3389,6 +3389,7 @@ def record_opening_eosb_provision(employee, *, user, amount, on):
     if emp.status == Employee.Status.TERMINATED:
         raise error("The employee's service has ended; no opening provision is recorded.",
                     "انتهت خدمة الموظف؛ لا يُسجَّل مخصص افتتاحي.", code="employee_terminated")
+    _refuse_after_opening(emp.entity)
     rows = EosbProvisionEntry.objects.filter(employee=emp)
     opening = rows.filter(kind=EosbProvisionEntry.Kind.OPENING).first()
     if opening is not None:
@@ -3403,6 +3404,15 @@ def record_opening_eosb_provision(employee, *, user, amount, on):
         return None, False
     return _save(EosbProvisionEntry(entity=emp.entity, employee=emp, date=on, kind=EosbProvisionEntry.Kind.OPENING,
                                     amount=amount)), True
+
+
+def _refuse_after_opening(entity):
+    """Migration R25 (review of aa856fa, item 1): an EOSB opening or a migrated contract is never added once the
+    entity's migration opening entry is posted (its rows are locked first: a concurrent posting waits or is seen)."""
+    if ledger.migration_opening_posted(entity, lock=True):
+        raise error(f"The migration opening entry of {entity.code} is posted; its sub-ledgers were tied out to it and "
+                    "are not loaded again (migration R25).", f"القيد الافتتاحي للترحيل للكيان {entity.code} مرحّل؛ وقد "
+                    "طوبقت سجلاته الفرعية معه ولا تُحمَّل مرة أخرى.", code="opening_posted")
 
 
 def opening_eosb_balances(entity):
@@ -3422,7 +3432,7 @@ def migrated_deferred_sale(entity, legacy_number):
 
 @transaction.atomic
 def load_migrated_deferred_sale(employee, *, user, legacy_number, asset_description_ar, sale_date, sale_price,
-                                profit_amount, instalments, paid_to_date, next_period, vat_amount="0",
+                                profit_amount, instalments, paid_to_date, next_period, cutover, vat_amount="0",
                                 asset_description_en="", consent_ref=""):
     """Migration W14 (dry run gap 4): a bai' ajel contract sold in the legacy system before go-live, from the
     workbook's contracts sheet. ``payroll.create_deferred_sale``, a person.
@@ -3435,7 +3445,12 @@ def load_migrated_deferred_sale(employee, *, user, legacy_number, asset_descript
     one taking the rest), and invoicing registers the sale through the port (no invoice, no ZATCA, no entry). The
     1240 / 1241 balances are in the migration opening entry, which posts only when these contracts tie out (R22).
     No rate, fee or penalty (R48). Idempotent per legacy number; other figures are refused. Returns the contract,
-    or None when nothing is left to collect."""
+    or None when nothing is left to collect.
+
+    The sale is on or before the cut-over ``cutover`` and the first instalment after its month. The employee's
+    signed consent to salary deductions (R49) is never invented: without ``consent_ref`` the contract loads with its
+    deductions **held** (no run or final settlement deducts it, W14 warns) until a person records the consent
+    (:func:`record_deferred_sale_consent`). Refused once the opening entry is posted (migration R25)."""
     emp = Employee.objects.select_related("entity").get(pk=employee.pk)
     _require(user, emp.entity, "payroll.create_deferred_sale")
     if emp.employment_basis != Basis.KSA_EMPLOYEE:
@@ -3456,6 +3471,12 @@ def load_migrated_deferred_sale(employee, *, user, legacy_number, asset_descript
                     "decimals) and at least one instalment are required.", "يلزم ثمن بيع أكبر من صفر وربح لا يقل عن صفر "
                     "وأقل من الثمن وضريبة ومسدد لا تقل عن صفر (بالريال بخانتين) وقسط واحد على الأقل.", code="sale_invalid")
     _check_period(next_period)
+    if cutover is None or sale_date > cutover:
+        raise error(f"The sale date {sale_date} must be on or before the cut-over {cutover}.",
+                    f"يجب أن يكون تاريخ البيع {sale_date} في تاريخ التحويل {cutover} أو قبله.", code="sale_after_cutover")
+    if next_period <= f"{cutover:%Y-%m}":
+        raise error(f"The first instalment after the cut-over ({next_period}) must be after {cutover:%Y-%m}.",
+                    f"يجب أن يكون أول قسط بعد التحويل ({next_period}) بعد {cutover:%Y-%m}.", code="next_period")
     receivable = price + vat
     if paid >= receivable:
         if paid > receivable:
@@ -3473,11 +3494,12 @@ def load_migrated_deferred_sale(employee, *, user, legacy_number, asset_descript
             raise error(f"Contract {legacy} was loaded before with other figures; it never changes.",
                         f"حُمّل العقد {legacy} سابقًا بأرقام أخرى؛ ولا يتغير.", code="migrated_contract_changed")
         return existing
+    _refuse_after_opening(emp.entity)
     c = _save(DeferredSaleContract(
         entity=emp.entity, employee=emp, asset_description_ar=asset_description_ar.strip(),
         asset_description_en=(asset_description_en or "").strip(), cost=price - profit, profit_amount=profit,
         vat_amount=vat, term_months=n, first_period=next_period,
-        consent_ref=(consent_ref or f"Legacy contract {legacy} / عقد سابق {legacy}")[:200], sale_date=sale_date,
+        consent_ref=(consent_ref or "").strip()[:200], sale_date=sale_date,
         sale_document_ref=f"MIG-{legacy}"[:60], pre_go_live=True, legacy_number=legacy, paid_before_cutover=paid,
         number=_next_number(emp.entity, "BAJ", int(next_period[:4])), status=DeferredSaleContract.Status.SOLD,
         created_by=user))
@@ -3491,6 +3513,32 @@ def load_migrated_deferred_sale(employee, *, user, legacy_number, asset_descript
         period = _next_period(period)
     invoicing_port.get_port().register_migrated_bai_ajel_sale(c, user=user, remaining_receivable=remaining,
                                                               unearned_profit=unearned)
+    return c
+
+
+@transaction.atomic
+def record_deferred_sale_consent(contract, *, user, consent_ref):
+    """Migration W14 (review of aa856fa, item 2): the employee's signed consent to salary deductions (R49) for a
+    migrated contract loaded without one. Until it is recorded the contract's deductions are held. Recorded once by
+    a person holding ``payroll.create_deferred_sale`` (the payroll officer) and logged with the reference."""
+    c = _lock(DeferredSaleContract, contract.pk)
+    _require(user, c.entity, "payroll.create_deferred_sale")
+    ref = str(consent_ref or "").strip()[:200]
+    if not c.pre_go_live:
+        raise error("The consent of an ERP contract is recorded with its terms (R49).",
+                    "تُسجَّل موافقة العقد في النظام مع شروطه.", code="not_migrated")
+    if not ref:
+        raise error("The reference of the signed consent is required (R49).", "مرجع الموافقة الموقعة مطلوب.",
+                    code="consent_required")
+    if c.consent_ref.strip():
+        raise error("The consent of this contract is already recorded.", "سُجّلت موافقة هذا العقد مسبقًا.",
+                    code="consent_recorded")
+    c.consent_ref, c.modified_by, c.modified_at = ref, user, _now()
+    _save(c)
+    access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=c.entity,
+                        permission="payroll.create_deferred_sale",
+                        details={"action": "record_bai_ajel_consent", "contract": c.pk, "number": c.number,
+                                 "legacy_number": c.legacy_number, "consent_ref": ref})
     return c
 
 
@@ -3770,6 +3818,8 @@ def _compute_settlement(fs, user, *, separate_amount, consent_ref):
         planned = list(c.installments.filter(status=DeferredSaleInstallment.Status.PLANNED).order_by("period", "pk"))
         outstanding = sum((i.amount for i in planned), ZERO)
         sale_room = room if (allowed and c.final_dues_undertaking) else min(room, max(ZERO, room - eosb_part))
+        if not c.consent_ref.strip():  # R49 (migration W14): held until the signed consent is recorded
+            sale_room = ZERO
         take = min(outstanding, sale_room)
         rest = take
         for inst in planned:

@@ -95,6 +95,8 @@ ALLOW = {
     # Migration sub-ledger loads (2026-10-21, migration R13, R16, R22, R23, W14):
     "core/access/engine.py:deciding": "a read of the engine's own context (inside engine.decide or not); no data",
     "ledger/services.py:register_post_check": "app wiring at ready() (a check added to every posting); no user action",
+    "ledger/services.py:migration_opening_posted": "internal state read (is the opening entry posted) for services "
+                                                   "that already checked their caller's rights (migration R25)",
     "invoicing/services.py:migrated_bai_ajel_balances": "the migration R22 source for 1240 / 1241, called by the "
                                                         "posting gate of an entry its caller is authorised to post",
     "payroll/services.py:opening_eosb_balances": "the migration R22 source for 2500, called by the posting gate of an "

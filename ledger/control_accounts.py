@@ -6,7 +6,8 @@ made in one place and every entity's chart follows it:
 - ``SUBLEDGER_CONTROL_CODES``: trade receivables 1200, due from group entities 1210, trade payables 2100, due to group
   entities 2110. Their balance is the sum of the open customer or vendor items in invoicing (R39); only invoicing
   documents (and the migration opening entry, M6) post to them. 2310 and 2320, named in earlier drafts of policy A,
-  are not in the chart and are not control accounts.
+  are not in the chart and are not control accounts; when 2310 is added (invoicing R99) it carries the ``control``
+  flag (invoicing OQ-81, team default).
 - ``TAX_CONTROL_CODES``: VAT input 1310, VAT output 2200, withholding tax payable 2220. Documents set them; a person
   never types them on a document line. They are not sub-ledger control accounts: their opening balance is evidenced
   against the last VAT and withholding-tax returns (migration W15), not against open items.

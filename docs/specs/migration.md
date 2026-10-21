@@ -178,6 +178,16 @@ The validation report and profiles are not stored: they are printed and optional
     "Sub-ledger account …" (en/ar). Nothing loaded at all for the entity keeps the single "no open items are loaded"
     refusal. The gate also runs inside the ledger posting (R16 amended). **[tests `test_subledgers.py`,
     `test_engine_routing.py`, `test_dry_run.py`]**
+    *Amended 2026-10-21 (review of aa856fa, items 5, 8 and 9; as built):* (a) **Per legacy system.** A source that
+    keeps the legacy system of its rows registers with `per_source_system=True` and is called `fn(entity,
+    source_system)`: the opening entry of Falcon ties only to the Falcon open items (invoicing's
+    `open_item_balances`); payroll's and the bai' ajel sources hold one opening per entity. (b) **Bank drafts first.**
+    A bank account still a draft in banking on a GL account the opening entry posts to refuses the posting ("approve
+    them in banking before the opening entry posts", en/ar): its approval sets the GL account's currency, which it can
+    no longer do once the balance is posted. (c) **Refusal codes.** Inside the ledger posting the gate's refusal has
+    the code `import_not_ready` only when the ledger itself found nothing; a ledger refusal (period, balance, Sharia,
+    restricted account …) keeps its own code and the gate's lines are added to its messages. **[tests
+    `test_review_aa856fa.py`]**
 23. Open items are loaded into invoicing as `source="import"` documents, status `final`, no ZATCA call, **no journal
     entry** (invoicing R115, OQ-24), by the loader of OQ-12, in the dry-run / `--apply` model; a re-run skips existing
     items (unique on entity, party, document type, legacy number). Intercompany items need the party's group entity and
@@ -208,7 +218,11 @@ The validation report and profiles are not stored: they are printed and optional
       through the payroll invoicing port, `invoicing.register_migrated_deferred_sale`); W14.
     The entity's workbook rows must check without an error first (W4 to W17, against its ERP chart and Sharia flag).
     Dry run unless `apply` (the same service calls in a transaction that is rolled back); all or nothing; a re-run
-    skips what is loaded and refuses changed values. Fixed assets are not loaded (no fixed-assets module; W11 ties them
+    skips what is loaded and refuses changed values (*amended 2026-10-21, review of aa856fa item 7:* banks too: a bank
+    account loaded before with another bank, currency, GL account, opening statement balance or date, IBAN, account
+    number, Sharia basis or purification flag is refused, not skipped; it is changed in banking with an approved
+    change). Only people run a section (R19): an agent or system user is refused before anything is read
+    (`agent_forbidden`). Fixed assets are not loaded (no fixed-assets module; W11 ties them
     in the workbook only). **[tests `test_subledgers.py`, `test_dry_run.py`]**
 24. Each entity is loaded with the user's own membership in that entity (no cascade, M7); workbook, checks and
     messages are the same for every entity (new entities are data).
@@ -216,6 +230,36 @@ The validation report and profiles are not stored: they are printed and optional
     refused once the entity's opening entry is posted (en/ar): the sub-ledgers are tied out to the opening balances
     once, before posting; later corrections go through each module's own documents. **[test
     `test_subledgers.py::test_r22_*`]**
+    *Amended 2026-10-21 (review of aa856fa, item 1; as built):* the refusal is in every write service that feeds an
+    R22 source, not only in the loader: `invoicing.migration_port.load_open_item`,
+    `invoicing.services.register_migrated_deferred_sale`, `payroll.services.record_opening_eosb_provision` and
+    `payroll.services.load_migrated_deferred_sale` refuse with `opening_posted` (en/ar) once the opening entry is
+    posted or reversed (`ledger.services.migration_opening_posted`). Each first locks the entity's opening journal
+    entry rows (`select_for_update`), the row the posting locks too, and the loader takes that lock inside its own
+    transaction before it loads anything, so a load and the posting of the opening entry never interleave (on
+    PostgreSQL the later one waits and then sees the other). Banks, employees and leave do not feed the gate and are
+    not refused (banks are approved before posting, R22 (b)). **[tests `test_review_aa856fa.py`,
+    `invoicing/test_deferred_sale_migrated.py`]**
+26. *Added 2026-10-21 (review of aa856fa, item 2).* **Bai' ajel consent is never invented.** A contract row without the
+    employee's written consent reference loads with its deductions **held**: no payroll run deducts its instalments
+    and no final settlement recovers it (payroll R49) — W14 warns (`bai_ajel_consent`). A payroll officer records the
+    consent later (`payroll.record_deferred_sale_consent(contract, user, consent_ref)`, `payroll.create_deferred_sale`,
+    migrated contracts only, once, logged with the reference); the next run deducts from then on, with the instalments
+    held so far caught up as for any held instalment. A balance left after exit is closed in payroll (write-off or
+    recovery). **[tests `invoicing/test_deferred_sale_migrated.py`, `test_dry_run.py::test_w14_a_contract_without_consent_*`]**
+27. *Added 2026-10-21 (review of aa856fa, item 10).* **Service-level bounds.** `load_migrated_deferred_sale` refuses a
+    sale dated after the cut-over (`sale_after_cutover`) and a first instalment in or before the cut-over month
+    (`next_period`), whatever the workbook checks said; invoicing's `create_deferred_sale` refuses a migrated contract
+    (`migrated_contract`: it is already sold and never gets an ERP invoice). A migrated sale counts as posted
+    (`DeferredSale.is_posted`) only once the entity's migration opening entry is posted. **Journal replay, all or nothing per
+    step:** `load_journal_entries` creates every replayed entry of a file in one transaction (one refusal creates
+    none); `post_imported_entries` checks every selected draft first and posts none while any has a problem, then
+    decides the ready ones in one transaction (one ledger refusal rolls all back). Each draft is a `ledger.manual_entry`
+    whose matrix rule is chosen by its own amount (access R73 bands), so with a banded matrix one run may post the
+    small entries while the large ones wait for their next approval step (`pending`, listed per legacy key): the
+    replay is complete only when nothing is `pending`, and `tie_out_ledger` (R18) with `include_drafts=False` shows
+    what is still missing. Nothing is ever half-posted within one entry. **[tests `test_review_aa856fa.py`,
+    `test_subledgers.py`, `test_loading.py`]**
 
 ## 5. Accounting
 

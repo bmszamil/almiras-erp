@@ -476,9 +476,12 @@ SHEETS = (
         # and invoicing as migrated contracts so payroll collects their remaining instalments.
         "bai_ajel_contracts", "Bai' ajel contracts", "عقود البيع الآجل",
         "Every employee bai' ajel (deferred-payment sale) contract with a balance on the cut-over date. The amounts "
-        "still open must equal the employee deferred-sale receivable and the deferred profit in the trial balance.",
+        "still open must equal the employee deferred-sale receivable and the deferred profit in the trial balance. "
+        "Without the signed consent reference the contract loads with its salary deductions held until payroll "
+        "records the consent.",
         "كل عقد بيع آجل لموظف عليه رصيد في تاريخ التحويل. يجب أن تساوي المبالغ المتبقية ذمم البيع الآجل للموظفين "
-        "والأرباح المؤجلة في ميزان المراجعة.",
+        "والأرباح المؤجلة في ميزان المراجعة. وبلا مرجع الموافقة الموقعة يُحمَّل العقد مع إيقاف استقطاعه من الراتب حتى "
+        "تسجل الرواتب الموافقة.",
         (
             ENTITY,
             C("contract_no", "Contract number (legacy)", "رقم العقد (السابق)", required=True, width=14, max_len=40),

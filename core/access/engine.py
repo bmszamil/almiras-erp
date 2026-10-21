@@ -91,6 +91,7 @@ MESSAGES = {
 _explicit = ContextVar("approval_engine_decide", default=None)
 _purpose = ContextVar("approval_engine_purpose", default="approve")
 _note = ContextVar("approval_engine_note", default=("", ""))  # (reason, reason_en) of a decide() return/reject
+_sending_back = ContextVar("approval_engine_send_back", default=False)  # decide() runs a return / reject hook
 
 
 class StepRecorded(Exception):
@@ -990,7 +991,11 @@ def _send_back(document, user, entity, info, permission, hook, action, note, not
     with transaction.atomic():
         result = None
         if hook is not None:
-            result = hook(document, user, note)
+            back = _sending_back.set(True)
+            try:
+                result = hook(document, user, note)
+            finally:
+                _sending_back.reset(back)
         req = find_request(entity, info)
         if req is not None and req.status == ApprovalRequest.Status.OPEN:
             with purpose("check"):
@@ -1118,9 +1123,10 @@ def current_version(request, document):
 # --- module seams --------------------------------------------------------------------------------------------------
 
 def deciding():
-    """True while :func:`decide` (the engine inbox) runs a module's approve service. A module whose approvals must
-    come through the inbox only (e.g. the migration account map, migration R13) refuses a direct call otherwise."""
-    return _explicit.get() is not None
+    """True while :func:`decide` (the engine inbox) runs a module's approve, return or reject service. A module whose
+    decisions must come through the inbox only (e.g. the migration account map, migration R13) refuses a direct call
+    otherwise."""
+    return _explicit.get() is not None or _sending_back.get()
 
 
 def grant_rule_source(grant):

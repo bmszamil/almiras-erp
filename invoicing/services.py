@@ -4998,6 +4998,10 @@ def create_deferred_sale(source, *, approver, employee, purchase_bill, cost, pro
     invoice (new number) replaces the rejected one.
     """
     entity = Entity.objects.get(pk=source.entity_id)
+    if getattr(source, "pre_go_live", False) or getattr(source, "legacy_number", ""):  # review of aa856fa, item 10
+        raise error("A contract migrated from the legacy system is already sold; no sale invoice is created for it "
+                    "(migration W14).", "العقد المرحَّل من النظام السابق مبيع مسبقًا؛ لا تُنشأ له فاتورة بيع.",
+                    code="migrated_contract")
     system = access.system_user(DEFERRED_SALE_SYSTEM)
     access.require(system, entity, "invoicing.create_deferred_sale")
     if access_services.kind_of(approver) != Kind.HUMAN:  # payroll R38: people approve sales, never agents or systems
@@ -5014,6 +5018,10 @@ def create_deferred_sale(source, *, approver, employee, purchase_bill, cost, pro
         live = (DeferredSale.objects.select_for_update(of=("self",)).select_related("sales_document")
                 .filter(entity=entity, source_type=source_type, source_id=source_id, active=True).first())
         if live is not None:
+            if live.pre_go_live:  # migration W14: a migrated contract is already sold; it never gets an ERP invoice
+                raise error(f"Contract {live.reference} was migrated from the legacy system already sold; no sale "
+                            "invoice is created for it (migration W14).", f"العقد {live.reference} مرحَّل من النظام "
+                            "السابق مبيعًا؛ لا تُنشأ له فاتورة بيع.", code="migrated_contract")
             if live.sales_document.status != Status.REJECTED:
                 doc = live.sales_document
                 doc.warnings = []
@@ -5127,6 +5135,9 @@ def register_migrated_deferred_sale(source, *, user, remaining_receivable, unear
     system = access.system_user(DEFERRED_SALE_SYSTEM)
     source_type, source_id = source._meta.label_lower, source.pk
     with transaction.atomic():
+        from . import migration_port
+
+        migration_port.refuse_after_opening(entity)  # migration R25: never after the opening entry is posted
         live = _live_deferred_sale(entity, source, lock=True)
         if live is not None:
             if (live.pre_go_live, live.legacy_number, live.receivable, live.profit_amount) != (True, legacy, remaining,

@@ -41,7 +41,6 @@ from core.access import AccessDenied
 
 from . import workbook_checks
 from . import workbook_spec as spec
-from .models import ImportedEntry
 from .readers import bi
 
 SECTIONS = ("receivables", "payables", "banks", "employees", "eosb", "leave", "bai_ajel")
@@ -149,7 +148,7 @@ def _party_fields(record, vendor=False):
     return fields
 
 
-def _open_items(entity, book, user, result, *, receivable, cutover):
+def _open_items(entity, book, user, result, *, receivable, cutover, source_system):
     from invoicing import migration_port
     from invoicing import services as invoicing
     from invoicing.models import MigratedOpenItem
@@ -182,7 +181,7 @@ def _open_items(entity, book, user, result, *, receivable, cutover):
             entity, user=user, side=side, party=party, doc_type=types[r["document_type"]],
             legacy_number=r["document_no"], document_date=r["document_date"], due_date=r["due_date"],
             currency=r["currency"], amount=r["amount"], amount_sar=r["sar_amount"], cutover=cutover,
-            description=r["description"] or "", file_sha256=book.sha256))
+            description=r["description"] or "", file_sha256=book.sha256, source_system=source_system))
         if outcome is not None:
             _count(result, outcome)
 
@@ -215,11 +214,18 @@ def _banks(entity, book, user, result, *, cutover, amap):
             result.problems.append(bi(f"{where}: Falcon {r['falcon_code']} is not in the approved account map.",
                                       f"{where}: الكود {r['falcon_code']} غير موجود في خريطة الحسابات المعتمدة."))
             continue
-        existing = entity.bank_accounts.filter(code=r["code"]).first()
-        if existing is not None:
-            result.skipped += 1
-            continue
         balance = r["statement_balance"] if r["statement_balance"] is not None else r["book_balance"]
+        existing = entity.bank_accounts.select_related("bank", "gl_account").filter(code=r["code"]).first()
+        if existing is not None:  # R23: a re-run skips the same account and refuses changed values
+            if _bank_differs(existing, r, row.account, balance, cutover):
+                result.problems.append(bi(
+                    f"{where}: bank account {r['code']} was loaded before with other values; change it in banking "
+                    "(an approved change), not through the workbook.",
+                    f"{where}: حُمّل الحساب البنكي {r['code']} سابقًا بقيم أخرى؛ عدّله في وحدة البنوك بطلب تعديل معتمد "
+                    "لا من خلال الملف."))
+            else:
+                result.skipped += 1
+            continue
         account = _attempt(result, "bank_accounts", r.row, lambda r=r, row=row, balance=balance:
                            banking.create_bank_account(
                                entity, user=user, code=r["code"], name_en=r["name_en"], name_ar=r["name_ar"],
@@ -230,6 +236,19 @@ def _banks(entity, book, user, result, *, cutover, amap):
                                is_purification_account=bool(r["is_purification"])))
         if account is not None:
             _count(result, account)
+
+
+def _bank_differs(existing, r, gl, balance, cutover):
+    from banking import iban as iban_rules
+    from banking.crypto import keyed_hash
+
+    iban = iban_rules.normalise(r["iban"] or "")
+    number = "".join(str(r["account_number"] or "").split())
+    return ((existing.bank.code, existing.currency_id, existing.gl_account_id, existing.opening_statement_balance,
+             existing.opening_statement_date, existing.is_purification_account, existing.sharia_basis)
+            != (r["bank"], r["currency"], gl.pk, balance, cutover, bool(r["is_purification"]), r["sharia_basis"])
+            or existing.iban_hash != (keyed_hash(iban) if iban else "")
+            or existing.account_number_last4 != (number[-4:] if number else ""))
 
 
 # --- employees, end of service, leave, bai' ajel (hr, payroll) ------------------------------------------------------
@@ -318,7 +337,7 @@ def _leave(entity, book, user, result, *, cutover):
             _count(result, (adjustment, True))
 
 
-def _bai_ajel(entity, book, user, result):
+def _bai_ajel(entity, book, user, result, *, cutover):
     from payroll import services as payroll
 
     employees = {r["employee_no"]: r for r in book.records("employees", entity.code) if r["employee_no"]}
@@ -341,16 +360,20 @@ def _bai_ajel(entity, book, user, result):
                                  sale_price=r["sale_price"], profit_amount=r["profit_amount"],
                                  vat_amount=r["vat_amount"] if r["vat_amount"] is not None else Decimal("0"),
                                  instalments=r["instalments"], paid_to_date=r["paid_to_date"],
-                                 next_period=r["next_instalment_period"], consent_ref=r["consent_ref"] or ""))
+                                 next_period=r["next_instalment_period"], cutover=cutover,
+                                 consent_ref=r["consent_ref"] or ""))
         if ok:
             _count(result, (contract, contract is not None and not known))
 
 
 # --- the run ---------------------------------------------------------------------------------------------------------
 
-def _opening_posted(entity):
-    return ImportedEntry.objects.filter(entity=entity, kind=ImportedEntry.Kind.OPENING,
-                                        journal_entry__status__in=("posted", "reversed")).exists()
+def _opening_posted(entity, *, lock=False):
+    """The entity's opening entry is posted (or reversed). With ``lock`` its rows are locked first (inside the load's
+    transaction), so the posting of the opening entry and this load never interleave (R22, R25)."""
+    from ledger import services as ledger
+
+    return ledger.migration_opening_posted(entity, lock=lock)
 
 
 def check_entity(entity, book):
@@ -367,6 +390,12 @@ def load_subledgers(entity, book, sections, *, user, apply=False, source_system=
     unknown = set(sections) - set(SECTIONS)
     if unknown or not sections:
         raise ValueError(f"Sections are {', '.join(SECTIONS)}. / الأقسام: {', '.join(SECTIONS)}.")
+    from core import access
+    from core.access.models import Kind
+    from core.access.services import kind_of
+
+    if kind_of(user) != Kind.HUMAN:  # R19: legacy data is loaded by people only, never agents or system users
+        access.deny(user, entity, "migration.import", "agent_forbidden")
     plan = SubledgerPlan(entity.code, check_entity(entity, book))
     record = book.entity(entity.code)
     cutover = record["cutover_date"] if record is not None else None
@@ -375,9 +404,9 @@ def load_subledgers(entity, book, sections, *, user, apply=False, source_system=
         plan.sections[name] = SectionResult()
     if plan.report.errors or cutover is None:
         return plan
-    posted = _opening_posted(entity)
     try:
         with transaction.atomic():
+            posted = _opening_posted(entity, lock=True)  # R25: locked before anything is loaded
             for name in ordered:
                 result = plan.sections[name]
                 if name in GATED and posted:
@@ -387,7 +416,8 @@ def load_subledgers(entity, book, sections, *, user, apply=False, source_system=
                         "طوبقت سجلاته الفرعية معه ولا تُحمَّل مرة أخرى."))
                     continue
                 if name in ("receivables", "payables"):
-                    _open_items(entity, book, user, result, receivable=name == "receivables", cutover=cutover)
+                    _open_items(entity, book, user, result, receivable=name == "receivables", cutover=cutover,
+                                source_system=source_system)
                 elif name == "banks":
                     _banks(entity, book, user, result, cutover=cutover, amap=_approved_map(entity, source_system))
                 elif name == "employees":
@@ -397,7 +427,7 @@ def load_subledgers(entity, book, sections, *, user, apply=False, source_system=
                 elif name == "leave":
                     _leave(entity, book, user, result, cutover=cutover)
                 else:
-                    _bai_ajel(entity, book, user, result)
+                    _bai_ajel(entity, book, user, result, cutover=cutover)
             if not apply or plan.problems:
                 raise _Rollback
     except _Rollback:

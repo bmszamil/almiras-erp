@@ -396,3 +396,13 @@ def test_w14_bai_ajel_balances_need_their_contracts(dry):
     rows["bai_ajel_contracts"][1]["employee_no"] = "F-999"
     report = workbook_checks.check_workbook(workbook.read_workbook(t.filled_workbook(rows)))
     assert "unknown_employee" in {p.code for p in report.errors}
+
+
+def test_w14_a_contract_without_consent_warns_that_its_deductions_are_held(dry):
+    """Review of aa856fa, item 2 (migration R26): the consent is never invented; without it W14 warns, no error."""
+    rows = f.workbook_rows()
+    rows["bai_ajel_contracts"][0]["consent_ref"] = None
+    report = workbook_checks.check_workbook(workbook.read_workbook(t.filled_workbook(rows)))
+    assert not report.errors
+    held = [p for p in report.warnings if p.code == "bai_ajel_consent"]
+    assert len(held) == 1 and "held" in held[0].message and "موافقة" in held[0].message

@@ -2213,9 +2213,12 @@ class DeferredSale(_DeferredSaleWritten):
     @property
     def is_posted(self):
         """The receivable is on 1240: the sale invoice is final and posted, or the contract was migrated (its balance
-        is in the migration opening entry, tied out before it posts, migration R22)."""
+        is in the migration opening entry, tied out before it posts, migration R22): only once that opening entry
+        is posted (review of aa856fa, item 4)."""
         if self.pre_go_live:
-            return True
+            from ledger import services as ledger
+
+            return ledger.migration_opening_posted(self.entity, booked=False)
         doc = self.sales_document
         return doc.status == "final" and doc.journal_entry_id is not None
 

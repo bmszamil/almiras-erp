@@ -52,7 +52,7 @@ def backwards(apps, schema_editor):
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("core", "0032_seed_access_v19_zatca_key_events"),
+        ("core", "0034_mfa_lock_alert_rekey_event"),
         ("invoicing", "0033_review5_catch_up"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]

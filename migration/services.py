@@ -62,34 +62,37 @@ def _is_control(account):
 _OPEN_ITEM_SOURCES = []
 
 
-def register_open_items_source(fn, codes=None):
+def register_open_items_source(fn, codes=None, *, per_source_system=False):
     """Register a sub-ledger's balances for the R22 posting gate (idempotent); ``codes``: the accounts it answers for
-    (default: the control accounts 1200, 1210, 2100, 2110)."""
-    if all(f is not fn for f, _ in _OPEN_ITEM_SOURCES):
-        _OPEN_ITEM_SOURCES.append((fn, frozenset(codes or CONTROL_CODES)))
+    (default: the control accounts 1200, 1210, 2100, 2110). ``per_source_system``: the source is called
+    ``fn(entity, source_system)`` and answers for the opening entry of that legacy system only (review of aa856fa,
+    item 8); otherwise ``fn(entity)`` for every opening entry of the entity."""
+    if all(f is not fn for f, _, _ in _OPEN_ITEM_SOURCES):
+        _OPEN_ITEM_SOURCES.append((fn, frozenset(codes or CONTROL_CODES), per_source_system))
 
 
 def unregister_open_items_source(fn):
-    _OPEN_ITEM_SOURCES[:] = [(f, c) for f, c in _OPEN_ITEM_SOURCES if f is not fn]
+    _OPEN_ITEM_SOURCES[:] = [(f, c, p) for f, c, p in _OPEN_ITEM_SOURCES if f is not fn]
 
 
 def _gated_codes():
     """The accounts the R22 gate ties out: the control accounts always, and every account a registered source
     answers for (e.g. 2500 end of service, 1240 / 1241 bai' ajel)."""
     out = set(CONTROL_CODES)
-    for _fn, codes in _OPEN_ITEM_SOURCES:
+    for _fn, codes, _per in _OPEN_ITEM_SOURCES:
         out |= codes
     return frozenset(out)
 
 
-def _open_item_balances(entity):
+def _open_item_balances(entity, source_system=FALCON):
     """What is loaded into the sub-ledgers of ``entity`` per (account code, counterparty code or ""), signed (debit
     positive); ``None`` when no sub-ledger has registered a source."""
     if not _OPEN_ITEM_SOURCES:
         return None
     out = defaultdict(lambda: ZERO)
-    for fn, codes in _OPEN_ITEM_SOURCES:
-        for (code, counterparty), amount in (fn(entity) or {}).items():
+    for fn, codes, per_source_system in _OPEN_ITEM_SOURCES:
+        found = fn(entity, source_system) if per_source_system else fn(entity)
+        for (code, counterparty), amount in (found or {}).items():
             if str(code) in codes:
                 out[(str(code), counterparty or "")] += Decimal(amount)
     return dict(out)
@@ -110,14 +113,14 @@ def _label(code, counterparty):
     return f"{code} ({counterparty})" if counterparty else code
 
 
-def _open_item_tie_out(entry):
+def _open_item_tie_out(entry, source_system=FALCON):
     """R22: the opening entry's balances on the gated accounts (control accounts, and the accounts of the other
     registered sub-ledgers) against what is loaded into the sub-ledgers. Returns (rows, problems); rows have account,
     counterparty, ledger, open_items, difference; problems are bilingual texts (one per difference, or one when
     nothing is loaded for the entity yet)."""
     gated = _gated_codes()
     ledger_side = _control_balances(entry, gated)
-    loaded = _open_item_balances(entry.entity)
+    loaded = _open_item_balances(entry.entity, source_system)
     if not loaded or not any(loaded.values()):
         if not any(ledger_side.values()):
             return [], []
@@ -368,6 +371,9 @@ def submit_account_map(account_map, *, user):
 def return_account_map(account_map, *, user, note=""):
     """The approver returns a submitted map to its preparer (engine inbox): it stays a draft, not submitted."""
     amap = AccountMap.objects.select_related("entity").get(pk=account_map.pk)
+    if not engine.deciding():  # R13 (review of aa856fa, item 6): returned through the engine inbox only
+        engine.refuse("approval_request_required", user, amap.entity, "migration.approve_account_map",
+                      {"document": ["migration.accountmap", amap.pk], "action": "return"}, remaining=1)
     _require_person(user, amap.entity, "migration.approve_account_map", document=amap, purpose="return")
     with transaction.atomic():
         amap = AccountMap.objects.select_for_update().get(pk=amap.pk)
@@ -1001,8 +1007,9 @@ def _import_problems(imp, entry):
         problems.append(bi(f"{imp.legacy_key}: the draft changed after the import; discard and import again.",
                            f"{imp.legacy_key}: تغيّرت المسودة بعد الاستيراد؛ احذفها واستوردها من جديد."))
     if imp.kind == ImportedEntry.Kind.OPENING:  # R22: control accounts tie out to the open items loaded
-        rows, gate = _open_item_tie_out(entry)
+        rows, gate = _open_item_tie_out(entry, imp.source_system)
         problems += [f"{imp.legacy_key}: {p}" for p in gate]
+        problems += [f"{imp.legacy_key}: {p}" for p in _bank_draft_problems(entry)]
     else:  # R16 amended (M7): a replayed draft with a control-account line is refused
         hits = sorted({code for code, _cp in _control_balances(entry)})
         if hits:
@@ -1011,6 +1018,23 @@ def _import_problems(imp, entry):
                                f"{imp.legacy_key}: لا تُرحَّل القيود المعاد ترحيلها إلى حسابات المراقبة "
                                f"({', '.join(hits)})؛ حمّل البنود المفتوحة من خلال القالب."))
     return problems, rows
+
+
+def _bank_draft_problems(entry):
+    """Review of aa856fa, item 9 (R23 banks): a bank account still a draft on a GL account the opening entry posts
+    to is approved (or discarded) in banking first: its approval sets the GL account's currency, which it can no
+    longer do once the opening balance is posted on it."""
+    from banking.models import BankAccount
+
+    accounts = JournalLine.objects.filter(entry=entry).values_list("account_id", flat=True)
+    drafts = sorted(BankAccount.objects.filter(entity=entry.entity, status=BankAccount.Status.DRAFT,
+                                               gl_account_id__in=list(accounts)).values_list("code", flat=True))
+    if not drafts:
+        return []
+    shown = ", ".join(drafts)
+    return [bi(f"Bank account draft(s) {shown} on the opening entry's accounts: approve them in banking before the "
+               "opening entry posts (R23).", f"مسودات حسابات بنكية ({shown}) على حسابات القيد الافتتاحي: اعتمدها في "
+               "وحدة البنوك قبل ترحيل القيد الافتتاحي.")]
 
 
 def _ledger_post_check(entry):

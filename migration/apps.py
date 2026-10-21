@@ -32,7 +32,8 @@ class MigrationConfig(AppConfig):
         from invoicing import services as invoicing
         from payroll import services as payroll
 
-        services.register_open_items_source(migration_port.open_item_balances, codes=services.CONTROL_CODES)
+        services.register_open_items_source(migration_port.open_item_balances, codes=services.CONTROL_CODES,
+                                            per_source_system=True)
         services.register_open_items_source(payroll.opening_eosb_balances, codes={payroll.EOSB_PROVISION})
         services.register_open_items_source(invoicing.migrated_bai_ajel_balances,
                                             codes={invoicing.EMPLOYEE_RECEIVABLE, invoicing.DEFERRED_PROFIT})

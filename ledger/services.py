@@ -159,6 +159,18 @@ def _post_check_problems(entry):
     return out, code
 
 
+def migration_opening_posted(entity, *, lock=False, booked=True):
+    """True once ``entity``'s migration opening entry (a draft linked to an ``ImportedEntry`` of kind ``opening``,
+    migration R14) is posted (``booked``: posted or reversed; else posted only). With ``lock`` the opening entries
+    are locked first (``select_for_update``), so a sub-ledger load and the posting of the opening entry, which locks
+    the same row, run one after the other (migration R22, R25). Internal: callers check their own rights."""
+    qs = JournalEntry.objects.filter(entity=entity, legacy_import__kind="opening")
+    if lock:
+        list(qs.select_for_update(of=("self",)).order_by("pk").values_list("pk", flat=True))
+    statuses = BOOKED if booked else (JournalEntry.Status.POSTED,)
+    return qs.filter(status__in=statuses).exists()
+
+
 def _restricted_codes(lines):
     return sorted({line.account.code for line in lines} & restricted.codes())
 
@@ -730,12 +742,11 @@ def _post(entry, posted_by):
     period = _lock_for_posting(entry)
     problems = validate_entry(entry)
     extra, extra_code = _post_check_problems(entry)
-    problems += extra
-    if problems:
-        exc = LedgerError(problems)
+    if problems or extra:
+        exc = LedgerError(problems + extra)
         if {restricted.refusal(code) for code in restricted.codes()} & set(problems):
             exc.code = "restricted_account"
-        elif extra_code:
+        elif not problems:  # the ledger's own refusal keeps its code; an app's code only when the ledger found none
             exc.code = extra_code
         raise exc
     entry.period = period
