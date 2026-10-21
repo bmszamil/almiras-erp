@@ -32,7 +32,7 @@ from core.access import services as access_services
 from core.access.models import AccessLog, Kind, Membership
 from core.models import Currency, Entity, label_part, validate_country_code, validate_vat_number
 from core.services import entity_ready_to_issue
-from ledger import fx
+from ledger import control_accounts, fx
 from ledger import restricted as ledger_restricted
 from ledger import services as ledger
 from ledger.models import Account, FiscalPeriod, JournalEntry, JournalLine, LedgerError
@@ -58,6 +58,7 @@ from .models import (
     IncomeType,
     InvoicingError,
     InvoicingSettings,
+    MigratedOpenItem,
     NoteReason,
     PayableAllocation,
     PaymentApplication,
@@ -110,7 +111,11 @@ PURIFICATION_CASH_NOTE_AR = (
     "تُحفظ لصالح الجهات الخيرية ولا تعود إلى الشركة وليست متاحة لاستخدامها؛ تُعرض منفصلة عن النقد والبنوك وتُستبعد "
     "من النقد وما في حكمه في قائمة التدفقات النقدية (معيار المحاسبة الدولي 7 / القسم 7 من المعيار الدولي للمنشآت "
     "الصغيرة والمتوسطة) مع هذا الإفصاح. والالتزام المقابل هو المستحق للجهات الخيرية (2600).")
-CONTROL_ACCOUNTS = frozenset({AR, AR_GROUP, AP, AP_GROUP, VAT_OUTPUT, VAT_INPUT, WHT_PAYABLE, PURIFICATION_BANK})
+# Set by the document, never typed on a line: the sub-ledger and tax control accounts of the one list
+# (ledger.control_accounts, read from the chart template) and the restricted purification account.
+CONTROL_ACCOUNTS = control_accounts.SUBLEDGER_CONTROL_CODES | control_accounts.TAX_CONTROL_CODES | {PURIFICATION_BANK}
+assert {AR, AR_GROUP, AP, AP_GROUP} == control_accounts.SUBLEDGER_CONTROL_CODES
+assert {VAT_OUTPUT, VAT_INPUT, WHT_PAYABLE} == control_accounts.TAX_CONTROL_CODES
 # R112 / E28 (payroll R47, owner decision E8): the bai' ajel sale to an employee. Its receivable is 1240, its lines
 # credit 1250 (cost) and 1241 (deferred profit); profit moves from 1241 to 4610 as the instalments are collected.
 EMPLOYEE_RECEIVABLE, DEFERRED_PROFIT, SALE_ASSET, SALE_PROFIT_INCOME = "1240", "1241", "1250", "4610"
@@ -4443,6 +4448,11 @@ def reconcile_subledger(entity, as_of, *, user):
     for p in booked(VendorPayment.objects.all()).select_related("vendor__group_entity"):
         add(*ctrl(p.vendor, False), p.currency_id,
             -p.amount if p.kind == VendorPayment.Kind.REFUND_RECEIVED else p.settled_amount)
+    # R115 / migration R23: open items migrated at the cut-over are on the control accounts through the migration
+    # opening entry, in the functional currency (OQ-13 default: SAR at the cut-over).
+    for item in MigratedOpenItem.objects.filter(entity=entity, cutover_date__lte=as_of).select_related("counterparty"):
+        add(item.control_account, item.counterparty.code if item.counterparty_id else None, entity.base_currency_id,
+            item.signed_sar)
     gl = {}
     lines = JournalLine.objects.filter(
         entry__entity=entity, entry__status__in=ledger.BOOKED, entry__date__lte=as_of,
@@ -5073,6 +5083,75 @@ def _live_deferred_sale(entity, source, *, lock=False):
     return qs.first()
 
 
+def register_migrated_deferred_sale(source, *, user, remaining_receivable, unearned_profit):
+    """Migration W14 (dry run gap 4): the bai' ajel sale of a contract migrated from the legacy system at the
+    cut-over. Called by payroll's ``load_migrated_deferred_sale`` through ``invoicing.payroll_port`` inside its
+    transaction; ``user`` is the person loading it (``payroll.create_deferred_sale``, a human).
+
+    No sale invoice or purchase bill exists in the ERP (pre-go-live), nothing goes to ZATCA and nothing is posted:
+    the remaining receivable is on 1240 and the profit still deferred on 1241 through the migration opening entry,
+    which posts only when these contracts tie out to it (migration R22). The row holds the figures still open at the
+    cut-over: ``profit_amount`` = ``unearned_profit``, ``cost`` = ``remaining_receivable`` less it, no VAT (charged
+    before the cut-over), so each later collection releases its pro-rata share of the deferred profit (R112, payroll
+    E12) and the last one releases the rest. Idempotent per contract; other figures are refused."""
+    entity = Entity.objects.get(pk=source.entity_id)
+    if access_services.kind_of(user) != Kind.HUMAN:
+        access.deny(user, entity, "payroll.create_deferred_sale", "agent_forbidden")
+    access.require(user, entity, "payroll.create_deferred_sale")
+    legacy = str(getattr(source, "legacy_number", "") or "").strip()[:40]
+    if not getattr(source, "pre_go_live", False) or not legacy:
+        raise error("Only a contract migrated from the legacy system is registered this way (W14).",
+                    "يُسجَّل بهذه الطريقة العقد المرحَّل من النظام السابق فقط.", code="not_migrated")
+    remaining = _money(remaining_receivable, "remaining receivable", positive=True, currency=SAR)
+    unearned = _money(unearned_profit, "unearned profit", currency=SAR)
+    if unearned >= remaining:
+        raise error(f"The unearned profit {unearned} must be less than the receivable still open {remaining}.",
+                    f"يجب أن يكون الربح غير المتحقق {unearned} أقل من الذمة المتبقية {remaining}.",
+                    code="unearned_above_receivable")
+    system = access.system_user(DEFERRED_SALE_SYSTEM)
+    source_type, source_id = source._meta.label_lower, source.pk
+    with transaction.atomic():
+        live = _live_deferred_sale(entity, source, lock=True)
+        if live is not None:
+            if (live.pre_go_live, live.legacy_number, live.receivable, live.profit_amount) != (True, legacy, remaining,
+                                                                                          unearned):
+                raise error(f"Contract {legacy} was registered before with other figures.",
+                            f"سُجّل العقد {legacy} سابقًا بأرقام أخرى.", code="migrated_contract_changed")
+            return live
+        customer = _employee_customer(entity, source.employee, system)
+        sale = DeferredSale(
+            entity=entity, sales_document=None, customer=customer, purchase_bill=None, source_type=source_type,
+            source_id=source_id, cost=remaining - unearned, profit_amount=unearned, vat_amount=ZERO,
+            possession_date=getattr(source, "sale_date", None) or timezone.localdate(),
+            possession_evidence_ref=f"Legacy contract {legacy} / عقد سابق {legacy}"[:200], approved_by=user,
+            approved_at=timezone.now(), created_by=user, pre_go_live=True, legacy_number=legacy,
+        )
+        sale._service_write = True
+        try:
+            with transaction.atomic():
+                sale.save()
+        except IntegrityError:
+            raise error(f"Contract {legacy} is already registered in {entity.code}.",
+                        f"العقد {legacy} مسجل مسبقًا في {entity.code}.", code="migrated_contract_twice") from None
+    return sale
+
+
+def migrated_bai_ajel_balances(entity):
+    """The R22 source for 1240 / 1241 (migration W14): {("1240", ""): receivable still open, ("1241", ""): - profit
+    still deferred} of the contracts migrated into ``entity``, before any collection after the cut-over. Internal (no
+    access check): the migration posting gate calls it."""
+    receivable = profit = ZERO
+    for sale in DeferredSale.objects.filter(entity=entity, pre_go_live=True, active=True):
+        receivable += sale.receivable
+        profit += sale.profit_amount
+    out = {}
+    if receivable:
+        out[(EMPLOYEE_RECEIVABLE, "")] = receivable.quantize(CENT)
+    if profit:
+        out[(DEFERRED_PROFIT, "")] = -profit.quantize(CENT)
+    return out
+
+
 def deferred_sale_of(source):
     """The live bai' ajel sale approved in ``source`` (a payroll contract), or None. No right needed: payroll reads
     its own contract's sale through its port (``invoicing.payroll_port``)."""
@@ -5138,6 +5217,11 @@ def create_deferred_sale_adjustment(source, *, approver, source_ref, amount, rea
         if sale is None:
             raise error("No bai' ajel sale was invoiced for this contract (R112).",
                         "لم تصدر فاتورة بيع آجل لهذا العقد.", code="no_deferred_sale")
+        if sale.pre_go_live:  # no ERP invoice to credit: a rebate on a migrated contract is a human decision (W14)
+            raise error(f"Contract {sale.reference} was migrated from the legacy system; it has no ERP sale invoice to "
+                        "credit, so an ibra' rebate on it is not issued here (migration W14).",
+                        f"العقد {sale.reference} مرحَّل من النظام السابق وليس له فاتورة بيع في النظام لإصدار إشعار دائن "
+                        "عليها، فلا يصدر الإبراء عليه هنا.", code="migrated_contract")
         invoice = sale.sales_document
         if invoice.status != Status.FINAL or invoice.journal_entry_id is None:
             raise error(f"The sale invoice {invoice.number} is not posted yet; a rebate waits for it (R128).",
@@ -5299,10 +5383,10 @@ def recognise_deferred_profit(source, *, user, collected_amount, collected_on, s
                             "first.", f"سُجّل التحصيل {ref} بمبلغ {existing.collected_amount} لا {amount}؛ اعكسه أولًا.",
                             code="collection_changed")
             return existing
-        doc = sale.sales_document
-        if doc.status != Status.FINAL or doc.journal_entry_id is None:
-            raise error(f"The sale invoice {doc.number} is not posted yet (it waits for ZATCA reporting); its profit is "
-                        "recognised once it is posted (R41, R112).", f"فاتورة البيع {doc.number} لم تُرحَّل بعد (بانتظار "
+        number = sale.reference
+        if not sale.is_posted:
+            raise error(f"The sale invoice {number} is not posted yet (it waits for ZATCA reporting); its profit is "
+                        "recognised once it is posted (R41, R112).", f"فاتورة البيع {number} لم تُرحَّل بعد (بانتظار "
                         "الإبلاغ للهيئة)؛ تتحقق أرباحها بعد ترحيلها.", code="sale_not_posted")
         posted = DeferredProfitRelease.objects.filter(deferred_sale=sale, status=DeferredProfitRelease.Status.POSTED)
         collected_before = Decimal(posted.aggregate(t=Sum("collected_amount"))["t"] or ZERO).quantize(CENT)
@@ -5323,8 +5407,8 @@ def recognise_deferred_profit(source, *, user, collected_amount, collected_on, s
             grant = access.require(system, entity, "invoicing.post_deferred_profit", document=release)
             with _posting_as(system):
                 entry = ledger.create_entry(
-                    entity, collected_on, f"Bai' ajel profit {doc.number} / أرباح البيع الآجل {doc.number}", None,
-                    user=system, reference=doc.number, post=True, grant=grant, document=release,
+                    entity, collected_on, f"Bai' ajel profit {number} / أرباح البيع الآجل {number}", None,
+                    user=system, reference=number, post=True, grant=grant, document=release,
                 )
             release.journal_entry = entry
             release._service_write = True
@@ -5365,6 +5449,8 @@ def catch_up_deferred_profit(source, *, source_ref, on, approver):
         existing = posted.filter(source_ref=ref).first()
         if existing is not None:
             return existing
+        if sale.pre_go_live:  # no rebate is issued on a migrated contract, so nothing was held back
+            return None
         doc = sale.sales_document
         if doc.status != Status.FINAL or doc.journal_entry_id is None:
             return None
@@ -5448,7 +5534,7 @@ def _deferred_profit_lines(release):
     _require_posting_context(release, DeferredProfitRelease.Status.POSTED)
     if release.profit_amount <= ZERO:
         raise error("No profit to recognise.", "لا يوجد ربح للتحقق.", code="nothing_to_post")
-    number = release.deferred_sale.sales_document.number
+    number = release.deferred_sale.reference
     label = f"{number} {release.source_ref}"
     return [
         {"account": DEFERRED_PROFIT, "debit": release.profit_amount,

@@ -3369,6 +3369,132 @@ def approve_deferred_sale(contract, *, user, sale_date=None):
 
 
 # =====================================================================================================
+# Migration openings (migration.md W10, W14, R22, R23; dry run 2026-10-21 gaps 4 and 5)
+# =====================================================================================================
+
+@transaction.atomic
+def record_opening_eosb_provision(employee, *, user, amount, on):
+    """Migration W10: the end-of-service provision of ``employee`` at the cut-over ``on``, from the workbook. It is the
+    first row of the employee's EOSB sub-ledger (``EosbProvisionEntry`` of kind ``opening``, R24); it books nothing:
+    the 2500 balance is in the migration opening entry, which posts only when these openings tie out to it (migration
+    R22). The first run then accrues from it (R24). ``payroll.prepare_run``, a person. Once per employee, before any
+    other EOSB row; a re-run with the same amount and date is skipped, another amount is refused. Returns (row,
+    created); a zero provision records nothing (None, False)."""
+    emp = Employee.objects.select_related("entity").get(pk=employee.pk)
+    _require(user, emp.entity, "payroll.prepare_run")
+    amount = _dec(amount, "amount")
+    if amount < 0 or amount != amount.quantize(CENT):
+        raise error(f"An opening provision is SAR, zero or more, with 2 decimals ({amount}).",
+                    f"المخصص الافتتاحي بالريال، صفر أو أكثر، بخانتين عشريتين ({amount}).", code="eosb_opening_amount")
+    if emp.status == Employee.Status.TERMINATED:
+        raise error("The employee's service has ended; no opening provision is recorded.",
+                    "انتهت خدمة الموظف؛ لا يُسجَّل مخصص افتتاحي.", code="employee_terminated")
+    rows = EosbProvisionEntry.objects.filter(employee=emp)
+    opening = rows.filter(kind=EosbProvisionEntry.Kind.OPENING).first()
+    if opening is not None:
+        if opening.amount == amount and opening.date == on:
+            return opening, False
+        raise error(f"An opening provision of {opening.amount} on {opening.date} is already recorded; it never changes.",
+                    f"سُجّل مخصص افتتاحي بمبلغ {opening.amount} في {opening.date}؛ ولا يتغير.", code="eosb_opening_changed")
+    if rows.exists():
+        raise error("The opening provision is recorded once, before any accrual (R24).",
+                    "يُسجَّل المخصص الافتتاحي مرة واحدة قبل أي استحقاق.", code="eosb_opening_after_rows")
+    if amount == ZERO:
+        return None, False
+    return _save(EosbProvisionEntry(entity=emp.entity, employee=emp, date=on, kind=EosbProvisionEntry.Kind.OPENING,
+                                    amount=amount)), True
+
+
+def opening_eosb_balances(entity):
+    """The R22 source for 2500 (migration W10): {("2500", ""): - the opening provisions recorded} (a credit).
+    Internal (no access check): the migration posting gate calls it."""
+    total = EosbProvisionEntry.objects.filter(entity=entity, kind=EosbProvisionEntry.Kind.OPENING).aggregate(
+        t=Sum("amount"))["t"] or ZERO
+    return {(EOSB_PROVISION, ""): -Decimal(total).quantize(CENT)} if total else {}
+
+
+def migrated_deferred_sale(entity, legacy_number):
+    """The migrated bai' ajel contract of ``entity`` with ``legacy_number``, or None (internal: the migration loader
+    tells a new load from a re-run)."""
+    return DeferredSaleContract.objects.filter(entity=entity, pre_go_live=True,
+                                               legacy_number=str(legacy_number or "").strip()[:40]).first()
+
+
+@transaction.atomic
+def load_migrated_deferred_sale(employee, *, user, legacy_number, asset_description_ar, sale_date, sale_price,
+                                profit_amount, instalments, paid_to_date, next_period, vat_amount="0",
+                                asset_description_en="", consent_ref=""):
+    """Migration W14 (dry run gap 4): a bai' ajel contract sold in the legacy system before go-live, from the
+    workbook's contracts sheet. ``payroll.create_deferred_sale``, a person.
+
+    The contract is created already sold (``pre_go_live``): sale price (cost + the fixed profit), VAT charged to the
+    employee, ``instalments`` in all and ``paid_to_date`` collected before the cut-over. The receivable still open is
+    price + VAT − paid; the profit recognised before the cut-over is the fixed profit × paid / receivable, rounded
+    half-up once (the ERP's rule, invoicing R112), the rest is still deferred on 1241. The instalments still to
+    collect are planned from ``next_period`` at the contract's monthly instalment (receivable / instalments, the last
+    one taking the rest), and invoicing registers the sale through the port (no invoice, no ZATCA, no entry). The
+    1240 / 1241 balances are in the migration opening entry, which posts only when these contracts tie out (R22).
+    No rate, fee or penalty (R48). Idempotent per legacy number; other figures are refused. Returns the contract,
+    or None when nothing is left to collect."""
+    emp = Employee.objects.select_related("entity").get(pk=employee.pk)
+    _require(user, emp.entity, "payroll.create_deferred_sale")
+    if emp.employment_basis != Basis.KSA_EMPLOYEE:
+        raise error("Bai' ajel is for KSA employees only (OQ-32 default).", "البيع الآجل لموظفي المملكة فقط.",
+                    code="sale_basis")
+    if emp.status == Employee.Status.TERMINATED:
+        raise error("The employee's service has ended: a balance after exit is a closure, not a migrated contract.",
+                    "انتهت خدمة الموظف: الرصيد بعد انتهاء الخدمة يُعالج بالإقفال لا بعقد مرحَّل.", code="employee_terminated")
+    legacy = str(legacy_number or "").strip()[:40]
+    price, profit, vat = _dec(sale_price, "sale_price"), _dec(profit_amount, "profit_amount"), _dec(vat_amount, "vat")
+    paid, n = _dec(paid_to_date, "paid_to_date"), int(instalments or 0)
+    if not legacy or not (asset_description_ar or "").strip() or sale_date is None:
+        raise error("The legacy contract number, the asset in Arabic and the sale date are required.",
+                    "رقم العقد السابق ووصف الأصل بالعربية وتاريخ البيع مطلوبة.", code="sale_invalid")
+    if any(v != v.quantize(CENT) for v in (price, profit, vat, paid)) or price <= 0 or profit < 0 or profit >= price \
+            or vat < 0 or paid < 0 or n < 1:
+        raise error("Sale price above zero, profit zero or more and below the price, VAT and paid zero or more (SAR, 2 "
+                    "decimals) and at least one instalment are required.", "يلزم ثمن بيع أكبر من صفر وربح لا يقل عن صفر "
+                    "وأقل من الثمن وضريبة ومسدد لا تقل عن صفر (بالريال بخانتين) وقسط واحد على الأقل.", code="sale_invalid")
+    _check_period(next_period)
+    receivable = price + vat
+    if paid >= receivable:
+        if paid > receivable:
+            raise error(f"Paid {paid} is more than the receivable {receivable} (price + VAT).",
+                        f"المسدد {paid} أكبر من المستحق {receivable} (الثمن مع الضريبة).", code="over_collected")
+        return None  # settled before the cut-over: nothing to load
+    remaining = receivable - paid
+    unearned = profit - _round(Fraction(profit) * Fraction(paid) / Fraction(receivable))
+    existing = DeferredSaleContract.objects.filter(entity=emp.entity, pre_go_live=True, legacy_number=legacy).first()
+    if existing is not None:
+        same = (existing.employee_id == emp.pk and existing.sale_price == price and existing.profit_amount == profit
+                and existing.vat_amount == vat and existing.paid_before_cutover == paid
+                and existing.term_months == n and existing.sale_date == sale_date)
+        if not same:
+            raise error(f"Contract {legacy} was loaded before with other figures; it never changes.",
+                        f"حُمّل العقد {legacy} سابقًا بأرقام أخرى؛ ولا يتغير.", code="migrated_contract_changed")
+        return existing
+    c = _save(DeferredSaleContract(
+        entity=emp.entity, employee=emp, asset_description_ar=asset_description_ar.strip(),
+        asset_description_en=(asset_description_en or "").strip(), cost=price - profit, profit_amount=profit,
+        vat_amount=vat, term_months=n, first_period=next_period,
+        consent_ref=(consent_ref or f"Legacy contract {legacy} / عقد سابق {legacy}")[:200], sale_date=sale_date,
+        sale_document_ref=f"MIG-{legacy}"[:60], pre_go_live=True, legacy_number=legacy, paid_before_cutover=paid,
+        number=_next_number(emp.entity, "BAJ", int(next_period[:4])), status=DeferredSaleContract.Status.SOLD,
+        created_by=user))
+    each = _round(Fraction(receivable) / n)
+    whole, rest = divmod(remaining, each)  # the instalments left at the contract's monthly amount (rounded up)
+    count = max(1, int(whole) + (1 if rest else 0))
+    period = next_period
+    for i in range(count):
+        amount = each if i < count - 1 else remaining - each * (count - 1)
+        _save(DeferredSaleInstallment(entity=c.entity, contract=c, period=period, amount=amount))
+        period = _next_period(period)
+    invoicing_port.get_port().register_migrated_bai_ajel_sale(c, user=user, remaining_receivable=remaining,
+                                                              unearned_profit=unearned)
+    return c
+
+
+# =====================================================================================================
 # Final settlement (3.8; R28, R34, R49; E5; compliance C-A11, review 14)
 # =====================================================================================================
 

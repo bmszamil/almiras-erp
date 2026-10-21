@@ -846,6 +846,13 @@ class DeferredSaleContract(Tracked, ServiceWritten):
     possession_date = models.DateField(bi("Possession date", "تاريخ القبض"), null=True, blank=True)
     possession_evidence_ref = models.CharField(bi("Possession evidence", "مستند القبض"), max_length=200, blank=True)
     sale_date = models.DateField(bi("Sale date", "تاريخ البيع"), null=True, blank=True)
+    # Migration W14 (dry run gap 4): a contract sold in the legacy system before go-live, loaded from the workbook's
+    # bai' ajel contracts sheet already sold, with the instalments still to collect after the cut-over.
+    pre_go_live = models.BooleanField(bi("Migrated from the legacy system (pre-go-live)", "مرحَّل من النظام السابق"),
+                                      default=False, editable=False)
+    legacy_number = models.CharField(bi("Legacy contract number", "رقم العقد في النظام السابق"), max_length=40,
+                                     blank=True)
+    paid_before_cutover = _money("Paid before the cut-over", "المسدد قبل تاريخ التحويل", default=ZERO)
     status = models.CharField(bi("Status", "الحالة"), max_length=16, choices=Status.choices, default=Status.DRAFT)
     submitted_by = _user("Submitted by", "قدّمه")
     terms_approved_by = _user("Terms approved by", "اعتمد الشروط")

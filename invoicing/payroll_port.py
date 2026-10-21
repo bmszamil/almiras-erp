@@ -100,11 +100,20 @@ class PayrollInvoicingPort:
         sale = services.deferred_sale_of(contract)
         if sale is None:
             return None
-        doc = sale.sales_document
         recognised = sum((r.profit_amount for r in sale.releases.filter(status="posted")), Decimal("0.00"))
-        return SaleState(document_ref=doc.number, status=doc.status,
-                         posted=doc.status == "final" and doc.journal_entry_id is not None,
+        status = "final" if sale.pre_go_live else sale.sales_document.status
+        return SaleState(document_ref=sale.reference, status=status, posted=sale.is_posted,
                          vat_amount=sale.vat_amount, receivable=sale.receivable, profit_recognised=recognised)
+
+    def register_migrated_bai_ajel_sale(self, contract, *, user, remaining_receivable, unearned_profit):
+        """Migration W14 (dry run gap 4): the invoicing side of a bai' ajel contract migrated from the legacy system
+        at the cut-over, called by payroll's ``load_migrated_deferred_sale`` inside its transaction. No invoice, no
+        ZATCA, no journal entry: the remaining receivable (1240) and the unearned profit (1241) are in the migration
+        opening entry. Profit is recognised from here on like any sale. Idempotent per contract."""
+        sale = services.register_migrated_deferred_sale(contract, user=user, remaining_receivable=remaining_receivable,
+                                                        unearned_profit=unearned_profit)
+        return SaleState(document_ref=sale.reference, status="final", posted=True, vat_amount=sale.vat_amount,
+                         receivable=sale.receivable, profit_recognised=Decimal("0.00"))
 
     def recognise_bai_ajel_profit(self, contract, *, amount, on, source_ref, user):
         return _result(services.recognise_deferred_profit(contract, user=user, collected_amount=amount,
