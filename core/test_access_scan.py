@@ -97,6 +97,7 @@ ALLOW = {
     "ledger/services.py:register_post_check": "app wiring at ready() (a check added to every posting); no user action",
     "ledger/services.py:migration_opening_posted": "internal state read (is the opening entry posted) for services "
                                                    "that already checked their caller's rights (migration R25)",
+    "invoicing/services.py:migrated_settlements": "list scoped by access.scope(invoicing.view) (R3, R129)",
     "invoicing/services.py:migrated_bai_ajel_balances": "the migration R22 source for 1240 / 1241, called by the "
                                                         "posting gate of an entry its caller is authorised to post",
     "payroll/services.py:opening_eosb_balances": "the migration R22 source for 2500, called by the posting gate of an "

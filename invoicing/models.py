@@ -2472,3 +2472,138 @@ class MigratedOpenItem(models.Model):
 
     def __str__(self):
         return f"{self.entity_id} {self.doc_type} {self.legacy_number} ({self.amount} {self.currency_id})"
+
+
+MIGRATED_SETTLEMENT_SERVICE_ONLY = (
+    "Settlements of migrated open items are made only through invoicing.services (R129); they are never changed or "
+    "deleted. / لا تتم تسويات البنود المرحَّلة إلا من خلال خدمات الفوترة، ولا تُعدَّل ولا تُحذف."
+)
+
+
+class _MigratedSettlementQuerySet(models.QuerySet):
+    def _refuse(self, *args, **kwargs):
+        raise error(*MIGRATED_SETTLEMENT_SERVICE_ONLY.split(" / "), code="service_only")
+
+    update = delete = bulk_update = bulk_create = _refuse
+
+
+class MigratedSettlement(models.Model):
+    """R129 (OQ-79, review of aa856fa item 11): an allocation that settles a migrated open item after go-live,
+    append-only like the other allocations (R36).
+
+    One row allocates ``amount`` (the item's currency) of the migrated ``item`` against one counter document of the
+    same entity, party and currency, on the other side of the control account: a posted receipt, refund, vendor
+    payment or refund received, a final sales invoice, debit or credit note, a posted bill or vendor credit note, or
+    another migrated item (credit notes and advances netted). An un-allocation is a new row with the negative amounts
+    and ``reverses`` set; the open balance of every document is its amount less its live rows.
+
+    In the functional currency the row is effective at once and has no journal entry (R35: both sides sit on the same
+    control account). A foreign-currency item was carried in SAR at the cut-over (OQ-13): the row is ``pending``
+    until a second person posts its entry, which clears the item's SAR carrying amount and the counter document's own
+    control line at its carrying rate (ledger-fx R18) and books the difference to the realised FX gain (4700) or loss
+    (5750). ``item_sar`` / ``counter_sar`` are the SAR amounts cleared and ``fx_difference`` the loss (positive) or
+    gain (negative). Only ``status``, the posting fields and the SAR amounts the posting priced change, once, from
+    ``pending``."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", bi("Pending posting (foreign currency)", "بانتظار الترحيل (عملة أجنبية)")
+        POSTED = "posted", bi("Effective", "نافذ")
+        DISCARDED = "discarded", bi("Discarded", "ملغى")
+
+    LIVE = ("pending", "posted")
+    COUNTERS = ("counter_item", "receipt", "payment", "sales_document", "purchase_document")
+
+    entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="+", verbose_name=bi("Entity", "الكيان"))
+    item = models.ForeignKey(MigratedOpenItem, on_delete=models.PROTECT, related_name="settlements",
+                             verbose_name=bi("Migrated open item", "البند المفتوح المرحَّل"))
+    counter_item = models.ForeignKey(MigratedOpenItem, null=True, blank=True, on_delete=models.PROTECT,
+                                     related_name="settlements_from",
+                                     verbose_name=bi("Against migrated item", "مقابل بند مرحَّل"))
+    receipt = models.ForeignKey(CustomerReceipt, null=True, blank=True, on_delete=models.PROTECT,
+                                related_name="migrated_settlements", verbose_name=bi("Receipt", "سند القبض"))
+    payment = models.ForeignKey(VendorPayment, null=True, blank=True, on_delete=models.PROTECT,
+                                related_name="migrated_settlements", verbose_name=bi("Payment", "سند الصرف"))
+    sales_document = models.ForeignKey(SalesDocument, null=True, blank=True, on_delete=models.PROTECT,
+                                       related_name="migrated_settlements",
+                                       verbose_name=bi("Sales document", "مستند المبيعات"))
+    purchase_document = models.ForeignKey(PurchaseDocument, null=True, blank=True, on_delete=models.PROTECT,
+                                          related_name="migrated_settlements",
+                                          verbose_name=bi("Purchase document", "مستند المشتريات"))
+    currency = models.ForeignKey(Currency, to_field="code", on_delete=models.PROTECT, related_name="+",
+                                 verbose_name=bi("Currency", "العملة"))
+    amount = models.DecimalField(bi("Amount", "المبلغ"), **DOC_MONEY_FIELD)
+    item_sar = models.DecimalField(bi("SAR cleared of the item", "المبلغ المسوّى من البند بالريال"), max_digits=18,
+                                   decimal_places=2)
+    counter_sar = models.DecimalField(bi("SAR cleared of the counter document", "المبلغ المسوّى من المستند المقابل"),
+                                      max_digits=18, decimal_places=2, null=True, blank=True)
+    fx_difference = models.DecimalField(bi("Realised FX loss (+) / gain (-)", "خسارة (+) / ربح (-) فروقات العملة"),
+                                        max_digits=18, decimal_places=2, default=ZERO)
+    status = models.CharField(bi("Status", "الحالة"), max_length=10, choices=Status.choices, default=Status.POSTED)
+    date = models.DateField(bi("Date", "التاريخ"))
+    journal_entry = models.ForeignKey("ledger.JournalEntry", null=True, blank=True, on_delete=models.PROTECT,
+                                      related_name="+", verbose_name=bi("Journal entry", "القيد اليومي"))
+    reverses = models.OneToOneField("self", null=True, blank=True, on_delete=models.PROTECT,
+                                    related_name="reversed_by", verbose_name=bi("Reverses", "يعكس"))
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
+                                   verbose_name=bi("Created by", "أنشأه"))
+    created_at = models.DateTimeField(bi("Created at", "تاريخ الإنشاء"), auto_now_add=True)
+    posted_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                  related_name="+", verbose_name=bi("Posted by", "رحّله"))
+    posted_at = models.DateTimeField(bi("Posted at", "تاريخ الترحيل"), null=True, blank=True)
+
+    objects = _MigratedSettlementQuerySet.as_manager()
+
+    # set once, from pending, by the posting or the discard
+    _MUTABLE = ("status", "journal_entry", "counter_sar", "fx_difference", "posted_by", "posted_at")
+
+    class Meta:
+        base_manager_name = "objects"
+        verbose_name = bi("migrated item settlement", "تسوية بند مرحَّل")
+        verbose_name_plural = bi("migrated item settlements", "تسويات البنود المرحَّلة")
+        ordering = ["entity", "item", "pk"]
+        constraints = [
+            models.CheckConstraint(condition=~models.Q(amount=0), name="migrated_settlement_not_zero"),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(counter_item__isnull=False, receipt__isnull=True, payment__isnull=True,
+                             sales_document__isnull=True, purchase_document__isnull=True)
+                    | models.Q(counter_item__isnull=True, receipt__isnull=False, payment__isnull=True,
+                               sales_document__isnull=True, purchase_document__isnull=True)
+                    | models.Q(counter_item__isnull=True, receipt__isnull=True, payment__isnull=False,
+                               sales_document__isnull=True, purchase_document__isnull=True)
+                    | models.Q(counter_item__isnull=True, receipt__isnull=True, payment__isnull=True,
+                               sales_document__isnull=False, purchase_document__isnull=True)
+                    | models.Q(counter_item__isnull=True, receipt__isnull=True, payment__isnull=True,
+                               sales_document__isnull=True, purchase_document__isnull=False)),
+                name="migrated_settlement_one_counter"),
+            models.CheckConstraint(condition=~models.Q(counter_item=models.F("item")),
+                                   name="migrated_settlement_not_itself"),
+        ]
+
+    @property
+    def counter(self):
+        for name in self.COUNTERS:
+            if getattr(self, f"{name}_id"):
+                return getattr(self, name)
+        return None
+
+    def save(self, *args, **kwargs):
+        allowed, self._service_write = getattr(self, "_service_write", False), False
+        if not allowed:
+            raise error(*MIGRATED_SETTLEMENT_SERVICE_ONLY.split(" / "), code="service_only")
+        if self.pk is not None:
+            stored = type(self)._base_manager.filter(pk=self.pk).values().first()
+            if stored is not None:
+                if stored["status"] != self.Status.PENDING:
+                    raise error(*MIGRATED_SETTLEMENT_SERVICE_ONLY.split(" / "), code="service_only")
+                for field in self._meta.concrete_fields:
+                    if field.name not in self._MUTABLE and stored[field.attname] != getattr(self, field.attname):
+                        raise error(*MIGRATED_SETTLEMENT_SERVICE_ONLY.split(" / "), code="service_only")
+                kwargs["update_fields"] = [f for f in self._MUTABLE]
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise error(*MIGRATED_SETTLEMENT_SERVICE_ONLY.split(" / "), code="service_only")
+
+    def __str__(self):
+        return f"{self.item_id} {self.amount} {self.currency_id} ({self.status})"

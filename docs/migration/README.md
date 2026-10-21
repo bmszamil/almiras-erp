@@ -44,13 +44,17 @@ in each entity separately):
    - the HR officer: `employees leave` (draft employee records, opening leave balances);
    - the payroll officer: `eosb bai_ajel` (end-of-service provisions, bai' ajel contracts with their remaining
      instalments).
-   A second person approves the bank accounts in banking and the opening leave balances in HR. Foreign-currency bank
-   accounts are not loaded (spec OQ-13); set them up in banking. Fixed assets are not loaded (no assets module yet).
+   A second person approves the bank accounts in banking (before step 6: a bank draft on the opening entry's
+   accounts stops the posting) and the opening leave balances in HR. Foreign-currency bank accounts are not loaded
+   (spec OQ-13); set them up in banking. Fixed assets are not loaded (no assets module yet). A bai' ajel contract
+   without the employee's signed consent reference loads with its deductions held (W14 warns) until the payroll
+   officer records the consent in payroll. Only people run these sections; an agent is refused.
 6. **Second person posts.** `migration_post --entity E --user <approver> --kind opening` (dry run), then `--apply`.
    It is the approval engine's decision on the draft; the preparer cannot post it. The opening entry posts only when
    what was loaded equals its balances on 1200, 1210, 2100, 2110 (open items), 2500 (end of service) and 1240, 1241
    (bai' ajel contracts) (spec R22); every difference is listed with its amount. After posting, those sub-ledgers are
-   not loaded again.
+   not loaded again (spec R25: refused by every service that writes them). After go-live, receipts, payments and
+   credit notes settle the migrated open items in invoicing (invoicing R129).
 7. **Tie-out sign-off.** `migration_tieout --entity E --user <approver> --workbook exports/wb.xlsx --as-of <cut-over>
    --posted-only --report exports/tieout.csv` must show zero differences to the halala. The accountant and the CFO /
    CEO sign the Checklist's sign-off block. Nothing goes to a real environment without this sign-off.
@@ -90,11 +94,14 @@ in each entity separately):
      تُرسل إلى الهيئة ولا قيد لها؛ والحسابات البنكية كمسودات)؛
    - مسؤول الموارد البشرية: `employees leave` (مسودات سجلات الموظفين وأرصدة الإجازات الافتتاحية)؛
    - مسؤول الرواتب: `eosb bai_ajel` (مخصصات نهاية الخدمة، وعقود البيع الآجل بأقساطها المتبقية).
-   يعتمد شخص آخر الحسابات البنكية في وحدة البنوك وأرصدة الإجازات في الموارد البشرية. لا تُحمَّل الحسابات البنكية بعملة
-   أجنبية (OQ-13)؛ أعدّها في وحدة البنوك. ولا تُحمَّل الأصول الثابتة (لا توجد وحدة أصول بعد).
+   يعتمد شخص آخر الحسابات البنكية في وحدة البنوك (قبل الخطوة 6: مسودة حساب بنكي على حسابات القيد الافتتاحي توقف
+   الترحيل) وأرصدة الإجازات في الموارد البشرية. لا تُحمَّل الحسابات البنكية بعملة أجنبية (OQ-13)؛ أعدّها في وحدة
+   البنوك. ولا تُحمَّل الأصول الثابتة (لا توجد وحدة أصول بعد). وعقد البيع الآجل بلا مرجع موافقة الموظف الموقعة يُحمَّل
+   مع إيقاف استقطاعه (تنبيه W14) حتى يسجل مسؤول الرواتب الموافقة. لا يشغّل هذه الأقسام إلا الأشخاص؛ ويُرفض الوكيل الآلي.
 6. **الترحيل بواسطة شخص آخر.** `migration_post ... --kind opening` بتجربة أولًا ثم مع `--apply`. هو قرار محرك الاعتماد
    في المسودة؛ ولا يرحّلها المُعد. لا يُرحَّل القيد الافتتاحي إلا إذا ساوى ما حُمّل أرصدته على 1200 و1210 و2100 و2110
    (البنود المفتوحة) و2500 (نهاية الخدمة) و1240 و1241 (عقود البيع الآجل) (القاعدة R22)، ويُعرض كل فرق بمبلغه. وبعد
-   الترحيل لا تُحمَّل هذه السجلات الفرعية مرة أخرى.
+   الترحيل لا تُحمَّل هذه السجلات الفرعية مرة أخرى (القاعدة R25: ترفضها كل خدمة تكتبها). وبعد التشغيل تُسوّى البنود
+   المفتوحة المرحَّلة بالمقبوضات والمدفوعات والإشعارات الدائنة في الفوترة (R129).
 7. **توقيع المطابقة.** يجب أن يُظهر `migration_tieout ... --posted-only` صفر فروق حتى الهللة. يوقع المحاسب والمدير
    المالي أو الرئيس التنفيذي في قسم الاعتماد في قائمة التحقق. لا يُنقل شيء إلى بيئة حقيقية دون هذا التوقيع.
