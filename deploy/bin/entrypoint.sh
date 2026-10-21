@@ -16,7 +16,7 @@
 set -eu
 
 for name in DJANGO_SECRET_KEY POSTGRES_PASSWORD HR_PERSONAL_DATA_KEYS HR_PERSONAL_DATA_HASH_KEY \
-            BANKING_DATA_KEYS DJANGO_EMAIL_PASSWORD ALMIRAS_ALERT_WEBHOOK_URL; do
+            BANKING_DATA_KEYS WEB_MFA_KEYS DJANGO_EMAIL_PASSWORD ALMIRAS_ALERT_WEBHOOK_URL; do
     file_var="${name}_FILE"
     eval "file_path=\${${file_var}:-}"
     if [ -n "${file_path}" ]; then

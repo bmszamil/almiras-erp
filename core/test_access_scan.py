@@ -131,6 +131,40 @@ ALLOW = {
     "core/access/engine.py:check_amount_places": "pure (CLAUDE.md rule 7)",
     "core/access/engine.py:grant_rule_source": "pure read of a grant",
     "core/access/engine.py:top_authority_holders": "helper of the alert jobs",
+    # web slice 2 (web.md R39, R40): the inbox reads requests the engine says the user may decide; deciding goes
+    # through engine.decide, whose module services call require() for every decision.
+    "core/access/engine.py:can_decide": "side-effect-free mirror of authorise for the inbox hint; decides nothing",
+    "core/access/engine.py:document_of": "reads the document of a request already read in its entity",
+    "core/access/engine.py:send_back_action": "pure lookup of the module adapter's return / reject service",
+    "core/access/engine.py:current_version": "reads the document version for the R7 check before engine.decide",
+    "core/access/inbox.py:pending": "the scope mechanism of the inbox: one entity's open requests filtered by "
+                                    "engine.can_decide (own memberships or delegation, R61, R62)",
+    "core/access/inbox.py:item": "one request of the entity, readable only if can_decide or access.has the request's "
+                                 "approval right in that entity; else 404 (R2)",
+    "core/access/inbox.py:decide": "calls engine.decide, whose module services call require() (R61); refuses a changed "
+                                   "document (web.md R7) before any check",
+    "core/access/inbox.py:decision_labels": "pure (model choices)",
+    # web/mfa.py (web.md R13 to R16): the signed-in person's own MFA device; no business data, no entity.
+    "web/mfa.py:enforced": "setting",
+    "web/mfa.py:requires_mfa": "reads the user's own memberships (holds_any_role, R13); grants nothing",
+    "web/mfa.py:device_of": "the user's own device",
+    "web/mfa.py:pending_device": "the user's own device",
+    "web/mfa.py:must_verify": "pure decision from the user's own device and memberships (R13, R14)",
+    "web/mfa.py:may_enrol": "pure decision from the user's own memberships and staff flag (R13, R19)",
+    "web/mfa.py:session_verified": "reads the user's own session and device (R14, R15)",
+    "web/mfa.py:gate": "reads the user's own session and device (R14)",
+    "web/mfa.py:mark_verified": "writes the user's own session after a verified code (R17)",
+    "web/mfa.py:normalise_code": "pure (R33 digits)",
+    "web/mfa.py:start_enrolment": "the signed-in person's own enrolment (R16); refused when a device is confirmed",
+    "web/mfa.py:provisioning": "pure: QR code and key of the user's own pending device (R16)",
+    "web/mfa.py:confirm_enrolment": "the user's own enrolment, under the code throttle; logged mfa_enrolled (R16, R26)",
+    "web/mfa.py:verify": "the user's own code check under the throttle; logged (R14, R15, R18, R26)",
+    "web/mfa.py:use_recovery_code": "the user's own recovery code under the throttle; logged (R16, R26)",
+    "web/mfa.py:recovery_codes_left": "the user's own count",
+    "web/mfa.py:renew_recovery_codes": "the user's own codes after a verified TOTP code; logged (R16, R26)",
+    "web/mfa.py:may_reset": "the OQ-11 rule itself (never self; managing partner or the user's access admin)",
+    "web/mfa.py:reset_device": "checks may_reset (OQ-11) itself; logged mfa_reset (R16, R26)",
+    "web/mfa.py:reset_device_by_operator": "web_mfa_reset operator command only (OQ-11 default); logged mfa_reset",
     "core/access/matrix.py:versions": "the scope mechanism for matrix versions (entities_for, no cascade, R90)",
     "core/access/matrix.py:get_version": "the scope mechanism for one version (404 outside, R2)",
     "core/access/matrix.py:rules": "the scope mechanism for a version's rows (404 outside, R2)",
@@ -152,6 +186,7 @@ ALLOW = {
 
 # Modules with public functions that are not called services.py but act like them.
 EXTRA_MODULES = ("ledger/services_setup.py", "ledger/fx.py", "core/access/engine.py", "core/access/matrix.py",
+                 "core/access/inbox.py", "web/mfa.py",
                  "core/access/delegations.py", "core/access/reports.py")
 
 

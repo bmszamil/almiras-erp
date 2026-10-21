@@ -199,9 +199,24 @@ WEB_LOGIN_LOCK_SECONDS = 15 * 60
 # OQ-27: the request header holding the client address. None = REMOTE_ADDR. Set below behind the TLS proxy, which
 # writes X-Real-IP itself (deploy/proxy/Caddyfile). X-Forwarded-For is never trusted.
 WEB_CLIENT_IP_HEADER = None
-# MFA (web.md R13 to R16) is not built yet. The deploy check (manage.py check --deploy, web.E001) fails while DEBUG
-# is off unless this is switched on explicitly: password-only sign-in is a go-live blocker.
-WEB_ALLOW_PASSWORD_ONLY_LOGIN = os.environ.get("DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN", "0") == "1"
+# MFA (web.md R13 to R16, slice 2): TOTP (pyotp, MIT) with recovery codes, required for superusers and the MFA roles
+# (web.services.MFA_ROLES). On by default. The deploy check web.E001 (manage.py check --deploy) fails while DEBUG is
+# off and this is switched off: password-only sign-in for approvers is a go-live blocker.
+WEB_MFA_ENFORCED = os.environ.get("DJANGO_WEB_MFA_ENFORCED", "1") == "1"
+# R16, OQ-2: TOTP secrets are encrypted at rest (Fernet, as HR and banking) with keys outside the database:
+# comma-separated secrets, first = current key. Development (DEBUG) falls back to a key derived from SECRET_KEY; the
+# deploy check web.E002 refuses a release without keys.
+WEB_MFA_KEYS = [k for k in os.environ.get("WEB_MFA_KEYS", "").split(",") if k]
+# R18: wrong codes double the wait (1, 2, 4, 8 s); 5 in a row lock the device for 15 minutes.
+WEB_MFA_MAX_FAILURES = 5
+WEB_MFA_LOCK_SECONDS = 15 * 60
+# R19: /admin/ is reached only through the web sign-in (throttle, R18) with an OTP-verified session, for every staff
+# user and superuser. Only the test settings switch this off (tests of other modules' admin pages use force_login);
+# web/test_mfa.py tests it on. With DEBUG off, web.E001 refuses a release where it is off.
+WEB_ADMIN_REQUIRE_MFA = True
+# R19, OQ-10: limiting /admin/ to superusers waits for the membership screens (J13), because staff access admins
+# still grant memberships there. Switch on with DJANGO_WEB_ADMIN_SUPERUSERS_ONLY=1.
+WEB_ADMIN_SUPERUSERS_ONLY = os.environ.get("DJANGO_WEB_ADMIN_SUPERUSERS_ONLY", "0") == "1"
 
 LOGIN_URL = "web:login"
 LOGIN_REDIRECT_URL = "web:home"

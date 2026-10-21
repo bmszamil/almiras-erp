@@ -88,3 +88,69 @@ class SalesDocumentFilterForm(_FilterForm):
         for name, enum in (("doc_type", SalesDocument.DocType), ("status", SalesDocument.Status),
                            ("zatca_status", SalesDocument.ZatcaStatus)):
             self.fields[name].choices = _choices(lang, [(v, label_part(label, lang)) for v, label in enum.choices])
+
+
+# --- MFA (R13 to R16) and the approval inbox (R7, R8, R15) ------------------------------------------------------
+
+class _LabelledForm(forms.Form):
+    """Labels and the "required" message from web/texts.py in the active language (R28)."""
+
+    labels = {}
+    required_key = "field_required"
+
+    def __init__(self, *args, lang="en", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lang = lang
+        for name, field in self.fields.items():
+            if isinstance(field.widget, forms.HiddenInput):
+                continue  # carried, not shown (the document version, R7)
+            field.label = text(self.labels.get(name, name), lang)
+            field.error_messages["required"] = text(self.required_key, lang)
+            field.widget.attrs.setdefault("class", "form-control")
+
+
+class OtpCodeForm(_LabelledForm):
+    """A 6-digit authenticator code. Arabic-Indic digits are accepted (R33); the service normalises them."""
+
+    code = forms.CharField(max_length=16, strip=True)
+    labels = {"code": "mfa_code"}
+    required_key = "mfa_code_required"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        widget = self.fields["code"].widget
+        widget.attrs = {**widget.attrs, "autocomplete": "one-time-code", "inputmode": "numeric", "dir": "ltr",
+                        "maxlength": "16", "class": "form-control alm-otp"}
+
+
+class RecoveryCodeForm(_LabelledForm):
+    recovery_code = forms.CharField(max_length=32, strip=True)
+    labels = {"recovery_code": "mfa_recovery_code"}
+    required_key = "mfa_code_required"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        widget = self.fields["recovery_code"].widget
+        widget.attrs = {**widget.attrs, "autocomplete": "off", "autocapitalize": "none", "dir": "ltr",
+                        "maxlength": "32"}
+
+
+VERSION = RegexValidator(r"^[\w:.+\-]{0,64}\Z", "Not a document version. / ليس إصدار مستند.")
+
+
+class ApproveForm(OtpCodeForm):
+    """Approve in the inbox: the document version shown (R7) and a fresh authenticator code (step-up, R15)."""
+
+    version = forms.CharField(max_length=64, required=False, validators=[VERSION], widget=forms.HiddenInput)
+    labels = {"code": "mfa_code_step_up"}
+
+
+class SendBackForm(_LabelledForm):
+    """Return or reject in the inbox: the version shown (R7) and the reason, Arabic required, English optional (R8)."""
+
+    version = forms.CharField(max_length=64, required=False, validators=[VERSION], widget=forms.HiddenInput)
+    reason_ar = forms.CharField(max_length=500, widget=forms.Textarea(attrs={"rows": 3, "dir": "rtl", "lang": "ar"}))
+    reason_en = forms.CharField(max_length=500, required=False,
+                                widget=forms.Textarea(attrs={"rows": 3, "dir": "ltr", "lang": "en"}))
+    labels = {"reason_ar": "reason_ar", "reason_en": "reason_en"}
+    required_key = "reason_ar_required"

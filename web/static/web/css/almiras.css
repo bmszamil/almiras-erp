@@ -187,3 +187,39 @@ label, th, .form-label, .btn, .alm-nav__link, .alm-status { font-weight: 500; }
 .alm-error__half + .alm-error__half { border-block-start: 1px solid var(--alm-navy-1); margin-block-start: 1rem; padding-block-start: 1rem; }
 .alm-error__detail { color: var(--alm-orange-4); }
 .alm-error__home { display: flex; gap: 1rem; flex-wrap: wrap; margin-block: 1.5rem 0; }
+
+/* --- slice 2: MFA pages and the approval inbox ------------------------------------------------------------ */
+.alm-auth__card--wide { inline-size: min(34rem, 100%); }
+.alm-auth__top { gap: .5rem; flex-wrap: wrap; }
+.alm-auth__secondary { margin-block-start: 1.25rem; }
+.alm-auth__secondary summary { cursor: pointer; color: var(--alm-orange-4); font-weight: 500; }
+.alm-auth__secondary form { margin-block-start: .75rem; }
+.alm-steps { padding-inline-start: 1.25rem; }
+.alm-qr { display: flex; flex-direction: column; align-items: center; gap: .5rem; margin-block: 1rem 1.25rem; }
+.alm-qr img { inline-size: 245px; max-inline-size: 100%; block-size: auto; border: 1px solid var(--alm-navy-1); border-radius: var(--alm-radius-input); }
+.alm-secret { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: .05em; overflow-wrap: anywhere; color: var(--alm-navy); }
+.alm-otp { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 1.375rem; letter-spacing: .25em; text-align: center; }
+.alm-codes { display: grid; grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr)); gap: .5rem 1.5rem; padding-inline-start: 1.5rem;
+  background: var(--alm-sand); border-radius: var(--alm-radius-sm); padding-block: 1rem; }
+.alm-codes code { color: var(--alm-navy); font-size: 1rem; }
+.alm-account__link { inline-size: 100%; color: var(--alm-sand); font-size: .875rem; }
+.alm-account__link:hover, .alm-account__link:focus { color: var(--alm-white); }
+.alm-messages:empty { display: none; }
+.alm-messages .alm-notice { margin-block-end: 1rem; }
+.alm-notice--warn, .alm-notice--warning { border-inline-start-color: var(--alm-orange-4); background: var(--alm-orange-1); color: var(--alm-orange-5); }
+.alm-notice--success { border-inline-start-color: var(--alm-navy); }
+.alm-badge { display: inline-block; padding: .05rem .5rem; border-radius: var(--alm-radius-sm); background: var(--alm-sand); color: var(--alm-navy);
+  border: 1px solid var(--alm-navy-1); font-size: .8125rem; font-weight: 500; white-space: nowrap; }
+.alm-badge--warn { background: var(--alm-orange-1); color: var(--alm-orange-5); border-color: var(--alm-orange-4); }
+.alm-form-narrow { max-inline-size: 22rem; }
+
+/* 360 px (web.md R36): inbox and decision tables become stacked cards, no horizontal scrolling. */
+@media (max-width: 575.98px) {
+  .alm-table--stack thead { position: absolute; inline-size: 1px; block-size: 1px; overflow: hidden; clip-path: inset(50%); }
+  .alm-table--stack, .alm-table--stack tbody, .alm-table--stack tr, .alm-table--stack td { display: block; inline-size: 100%; }
+  .alm-table--stack tr { border-block-end: 2px solid var(--alm-navy-1); padding-block: .5rem; }
+  .alm-table--stack td { border: 0; padding: .2rem 0; }
+  .alm-table--stack td[data-label]::before { content: attr(data-label); display: block; font-size: .8125rem; font-weight: 500; color: var(--alm-text-muted); }
+  .alm-table--stack td.text-end { text-align: start !important; }
+  .alm-card { padding: 1rem; }
+}

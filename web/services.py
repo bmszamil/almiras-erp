@@ -128,9 +128,10 @@ def _requires_mfa(user):
     return user.is_superuser or access_services.holds_any_role(user, MFA_ROLES)
 
 
-def idle_timeout(user):
-    """OQ-8 default: 15 minutes for users who need MFA, 30 minutes for the others."""
-    if _requires_mfa(user):
+def idle_timeout(user, required=None):
+    """OQ-8 default: 15 minutes for users who need MFA, 30 minutes for the others. ``required``: the value the caller
+    already read in this request (one membership query per request)."""
+    if (_requires_mfa(user) if required is None else required):
         return timedelta(seconds=_setting("WEB_SESSION_IDLE_MFA_SECONDS", 15 * 60))
     return timedelta(seconds=_setting("WEB_SESSION_IDLE_SECONDS", 30 * 60))
 

@@ -83,7 +83,7 @@ deploy/
 | `GUNICORN_WORKERS` | 3 | ~2 × vCPU |
 | `ZATCA_SANDBOX_BASE_URL`, `ZATCA_SIMULATION_BASE_URL`, `ZATCA_PRODUCTION_BASE_URL` | empty | From ZATCA's portal / Swagger at deployment (zatca OQ-30) |
 | `ZATCA_PRODUCTION_ALLOWED` | `0` | `1` only at go-live (R-29) |
-| `DJANGO_WEB_ALLOW_PASSWORD_ONLY_LOGIN` | `0` | Web UI sign-in without MFA (web.md R13 to R16 not built). While `0`, `release-check` fails with `web.E001`. **Go-live blocker:** keep `0` in production until the MFA slice ships; CI's deploy-check sets `1` |
+| `DJANGO_WEB_MFA_ENFORCED` | `1` | Web UI MFA (TOTP) for superusers and the MFA roles (web.md R13 to R16). `0` makes `release-check` fail with `web.E001`; never `0` in production |
 | `ALMIRAS_ALERT_WEBHOOK_URL` | empty | Optional KSA-hosted webhook for job failures |
 
 Variables the containers receive (set by `docker-compose.yml`): `DJANGO_DEBUG=0`, `DJANGO_BEHIND_TLS_PROXY=1`,
@@ -109,6 +109,7 @@ mount). `./init-secrets.sh` generates the random ones; `./init-secrets.sh --chec
 | `hr_personal_data_keys` | yes (generated; comma-separated, first = current) | web, scheduler | `HR_PERSONAL_DATA_KEYS` (hr R10, check hr.E001) |
 | `hr_personal_data_hash_key` | yes (generated; never rotated) | web, scheduler | `HR_PERSONAL_DATA_HASH_KEY` (hr R9) |
 | `banking_data_keys` | yes (generated; comma-separated) | web, scheduler | `BANKING_DATA_KEYS` (banking R4, check banking.E001) |
+| `web_mfa_keys` | yes (generated; comma-separated, first = current) | web, scheduler, migrate | `WEB_MFA_KEYS` (web.md R16: TOTP secrets encrypted at rest; check web.E002) |
 | `smtp_password` | yes (from mail admin) | web, scheduler, alertmanager | `DJANGO_EMAIL_PASSWORD` |
 | `grafana_admin_password` | yes (generated) | grafana | |
 | `openbao_erp_role_id`, `openbao_erp_secret_id` | yes (bootstrap) | web, scheduler | ERP AppRole login (for the OpenBao client, OQ-34) |
@@ -275,7 +276,7 @@ docker compose exec -e BAO_TOKEN openbao bao token revoke -self && unset BAO_TOK
 
 Offline envelope (two sealed copies, two places in KSA): OpenBao unseal key (PGP-encrypted) and the MP's GPG
 key, age backup identities, `hr_personal_data_keys`, `hr_personal_data_hash_key`, `banking_data_keys`,
-`django_secret_key`. Unseal after every restart: `docker compose exec openbao bao operator unseal`.
+`web_mfa_keys`, `django_secret_key`. Unseal after every restart: `docker compose exec openbao bao operator unseal`.
 
 New subsidiary: `./openbao/bootstrap.sh ALM ALM SUB1 ... NEW` (MP token), then grant custody and record it.
 Revoking custody: delete the user's policy binding (`bao write auth/userpass/users/<u> token_policies=`) and

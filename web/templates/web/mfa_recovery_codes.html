@@ -1,0 +1,17 @@
+{% extends "web/base.html" %}{% load web_tags %}
+{% block title %}{% t "mfa_codes_title" %}{% endblock %}
+{% block shell %}
+<div class="alm-auth">
+  <main class="alm-auth__card alm-auth__card--wide" id="main" tabindex="-1">
+    {% include "web/_auth_head.html" %}
+    <h1 class="alm-title">{% t "mfa_codes_title" %}</h1>
+    {% if first %}<p class="alm-notice" role="status">{% t "mfa_enrolled_notice" %}</p>{% endif %}
+    <p>{% t "mfa_codes_intro" %}</p>
+    <ol class="alm-codes" dir="ltr" lang="en">
+      {% for code in codes %}<li><code>{{ code }}</code></li>{% endfor %}
+    </ol>
+    <p class="alm-muted">{% t "mfa_codes_once" %}</p>
+    <a class="btn btn-primary w-100" href="{{ next }}">{% t "mfa_codes_done" %}</a>
+  </main>
+</div>
+{% endblock %}

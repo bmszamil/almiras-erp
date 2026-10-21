@@ -1,0 +1,41 @@
+{% extends "web/base.html" %}{% load web_tags %}
+{% block title %}{% t "mfa_security_title" %}{% endblock %}
+{% block content %}
+<div class="alm-page-head">
+  <h1 class="alm-title">{% t "mfa_security_title" %}</h1>
+</div>
+{% if error or form.errors %}
+<div class="alm-error-summary" role="alert" tabindex="-1" id="alm-errors">
+  <p class="alm-error-summary__title">{% t "error_summary" %}</p>
+  <ul>
+    {% if error %}<li><a href="#id_code">{{ error }}</a></li>{% endif %}
+    {% for e in form.code.errors %}<li><a href="#id_code">{{ form.code.label }}: {{ e }}</a></li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% if not device %}
+<div class="alm-card">{% include "web/_empty.html" with message_key="mfa_not_needed" %}</div>
+{% else %}
+<section class="alm-card" aria-labelledby="mfa-device">
+  <h2 class="alm-card__title" id="mfa-device">{% t "mfa_device" %}</h2>
+  <dl class="alm-dl">
+    <div><dt>{% t "status" %}</dt><dd><span class="alm-status alm-status--posted"><span class="alm-status__shape" aria-hidden="true">●</span>{% t "mfa_active" %}</span></dd></div>
+    <div><dt>{% t "mfa_enrolled_at" %}</dt><dd>{% moment device.confirmed_at %}</dd></div>
+    <div><dt>{% t "mfa_codes_left" %}</dt><dd><bdi dir="ltr">{{ left }}</bdi></dd></div>
+  </dl>
+  <p class="alm-muted mt-3">{% t "mfa_lost_device" %}</p>
+</section>
+<section class="alm-card" aria-labelledby="mfa-renew">
+  <h2 class="alm-card__title" id="mfa-renew">{% t "mfa_renew_title" %}</h2>
+  <p>{% t "mfa_renew_intro" %}</p>
+  <form method="post" action="{% url 'web:mfa_security' %}" class="alm-form-narrow" novalidate>
+    {% csrf_token %}
+    <div class="mb-3">
+      <label class="form-label" for="{{ form.code.id_for_label }}">{{ form.code.label }}</label>
+      {{ form.code }}
+    </div>
+    <button type="submit" class="btn btn-primary">{% t "mfa_renew" %}</button>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

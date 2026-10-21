@@ -8,11 +8,13 @@ a superuser without memberships (``su``); an agent and the billing system user. 
 PART and MIN; sales documents in ALM (business and individual buyer), SUB and PART. Every record outside ALM carries
 "<CODE>-ONLY-SECRET", so a leak into another entity's page shows.
 """
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pyotp
 import pytest
+from django.utils import timezone
 
 from core import access
 from core.access.testing import make_agent, make_user, member
@@ -21,6 +23,8 @@ from invoicing import services as invoicing
 from invoicing.conftest import ADDRESS, make_entity
 from invoicing.testing import fake_zatca
 from ledger import services as ledger
+from web import mfa as web_mfa
+from web.models import MfaDevice
 
 PASSWORD = "made-up-test-password-7Q!"  # set on fixture users only; never a real credential
 CASH = [{"account": "1100", "debit": Decimal("1250.50")}, {"account": "3100", "credit": Decimal("1250.50")}]
@@ -116,13 +120,70 @@ def w(db, zatca):
     return ns
 
 
+class Clock:
+    """The MFA clock of a test (``web.mfa._now``): starts now, moves only when a test moves it."""
+
+    def __init__(self):
+        self.at = timezone.now()
+
+    def __call__(self):
+        return self.at
+
+    def tick(self, seconds=30):
+        self.at += timedelta(seconds=seconds)
+
+
+_CLOCK = []
+
+
+@pytest.fixture(autouse=True)
+def mfa_clock(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(web_mfa, "_now", clock)
+    _CLOCK[:] = [clock]
+    yield clock
+    _CLOCK.clear()
+
+
+def next_code(user):
+    """A right code for ``user``'s device in the next 30-second step of the test clock (each step is usable once)."""
+    clock = _CLOCK[0]
+    clock.tick(30)
+    return pyotp.TOTP(MfaDevice.objects.get(user=user).secret).at(clock.at)
+
+
+def enrol(user):
+    """Give ``user`` a confirmed device through the MFA service (as the enrolment page does); returns the codes."""
+    web_mfa.start_enrolment(user)
+    _device, codes = web_mfa.confirm_enrolment(user, next_code(user))
+    return codes
+
+
+@pytest.fixture
+def periods_now(w):
+    """Approving a sales document issues it today (invoicing): open fiscal periods for this year too."""
+    from ledger.services_setup import create_monthly_periods
+
+    year = timezone.localdate().year
+    if year != 2027:
+        for entity in (w.alm, w.sub, w.part):
+            create_monthly_periods(entity, year)
+    return year
+
+
 @pytest.fixture
 def signed_in(client):
-    """``signed_in(user)``: the test client signed in through the real sign-in form (R12, R17)."""
+    """``signed_in(user)``: the test client signed in through the real sign-in form (R12, R17) and, for a user who
+    needs MFA (R13), enrolled if needed and verified through the real verification form (R14)."""
 
     def sign_in(user):
         response = client.post("/login/", {"username": user.username, "password": PASSWORD})
         assert response.status_code == 302, response.content[:500]
+        if web_mfa.must_verify(user):
+            if web_mfa.device_of(user) is None:
+                enrol(user)
+            response = client.post("/mfa/verify/", {"code": next_code(user)})
+            assert response.status_code == 302, response.content[:500]
         return client
 
     return sign_in

@@ -385,7 +385,8 @@ class ApprovalDecision(models.Model):
     top_authority = models.BooleanField(default=False)
     permission = models.CharField(max_length=100)
     grant_log = models.ForeignKey(AccessLog, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
-    note = models.CharField(max_length=500, blank=True)
+    note = models.CharField(max_length=500, blank=True, help_text="Reason (Arabic, or as given)")
+    note_en = models.CharField(max_length=500, blank=True, help_text="Reason in English, optional (web.md R8)")
     at = models.DateTimeField(default=timezone.now)
 
     objects = ServiceWrittenQuerySet.as_manager()

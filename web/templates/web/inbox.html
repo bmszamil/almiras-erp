@@ -1,0 +1,48 @@
+{% extends "web/base.html" %}{% load web_tags %}
+{% block title %}{% t "inbox_title" %} | {{ entity.code }}{% endblock %}
+{% block content %}
+<div class="alm-page-head">
+  <h1 class="alm-title">{% t "inbox_title" %}</h1>
+  <p class="alm-page-head__entity">{% pick entity "name" %} <span class="alm-code">{{ entity.code|ident }}</span></p>
+</div>
+<p class="alm-muted">{% t "inbox_intro" %}</p>
+{% if page.object_list %}
+<section class="alm-card" aria-labelledby="inbox-results">
+  <h2 class="alm-card__title" id="inbox-results">{% t "results" %} <span class="alm-count">{% t "rows_found" count=count %}</span></h2>
+  <div class="table-responsive">
+    <table class="table table-hover alm-table alm-table--stack">
+      <caption class="visually-hidden">{% t "inbox_title" %}</caption>
+      <thead>
+        <tr>
+          <th scope="col">{% t "doc_type" %}</th>
+          <th scope="col">{% t "number" %}</th>
+          <th scope="col" class="text-end">{% t "amount" %}</th>
+          <th scope="col">{% t "submitted_by" %}</th>
+          <th scope="col">{% t "submitted_at" %}</th>
+          <th scope="col">{% t "age" %}</th>
+          <th scope="col">{% t "source" %}</th>
+          <th scope="col"><span class="visually-hidden">{% t "view" %}</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in page.object_list %}
+        <tr>
+          <td data-label="{% t 'doc_type' %}">{% pick item.request.activity "name" %}{% if item.delegator %}<br><span class="alm-badge">{% t "inbox_on_behalf_of" %} <bdi>{% person item.delegator %}</bdi></span>{% endif %}{% if item.eligibility.self_approval %}<br><span class="alm-badge alm-badge--warn">{% t "inbox_self_approval" %}</span>{% endif %}</td>
+          <td data-label="{% t 'number' %}">{% pick item.request "label" %}</td>
+          <td data-label="{% t 'amount' %}" class="text-end">{% if item.request.amount is not None %}{% money item.request.amount item.request.currency %}{% endif %}</td>
+          <td data-label="{% t 'submitted_by' %}">{% if item.request.submitted_by %}<bdi>{% person item.request.submitted_by %}</bdi>{% endif %}</td>
+          <td data-label="{% t 'submitted_at' %}">{% moment item.request.opened_at %}</td>
+          <td data-label="{% t 'age' %}">{% t "age_days" days=item.age_days %}</td>
+          <td data-label="{% t 'source' %}">{% if item.source_kind %}<span class="alm-badge">{% t item.source_key %}</span>{% endif %}</td>
+          <td><a class="btn btn-sm btn-outline-primary" href="{% url 'web:inbox_item' entity.code item.request.pk %}">{% t "inbox_review" %}</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% include "web/_pagination.html" %}
+</section>
+{% else %}
+<div class="alm-card">{% include "web/_empty.html" with message_key="inbox_empty" %}</div>
+{% endif %}
+{% endblock %}

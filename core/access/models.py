@@ -498,6 +498,13 @@ class AccessLog(models.Model):
         ALERT_SENT = "access_alert_sent", "Access alert sent"
         LOGIN_SUCCEEDED = "login_succeeded", "Signed in to the web UI"  # web.md 3.4, R26
         LOGOUT = "logout", "Signed out of the web UI"  # web.md 3.4, R26
+        # web.md 3.4, R16, R26 (slice 2): MFA events. Never the code, the secret or a recovery code.
+        MFA_ENROLLED = "mfa_enrolled", "MFA device enrolled"
+        MFA_VERIFIED = "mfa_verified", "MFA code verified"
+        MFA_VERIFY_FAILED = "mfa_verify_failed", "MFA code refused"
+        MFA_RECOVERY_USED = "mfa_recovery_code_used", "MFA recovery code used"
+        MFA_RECOVERY_RENEWED = "mfa_recovery_codes_renewed", "MFA recovery codes renewed"
+        MFA_RESET = "mfa_reset", "MFA device reset by another person"
 
     at = models.DateTimeField(default=timezone.now)
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+")

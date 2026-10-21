@@ -52,6 +52,9 @@
         <nav class="alm-nav" aria-label="{% t 'nav_label' %}">
           <ul class="alm-nav__list">
             <li><a class="alm-nav__link{% if active == 'dashboard' %} is-active{% endif %}" href="{% url 'web:dashboard' entity.code %}"{% if active == 'dashboard' %} aria-current="page"{% endif %}>{% t "nav_dashboard" %}</a></li>
+            {% if nav.inbox %}
+            <li><a class="alm-nav__link{% if active == 'inbox' %} is-active{% endif %}" href="{% url 'web:inbox' entity.code %}"{% if active == 'inbox' %} aria-current="page"{% endif %}>{% t "nav_inbox" %}</a></li>
+            {% endif %}
             {% if nav.ledger %}
             <li class="alm-nav__section">{% t "nav_section_accounting" %}</li>
             <li><a class="alm-nav__link{% if active == 'ledger' %} is-active{% endif %}" href="{% url 'web:journal_entries' entity.code %}"{% if active == 'ledger' %} aria-current="page"{% endif %}>{% t "nav_journal_entries" %}</a></li>
@@ -65,6 +68,7 @@
         {% endif %}
         <div class="alm-account">
           <p class="alm-account__who"><span class="alm-account__label">{% t "signed_in_as" %}</span> <bdi>{% person user %}</bdi></p>
+          <a class="alm-account__link" href="{% url 'web:mfa_security' %}">{% t "nav_mfa" %}</a>
           {% include "web/_language_switch.html" with on_navy=True %}
           <form method="post" action="{% url 'web:logout' %}">
             {% csrf_token %}
@@ -77,6 +81,9 @@
       {% if entity and not entity.is_active %}
       <p class="alm-notice" role="status"><span class="alm-status alm-status--inactive"><span class="alm-status__shape" aria-hidden="true">◌</span>{% t "inactive" %}</span> {% t "inactive_notice" %}</p>
       {% endif %}
+      <div class="alm-messages" role="status" aria-live="polite">
+        {% for message in messages %}<p class="alm-notice alm-notice--{{ message.tags }}">{{ message }}</p>{% endfor %}
+      </div>
       {% block content %}{% endblock %}
     </main>
   </div>
