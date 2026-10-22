@@ -35,7 +35,8 @@ def test_v13_seed_payroll_rights(db):
     # may name for it; who approves is then the matrix or the code default (runs: hr_officer only; loans: the top
     # authority), not the role list.
     # V19 (core.0032), V20 (invoicing R129, core.0035) and V21 (fixed assets, core.0038) change no payroll right
-    assert ROLE_SEED is ROLE_SEED_V21 and ROLE_SEED_V20
+    assert ROLE_SEED is ROLE_SEED_V21
+    assert set(ROLE_SEED_V20) <= set(ROLE_SEED_V21)
     assert ROLE_SEED_V19
     perms = {code: set(row[5]) for code, row in ROLE_SEED.items()}
     assert {c for c, p in perms.items() if "payroll.approve_run" in p} == {"hr_officer", "managing_partner", "ceo"}

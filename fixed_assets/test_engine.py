@@ -82,8 +82,9 @@ def test_r61_approve_services_refuse_a_direct_call(w):
     assert exc.value.code == "approval_request_required"
     asset.refresh_from_db()
     e = t.event(w, asset, "impairment", date(2027, 1, 20), approve=False, recoverable_amount=D("50000.00"))
-    with pytest.raises(access.AccessDenied):
+    with pytest.raises(access.AccessDenied) as exc:
         services.approve_event(e, user=w.c)
+    assert exc.value.code == "approval_request_required"
     assert DepreciationRun.objects.get(pk=run.pk).status == "submitted"
 
 
