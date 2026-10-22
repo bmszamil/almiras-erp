@@ -81,8 +81,17 @@ def load_opening_asset(entity, *, user, legacy_code, description_ar, description
         residual = services._money(residual_value or ZERO, "Residual value", "القيمة المتبقية")
         if not category.depreciable:
             accumulated, method, useful_life_months, remaining_life_months = ZERO, "", None, None
-        elif method not in Method.values:
-            method = Method.STRAIGHT_LINE
+        else:  # review item 4: the legacy estimate is kept (OQ-20), so it must be complete
+            if method == Method.REDUCING_BALANCE:
+                raise error("opening_row", legacy_code=legacy_code,
+                            why="reducing balance needs the annual rate, and the workbook has no rate column yet; "
+                                "load it as straight line with its remaining life, or wait for the rate column",
+                            why_ar="القسط المتناقص يحتاج إلى النسبة السنوية ولا يوجد في الملف عمود لها بعد؛ حمّله "
+                                   "بالقسط الثابت مع عمره المتبقي أو انتظر عمود النسبة")
+            if method != Method.STRAIGHT_LINE or not remaining_life_months:
+                raise error("opening_row", legacy_code=legacy_code,
+                            why="a depreciable asset needs its method (straight line) and its remaining life",
+                            why_ar="يحتاج الأصل القابل للاستهلاك إلى طريقة استهلاكه (القسط الثابت) وعمره المتبقي")
         values = {
             "category": category, "description_ar": (description_ar or "")[:300],
             "description_en": (description_en or "")[:300], "usage": usage, "acquisition_date": acquisition_date,

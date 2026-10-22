@@ -19,6 +19,13 @@ def _reversal_version(document):
     return f"rev:{version_text(document.reversal_requested_at or '')}"
 
 
+def _reversal_amount(event):
+    """The entry total the reversal undoes (§7 "amount (entry total)"): a write-off's cost derecognised."""
+    if event.kind == "write_off" and event.cost_derecognised is not None:
+        return event.cost_derecognised
+    return abs(event.amount) if event.amount is not None else None
+
+
 def _reversal_people(document):
     return [document.reversal_requested_by_id]
 
@@ -74,11 +81,10 @@ def register():
             approve=lambda d, user, p=permission: services.approve_event(d, user=user, permission=p),
             return_=lambda d, user, note: services.return_event(d, user=user, note=note),
         )
-    engine.register(
+    engine.register(  # §7: a reversal is measured on the entry total (a write-off: the cost derecognised)
         AssetEvent, "fixed_assets.reversal", permission="fixed_assets.reverse_document",
-        submit_permission="fixed_assets.record_event",
-        amount=lambda d: abs(d.amount) if d.amount is not None else None, currency=_functional,
-        functional_amount=lambda d: abs(d.amount) if d.amount is not None else None,
+        submit_permission="fixed_assets.record_event", amount=_reversal_amount, currency=_functional,
+        functional_amount=_reversal_amount,
         version=_reversal_version, people=_reversal_people,
         label=lambda d: (f"Reversal of asset event #{d.pk}", f"عكس حدث الأصل رقم {d.pk}"),
         approve=lambda d, user: services.reverse_document(d, user=user),

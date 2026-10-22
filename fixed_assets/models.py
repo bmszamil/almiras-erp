@@ -387,6 +387,11 @@ class AssetCostComponent(Kept):
                                     verbose_name=bi("Reverses component", "يعكس المكوّن"))
     amount = models.DecimalField(bi("Amount (SAR)", "المبلغ (ريال)"), **MONEY)
     accounting_date = models.DateField(bi("Accounting date", "تاريخ القيد"))
+    acquired_on = models.DateField(bi("Acquired on", "تاريخ الاقتناء"), null=True, blank=True,
+                                   help_text=bi("When the cost was first acquired, if earlier than the accounting date "
+                                                "(a CWIP transfer keeps the CWIP's date, R5, R33)",
+                                                "تاريخ اقتناء التكلفة إن سبق تاريخ القيد (التحويل من المشروعات تحت "
+                                                "التنفيذ يحتفظ بتاريخها)"))
     effective_from = models.DateField(bi("Depreciated from", "يُستهلك من"), null=True, blank=True,
                                       help_text=bi("Empty: part of the cost at activation; else the first day of the "
                                                    "month it changes depreciation", "فارغ: جزء من التكلفة عند التفعيل"))
@@ -403,8 +408,10 @@ class AssetCostComponent(Kept):
         verbose_name_plural = bi("asset cost components", "مكوّنات تكلفة الأصول")
         ordering = ["asset", "pk"]
         constraints = [
-            # R4: a bill line feeds one asset once (a split feeds several assets, each once); the service caps the sum.
-            models.UniqueConstraint(fields=["purchase_line", "asset"], condition=Q(purchase_line__isnull=False),
+            # R4: a bill line is linked directly to one asset once (a split feeds several assets, each once); the
+            # service caps the sum and lets an event re-link a line only once its earlier links net to zero.
+            models.UniqueConstraint(fields=["purchase_line", "asset"],
+                                    condition=Q(purchase_line__isnull=False, source_event__isnull=True),
                                     name="fa_line_once_per_asset"),
         ]
 
@@ -486,6 +493,7 @@ class AssetEvent(Written):
         IMPAIRMENT = "impairment", bi("Impairment", "هبوط القيمة")
         IMPAIRMENT_REVERSAL = "impairment_reversal", bi("Impairment reversal", "عكس هبوط القيمة")
         WRITE_OFF = "write_off", bi("Write-off", "شطب")
+        DISPOSAL_ADJUSTMENT = "disposal_adjustment", bi("Cost adjustment after disposal", "تسوية تكلفة بعد الاستبعاد")
         VAT_USE_CHANGE = "vat_use_change", bi("Change of VAT use", "تغيير استخدام الضريبة")
         DISPOSAL_SALE = "disposal_sale", bi("Sale (slice 2)", "بيع (المرحلة الثانية)")
         INTERCOMPANY_SALE = "intercompany_sale", bi("Intercompany sale (slice 2)", "بيع بين الشركات (المرحلة الثانية)")

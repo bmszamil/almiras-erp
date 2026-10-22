@@ -103,42 +103,78 @@ class Basis:
     stop: date | None = None  # last day depreciated (write-off date), inclusive
 
 
+def _apply(change, state):
+    """Apply one change to ``state`` (carrying, residual, method, life_end, rate); returns its carrying delta."""
+    state["carrying"] += change.carrying_delta
+    if change.residual is not None:
+        state["residual"] = Decimal(change.residual)
+    if change.method:
+        state["method"] = change.method
+    if change.life_end is not None:
+        state["life_end"] = change.life_end
+    if change.annual_rate is not None:
+        state["rate"] = change.annual_rate
+    return Decimal(change.carrying_delta)
+
+
+def _lump(m, state, negative):
+    """A cost reduction (or a residual raised) that takes the carrying amount below the residual: book the difference
+    in the month of the change, but never below what the cost reductions themselves took away (``negative``), so the
+    net book value never goes below the residual because of a cost change and never rises because of a residual."""
+    room = state["carrying"] - state["residual"]
+    amount = max(room, negative) if room < 0 else room
+    if not amount:
+        return None
+    month = Month(m, 0, amount, state["carrying"], True)
+    state["carrying"] -= amount
+    return month
+
+
 def schedule(basis, *, until=None):
-    """The :class:`Month` list of ``basis`` through the month of ``until`` (inclusive; None: to the end)."""
+    """The :class:`Month` list of ``basis`` through the month of ``until`` (inclusive; None: to the end).
+
+    A change that leaves the carrying amount below the residual (a cost reduction larger than what is left), and any
+    change that takes effect after the life has ended or the asset is fully depreciated, is booked whole in the month
+    it takes effect (``days`` 0); a write-off's ``stop`` ends everything, later changes included."""
     out = []
-    carrying, residual, method = Decimal(basis.carrying), Decimal(basis.residual), basis.method
-    life_end, rate = basis.life_end, basis.annual_rate
+    state = {"carrying": Decimal(basis.carrying), "residual": Decimal(basis.residual), "method": basis.method,
+             "life_end": basis.life_end, "rate": basis.annual_rate}
     changes = sorted(basis.changes, key=lambda c: c.on)
     start = basis.start
     exact = None
-    if method == STRAIGHT_LINE and life_end is not None:
-        units = month_units(start, life_end)
-        exact = (carrying - residual) / units if units else ZERO
+    if state["method"] == STRAIGHT_LINE and state["life_end"] is not None:
+        units = month_units(start, state["life_end"])
+        exact = (state["carrying"] - state["residual"]) / units if units else ZERO
     m = month_start(start)
     last_month = month_start(until) if until is not None else None
+    stop_month = month_start(basis.stop) if basis.stop is not None else None
     guard = 0
     while True:
         guard += 1
         if guard > 2400 or (last_month is not None and m > last_month):
             break
-        respread = False
+        if stop_month is not None and m > stop_month:
+            break
+        respread, negative = False, ZERO
         while changes and month_start(changes[0].on) <= m:
-            c = changes.pop(0)
-            carrying += c.carrying_delta
-            if c.residual is not None:
-                residual = Decimal(c.residual)
-            if c.method:
-                method = c.method
-            if c.life_end is not None:
-                life_end = c.life_end
-            if c.annual_rate is not None:
-                rate = c.annual_rate
+            negative += min(ZERO, _apply(changes.pop(0), state))
             respread = True
+        carrying, residual, method = state["carrying"], state["residual"], state["method"]
+        life_end, rate = state["life_end"], state["rate"]
+        room = carrying - residual
+        if room < 0:  # the change took the carrying amount below the residual: settle it now, then nothing is left
+            lump = _lump(m, state, negative)
+            if lump is not None:
+                out.append(lump)
+            break
         if respread and method == STRAIGHT_LINE and life_end is not None:
             units = month_units(max(start, m), life_end)
-            exact = (carrying - residual) / units if units > 0 else ZERO
-        if basis.stop is not None and m > basis.stop:
-            break
+            exact = room / units if units > 0 else None
+            if exact is None:  # the life has already ended: what is left is booked in this month
+                lump = _lump(m, state, negative)
+                if lump is not None:
+                    out.append(lump)
+                break
         lo = max(start, m)
         hi = next_month(m)
         if method == STRAIGHT_LINE and life_end is not None:
@@ -146,7 +182,6 @@ def schedule(basis, *, until=None):
         if basis.stop is not None:
             hi = min(hi, basis.stop + timedelta(days=1))
         days = (hi - lo).days
-        room = carrying - residual
         if room <= 0:
             break
         if days <= 0:
@@ -164,15 +199,25 @@ def schedule(basis, *, until=None):
             else:
                 amount = q(exact * Decimal(days) / dim)
         else:
-            amount = q(carrying * Decimal(rate or 0) / TWELVE * Decimal(days) / dim)
+            amount = q(carrying * Decimal(rate) / TWELVE * Decimal(days) / dim)
         amount = max(ZERO, min(amount, room))
         out.append(Month(m, days, amount, carrying, last))
-        carrying -= amount
-        if last or carrying <= residual:
+        state["carrying"] -= amount
+        if last or state["carrying"] <= residual:
             break
         if basis.stop is not None and basis.stop < next_month(m):
             break
         m = next_month(m)
+    # Changes after the life ended (or after full depreciation): each is booked whole in its month, up to the
+    # write-off's stop and ``until``.
+    for change in changes:
+        cm = month_start(change.on)
+        if (last_month is not None and cm > last_month) or (stop_month is not None and cm > stop_month):
+            break
+        negative = min(ZERO, _apply(change, state))
+        lump = _lump(cm, state, negative)
+        if lump is not None:
+            out.append(lump)
     return out
 
 

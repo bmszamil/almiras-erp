@@ -52,6 +52,10 @@ class FixedAssetAdmin(FixedAssetsAdmin):
 
     list_display = ("code", "entity", "description_ar", "category", "status", "cost", "acquisition_date",
                     "available_for_use_date", "retention_until")
+    exclude = ("transferred_from",)  # R29: the origin is shown by services.asset_detail to users with both rights
+
+    def get_readonly_fields(self, request, obj=None):
+        return [f.name for f in self.model._meta.fields if f.name != "transferred_from"]
     list_filter = ("status", "category__asset_class")
     search_fields = ("code", "description_ar", "description_en", "serial_or_plate", "legacy_code")
 

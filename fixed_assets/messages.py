@@ -110,6 +110,22 @@ MESSAGES = {
                          "first.", "لا توجد فئة للكيان {entity} بالفئة {asset_class} وحساب التكلفة {code}؛ أعدّها أولًا."),
     "not_visible": ("Not visible: you have no fixed-asset view right in the asset's origin entity (R29).",
                     "غير ظاهر: ليست لديك صلاحية عرض الأصول في كيان المصدر."),
+    "event_before_posted_run": (
+        "The event date {on} is not after {through}, the end of the last month depreciated by a posted run for asset "
+        "{asset}; date it on or after {first} (or reverse the later runs first).",
+        "تاريخ الحدث {on} ليس بعد {through}، نهاية آخر شهر استُهلك فيه الأصل {asset} بمسيّر مرحّل؛ أرّخه في {first} أو "
+        "بعده (أو اعكس المسيرات اللاحقة أولًا)."),
+    "no_unrun_month": ("{entity} has no open month on or after {on} without a posted depreciation run.",
+                       "لا يوجد للكيان {entity} شهر مفتوح في {on} أو بعده بلا مسيّر استهلاك مرحّل."),
+    "life_too_short": (
+        "The new total life of {life} months ends on {end}, not after {effective}, when the change takes effect; a "
+        "new life must exceed the months already elapsed.",
+        "العمر الكلي الجديد {life} شهرًا ينتهي في {end}، وليس بعد {effective} حين يسري التغيير؛ يجب أن يتجاوز العمر "
+        "الجديد الأشهر المنقضية."),
+    "opening_row": ("Opening asset {legacy_code}: {why}", "الأصل الافتتاحي {legacy_code}: {why_ar}"),
+    "settings_value": ("Setting {name}: {why}", "الإعداد {name}: {why_ar}"),
+    "estimate_incomplete": ("Asset {asset} has no usable depreciation estimate: {why}",
+                            "لا يوجد للأصل {asset} تقدير استهلاك صالح: {why_ar}"),
     "setup_missing": ("{entity} has no fixed-asset settings; run the setup first (R31).",
                       "لا توجد إعدادات أصول ثابتة للكيان {entity}؛ شغّل الإعداد أولًا."),
 }
@@ -121,6 +137,7 @@ ROLE_NAMES = {
     "accumulated impairment": ("accumulated impairment", "مجمع هبوط القيمة"),
     "impairment expense": ("impairment expense", "خسائر هبوط القيمة"),
     "disposal": ("disposal gain or loss", "أرباح وخسائر الاستبعاد"),
+    "financing": ("Islamic financing (2400)", "التمويل الإسلامي (2400)"),
 }
 
 

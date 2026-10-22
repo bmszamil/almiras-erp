@@ -68,9 +68,14 @@ def posted_lines(entity, account_ids, *, include_reversed=False, date_from=None,
     return qs
 
 
-def line_of(entity, pk):
-    """One purchase-document line of ``entity`` (any status), or None."""
-    return PurchaseDocumentLine.objects.select_related("document", "account").filter(entity=entity, pk=pk).first()
+def line_of(entity, pk, *, lock=False):
+    """One purchase-document line of ``entity`` (any status), or None. With ``lock`` the line row is locked FOR UPDATE
+    (inside the caller's transaction) so two register links of one line run one after the other (fixed-assets R4); a
+    row lock is a read here: nothing is written."""
+    qs = PurchaseDocumentLine.objects.select_related("document", "account").filter(entity=entity, pk=pk)
+    if lock:
+        qs = qs.select_for_update(of=("self",))
+    return qs.first()
 
 
 def _sar(amount, document):

@@ -42,10 +42,10 @@ def test_at9_write_offs_in_a_depreciated_month_and_in_an_open_month(w2):
     itx = services.create_category(w.alm, user=w.a, code="ITX", name_ar="أجهزة قصيرة العمر", asset_class="it_equipment",
                                    cost_account="1540", accum_depr_account="1590", depr_expense_account="5400",
                                    disposal_account="4800")
-    policy(w, w.alm, itx, 8)
+    policy(w, w.alm, itx, 7)
     first_bill = t.bill(w, w.alm, [("1540", "8000.00")], on=date(2026, 9, 1))
     first = t.capitalise(w, t.line_of(first_bill), available=date(2026, 9, 1), category_code="ITX",
-                         residual_value=D("0.00"))
+                         residual_value=D("1000.00"))  # 1,000.00 a month to the residual, fully depreciated by March
     second_bill = t.bill(w, w.alm, [("1540", "3600.00")], on=date(2027, 1, 1))
     second = t.capitalise(w, t.line_of(second_bill), available=date(2027, 1, 1), category_code="IT",
                           residual_value=D("0.00"))
@@ -53,13 +53,16 @@ def test_at9_write_offs_in_a_depreciated_month_and_in_an_open_month(w2):
         t.run(w, w.alm, name)
     first.refresh_from_db()
     assert services._values(first, date(2027, 3, 31))["accumulated_depreciation"] == D("7000.00")
-    off = t.event(w, first, "write_off", date(2027, 3, 20))
+    with pytest.raises(FixedAssetError) as exc:  # review item 1: never into a month a posted run depreciated
+        t.event(w, first, "write_off", date(2027, 3, 20))
+    assert code_of(exc) == "event_before_posted_run" and "2027-04-01" in str(exc.value)
+    off = t.event(w, first, "write_off", date(2027, 4, 10))
     assert off.status == "posted" and off.journal_entry.document_type == "fixed_assets.assetevent"
     assert t.lines_of(off) == [("1540", D("0"), D("8000.00")), ("1590", D("7000.00"), D("0")),
-                               ("4800", D("1000.00"), D("0"))]  # FA4: no extra depreciation (R25), loss on 4800 (R26)
+                               ("4800", D("1000.00"), D("0"))]  # FA4: nothing left to depreciate, loss on 4800 (R26)
     first.refresh_from_db()
-    assert (first.status, first.disposal_date, off.depreciation_until) == ("disposed", date(2027, 3, 20),
-                                                                           date(2027, 3, 31))
+    assert (first.status, first.disposal_date, off.depreciation_until) == ("disposed", date(2027, 4, 10),
+                                                                           date(2027, 4, 10))
     with pytest.raises(FixedAssetError):
         services.update_asset(first, user=w.a, serial_or_plate="X")  # disposed: read-only
     off2 = t.event(w, second, "write_off", date(2027, 4, 15))
@@ -95,11 +98,11 @@ def test_at12_impairment_recomputes_depreciation_and_its_reversal_is_capped(w):
     assert jan.total == D("1875.00")  # 900,000 / 480 (old basis in the impairment month)
     assert feb.total == ((D("900000.00") - D("1875.00") - D("50000.00")) / 479).quantize(D("0.01"))  # new basis
     carrying = services._values(ip, date(2027, 2, 28))["nbv"]
-    rev = t.event(w, ip, "impairment_reversal", date(2027, 2, 28), recoverable_amount=carrying + D("80000.00"))
+    rev = t.event(w, ip, "impairment_reversal", date(2027, 3, 1), recoverable_amount=carrying + D("80000.00"))
     assert rev.amount == D("896250.00") - carrying  # capped at 900,000 - 2 x 1,875 (IAS 36.117)
     assert rev.amount < D("50000.00")
     assert t.lines_of(rev) == [("1596", rev.amount, D("0")), ("5420", D("0"), rev.amount)]
-    assert services._values(ip, date(2027, 2, 28))["nbv"] == D("896250.00")
+    assert services._values(ip, date(2027, 3, 1))["nbv"] == D("896250.00")
 
 
 # --- AT-13, R20, R21 ----------------------------------------------------------------------------------------------

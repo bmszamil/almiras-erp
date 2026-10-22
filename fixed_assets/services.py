@@ -51,11 +51,14 @@ KIND_PERMISSION = {
     EK.IMPAIRMENT: "fixed_assets.impair",
     EK.IMPAIRMENT_REVERSAL: "fixed_assets.impair",
     EK.WRITE_OFF: "fixed_assets.dispose",
+    EK.DISPOSAL_ADJUSTMENT: "fixed_assets.dispose",
     EK.CHANGE_OF_ESTIMATE: "fixed_assets.change_estimate",
     EK.VAT_USE_CHANGE: "fixed_assets.change_estimate",
 }
 POSTING_KINDS = frozenset({EK.FINANCED_ACQUISITION, EK.CAPITALISE_CWIP, EK.IMPAIRMENT, EK.IMPAIRMENT_REVERSAL,
-                           EK.WRITE_OFF})
+                           EK.WRITE_OFF, EK.DISPOSAL_ADJUSTMENT})
+# Cost changes that follow a bill line, a credit note or a reversed bill (R4): before or after disposal.
+COST_ADJUSTMENT_KINDS = frozenset({EK.SUBSEQUENT_COST, EK.DISPOSAL_ADJUSTMENT})
 NOT_BUILT = {EK.REVALUATION: ("not built until OQ-8 (revaluation model; Needs expert sign-off: auditor)",
                               "غير متاحة حتى يُحسم السؤال 8 (نموذج إعادة التقييم)"),
              EK.FAIR_VALUE_CHANGE: ("every entity uses the cost model until OQ-6; record fair values instead (R48)",
@@ -335,6 +338,39 @@ def setup_entity(entity, *, user):
     return created, skipped
 
 
+def _settings_values(fields):
+    """Checked settings (3.9): Art. 52 periods 1 to 600 months, normal credit days empty or 0 to 3,650, reporting
+    dates as ISO dates that are month ends."""
+    out = {}
+
+    def bad(name, en, ar):
+        raise error("settings_value", name=name, why=en, why_ar=ar)
+
+    for name, value in fields.items():
+        if name in ("art52_adjustment_months_movable", "art52_adjustment_months_real_estate", "normal_credit_days"):
+            if value is None and name == "normal_credit_days":
+                out[name] = None
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                bad(name, "a whole number", "عدد صحيح")
+            low, high = (0, 3650) if name == "normal_credit_days" else (1, 600)
+            if not low <= value <= high:
+                bad(name, f"from {low} to {high}", f"من {low} إلى {high}")
+            out[name] = value
+        elif name == "reporting_dates":
+            days = []
+            for item in value or []:
+                try:
+                    day = item if isinstance(item, date) else date.fromisoformat(str(item))
+                except ValueError:
+                    bad(name, f"{item!r} is not a date (YYYY-MM-DD)", f"{item!r} ليس تاريخًا")
+                if day != calc.month_end(day):
+                    bad(name, f"{day} is not a period end", f"{day} ليس نهاية فترة")
+                days.append(str(day))
+            out[name] = sorted(set(days))
+    return out
+
+
 def update_settings(entity, *, user, **fields):
     """Change the entity's settings (``fixed_assets.maintain_setup``); logged (3.9). Retention dates are re-derived and
     never shortened (R33); deferred-payment flags follow ``normal_credit_days`` (R4a)."""
@@ -343,11 +379,10 @@ def update_settings(entity, *, user, **fields):
     if unknown:
         raise error("event_values", why=f"Unknown settings: {', '.join(sorted(unknown))}.",
                     why_ar="إعدادات غير معروفة.")
+    fields = _settings_values(fields)
     with transaction.atomic():
         row = FixedAssetSettings.objects.select_for_update().get(entity=entity)
         before = {f: getattr(row, f) for f in SETTINGS_FIELDS}
-        if "reporting_dates" in fields:
-            fields["reporting_dates"] = sorted(str(date.fromisoformat(str(d))) for d in fields["reporting_dates"] or [])
         for name, value in fields.items():
             setattr(row, name, value)
         row.modified_by, row.modified_at = user, _now()
@@ -380,13 +415,33 @@ def _policy_problems(method, life, rate, residual_pct):
     return [f"{en} / {ar}" for en, ar in out]
 
 
+def _decimal_value(value, places, what_en, what_ar):
+    """A rate or percentage typed in: Decimal or text (never float), with at most the places it is stored with."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (float, bool)):
+        raise error("amount_decimals", what=what_en, what_ar=what_ar, amount=repr(value))
+    try:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise error("amount_decimals", what=what_en, what_ar=what_ar, amount=str(value)) from None
+    quantum = Decimal(1).scaleb(-places)
+    if not number.is_finite() or number != number.quantize(quantum):
+        raise error("amount_decimals", what=what_en, what_ar=what_ar, amount=number)
+    return number.quantize(quantum)
+
+
 def draft_policy(category, *, user, effective_from, method=Method.STRAIGHT_LINE, useful_life_months=None,
                  annual_rate=None, residual_pct="0", basis_note_ar, basis_note_en=""):
     """Draft a policy version (``fixed_assets.maintain_policy``). Values are data entered by the CFO's staff (OQ-2)."""
     entity = category.entity
     access.require(user, entity, "fixed_assets.maintain_policy")
-    rate = Decimal(str(annual_rate)) if annual_rate not in (None, "") else None
-    pct = Decimal(str(residual_pct or "0"))
+    rate = _decimal_value(annual_rate, 4, "Annual rate", "النسبة السنوية")
+    pct = _decimal_value(residual_pct or "0", 3, "Residual value %", "نسبة القيمة المتبقية")
+    if useful_life_months is not None and (isinstance(useful_life_months, bool) or not isinstance(useful_life_months, int)
+                                           or useful_life_months <= 0):
+        raise error("event_values", why="The useful life is a whole number of months above zero.",
+                    why_ar="العمر الإنتاجي عدد صحيح من الأشهر أكبر من صفر.")
     problems = _policy_problems(method, useful_life_months, rate, pct)
     if not category.depreciable:
         problems.append("A non-depreciable category has no depreciation policy (R12). / لا سياسة استهلاك لفئة لا تُستهلك.")
@@ -475,6 +530,11 @@ def _linked(line_id):
     return AssetCostComponent.objects.filter(purchase_line_id=line_id).aggregate(t=Sum("amount"))["t"] or ZERO
 
 
+def _linked_to(line, asset):
+    """What ``line`` feeds ``asset`` now, net of voided links (R4); zero when never linked or voided."""
+    return AssetCostComponent.objects.filter(purchase_line=line, asset=asset).aggregate(t=Sum("amount"))["t"] or ZERO
+
+
 def _remaining(booking):
     return booking.amount - _linked(booking.line_id)
 
@@ -547,12 +607,15 @@ def create_asset_from_line(line, *, user, category=None, asset=None, amount=None
     for name, value in (("usage", usage), ("held_for", held_for), ("vat_use", vat_use)):
         _check_choice(name, value)
     with transaction.atomic():
-        line = port.line_of(entity, line.pk)
+        line = port.line_of(entity, line.pk, lock=True)  # R4: one linker of a line at a time
         if asset is not None:
             _same_entity(entity, asset, "The asset", "الأصل")
             asset = _lock(FixedAsset, asset.pk)
             _same_entity(entity, asset, "The asset", "الأصل")
-            category = category or asset.category
+            if category is not None and category.pk != asset.category_id:
+                raise error("line_category", line=port.document_label(line), code=line.account.code,
+                            category=asset.category.label)
+            category = asset.category
         _same_entity(entity, category, "The category", "الفئة")
         _same_entity(entity, location, "The location", "الموقع")
         label = port.document_label(line)
@@ -591,7 +654,7 @@ def create_asset_from_line(line, *, user, category=None, asset=None, amount=None
             raise error("active_through_event")
         elif asset.status != AS.DRAFT:
             raise error("not_draft")
-        if AssetCostComponent.objects.filter(purchase_line=line, asset=asset).exists():  # R4: once per asset
+        if _linked_to(line, asset):  # R4: once per asset (unless its earlier links net to zero)
             raise error("line_fully_linked", line=label, amount=booking.amount)
         settings = _settings(entity)
         share = value / booking.amount if booking.amount else ZERO
@@ -651,7 +714,7 @@ def _deferred(booking, settings):
 
 def _refresh_cost(asset):
     asset.cost = calc.q(asset.components.aggregate(t=Sum("amount"))["t"] or ZERO)
-    dates = [c.accounting_date for c in asset.components.all() if c.amount > ZERO]
+    dates = [c.acquired_on or c.accounting_date for c in asset.components.all() if c.amount > ZERO]
     if asset.status in (AS.DRAFT, AS.SUBMITTED) and not asset.is_migrated:
         asset.acquisition_date = min(dates) if dates else None  # R5: fixed at activation
 
@@ -886,6 +949,12 @@ def _basis(asset, *, with_impairment=True):
     base_cost = asset.components.filter(effective_from__isnull=True).aggregate(t=Sum("amount"))["t"] or ZERO
     carrying = base_cost - asset.opening_accumulated_depreciation
     life_end = calc.add_months(start, life) if (method == Method.STRAIGHT_LINE and life) else None
+    if method == Method.STRAIGHT_LINE and life_end is None:
+        raise error("estimate_incomplete", asset=asset.code, why="straight line without a (remaining) life",
+                    why_ar="قسط ثابت بلا عمر (متبقٍ)")
+    if method == Method.REDUCING_BALANCE and rate is None:
+        raise error("estimate_incomplete", asset=asset.code, why="reducing balance without a rate",
+                    why_ar="قسط متناقص بلا نسبة")
     changes = [calc.Change(on=c.effective_from, carrying_delta=c.amount)
                for c in asset.components.filter(effective_from__isnull=False)]
     if with_impairment:
@@ -933,7 +1002,7 @@ def _pending_adjustments(asset):
                 if booking is not None and booking.amount:
                     out.append(port.document_label(line))
     for c in components:
-        if c.purchase_line.document.status == port.REVERSED and c.amount > ZERO and not \
+        if c.reverses_id is None and c.purchase_line.document.status == port.REVERSED and not \
                 AssetCostComponent.objects.filter(reverses=c).exists():
             out.append(f"{port.document_label(c.purchase_line)} (reversed / معكوسة)")
     return out
@@ -1248,9 +1317,15 @@ def _vehicle_contracts(asset):
     or plate (read-only; OQ-13 until billing links the asset)."""
     from billing.models import Contract, ContractType
 
-    refs = [r for r in (asset.code, asset.serial_or_plate) if r]
-    return list(Contract.objects.filter(entity_id=asset.entity_id, contract_type=ContractType.VEHICLE_RENTAL,
-                                        status=Contract.Status.ACTIVE, vehicle_ref__in=refs))
+    refs = {_plate(r) for r in (asset.code, asset.serial_or_plate) if r}
+    return [c for c in Contract.objects.filter(entity_id=asset.entity_id, contract_type=ContractType.VEHICLE_RENTAL,
+                                               status=Contract.Status.ACTIVE).order_by("pk")
+            if _plate(c.vehicle_ref) in refs]
+
+
+def _plate(value):
+    """A plate or code compared without spaces, hyphens and case (R27)."""
+    return "".join(ch for ch in (value or "").upper() if ch not in " -\u00a0")
 
 
 def _check_vehicle(asset):
@@ -1259,20 +1334,33 @@ def _check_vehicle(asset):
         raise error("vehicle_on_contract", code=asset.code, contract=contracts[0].number or contracts[0].pk)
 
 
+def _last_posted_end(asset):
+    """The end of the last month a posted run depreciated ``asset`` (or its cut-over date), else None."""
+    last = (_posted_lines(asset).order_by("-run__period__end_date").values_list("run__period__end_date", flat=True)
+            .first())
+    candidates = [d for d in (last, asset.opening_date) if d is not None]
+    return max(candidates) if candidates else None
+
+
+def _check_event_date(asset, on):
+    """Review item 1, 3: an event never reaches back into a month a posted run has depreciated (or before the
+    cut-over), so what it derecognises or changes never depends on catching up booked months."""
+    through = _last_posted_end(asset)
+    if through is not None and on <= through:
+        raise error("event_before_posted_run", on=on, through=through, asset=asset.code,
+                    first=through + timedelta(days=1))
+
+
 def _write_off_values(asset, on):
-    """R23, R25: what a write-off dated ``on`` derecognises. A month already depreciated by a posted run gets no
-    extra depreciation; otherwise the depreciation up to ``on`` is included (that month's run books it)."""
-    period = _period_of(asset.entity, on)
-    if _posted_lines(asset).filter(run__period=period).exists():
-        until = period.end_date
-    else:
-        until = on
+    """R23, R25: what a write-off dated ``on`` derecognises: the cost, the impairment and the depreciation scheduled
+    through ``on`` (the months after the last posted run, up to ``on``, are booked by their runs later)."""
+    until = on
     depreciation = asset.opening_accumulated_depreciation + _posted_depreciation(asset)
     if asset.category.depreciable and _start_of(asset) and asset.method:
         basis = _basis(asset)
         basis.stop = until
-        scheduled = sum((m.amount for m in calc.schedule(basis, until=until)), ZERO)
-        depreciation = asset.opening_accumulated_depreciation + max(scheduled, _posted_depreciation(asset))
+        depreciation = asset.opening_accumulated_depreciation + sum(
+            (m.amount for m in calc.schedule(basis, until=until)), ZERO)
     impairment = _net_impairment(asset)
     cost = asset.cost
     return {"cost_derecognised": cost, "depreciation_derecognised": calc.q(depreciation),
@@ -1296,6 +1384,10 @@ def _impairment_cap(asset):
 def _event_values(event):
     """Computed amounts of an event (R7, R19, R23, R44); raises on invalid values."""
     asset, kind, entity = event.asset, event.kind, event.entity
+    if kind not in (EK.CHANGE_OF_ESTIMATE, EK.DISPOSAL_ADJUSTMENT):
+        _check_event_date(asset, event.event_date)
+        if kind == EK.CAPITALISE_CWIP and event.target_asset is not None:
+            _check_event_date(event.target_asset, event.event_date)
     if kind == EK.FINANCED_ACQUISITION:
         if not event.financing_ref or event.cash_cost_price is None or event.financing_total is None:
             raise error("event_values", why="A financed acquisition needs the financing contract, the cash cost price "
@@ -1312,7 +1404,7 @@ def _event_values(event):
             raise error("cwip_target")
         if event.amount is None or event.amount > asset.cost:
             raise error("cwip_amount", amount=event.amount, cost=asset.cost)
-    elif kind == EK.SUBSEQUENT_COST:
+    elif kind in COST_ADJUSTMENT_KINDS:
         line, component, journal_line = event.purchase_line, event.reverses_component, event.source_journal_line
         if journal_line is not None:
             if _financing_account(journal_line.account):
@@ -1321,7 +1413,8 @@ def _event_values(event):
                         "(OQ-22).", why_ar="تأتي تكلفة الأصل من بنود الفواتير والاقتناء الممول والمشروعات تحت التنفيذ فقط.")
         if component is not None:
             if component.asset_id != asset.pk or component.purchase_line is None or \
-                    component.purchase_line.document.status != port.REVERSED:
+                    component.purchase_line.document.status != port.REVERSED or \
+                    AssetCostComponent.objects.filter(reverses=component).exclude(source_event_id=event.pk).exists():
                 raise error("event_values", why="Only a component of a reversed bill of this asset is reversed.",
                             why_ar="يُعكس مكوّن فاتورة معكوسة لهذا الأصل فقط.")
             event.amount = -component.amount
@@ -1330,11 +1423,12 @@ def _event_values(event):
                 raise error("other_entity", what="The bill line", what_ar="بند الفاتورة")
             if _financing_account(line.account):
                 raise error(_r7_code(entity))
+            line = port.line_of(entity, line.pk, lock=True)  # R4: one linker of a line at a time
             booking = port.booking_of(line)
             if booking is None or booking.status != port.POSTED or line.account_id != asset.category.cost_account_id:
                 raise error("line_not_capitalisable", line=port.document_label(line), entity=entity.code)
             remaining = _remaining(booking)
-            if not remaining or AssetCostComponent.objects.filter(purchase_line=line, asset=asset).exists():
+            if not remaining or _linked_to(line, asset):
                 raise error("line_fully_linked", line=port.document_label(line), amount=booking.amount)
             event.amount = remaining
         else:
@@ -1381,6 +1475,7 @@ EVENT_STATUSES = {
     EK.IMPAIRMENT: (AS.ACTIVE, AS.FULLY_DEPRECIATED),
     EK.IMPAIRMENT_REVERSAL: (AS.ACTIVE, AS.FULLY_DEPRECIATED),
     EK.WRITE_OFF: (AS.ACTIVE, AS.FULLY_DEPRECIATED),
+    EK.DISPOSAL_ADJUSTMENT: (AS.DISPOSED,),
     EK.VAT_USE_CHANGE: (AS.ACTIVE, AS.FULLY_DEPRECIATED),
 }
 
@@ -1405,12 +1500,21 @@ def _check_event_accounts(event):
     if event.kind in (EK.IMPAIRMENT, EK.IMPAIRMENT_REVERSAL):
         _need_account(category, category.impairment_expense_account, "impairment expense")
         _need_account(category, category.accum_impairment_account, "accumulated impairment")
+    elif event.kind == EK.DISPOSAL_ADJUSTMENT:
+        _need_account(category, category.disposal_account, "disposal")
+    elif event.kind == EK.FINANCED_ACQUISITION:
+        _financing_account_of(event.entity, category)
     elif event.kind == EK.WRITE_OFF:
         _need_account(category, category.disposal_account, "disposal")
         if event.depreciation_derecognised:
             _need_account(category, category.accum_depr_account, "accumulated depreciation")
         if event.impairment_derecognised:
             _need_account(category, category.accum_impairment_account, "accumulated impairment")
+
+
+def _financing_account_of(entity, category):
+    """FA8: the entity's Islamic financing account (2400); refused bilingually when the chart lacks it (R45)."""
+    return _need_account(category, Account.objects.filter(entity=entity, code=template.FINANCING).first(), "financing")
 
 
 EVENT_FIELDS = ("amount", "cash_cost_price", "financing_total", "financing_ref", "recoverable_amount", "target_asset",
@@ -1459,10 +1563,13 @@ def record_cost_adjustment(asset, *, user, purchase_line=None, reverses_componen
                            reason_en=""):
     """R4: the event that brings a vendor credit note line, a further bill line or a reversed bill into an active
     asset's cost (kind ``subsequent_cost``; approved under ``fixed_assets.capitalisation``; no entry: invoicing booked
-    the GL side)."""
+    the GL side). On a disposed asset it is a ``disposal_adjustment`` (approved under ``fixed_assets.disposal``) that
+    books the difference against the disposal result (review item 7)."""
     access.require(user, asset.entity, "fixed_assets.record_event")
     when = event_date or (purchase_line.document.accounting_date if purchase_line is not None else _today())
-    return draft_event(asset, user=user, kind=EK.SUBSEQUENT_COST, event_date=when, reason_ar=reason_ar,
+    stored = FixedAsset.objects.get(pk=asset.pk)
+    kind = EK.DISPOSAL_ADJUSTMENT if stored.status == AS.DISPOSED else EK.SUBSEQUENT_COST  # review item 7
+    return draft_event(stored, user=user, kind=kind, event_date=when, reason_ar=reason_ar,
                        reason_en=reason_en, purchase_line=purchase_line, reverses_component=reverses_component)
 
 
@@ -1494,12 +1601,23 @@ def submit_event(event, *, user):
 
 
 def _effective_month(entity, on):
-    """R16 house convention: the first day of the earliest open month on or after ``on``."""
+    """R16 house convention (review item 3): the first day of the earliest open month on or after ``on`` that has no
+    posted depreciation run; refused when there is none."""
+    posted = _posted_periods(entity)
     period = (FiscalPeriod.objects.filter(entity=entity, status=FiscalPeriod.Status.OPEN, end_date__gte=on)
-              .order_by("start_date").first())
+              .exclude(pk__in=posted).order_by("start_date").first())
     if period is None:
-        raise error("no_period", entity=entity.code, on=on)
+        raise error("no_unrun_month", entity=entity.code, on=on)
     return period.start_date
+
+
+def _check_new_life(asset, event):
+    """Review item 6: a new total life ends after the month the change takes effect."""
+    if event.new_useful_life_months:
+        origin = asset.available_for_use_date or _start_of(asset)
+        end = calc.add_months(origin, event.new_useful_life_months)
+        if end <= event.effective_from:
+            raise error("life_too_short", life=event.new_useful_life_months, end=end, effective=event.effective_from)
 
 
 def approve_event(event, *, user, permission=None):
@@ -1546,6 +1664,7 @@ def approve_event(event, *, user, permission=None):
             event.status = ES.APPROVED
             if event.kind == EK.CHANGE_OF_ESTIMATE:
                 event.effective_from = _effective_month(entity, _today())
+                _check_new_life(asset, event)
             _save(event)
             access.use_grant(grant, target=event)
         _apply_event(event, asset, user)
@@ -1573,9 +1692,9 @@ def _apply_event(event, asset, user):
         _save(AssetCostComponent(entity=asset.entity, asset=asset, kind=AssetCostComponent.Kind.CWIP_TRANSFER,
                                  amount=-event.amount, accounting_date=event.event_date, source_event=event,
                                  created_by=user))
-        _save(AssetCostComponent(
+        _save(AssetCostComponent(  # booked on the target's account on the transfer date; acquired with the CWIP
             entity=asset.entity, asset=target, kind=AssetCostComponent.Kind.CWIP_TRANSFER, amount=event.amount,
-            accounting_date=asset.acquisition_date or event.event_date, source_event=event, created_by=user,
+            accounting_date=event.event_date, acquired_on=asset.acquisition_date, source_event=event, created_by=user,
             effective_from=calc.next_month(event.event_date) if target.status == AS.ACTIVE else None))
         _refresh_cost(asset)
         _refresh_cost(target)
@@ -1585,7 +1704,7 @@ def _apply_event(event, asset, user):
         _refresh_dates(target, settings)
         target.version += 1
         _save(target)
-    elif kind == EK.SUBSEQUENT_COST:
+    elif kind in COST_ADJUSTMENT_KINDS:
         _save(AssetCostComponent(
             entity=asset.entity, asset=asset, kind=AssetCostComponent.Kind.SUBSEQUENT_COST,
             purchase_line=event.purchase_line, reverses=event.reverses_component, amount=event.amount,
@@ -1655,13 +1774,18 @@ def _event_lines(event):
             out.append({"account": credit, "credit": amount, "description": label})
 
     if event.kind == EK.FINANCED_ACQUISITION:
-        pair(category.cost_account, Account.objects.get(entity=event.entity, code=template.FINANCING), event.amount)
+        pair(category.cost_account, _financing_account_of(event.entity, category), event.amount)
     elif event.kind == EK.CAPITALISE_CWIP:
         pair(event.target_asset.category.cost_account, category.cost_account, event.amount)
     elif event.kind == EK.IMPAIRMENT:
         pair(category.impairment_expense_account, category.accum_impairment_account, event.amount)
     elif event.kind == EK.IMPAIRMENT_REVERSAL:
         pair(category.accum_impairment_account, category.impairment_expense_account, event.amount)
+    elif event.kind == EK.DISPOSAL_ADJUSTMENT:  # a credit note lowers the cost already derecognised: a gain
+        if event.amount < ZERO:
+            pair(category.cost_account, category.disposal_account, -event.amount)
+        else:
+            pair(category.disposal_account, category.cost_account, event.amount)
     elif event.kind == EK.WRITE_OFF:
         for account, amount in ((category.accum_depr_account, event.depreciation_derecognised),
                                 (category.accum_impairment_account, event.impairment_derecognised),
@@ -1677,14 +1801,14 @@ def _event_accounts(event):
     ids = {category.cost_account_id, category.accum_depr_account_id, category.accum_impairment_account_id,
            category.impairment_expense_account_id, category.disposal_account_id, category.depr_expense_account_id}
     if event.kind == EK.FINANCED_ACQUISITION:
-        ids.add(Account.objects.get(entity=event.entity, code=template.FINANCING).pk)  # R38: 2400 for FA8 only
+        ids.add(_financing_account_of(event.entity, category).pk)  # R38: 2400 for FA8 only
     if event.kind == EK.CAPITALISE_CWIP and event.target_asset_id:
         ids.add(event.target_asset.category.cost_account_id)
     return ids - {None}
 
 
 def _validate_event_lines(event, lines):
-    expected = {EK.WRITE_OFF: event.cost_derecognised}.get(event.kind, event.amount) or ZERO
+    expected = abs({EK.WRITE_OFF: event.cost_derecognised}.get(event.kind, event.amount) or ZERO)
     return _line_problems(event.entity, lines, _event_accounts(event), expected, f"event {event.pk}")
 
 
@@ -1726,13 +1850,20 @@ def request_reversal(document, *, user, reason_ar, reason_en=""):
         raise error("reason_required")
     with transaction.atomic():
         document = _lock(type(document), document.pk)
-        if document.status != "posted" or document.journal_entry_id is None:
+        if not _reversible(document):
             raise error("not_posted")
         document.reversal_requested_by, document.reversal_requested_at = user, _now()
         document.reversal_reason_ar, document.reversal_reason_en = reason_ar.strip(), (reason_en or "").strip()
         _save(document)
         engine.submit(document, user, submit_permission=right, permission="fixed_assets.reverse_document")
     return document
+
+
+def _reversible(document):
+    """A posted run or event, or an approved cost adjustment (no entry: it is voided, review item 8)."""
+    if document.status == "posted" and document.journal_entry_id is not None:
+        return True
+    return isinstance(document, AssetEvent) and document.status == ES.APPROVED and document.kind == EK.SUBSEQUENT_COST
 
 
 def _later_dependants(document):
@@ -1759,12 +1890,18 @@ def reverse_document(document, *, user, date=None):
     with transaction.atomic():
         document = _lock(model, document.pk)
         grant = access.require(user, entity, "fixed_assets.reverse_document", document=document, through_engine=True)
-        if document.status != "posted" or document.journal_entry_id is None:
+        if not _reversible(document):
             raise error("not_posted")
         if not document.reversal_reason_ar:
             raise error("reason_required")
         if _later_dependants(document):
             raise error("reversal_order")
+        if document.journal_entry_id is None:  # an approved cost adjustment: voided, nothing to reverse in the GL
+            access.use_grant(grant, target=document)
+            document.status = "reversed"
+            _save(document)
+            _undo_event(document, user)
+            return document
         token = _reversing.set((model._meta.label_lower, document.pk))
         try:
             reversal = ledger.reverse_entry(document.journal_entry, grant, date=date,
@@ -1797,10 +1934,15 @@ def cancel_reversal(document, *, user, note=""):
 def _undo_event(event, user):
     asset = _lock(FixedAsset, event.asset_id)
     for component in AssetCostComponent.objects.filter(source_event=event, reverses__isnull=True):
+        effective = component.effective_from
+        if effective is not None and event.kind == EK.SUBSEQUENT_COST:  # prospective: never into a posted month
+            through = _last_posted_end(component.asset)
+            if through is not None and effective <= through:
+                effective = calc.next_month(through)
         _save(AssetCostComponent(entity=component.entity, asset=component.asset, kind=component.kind,
                                  amount=-component.amount, accounting_date=component.accounting_date,
-                                 reverses=component, source_event=event, created_by=user,
-                                 effective_from=component.effective_from))
+                                 acquired_on=component.acquired_on, reverses=component, source_event=event,
+                                 purchase_line=component.purchase_line, created_by=user, effective_from=effective))
         if component.asset_id != asset.pk:
             other = _lock(FixedAsset, component.asset_id)
             _refresh_cost(other)
@@ -1824,10 +1966,12 @@ def _gl_balance(entity, code, as_of):
 
 def register_to_gl(entity, as_of, *, user):
     """R9: per asset account, the register's balance against the ledger's on ``as_of`` (zero difference expected).
-    Migrated assets count once the entity's opening entry is posted (R40)."""
+    Migrated assets count once the entity's opening entry is posted (R40). ``reconciling`` lists what explains a
+    balance that looks odd but ties: a write-off's depreciation to its date that its month's run has not booked yet
+    (the accumulated account shows a debit until then)."""
     access.require(user, entity, VIEW)
     opening = ledger.migration_opening_posted(entity)
-    register_side = {}
+    register_side, reconciling = {}, {}
 
     def add(account, amount):
         if account is not None:
@@ -1845,6 +1989,15 @@ def register_to_gl(entity, as_of, *, user):
         if written is not None:
             add(c.cost_account, -written.cost_derecognised)
             depreciation -= written.depreciation_derecognised
+            stub = written.depreciation_derecognised - asset.opening_accumulated_depreciation - \
+                _posted_depreciation(asset, as_of)
+            if stub and c.accum_depr_account is not None:  # derecognised now, booked by a later run
+                reconciling.setdefault(c.accum_depr_account.code, []).append({
+                    "asset": asset.code, "amount": calc.q(stub),
+                    "note": f"Write-off {written.event_date}: depreciation to that date not yet booked by its run "
+                            f"/ شطب {written.event_date}: استهلاك حتى تاريخه لم يُرحَّل بمسيّره بعد"})
+        for adj in _posted_events(asset, EK.DISPOSAL_ADJUSTMENT, through=as_of):
+            add(c.cost_account, -adj.amount)  # the cost change after disposal went to the disposal result
         add(c.accum_depr_account, -depreciation)
         impairment = _net_impairment(asset, as_of) - (written.impairment_derecognised if written else ZERO)
         add(c.accum_impairment_account, -impairment)
@@ -1854,7 +2007,8 @@ def register_to_gl(entity, as_of, *, user):
     for code in sorted(codes):
         reg = calc.q(register_side.get(code, ZERO))
         gl = _gl_balance(entity, code, as_of)
-        rows.append({"account": code, "register": reg, "ledger": gl, "difference": gl - reg})
+        rows.append({"account": code, "register": reg, "ledger": gl, "difference": gl - reg,
+                     "reconciling": reconciling.get(code, [])})
     return rows
 
 

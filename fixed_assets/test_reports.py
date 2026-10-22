@@ -160,7 +160,9 @@ def test_at23_register_to_gl_is_zero_after_every_posting_kind(w):
     ip = t.capitalise(w, t.line_of(bill, 4), available=on, category_code="IPB", usage="investment_property",
                       held_for="rental", residual_value=D("0.00"))
     t.run(w, w.alm, "2027-01")  # FA2
-    t.event(w, it, "write_off", date(2027, 1, 31))  # FA4
+    jan = services.register_to_gl(w.alm, date(2027, 1, 31), user=w.v)
+    assert all(r["difference"] == 0 and not r["reconciling"] for r in jan), jan
+    off = t.event(w, it, "write_off", date(2027, 2, 1))  # FA4 (one day of February to its date)
     building = services.create_asset(w.alm, user=w.a, category=t.category(w.alm, "BLDG"), location=w.loc,
                                      description_ar="مبنى", vat_use="taxable", held_for="own_use")
     t.event(w, cwip, "capitalise_cwip", date(2027, 2, 1), amount=D("50000.00"), target_asset=building)  # FA5
@@ -169,9 +171,16 @@ def test_at23_register_to_gl_is_zero_after_every_posting_kind(w):
                                     description_ar="آلة", vat_use="taxable", held_for="own_use")
     t.event(w, machine, "financed_acquisition", date(2027, 2, 1), cash_cost_price=D("300000.00"),
             financing_total=D("330000.00"), financing_ref="MUR-9")  # FA8
-    rows = services.register_to_gl(w.alm, date(2027, 2, 28), user=w.v)
-    assert rows and all(r["difference"] == 0 for r in rows), rows
+    for on in (date(2027, 2, 1), date(2027, 2, 15), date(2027, 2, 28)):
+        rows = services.register_to_gl(w.alm, on, user=w.v)
+        assert rows and all(r["difference"] == 0 for r in rows), (on, rows)
     assert {r["account"] for r in rows} >= {"1500", "1510", "1520", "1540", "1550", "1570", "1590", "1591", "1596"}
+    stub = {r["account"]: r["reconciling"] for r in rows}["1590"]  # the write-off's day of February, not run yet
+    assert [(x["asset"], x["amount"]) for x in stub] == [(it.code, off.depreciation_derecognised - D("222.22"))]
+    assert "لم يُرحَّل" in stub[0]["note"]
+    t.run(w, w.alm, "2027-02")
+    rows = services.register_to_gl(w.alm, date(2027, 2, 28), user=w.v)
+    assert all(r["difference"] == 0 and not r["reconciling"] for r in rows), rows
     assert car.status == "active"
 
 
