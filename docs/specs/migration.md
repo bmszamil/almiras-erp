@@ -446,6 +446,9 @@ is the bilingual guide. Code: `migration/workbook_spec.py` (sheets, columns, lis
 - W11 *Fixed assets* (fixed-assets OQ-19). Accumulated depreciation ≤ cost; per Falcon cost code Σ cost = TB
   balance; per accumulated-depreciation code Σ accumulated = − TB balance; codes mapped to 1500, 1510, 1520 or 1590
   with a balance and no asset row are differences.
+  *Note 2026-10-22 (fixed-assets review of ccb9cef, item 4):* a depreciable row needs a method and a remaining
+  life (`depreciation_estimate`); `reducing_balance` rows are refused (`reducing_balance_rate`) until the sheet has
+  a rate column. The fixed-assets loader (R40) refuses the same rows (`opening_row`, en/ar).
 - W12 *Command* `migration_workbook_check --workbook f [--user u] [--entity E …] [--report out.csv]`: read-only,
   prints the report (summary per entity, problems, tie-outs), exit status 1 when it has an error.
 - W13 *Existing commands* accept `--workbook f` instead of `--tb` / `--import`: `migration_map` drafts the map from
