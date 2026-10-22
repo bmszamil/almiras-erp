@@ -87,7 +87,7 @@ class Column:
     en: str
     ar: str
     kind: str  # entity, text, legacy_code, erp_code, sar, amount, date, int, choice, yesno, currency, country, vat,
-    #            cr, iban, rate
+    #            cr, iban, rate, period (a month, YYYY-MM)
     required: bool = False
     choices: str = ""  # key of CHOICES for kind "choice"
     personal: bool = False  # personal data (PDPL): marked [PD], values never repeated in messages
@@ -472,6 +472,50 @@ SHEETS = (
         unique=(("entity", "employee_no"),),
     ),
     Sheet(
+        # migration W14 (dry run 2026-10-21 gap 4): the bai' ajel contracts behind 1240 / 1241, loaded into payroll
+        # and invoicing as migrated contracts so payroll collects their remaining instalments.
+        "bai_ajel_contracts", "Bai' ajel contracts", "عقود البيع الآجل",
+        "Every employee bai' ajel (deferred-payment sale) contract with a balance on the cut-over date. The amounts "
+        "still open must equal the employee deferred-sale receivable and the deferred profit in the trial balance. "
+        "Without the signed consent reference the contract loads with its salary deductions held until payroll "
+        "records the consent.",
+        "كل عقد بيع آجل لموظف عليه رصيد في تاريخ التحويل. يجب أن تساوي المبالغ المتبقية ذمم البيع الآجل للموظفين "
+        "والأرباح المؤجلة في ميزان المراجعة. وبلا مرجع الموافقة الموقعة يُحمَّل العقد مع إيقاف استقطاعه من الراتب حتى "
+        "تسجل الرواتب الموافقة.",
+        (
+            ENTITY,
+            C("contract_no", "Contract number (legacy)", "رقم العقد (السابق)", required=True, width=14, max_len=40),
+            C("employee_no", "Employee number (as on the Employees sheet)", "الرقم الوظيفي (كما في ورقة الموظفين)",
+              required=True, width=14, max_len=20),
+            C("asset_description_ar", "Asset sold (Arabic)", "الأصل المبيع (بالعربية)", required=True, width=26),
+            C("asset_description_en", "Asset sold (English)", "الأصل المبيع (بالإنجليزية)", width=26),
+            C("sale_date", "Sale date", "تاريخ البيع", "date", required=True, width=13),
+            C("sale_price", "Sale price (cost + profit, SAR, before VAT)",
+              "ثمن البيع (التكلفة + الربح، ريال، قبل الضريبة)", "sar", required=True),
+            C("profit_amount", "Fixed profit in the price (SAR)", "الربح الثابت ضمن الثمن (ريال)", "sar", required=True),
+            C("vat_amount", "VAT charged to the employee (SAR)", "الضريبة المحملة على الموظف (ريال)", "sar"),
+            C("instalments", "Number of instalments (whole contract)", "عدد الأقساط (للعقد كله)", "int", required=True,
+              width=10),
+            C("paid_to_date", "Paid up to the cut-over (SAR, of price + VAT)",
+              "المسدد حتى تاريخ التحويل (ريال، من الثمن والضريبة)", "sar", required=True),
+            C("next_instalment_period", "First instalment after the cut-over (YYYY-MM)",
+              "أول قسط بعد تاريخ التحويل (سنة-شهر)", "period", required=True, width=12, max_len=7),
+            C("consent_ref", "Signed salary-deduction consent (reference)", "مرجع الموافقة الموقعة على الاستقطاع",
+              width=22, max_len=200),
+        ),
+        examples=(
+            {"entity": "EXA", "contract_no": "EX-BAJ-01", "employee_no": "EX-001", "asset_description_ar": "سيارة مثال",
+             "asset_description_en": "Example car", "sale_date": date(2025, 1, 15), "sale_price": D("60000.00"),
+             "profit_amount": D("6000.00"), "vat_amount": D("9000.00"), "instalments": 36,
+             "paid_to_date": D("44083.33"), "next_instalment_period": "2027-01", "consent_ref": "EX-CONSENT-01"},
+            {"entity": "EXA", "contract_no": "EX-BAJ-02", "employee_no": "EX-002", "asset_description_ar": "أثاث مثال",
+             "asset_description_en": "Example furniture", "sale_date": date(2026, 6, 1), "sale_price": D("12000.00"),
+             "profit_amount": D("1000.00"), "vat_amount": D("1800.00"), "instalments": 12,
+             "paid_to_date": D("6900.00"), "next_instalment_period": "2027-01", "consent_ref": None},
+        ),
+        unique=(("entity", "contract_no"),),
+    ),
+    Sheet(
         "fixed_assets", "Fixed assets", "الأصول الثابتة",
         "The asset register on the cut-over date, one row per asset (or per category where no detail exists). Cost "
         "and accumulated depreciation must equal the Falcon accounts in the trial balance.",
@@ -597,11 +641,17 @@ CHECKLIST_STEPS = (
      "Treasury or accountant / الخزينة أو المحاسب", "CFO / المدير المالي"),
     ("Employees entered in the secured copy (personal data)", "إدخال الموظفين في النسخة المحمية (بيانات شخصية)",
      "HR / الموارد البشرية", "HR manager or CEO / مدير الموارد البشرية أو الرئيس التنفيذي"),
+    ("Bai' ajel contracts entered; tie to 1240 and 1241", "إدخال عقود البيع الآجل ومطابقتها مع 1240 و1241",
+     "Payroll officer / مسؤول الرواتب", "CFO / المدير المالي"),
     ("Fixed asset register entered; ties to cost and depreciation", "إدخال سجل الأصول الثابتة ومطابقته",
      "Accountant / المحاسب", "CFO / المدير المالي"),
     ("Validation run: no errors; every warning decided", "تشغيل الفحص: لا أخطاء، وقرار في كل تنبيه", "Accountant / المحاسب", "CFO / المدير المالي"),
     ("Opening drafts loaded in the ERP (dry run first)", "تحميل المسودات الافتتاحية في النظام (بتجربة أولًا)",
      "Accountant / المحاسب", "-"),
+    ("Sub-ledgers loaded (open items, banks, employees, provisions, leave, bai' ajel); bank accounts and leave "
+     "approved", "تحميل السجلات الفرعية (البنود المفتوحة والبنوك والموظفين والمخصصات والإجازات والبيع الآجل) واعتماد "
+     "الحسابات البنكية والإجازات", "Accountant, HR, payroll / المحاسب والموارد البشرية والرواتب",
+     "Approver / المعتمد"),
     ("Opening drafts posted by a second person", "ترحيل المسودات بواسطة شخص آخر", "Approver, not the preparer / المعتمد، وليس المُعد", "-"),
     ("Tie-out report: ERP = legacy to the halala, signed", "تقرير المطابقة: النظام = النظام السابق حتى الهللة، موقع",
      "Accountant / المحاسب", "CFO and CEO / المدير المالي والرئيس التنفيذي"),

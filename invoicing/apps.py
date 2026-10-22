@@ -18,6 +18,7 @@ class InvoicingConfig(AppConfig):
         from .models import (
             CustomerReceipt,
             DeferredProfitRelease,
+            MigratedSettlement,
             PurchaseDocument,
             PurificationTransfer,
             SalesDocument,
@@ -44,11 +45,13 @@ class InvoicingConfig(AppConfig):
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._receipt_lines, validate_lines=services._check_document_rate,
             creator_may_post=services._receipt_creator_may_post,
+            reverse_guard=services._money_reverse_guard,  # R129: not while a migrated settlement uses it
         )
         documents.register(
             VendorPayment, post_permissions={"invoicing.approve_vendor_payment"},
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._payment_lines, validate_lines=services._check_document_rate,
+            reverse_guard=services._money_reverse_guard,  # R129: not while a migrated settlement uses it
         )
         # R54: E14 by a second person with invoicing.post_purification_transfer; the funding (owner decision C2) and
         # E15 approved by the CFO. All are corrected by reversal (reverse_purification_transfer) with
@@ -67,6 +70,13 @@ class InvoicingConfig(AppConfig):
             DeferredProfitRelease, post_permissions={"invoicing.post_deferred_profit"},
             reverse_permissions={"payroll.reverse_run"}, changed_at_field=None,
             build_lines=services._deferred_profit_lines, reverse_guard=services._deferred_profit_reverse_guard,
+        )
+        # R129 (OQ-79): a foreign-currency settlement of a migrated open item, posted by its approval in the engine
+        # (invoicing.migrated_settlement); undone only through invoicing.services.unallocate_migrated_item.
+        documents.register(
+            MigratedSettlement, post_permissions={services.MIGRATED_SETTLEMENT_APPROVAL},
+            reverse_permissions={"invoicing.reverse_document"}, changed_at_field=None,
+            build_lines=services._migrated_settlement_lines, reverse_guard=services._migrated_settlement_reverse_guard,
         )
         # D31b review fix 1 and 2: GL 1140 (the purification account) is posted only by purification fundings and
         # payouts, the banking kinds banking allows on it and migration openings (and their reversals); every such

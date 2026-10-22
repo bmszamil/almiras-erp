@@ -149,6 +149,8 @@ _PERMS = [
     _p("invoicing.submit_vendor_payment", "Submit vendor payments", "تقديم مدفوعات الموردين"),
     _p("invoicing.approve_bill", "Approve bills", "اعتماد فواتير الموردين", APPROVAL, POSTS),
     _p("invoicing.approve_vendor_payment", "Approve vendor payments", "اعتماد مدفوعات الموردين", APPROVAL, POSTS),
+    _p("invoicing.approve_migrated_settlement", "Approve foreign-currency settlements of migrated open items",
+       "اعتماد تسويات البنود المرحَّلة بالعملة الأجنبية", APPROVAL, POSTS),
     _p("invoicing.reverse_document", "Reverse documents", "عكس المستندات", POSTS),
     _p("invoicing.post_receipt", "Post customer receipts", "ترحيل المقبوضات من العملاء", POSTS),
     _p("invoicing.allocate", "Allocate payments", "تخصيص الدفعات"),

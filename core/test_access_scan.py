@@ -97,6 +97,22 @@ ALLOW = {
     "migration/services.py:imported_entries": "the scope mechanism for imported entries (access.scope with migration.view)",
     "migration/services.py:register_open_items_source": "app wiring at ready() (R22, R23 open-item source); no user action",
     "migration/services.py:unregister_open_items_source": "app wiring (R22, R23 open-item source); no user action",
+    # Migration sub-ledger loads (2026-10-21, migration R13, R16, R22, R23, W14):
+    "core/access/engine.py:deciding": "a read of the engine's own context (inside engine.decide or not); no data",
+    "core/access/engine.py:withdraw": "closes the open request of a document its own module drops; the module checks "
+                                      "its caller's rights first (invoicing R129 discard)",
+    "invoicing/services.py:migrated_settlement_measure": "the engine's band measure of a settlement; no data access",
+    "invoicing/services.py:migrated_settlement_version": "the engine's version of a settlement (its own content)",
+    "ledger/services.py:register_post_check": "app wiring at ready() (a check added to every posting); no user action",
+    "ledger/services.py:migration_opening_posted": "internal state read (is the opening entry posted) for services "
+                                                   "that already checked their caller's rights (migration R25)",
+    "invoicing/services.py:migrated_settlements": "list scoped by access.scope(invoicing.view) (R3, R129)",
+    "invoicing/services.py:migrated_bai_ajel_balances": "the migration R22 source for 1240 / 1241, called by the "
+                                                        "posting gate of an entry its caller is authorised to post",
+    "payroll/services.py:opening_eosb_balances": "the migration R22 source for 2500, called by the posting gate of an "
+                                                 "entry its caller is authorised to post",
+    "payroll/services.py:migrated_deferred_sale": "a lookup by legacy number for the migration loader, which then calls "
+                                                  "load_migrated_deferred_sale (payroll.create_deferred_sale)",
     "zatca/services.py:einvoices": "the scope mechanism for e-invoices (access.scope with zatca.view, R-3)",
     "zatca/services.py:einvoice_statuses": "the scope mechanism for statuses (access.scope with zatca.view_status, R-34)",
     "zatca/services.py:is_issued": "invoicing port read: may the buyer get this document (R-22, R-23); writes nothing",

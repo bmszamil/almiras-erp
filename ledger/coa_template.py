@@ -5,7 +5,9 @@ system) chart before opening balances are loaded (docs/specs/migration.md). Form
 Header accounts end in "000" and are not postable.
 
 Flags: header, intercompany, prohibited (Sharia), purify, monetary (included in FX
-revaluation, ledger-fx.md R21), report_only (not postable; used by reports such as
+revaluation, ledger-fx.md R21), control (a sub-ledger control account, invoicing R97 policy A: its balance is the sum
+of open customer or vendor items; ``ledger/control_accounts.py`` reads the list from here), tax_control (a VAT or
+withholding-tax account set by documents, never typed on a document line), report_only (not postable; used by reports such as
 currency translation, never posted to in an entity's own ledger), parent (code of the parent account when it is
 not the type's header, e.g. bank sub-accounts under 1100).
 """
@@ -20,8 +22,9 @@ TEMPLATE = [
     # bank account (Saudi IBAN, SAR). A sub-account of 1100 so banking R5 accepts it as a bank GL account; only the
     # purification account uses it. Restricted cash under IFRS (IAS 7, owner decision C6; ledger.restricted).
     ("1140", "Bank – purification account", "البنك – حساب التطهير", A, {"monetary": True, "parent": "1100"}),
-    ("1200", "Trade receivables", "الذمم المدينة التجارية", A, {"monetary": True}),
-    ("1210", "Due from group entities", "مستحق من شركات المجموعة", A, {"intercompany": True, "monetary": True}),
+    ("1200", "Trade receivables", "الذمم المدينة التجارية", A, {"control": True, "monetary": True}),
+    ("1210", "Due from group entities", "مستحق من شركات المجموعة", A,
+     {"control": True, "intercompany": True, "monetary": True}),
     ("1220", "Loans to group entities", "قروض لشركات المجموعة", A, {"intercompany": True, "monetary": True}),
     # Approved by the CFO 2026-10-17 (payroll.md §5, P19(g)): payroll control accounts (payroll documents only).
     ("1230", "Employee loans and advances", "قروض وسلف الموظفين", A, {"monetary": True}),
@@ -32,7 +35,7 @@ TEMPLATE = [
     ("1241", "Deferred bai' ajel profit (contra 1240)", "أرباح البيع الآجل المؤجلة", A, {"monetary": True}),
     ("1250", "Assets acquired for employee deferred sale", "أصول مشتراة للبيع الآجل للموظفين", A, {}),
     ("1300", "Sharia-compliant deposits (e.g. murabaha, wakala)", "ودائع متوافقة مع الشريعة", A, {"monetary": True}),
-    ("1310", "VAT input", "ضريبة القيمة المضافة - مدخلات", A, {"monetary": True}),
+    ("1310", "VAT input", "ضريبة القيمة المضافة - مدخلات", A, {"tax_control": True, "monetary": True}),
     ("1320", "Prepayments", "مصروفات مدفوعة مقدماً", A, {}),
     ("1400", "Investments in subsidiaries", "استثمارات في شركات تابعة", A, {}),
     ("1410", "Investments in associates (equity method)", "استثمارات في شركات زميلة", A, {}),
@@ -43,12 +46,13 @@ TEMPLATE = [
     ("1590", "Accumulated depreciation", "مجمع الاستهلاك", A, {}),
     ("1600", "Intangible assets and IP", "الأصول غير الملموسة والملكية الفكرية", A, {}),
     ("2000", "Liabilities", "الالتزامات", L, {"header": True}),
-    ("2100", "Trade payables", "الذمم الدائنة التجارية", L, {"monetary": True}),
-    ("2110", "Due to group entities", "مستحق لشركات المجموعة", L, {"intercompany": True, "monetary": True}),
-    ("2200", "VAT output", "ضريبة القيمة المضافة - مخرجات", L, {"monetary": True}),
+    ("2100", "Trade payables", "الذمم الدائنة التجارية", L, {"control": True, "monetary": True}),
+    ("2110", "Due to group entities", "مستحق لشركات المجموعة", L,
+     {"control": True, "intercompany": True, "monetary": True}),
+    ("2200", "VAT output", "ضريبة القيمة المضافة - مخرجات", L, {"tax_control": True, "monetary": True}),
     ("2210", "Zakat payable", "الزكاة المستحقة", L, {"monetary": True}),
     # PROPOSED (invoicing.md §5, D14, D18, D29): accountant / CFO to review; WHT on payments to non-residents (E20 to E22).
-    ("2220", "Withholding tax payable", "ضريبة الاستقطاع المستحقة", L, {"monetary": True}),
+    ("2220", "Withholding tax payable", "ضريبة الاستقطاع المستحقة", L, {"tax_control": True, "monetary": True}),
     ("2300", "Accrued expenses", "مصروفات مستحقة", L, {"monetary": True}),
     ("2330", "Salaries payable", "رواتب مستحقة", L, {"monetary": True}),  # payroll.md §5, P19(g)
     ("2340", "GOSI payable", "اشتراكات التأمينات الاجتماعية المستحقة", L, {"monetary": True}),  # P19(g)

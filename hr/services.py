@@ -758,6 +758,16 @@ def _save_employee(emp, hr_settings):
     return emp
 
 
+def find_current_employee(entity, id_number, *, user):
+    """The current (not terminated) employee of ``entity`` with ``id_number`` (R9: one per entity), or None
+    (``hr.view``). The migration loaders match the workbook's employees to hr by ID number, never by name; nothing
+    personal is returned beyond the record the caller may already open."""
+    access.require(user, entity, "hr.view")
+    hashes = crypto.keyed_hashes("".join(str(id_number or "").split()).upper())
+    return Employee.objects.filter(entity=entity, id_number_hash__in=hashes).exclude(
+        status=Employee.Status.TERMINATED).first()
+
+
 @transaction.atomic
 def create_employee(entity, *, user, **fields):
     """Create a draft employee (``hr.manage_employee``). The employee code is the next gap-free
@@ -2375,6 +2385,16 @@ def cancel_leave(leave_request, *, user):
     req = _cancel_leave(req, user, max(_today(), req.start_date), use)
     use.mark_used()
     return req
+
+
+def opening_leave_adjustment(employee, leave_type, *, user):
+    """The employee's opening balance of ``leave_type`` recorded from a migration (draft or approved, not rejected),
+    or None (``hr.view``). The migration loader skips an employee whose opening is already recorded."""
+    emp = Employee.objects.select_related("entity").get(pk=employee.pk)
+    access.require(user, emp.entity, "hr.view")
+    return LeaveAdjustment.objects.filter(employee=emp, leave_type=_leave_type(emp.entity, leave_type),
+                                          kind=LeaveAdjustment.Kind.OPENING).exclude(
+        status=LeaveAdjustment.Status.REJECTED).first()
 
 
 @transaction.atomic

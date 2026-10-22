@@ -135,6 +135,42 @@ def validate_entry(entry):
     return problems
 
 
+# Checks another app adds to the posting of the drafts it created (e.g. migration R16 and R22: an import draft whose
+# lines changed, or an opening entry whose control accounts do not tie out to the open items loaded, never posts,
+# whichever path posts it: the migration command or the approval engine's inbox). ``fn(entry)`` returns problems
+# ("English / العربية"), empty when the entry is not the app's or passes; it runs inside the posting transaction,
+# after the entry and its period are locked. Registered from ``AppConfig.ready()``.
+_POST_CHECKS = []
+
+
+def register_post_check(fn, *, code):
+    """Register ``fn`` (idempotent); a posting it refuses raises LedgerError with ``code``."""
+    if all(f is not fn for f, _ in _POST_CHECKS):
+        _POST_CHECKS.append((fn, code))
+
+
+def _post_check_problems(entry):
+    out, code = [], None
+    for fn, fn_code in _POST_CHECKS:
+        found = list(fn(entry) or [])
+        if found and code is None:
+            code = fn_code
+        out += found
+    return out, code
+
+
+def migration_opening_posted(entity, *, lock=False, booked=True):
+    """True once ``entity``'s migration opening entry (a draft linked to an ``ImportedEntry`` of kind ``opening``,
+    migration R14) is posted (``booked``: posted or reversed; else posted only). With ``lock`` the opening entries
+    are locked first (``select_for_update``), so a sub-ledger load and the posting of the opening entry, which locks
+    the same row, run one after the other (migration R22, R25). Internal: callers check their own rights."""
+    qs = JournalEntry.objects.filter(entity=entity, legacy_import__kind="opening")
+    if lock:
+        list(qs.select_for_update(of=("self",)).order_by("pk").values_list("pk", flat=True))
+    statuses = BOOKED if booked else (JournalEntry.Status.POSTED,)
+    return qs.filter(status__in=statuses).exists()
+
+
 def _restricted_codes(lines):
     return sorted({line.account.code for line in lines} & restricted.codes())
 
@@ -705,10 +741,13 @@ def _post(entry, posted_by):
     _lock_restricted(entry)
     period = _lock_for_posting(entry)
     problems = validate_entry(entry)
-    if problems:
-        exc = LedgerError(problems)
+    extra, extra_code = _post_check_problems(entry)
+    if problems or extra:
+        exc = LedgerError(problems + extra)
         if {restricted.refusal(code) for code in restricted.codes()} & set(problems):
             exc.code = "restricted_account"
+        elif not problems:  # the ledger's own refusal keeps its code; an app's code only when the ledger found none
+            exc.code = extra_code
         raise exc
     entry.period = period
     lines = list(entry.lines.select_related("account"))

@@ -1060,7 +1060,7 @@ def _unpaid_bills(ret, acks):
     """C15 (VAT IR as amended 2025, unverified, OQ-43): input VAT on a bill still unpaid 12 months after its date
     may have to be reversed. Listed for the reviewer in the return of the period in which the 12 months end; no
     automatic reversal."""
-    from invoicing.models import PayableAllocation, PurchaseDocument
+    from invoicing.models import MigratedSettlement, PayableAllocation, PurchaseDocument
 
     found = []
     bills = PurchaseDocument.objects.filter(
@@ -1068,6 +1068,13 @@ def _unpaid_bills(ret, acks):
         accounting_date__gte=_add_months(ret.period_start, -12), accounting_date__lte=_add_months(ret.period_end, -12))
     for doc in bills.order_by("accounting_date", "pk"):
         paid = PayableAllocation.objects.filter(target=doc, date__lte=ret.period_end).aggregate(t=Sum("amount"))["t"]
+        # invoicing R129: a migrated vendor credit note or advance paid settled against the bill counts as paid once
+        # the settlement is effective by the period end (SAR: its date; foreign currency: its posted entry's date);
+        # a pending one does not count (review of 07da401, item 6)
+        paid = (paid or ZERO) + (MigratedSettlement.objects.filter(
+            Q(journal_entry__isnull=True, date__lte=ret.period_end) | Q(journal_entry__date__lte=ret.period_end),
+            purchase_document=doc, status=MigratedSettlement.Status.POSTED)
+            .aggregate(t=Sum("amount"))["t"] or ZERO)
         if doc.total_gross - (paid or ZERO) > ZERO:
             ref = f"purchase:{doc.pk}"
             found.append({"kind": ExceptionKind.UNPAID_BILL_12_MONTHS, "reference": ref, "document": doc.pk,

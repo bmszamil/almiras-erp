@@ -102,6 +102,7 @@ MESSAGES = {
 _explicit = ContextVar("approval_engine_decide", default=None)
 _purpose = ContextVar("approval_engine_purpose", default="approve")
 _note = ContextVar("approval_engine_note", default=("", ""))  # (reason, reason_en) of a decide() return/reject
+_sending_back = ContextVar("approval_engine_send_back", default=False)  # decide() runs a return / reject hook
 
 
 class StepRecorded(Exception):
@@ -502,6 +503,23 @@ def _save(obj):
     obj._service_write = True
     obj.save()
     return obj
+
+
+def withdraw(document, user, *, permission=None, entity=None):
+    """Close the open approval request of ``document`` when its own module drops the document before a decision
+    (e.g. a pending migrated settlement discarded, invoicing R129): the request is marked superseded and leaves every
+    inbox; an ``approval_withdrawn`` row records who did it (R27). The module checks its caller's rights first;
+    nothing is approved or rejected here."""
+    entity = entity or document.entity
+    permission = permission or _main_permission(document)
+    info = describe(document, permission, entity)
+    at = _now()
+    for req in ApprovalRequest.objects.filter(entity=entity, document_type=info.label, document_id=info.pk,
+                                              activity__code=info.activity, status=ApprovalRequest.Status.OPEN):
+        req.status, req.closed_at = ApprovalRequest.Status.SUPERSEDED, at
+        _save(req)
+        _services().log(AccessLog.Event.APPROVAL_WITHDRAWN, actor=user, entity=entity, permission=permission,
+                        details={"request": req.pk, "activity": info.activity, "document": [info.label, info.pk]})
 
 
 def find_request(entity, info):
@@ -1011,7 +1029,11 @@ def _send_back(document, user, entity, info, permission, hook, action, note, not
     with transaction.atomic():
         result = None
         if hook is not None:
-            result = hook(document, user, note)
+            back = _sending_back.set(True)
+            try:
+                result = hook(document, user, note)
+            finally:
+                _sending_back.reset(back)
         req = find_request(entity, info)
         if req is not None and req.status == ApprovalRequest.Status.OPEN:
             with purpose("check"):
@@ -1184,6 +1206,13 @@ def current_version(request, document):
 
 
 # --- module seams --------------------------------------------------------------------------------------------------
+
+def deciding():
+    """True while :func:`decide` (the engine inbox) runs a module's approve, return or reject service. A module whose
+    decisions must come through the inbox only (e.g. the migration account map, migration R13) refuses a direct call
+    otherwise."""
+    return _explicit.get() is not None or _sending_back.get()
+
 
 def grant_rule_source(grant):
     """``matrix`` or ``default``: which rules the engine applied for ``grant`` (payroll's seam, R70)."""

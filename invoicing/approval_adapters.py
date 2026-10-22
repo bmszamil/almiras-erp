@@ -33,7 +33,8 @@ def register():
     from core.access import engine
 
     from . import services
-    from .models import CharityRecipient, PurchaseDocument, PurificationTransfer, SalesDocument, VendorPayment
+    from .models import (CharityRecipient, MigratedSettlement, PurchaseDocument, PurificationTransfer, SalesDocument,
+                         VendorPayment)
 
     engine.register(
         SalesDocument, "invoicing.sales_document", permission="invoicing.approve_sales_document",
@@ -70,6 +71,20 @@ def register():
             label=lambda d: _label(d, "Purification transfer", "تحويل تطهير"),
             approve=lambda d, user: services.post_purification_transfer(d, user=user),
         )
+    # R129 (review of 4986344, item 2): a foreign-currency settlement of a migrated open item; measured in SAR on the
+    # item's SAR cleared plus the expected FX difference; the approval posts the entry, a return or rejection drops it.
+    engine.register(
+        MigratedSettlement, "invoicing.migrated_settlement", permission="invoicing.approve_migrated_settlement",
+        submit_permission="invoicing.allocate",
+        amount=services.migrated_settlement_measure, currency=lambda d: d.entity.base_currency_id,
+        functional_amount=services.migrated_settlement_measure,
+        version=services.migrated_settlement_version,
+        beneficiaries=lambda d: _employee_users(d.item.party),
+        label=lambda d: (f"Migrated settlement {d.item.legacy_number}", f"تسوية بند مرحَّل {d.item.legacy_number}"),
+        created_at=lambda d: d.created_at,
+        approve=lambda d, user: services.post_migrated_settlement(d, user=user),
+        return_=services._reject_migrated_settlement, reject=services._reject_migrated_settlement,
+    )
     engine.register(
         CharityRecipient, "invoicing.charity_recipient", permission="invoicing.approve_charity_recipient",
         version=lambda d: _charity_version(d),

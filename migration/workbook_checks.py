@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from banking import iban as iban_rules
+from ledger.control_accounts import SUBLEDGER_CONTROL_CODES, TAX_CONTROL_CODES
 
 from . import workbook_spec as spec
 from .readers import ZERO
@@ -18,7 +19,8 @@ from .workbook import _ENTITY_CODE as ENTITY_CODE
 from .workbook import problem
 
 AR_CONTROL, AR_GROUP, AP_CONTROL, AP_GROUP = "1200", "1210", "2100", "2110"
-BANK_PARENT, PURIFICATION, EOSB = "1100", "1140", "2500"
+assert {AR_CONTROL, AR_GROUP, AP_CONTROL, AP_GROUP} == SUBLEDGER_CONTROL_CODES  # the one list (dry run gap 7)
+BANK_PARENT, PURIFICATION, EOSB, CHARITY_PAYABLE = "1100", "1140", "2500", "2600"
 ASSET_COST_CODES, ACCUMULATED_DEPRECIATION = frozenset({"1500", "1510", "1520"}), "1590"
 BAI_AJEL_RECEIVABLE, BAI_AJEL_DEFERRED, BAI_AJEL_INCOME = "1240", "1241", "4610"
 AR_SIGNS = {"invoice": 1, "debit_note": 1, "credit_note": -1, "advance": -1}
@@ -89,6 +91,7 @@ class _Checker:
         self.codes = book.entity_codes()
         self.only = set(only or self.codes)
         self.charts = charts or {}
+        self.erp_entities = {}
 
     # helpers ------------------------------------------------------------------------------------------------------
 
@@ -235,8 +238,7 @@ class _Checker:
 
     def mapping(self, entity, chart_rows, net):
         erp = self.chart(entity)
-        record = self.book.entity(entity)
-        sharia = bool(record and record["sharia_enforced"])
+        sharia = self.sharia_flag(entity)
         rows = {r["legacy_code"]: r for r in self.book.records("account_map", entity) if r["legacy_code"]}
         for code, amount in sorted(net.items()):
             if amount and code not in rows:
@@ -518,27 +520,76 @@ class _Checker:
                      en=f"Accumulated depreciation on Falcon {code}", ar=f"مجمع الاستهلاك على الكود {code}")
         self.report.summary[entity]["fixed_assets_rows"] = len(records)
 
-    # bai' ajel (payroll.md slice 2 item 3, invoicing R127) ---------------------------------------------------------
+    # bai' ajel (W14; payroll.md slice 2 item 3, invoicing R127; dry run gap 4) ----------------------------------------
 
     def bai_ajel(self, entity, net, mapping):
-        """1240 / 1241 / 4610 load through the opening entry (the migration allowance on restricted accounts), but the
-        workbook has no sheet for the contracts behind them: the balance is listed for the CFO's decision (warning),
-        and a deferred profit (1241, contra 1240) that is a debit or larger than the receivable is an error."""
+        """W14: 1240 / 1241 / 4610 load through the opening entry (the migration allowance on restricted accounts); the
+        contracts behind 1240 / 1241 are on the Bai' ajel contracts sheet and are loaded into payroll and invoicing as
+        migrated contracts. The receivable still open (price + VAT − paid) of the entity's contracts equals 1240 and
+        the profit still deferred (the fixed profit less its share of what was paid, the ERP's rule) equals − 1241;
+        a 1240 or 1241 balance without contract rows is an error. A deferred profit (1241, contra 1240) that is a
+        debit or larger than the receivable is an error too."""
         receivable = self.on(net, mapping, {BAI_AJEL_RECEIVABLE}, any_counterparty=True)
         deferred = self.on(net, mapping, {BAI_AJEL_DEFERRED}, any_counterparty=True)
         income = self.on(net, mapping, {BAI_AJEL_INCOME}, any_counterparty=True)
-        if not (receivable or deferred or income):
+        contracts = self.book.records("bai_ajel_contracts", entity) if "bai_ajel_contracts" in self.book.sheets else []
+        cutover = self.book.entity(entity)["cutover_date"] if self.book.entity(entity) else None
+        employees = {r["employee_no"] for r in self.book.records("employees", entity) if r["employee_no"]}
+        open_total, unearned_total = ZERO, ZERO
+        for r in contracts:
+            where = dict(sheet="bai_ajel_contracts", row=r.row, entity=entity)
+            if r["employee_no"] and r["employee_no"] not in employees:
+                self.error("unknown_employee", f"Employee {r['employee_no']} is not on the Employees sheet of {entity}.",
+                           f"الموظف {r['employee_no']} غير موجود في ورقة الموظفين للكيان {entity}.", **where)
+            figures = contract_figures(r)
+            if figures is None:
+                continue
+            price, profit, vat, paid = (r.get(k, ZERO) for k in ("sale_price", "profit_amount", "vat_amount",
+                                                                    "paid_to_date"))
+            if profit >= price:
+                self.error("bai_ajel_profit", f"The profit {profit} must be less than the sale price {price}.",
+                           f"يجب أن يكون الربح {profit} أقل من ثمن البيع {price}.", **where)
+                continue
+            if paid > price + vat:
+                self.error("bai_ajel_overpaid", f"Paid {paid} is more than the price and VAT {price + vat}.",
+                           f"المسدد {paid} أكبر من الثمن مع الضريبة {price + vat}.", **where)
+                continue
+            if cutover and r["sale_date"] and r["sale_date"] > cutover:
+                self.error("after_cutover", f"Sale date {r['sale_date']} is after the cut-over {cutover}.",
+                           f"تاريخ البيع {r['sale_date']} بعد تاريخ التحويل {cutover}.", **where)
+            if cutover and r["next_instalment_period"] and r["next_instalment_period"] <= f"{cutover:%Y-%m}":
+                self.error("next_period", f"The first instalment after the cut-over ({r['next_instalment_period']}) "
+                           f"must be after {cutover:%Y-%m}.", f"يجب أن يكون أول قسط بعد التحويل "
+                           f"({r['next_instalment_period']}) بعد {cutover:%Y-%m}.", **where)
+            if not r["consent_ref"]:  # R49: never invented; the deductions are held until it is recorded
+                self.warning("bai_ajel_consent", f"Contract {r['contract_no']} has no signed consent reference: it "
+                             "loads with its deductions held until payroll records the employee's written consent.",
+                             f"العقد {r['contract_no']} بلا مرجع موافقة موقعة: يُحمَّل مع إيقاف الاستقطاع حتى تسجل "
+                             "الرواتب موافقة الموظف المكتوبة.", **where)
+            _receivable, remaining, _recognised, unearned = figures
+            if not remaining:
+                self.warning("bai_ajel_settled", "The contract is fully paid: leave it out.", "العقد مسدد بالكامل: احذفه.",
+                             **where)
+            open_total += remaining
+            unearned_total += unearned
+        if not (receivable or deferred or income or contracts):
             return
         self.report.summary[entity].update({"bai_ajel_1240": receivable, "bai_ajel_1241": deferred,
-                                            "bai_ajel_4610": income})
-        if receivable or deferred:
-            self.warning("bai_ajel_contracts", f"Bai' ajel balances {BAI_AJEL_RECEIVABLE} {receivable}, "
-                         f"{BAI_AJEL_DEFERRED} {deferred}: the workbook has no contract detail, so they are not tied to "
-                         "a sub-ledger; the open contracts must be set up in invoicing before payroll collects their "
-                         "instalments (CFO decision).", f"أرصدة البيع الآجل {BAI_AJEL_RECEIVABLE} {receivable}، "
-                         f"{BAI_AJEL_DEFERRED} {deferred}: لا يحتوي الملف على تفاصيل العقود فلا تُطابق مع سجل فرعي؛ "
-                         "ويلزم إعداد العقود القائمة في الفوترة قبل أن تحصّل الرواتب أقساطها (قرار المدير المالي).",
-                         sheet="account_map", entity=entity, account_code=BAI_AJEL_RECEIVABLE)
+                                            "bai_ajel_4610": income, "bai_ajel_contracts_rows": len(contracts)})
+        if (receivable or deferred) and not contracts:
+            self.error("bai_ajel_contracts", f"Bai' ajel balances {BAI_AJEL_RECEIVABLE} {receivable}, "
+                       f"{BAI_AJEL_DEFERRED} {deferred} and no row on the Bai' ajel contracts sheet: give every open "
+                       "contract so they tie to a sub-ledger and payroll collects their instalments (W14).",
+                       f"أرصدة البيع الآجل {BAI_AJEL_RECEIVABLE} {receivable}، {BAI_AJEL_DEFERRED} {deferred} ولا يوجد "
+                       "صف في ورقة عقود البيع الآجل: أدخل كل عقد قائم لتُطابق مع سجل فرعي وتحصّل الرواتب أقساطه.",
+                       sheet="bai_ajel_contracts", entity=entity, account_code=BAI_AJEL_RECEIVABLE)
+        elif contracts:
+            self.tie(entity, "bai_ajel_contracts", BAI_AJEL_RECEIVABLE, open_total, receivable,
+                     sheet="bai_ajel_contracts", en=f"Bai' ajel receivable still open vs ERP {BAI_AJEL_RECEIVABLE}",
+                     ar=f"ذمم البيع الآجل المتبقية مقابل الحساب {BAI_AJEL_RECEIVABLE}")
+            self.tie(entity, "bai_ajel_deferred_profit", BAI_AJEL_DEFERRED, unearned_total, -deferred,
+                     sheet="bai_ajel_contracts", en=f"Bai' ajel profit still deferred vs ERP {BAI_AJEL_DEFERRED}",
+                     ar=f"أرباح البيع الآجل المؤجلة مقابل الحساب {BAI_AJEL_DEFERRED}")
         if deferred > 0 or -deferred > max(receivable, ZERO):
             self.error("bai_ajel_contra", f"Deferred bai' ajel profit {BAI_AJEL_DEFERRED} ({deferred}) must be a credit "
                        f"no larger than the receivable {BAI_AJEL_RECEIVABLE} ({receivable}).",
@@ -546,9 +597,111 @@ class _Checker:
                        f"الذمة {BAI_AJEL_RECEIVABLE} ({receivable}).", sheet="account_map", entity=entity,
                        account_code=BAI_AJEL_DEFERRED)
 
+    # purification (W16; invoicing R54, E14a, E15; dry run gap 8) ---------------------------------------------------
+
+    def purification(self, entity, net, mapping):
+        """W16: the purification account (1140, restricted cash) holds money owed to charity, so its balance is never
+        above the charity payable (2600): funding is capped by what is payable (invoicing R54). Above it, or below
+        zero, is an error; below it is a warning (the difference is still to be funded after go-live)."""
+        held = self.on(net, mapping, {PURIFICATION}, any_counterparty=True)
+        payable = -self.on(net, mapping, {CHARITY_PAYABLE}, any_counterparty=True)
+        if not (held or payable):
+            return
+        difference = held - payable
+        self.report.ties.append({"entity": entity, "check": "purification", "account": f"{PURIFICATION}/{CHARITY_PAYABLE}",
+                                 "subledger": held, "ledger": payable, "difference": difference})
+        where = dict(sheet="trial_balance", entity=entity, account_code=PURIFICATION)
+        if held < 0 or payable < 0:
+            self.error("purification_sign", f"The purification account {PURIFICATION} ({held}) is a debit and the "
+                       f"charity payable {CHARITY_PAYABLE} ({payable}) a credit.", f"حساب التطهير {PURIFICATION} ({held}) "
+                       f"مدين والمستحق للجهات الخيرية {CHARITY_PAYABLE} ({payable}) دائن.", **where)
+        elif difference > 0:
+            self.error("purification_over_funded", f"The purification account {PURIFICATION} holds {held}, more than the "
+                       f"charity payable {CHARITY_PAYABLE} ({payable}) by {difference}: it never holds more than is owed "
+                       "to charity (invoicing R54).", f"يحتوي حساب التطهير {PURIFICATION} على {held}، أكثر من المستحق "
+                       f"للجهات الخيرية {CHARITY_PAYABLE} ({payable}) بمبلغ {difference}: لا يزيد على المستحق للجهات "
+                       "الخيرية.", **where)
+        elif difference < 0:
+            self.warning("purification_to_fund", f"The charity payable {CHARITY_PAYABLE} ({payable}) is {-difference} "
+                         f"more than the purification account {PURIFICATION} ({held}): fund it after go-live "
+                         "(invoicing R54, E14a).", f"المستحق للجهات الخيرية {CHARITY_PAYABLE} ({payable}) أكبر من حساب "
+                         f"التطهير {PURIFICATION} ({held}) بمبلغ {-difference}: يُموَّل بعد التشغيل.", **where)
+
+    # VAT and withholding tax (W15; dry run gap 7) ---------------------------------------------------------------------
+
+    def tax_balances(self, entity, net, mapping):
+        """W15: VAT (1310, 2200) and withholding tax (2220) are set by documents, not sub-ledger control accounts; their
+        opening balances load through the opening entry and are evidenced against the last VAT and withholding-tax
+        returns filed before the cut-over (team default): a warning per account with a balance, for the accountant."""
+        for code in sorted(TAX_CONTROL_CODES):
+            amount = self.on(net, mapping, {code}, any_counterparty=True)
+            if amount:
+                self.warning("tax_balance_evidence", f"ERP {code} has an opening balance of {amount}: agree it to the "
+                             "last VAT or withholding-tax return filed before the cut-over (W15).",
+                             f"للحساب {code} رصيد افتتاحي {amount}: طابقه مع آخر إقرار ضريبة قيمة مضافة أو استقطاع قُدّم "
+                             "قبل تاريخ التحويل.", sheet="trial_balance", entity=entity, account_code=code)
+
+    # intercompany mirrors across entities (W17; rule 6; dry run gap 9) -------------------------------------------------
+
+    def intercompany(self, entity, net, mapping):
+        """The entity's net intercompany balance per counterparty (all intercompany ERP accounts: 1210, 1220, 2110,
+        ...), debit positive."""
+        erp = self.chart(entity)
+        out = defaultdict(lambda: ZERO)
+        for code, amount in net.items():
+            if code in mapping and mapping[code][1]:
+                account = erp.get(mapping[code][0])
+                if account is not None and account.intercompany:
+                    out[mapping[code][1]] += amount
+        return dict(out)
+
+    def mirrors(self, balances):
+        """W17: what an entity is owed by (or owes) another group entity equals, with the opposite sign, what that
+        entity shows for it: E's intercompany balance with CP + CP's with E = 0. Both entities on the workbook are
+        checked; a counterparty left out of the run (``--entity``) is a warning."""
+        seen = set()
+        for entity, by_cp in sorted(balances.items()):
+            for cp in sorted(by_cp):
+                pair = tuple(sorted((entity, cp)))
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                if cp not in balances:
+                    if cp in self.codes:
+                        self.warning("intercompany_mirror_not_checked", f"{entity}'s balance with {cp} "
+                                     f"({by_cp[cp]}) is not compared: {cp} is not in this check.",
+                                     f"لم يُقارن رصيد {entity} مع {cp} ({by_cp[cp]}): {cp} ليس ضمن هذا الفحص.",
+                                     sheet="account_map", entity=entity)
+                    continue
+                mine, theirs = by_cp[cp], balances[cp].get(entity, ZERO)
+                self.report.ties.append({"entity": entity, "check": "intercompany_mirror", "account": f"{entity}/{cp}",
+                                         "subledger": mine, "ledger": -theirs, "difference": mine + theirs})
+                if mine + theirs:
+                    self.error("intercompany_mirror", f"Intercompany {entity} with {cp}: {mine}; {cp} with {entity}: "
+                               f"{theirs}; they must mirror each other (difference {mine + theirs}).",
+                               f"بين الشركات: {entity} مع {cp} {mine}؛ و{cp} مع {entity} {theirs}؛ يجب أن يتطابقا "
+                               f"بعكس الإشارة (الفرق {mine + theirs}).", sheet="account_map", entity=entity)
+
+    def sharia_flag(self, entity):
+        """The ERP's ``Entity.sharia_enforced`` governs (CLAUDE.md rule 5; dry run gap 9): a workbook flag that
+        differs from it is an error, and the prohibited-account check uses the ERP's flag."""
+        record = self.book.entity(entity)
+        sheet = bool(record and record["sharia_enforced"])
+        if entity not in self.erp_entities:
+            return sheet
+        erp = bool(self.erp_entities[entity])
+        if record is not None and record["sharia_enforced"] is not None and sheet != erp:
+            yes = {True: ("yes", "نعم"), False: ("no", "لا")}
+            self.error("sharia_flag_mismatch", f"Sharia rules enforced: the workbook says {yes[sheet][0]}, the ERP entity "
+                       f"says {yes[erp][0]}; the ERP setting governs (it changes only through its own controls).",
+                       f"تطبيق الضوابط الشرعية: الملف يقول {yes[sheet][1]} والكيان في النظام يقول {yes[erp][1]}؛ "
+                       "إعداد النظام هو المعتمد.", sheet="entities", row=record.row, entity=entity)
+        return erp
+
     def run(self):
         self.rows()
         self.entities()
+        balances = {}
         for entity in [c for c in self.codes if c in self.only]:
             net, mapping = self.ledger(entity)
             self.parties(entity)
@@ -560,6 +713,10 @@ class _Checker:
             self.employees(entity, net, mapping)
             self.fixed_assets(entity, net, mapping)
             self.bai_ajel(entity, net, mapping)
+            self.purification(entity, net, mapping)
+            self.tax_balances(entity, net, mapping)
+            balances[entity] = self.intercompany(entity, net, mapping)
+        self.mirrors(balances)
         unknown = set(self.only) - set(self.codes)
         for code in sorted(unknown):
             self.error("unknown_entity", f"Entity {code} is not on the Entities sheet.",
@@ -567,10 +724,31 @@ class _Checker:
         return self.report
 
 
-def check_workbook(book, *, charts=None, entities=None):
-    """The validation report of a parsed workbook (W4 to W11). ``charts``: {entity code: {code: ErpAccount}}; an
-    entity without one is checked against the group template. ``entities``: limit the checks to these codes."""
-    return _Checker(book, dict(charts or {}), entities).run()
+def contract_figures(r):
+    """(receivable, still open, profit recognised, profit still deferred) of a Bai' ajel contracts row (W14), by the
+    ERP's rule (invoicing R112): recognised = fixed profit x paid / (price + VAT), rounded half-up once. None when a
+    figure is missing."""
+    from fractions import Fraction
+
+    price, profit, paid = r["sale_price"], r["profit_amount"], r["paid_to_date"]
+    if price is None or profit is None or paid is None:
+        return None
+    receivable = price + r.get("vat_amount", ZERO)
+    if not receivable:
+        return None
+    share = Fraction(profit) * Fraction(min(paid, receivable)) / Fraction(receivable)
+    recognised = (Decimal(share.numerator) / Decimal(share.denominator)).quantize(Decimal("0.01"),
+                                                                                  rounding="ROUND_HALF_UP")
+    return receivable, max(receivable - paid, ZERO), recognised, profit - recognised
+
+
+def check_workbook(book, *, charts=None, entities=None, erp_entities=None):
+    """The validation report of a parsed workbook (W4 to W17). ``charts``: {entity code: {code: ErpAccount}}; an
+    entity without one is checked against the group template. ``entities``: limit the checks to these codes.
+    ``erp_entities``: {entity code: Entity.sharia_enforced} of the entities set up in the ERP (their flag governs)."""
+    checker = _Checker(book, dict(charts or {}), entities)
+    checker.erp_entities = dict(erp_entities or {})
+    return checker.run()
 
 
 def render(report, *, limit=300):

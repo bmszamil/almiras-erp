@@ -1,8 +1,11 @@
 """``manage.py migration_post --entity ALM --user approver --kind opening|journal [--entries N ...] [--apply]``
 (migration R16).
 
-Posts import drafts through ``ledger.services.post_entry``, one ``ledger.post_entry`` grant per draft, by a person
-other than the preparer. A draft changed since the import is refused. All or nothing. Dry run unless ``--apply``.
+Posts import drafts by a person other than the preparer: each posting is the decision on the draft's approval
+request in the approval engine (activity ``ledger.manual_entry``), and the ledger posts it through
+``ledger.services.post_entry`` with the engine's grant. A draft changed since the import, or an opening entry whose
+sub-ledgers do not tie out (R22), is refused. All or nothing. Under a multi-step matrix an earlier step is recorded
+and the draft waits for the next approver. Dry run unless ``--apply``.
 """
 from django.core.management.base import BaseCommand, CommandError
 
@@ -33,5 +36,8 @@ class Command(BaseCommand):
         if o["apply"]:
             for entry in result["posted"]:
                 self.stdout.write(f"  posted / رُحّل {entry.number} {entry.reference}")
+            for key in result["pending"]:
+                for p in result["details"][key]:
+                    self.stdout.write(f"  [waiting] {p}")
         else:
             self.stdout.write("dry run: nothing posted / تجربة: لم يُرحَّل شيء")

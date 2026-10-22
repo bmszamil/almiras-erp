@@ -68,7 +68,9 @@ def _styles():
 
 
 NUMBER_FORMATS = {"sar": "#,##0.00", "amount": "#,##0.000", "rate": "0.##", "date": "yyyy-mm-dd", "int": "0"}
-TEXT_KINDS = {"entity", "text", "legacy_code", "erp_code", "vat", "cr", "iban", "currency", "country", "choice", "yesno"}
+TEXT_KINDS = {"entity", "text", "legacy_code", "erp_code", "vat", "cr", "iban", "currency", "country", "choice", "yesno",
+              "period"}
+_PERIOD = re.compile(r"^(\d{4})-(\d{2})$")
 LIST_SHEET = "Lists"
 
 
@@ -375,6 +377,14 @@ def convert(column, value):
         return _choice(value, column.choices)
     if kind == "yesno":
         return _choice(value, "yes_no") == "yes"
+    if kind == "period":  # a month; Excel may have turned "2027-01" into a date
+        if hasattr(value, "year") and hasattr(value, "month"):
+            return f"{value.year:04d}-{value.month:02d}"
+        match = _PERIOD.match(to_text(value).translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")))
+        if match is None or not 1 <= int(match.group(2)) <= 12:
+            raise CellError(f"{value!r} is not a month written YYYY-MM (e.g. 2027-01).",
+                            f"{value!r} ليس شهرًا بصيغة سنة-شهر (مثل 2027-01).")
+        return match.group(0)
     text = to_text(value)
     if kind == "entity":
         text = text.upper()

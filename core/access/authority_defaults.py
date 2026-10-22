@@ -88,6 +88,13 @@ _ACTIVITIES = [
        "invoicing.approve_bill"),
     _a("invoicing.vendor_payment", "Vendor payments", "مدفوعات الموردين", "invoicing.approve_vendor_payment",
        basis=AMOUNT),
+    # invoicing R129 (review of 4986344, item 2): a foreign-currency settlement of a migrated open item books a
+    # realised FX difference; measured on the SAR cleared plus the expected FX difference. Code default: the CFO
+    # (approver role) only.
+    _a("invoicing.migrated_settlement", "Foreign-currency settlements of migrated open items",
+       "تسويات البنود المرحَّلة بالعملة الأجنبية", "invoicing.approve_migrated_settlement", basis=AMOUNT,
+       default=Default(roles=("approver",), note_en="The CFO (approver role); invoicing R129",
+                       note_ar="المدير المالي (دور المعتمد)")),
     _a("invoicing.purification_funding", "Purification account fundings", "تمويل حساب التطهير",
        "invoicing.approve_purification_funding", basis=AMOUNT),
     _a("invoicing.purification_payout", "Purification payouts", "صرف مبالغ التطهير",

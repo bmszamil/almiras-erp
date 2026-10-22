@@ -1166,7 +1166,8 @@ def test_rv93_0029_carries_its_own_frozen_seed():
             assert (*ROLE_SEED_V17[code][:5], tuple(sorted(set(ROLE_SEED_V17[code][5])))) == expected, code
         else:
             assert frozen == expected, code
-    assert {a[0] for a in mod.ACTIVITIES} == set(authority_defaults.ACTIVITIES)
+    later = importlib.import_module("core.migrations.0035_seed_access_v20_migrated_settlement")  # invoicing R129
+    assert {a[0] for a in mod.ACTIVITIES} | {later.ACTIVITY[0]} == set(authority_defaults.ACTIVITIES)
 
 
 def test_rv93_n8_only_the_proposer_or_the_top_authority_withdraws_a_version(g):

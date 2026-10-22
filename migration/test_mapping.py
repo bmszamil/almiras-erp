@@ -14,15 +14,15 @@ def test_at5_map_is_drafted_then_approved_by_a_second_person(w):
     amap = services.create_account_map(w.alm, user=w.a, rows=map_rows())
     assert amap.status == "draft" and amap.version == 1 and amap.rows.count() == 9
     with pytest.raises(AccessDenied):  # the accountant holds no approval right
-        services.approve_account_map(amap, user=w.a)
+        t.approve_map(amap, approver=w.a)
     both = make_user("mig.both")
     member(both, w.alm, "accountant")
     member(both, w.alm, "approver")
     services.set_map_row(amap, user=both, legacy_code="1101", erp_code="1110", legacy_name="الصندوق")
     with pytest.raises(AccessDenied) as exc:  # last modifier (R13, access R14)
-        services.approve_account_map(amap, user=both)
+        t.approve_map(amap, approver=both)
     assert exc.value.code == "self_approval"
-    approved = services.approve_account_map(amap, user=w.p)
+    approved = t.approve_map(amap, approver=w.p)
     assert (approved.status, approved.approved_by) == ("approved", w.p)
 
 
@@ -53,7 +53,7 @@ def test_new_version_supersedes_the_approved_one(w, mapped):
     assert v2.version == 2
     with pytest.raises(MigrationError):  # one draft at a time
         services.create_account_map(w.alm, user=w.a, rows=map_rows())
-    services.approve_account_map(v2, user=w.p)
+    t.approve_map(v2, approver=w.p)
     assert AccountMap.objects.get(pk=mapped.pk).status == "superseded"
     assert services._approved_map(w.alm, "falcon").pk == v2.pk
 

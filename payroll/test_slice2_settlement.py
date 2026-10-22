@@ -62,7 +62,8 @@ def test_correction_difference_lines_post_their_own_entry_and_never_edit_the_set
     assert c.journal_entry.document_type == "payroll.settlementcorrection" and c.journal_entry.document_id == c.pk
     assert all(l.description == c.number for l in c.journal_entry.lines.all())  # no names or pay (R36)
     assert snapshot(fs) == before  # the approved settlement and its entry are untouched (CLAUDE.md rule 1)
-    assert AccessLog.objects.filter(details__action="settlement_correction_approved", actor=w.c).exists()
+    assert AccessLog.objects.filter(event="permission_granted", details__action="settlement_correction_approved",
+                                    actor=w.c).exists()
     # The settlement's open net includes the correction; GOSI of the month includes its 2340 credit.
     assert services._settlement_due(fs) == fs.net + D("266.67")
     assert services._correction_credits_2340(w.alm, "2027-03") == D("10.00")

@@ -32,7 +32,7 @@ from core.access import services as access_services
 from core.access.models import AccessLog, Kind, Membership
 from core.models import Currency, Entity, label_part, validate_country_code, validate_vat_number
 from core.services import entity_ready_to_issue
-from ledger import fx
+from ledger import control_accounts, fx
 from ledger import restricted as ledger_restricted
 from ledger import services as ledger
 from ledger.models import Account, FiscalPeriod, JournalEntry, JournalLine, LedgerError
@@ -58,6 +58,8 @@ from .models import (
     IncomeType,
     InvoicingError,
     InvoicingSettings,
+    MigratedOpenItem,
+    MigratedSettlement,
     NoteReason,
     PayableAllocation,
     PaymentApplication,
@@ -94,6 +96,9 @@ SIMPLIFIED_LIMIT_SAR = Decimal("1000.00")  # R48: "less than SAR 1,000"; gross i
 
 # Accounts (ledger/coa_template.py; invoicing §5).
 AR, AR_GROUP, AP, AP_GROUP = "1200", "1210", "2100", "2110"
+CONTROL_MISMATCH = ("The documents were booked on different control accounts or counterparties (the party's group "
+                    "entity changed); a settlement never moves a balance between them. / المستندان مرحّلان على حسابي "
+                    "مراقبة أو كيانين مقابلين مختلفين؛ لا تنقل التسوية رصيدًا بينهما.")
 VAT_OUTPUT, VAT_INPUT, BANK, BANK_CHARGES = "2200", "1310", "1100", "5700"
 WHT_PAYABLE, WHT_BORNE = "2220", "5920"  # PROPOSED accounts (§5, E20 to E22; D29)
 NON_COMPLIANT_INCOME, CHARITY_PAYABLE = "4900", "2600"  # E14, E15
@@ -110,7 +115,11 @@ PURIFICATION_CASH_NOTE_AR = (
     "تُحفظ لصالح الجهات الخيرية ولا تعود إلى الشركة وليست متاحة لاستخدامها؛ تُعرض منفصلة عن النقد والبنوك وتُستبعد "
     "من النقد وما في حكمه في قائمة التدفقات النقدية (معيار المحاسبة الدولي 7 / القسم 7 من المعيار الدولي للمنشآت "
     "الصغيرة والمتوسطة) مع هذا الإفصاح. والالتزام المقابل هو المستحق للجهات الخيرية (2600).")
-CONTROL_ACCOUNTS = frozenset({AR, AR_GROUP, AP, AP_GROUP, VAT_OUTPUT, VAT_INPUT, WHT_PAYABLE, PURIFICATION_BANK})
+# Set by the document, never typed on a line: the sub-ledger and tax control accounts of the one list
+# (ledger.control_accounts, read from the chart template) and the restricted purification account.
+CONTROL_ACCOUNTS = control_accounts.SUBLEDGER_CONTROL_CODES | control_accounts.TAX_CONTROL_CODES | {PURIFICATION_BANK}
+assert {AR, AR_GROUP, AP, AP_GROUP} == control_accounts.SUBLEDGER_CONTROL_CODES
+assert {VAT_OUTPUT, VAT_INPUT, WHT_PAYABLE} == control_accounts.TAX_CONTROL_CODES
 # R112 / E28 (payroll R47, owner decision E8): the bai' ajel sale to an employee. Its receivable is 1240, its lines
 # credit 1250 (cost) and 1241 (deferred profit); profit moves from 1241 to 4610 as the instalments are collected.
 EMPLOYEE_RECEIVABLE, DEFERRED_PROFIT, SALE_ASSET, SALE_PROFIT_INCOME = "1240", "1241", "1250", "4610"
@@ -510,8 +519,45 @@ def update_customer(customer, *, user, **fields):
     """Change a customer. Issued documents keep their frozen buyer snapshot (R15)."""
     customer = Customer.objects.select_for_update(of=("self",)).get(pk=customer.pk)
     access.require(user, customer.entity, "invoicing.manage_customer")
+    _refuse_group_change(customer, fields, receivable=True)
     customer.modified_by, customer.modified_at = user, timezone.now()
     return _save_party(customer, user, fields, CUSTOMER_FIELDS)
+
+
+def _party_has_open_items(party, receivable):
+    """True while a booked document or migrated item of the party still has an open (or unallocated) amount."""
+    if receivable:
+        for doc in SalesDocument.objects.filter(customer=party, status=Status.FINAL, journal_entry__isnull=False):
+            if _is_deferred_sale(doc):
+                continue
+            credit = doc.doc_type == SalesDocument.DocType.CREDIT_NOTE
+            if (_available(doc) if credit else _open_receivable(doc)) != ZERO:
+                return True
+        movements = CustomerReceipt.objects.filter(customer=party, status="posted", kind=CustomerReceipt.Kind.RECEIPT)
+        items = MigratedOpenItem.objects.filter(customer=party)
+    else:
+        for doc in PurchaseDocument.objects.filter(vendor=party, status=PStatus.POSTED):
+            bill = doc.doc_type == PurchaseDocument.DocType.BILL
+            if (_open_payable(doc) if bill else _available(doc)) != ZERO:
+                return True
+        movements = VendorPayment.objects.filter(vendor=party, status="posted", kind=VendorPayment.Kind.PAYMENT)
+        items = MigratedOpenItem.objects.filter(vendor=party)
+    return any(_available(m) != ZERO for m in movements) or any(_migrated_open(i) != ZERO for i in items)
+
+
+def _refuse_group_change(party, fields, *, receivable):
+    """Review of 07da401, item 8 (decision): a party's group entity decides its control account (1200 / 1210,
+    2100 / 2110 with the counterparty); it is not changed while the party has open documents or migrated items,
+    whose balances sit on the current account. Settle or allocate them first."""
+    if "group_entity" not in fields:
+        return
+    new = fields["group_entity"]
+    new_id = getattr(new, "pk", new) or None
+    if new_id == party.group_entity_id or not _party_has_open_items(party, receivable):
+        return
+    raise error(f"{party.code} has open documents or migrated items on its current control account; settle them "
+                "before changing its group entity (R39, R129).", f"لدى الطرف {party.code} مستندات أو بنود مرحّلة "
+                "مفتوحة على حساب المراقبة الحالي؛ سوّها قبل تغيير كيان المجموعة.", code="party_has_open_items")
 
 
 def add_customer_identifier(customer, scheme, value, *, user):
@@ -543,6 +589,7 @@ def update_vendor(vendor, *, user, **fields):
     access.require(user, vendor.entity, "invoicing.manage_vendor")
     if set(fields) & WHT_VENDOR_FIELDS:
         access.require(user, vendor.entity, "invoicing.enter_wht_data")
+    _refuse_group_change(vendor, fields, receivable=False)
     vendor.modified_by, vendor.modified_at = user, timezone.now()
     return _save_party(vendor, user, fields, VENDOR_FIELDS)
 
@@ -1665,7 +1712,19 @@ def _lock_note_target(doc):
 
 
 def _note_settlement_amount(doc):
+    """R37: what a credit note settles on its original: up to the original's open amount, and nothing when the
+    note books on another control account or counterparty than the original was booked on (review of 07da401,
+    item 2): the note then stays open on its own account."""
+    if not _same_control(doc, doc.original_document, True):
+        return ZERO
     return min(doc.total_gross, _open_receivable(doc.original_document))
+
+
+def _vendor_note_settlement_amount(doc):
+    """R37 for a vendor credit note on its bill, under the same control-account condition."""
+    if not _same_control(doc, doc.original_document, False):
+        return ZERO
+    return min(doc.total_gross, _open_payable(doc.original_document))
 
 
 # --- document lines for the ledger (registered hooks, ledger.documents) --------------------------
@@ -1696,6 +1755,18 @@ def _control(party, receivable):
     if party.group_entity_id:
         return (AR_GROUP if receivable else AP_GROUP), party.group_entity
     return (AR if receivable else AP), None
+
+
+def _same_control(document, booked, receivable):
+    """True when ``document`` (not yet booked: its party's control account today) would sit on the control account
+    and counterparty ``booked`` was booked on (reviews of 4986344 item 1 and 07da401 item 2). A document not booked
+    yet, or not on a control account, does not block."""
+    key = _control_key(booked)
+    if key is None:
+        return True
+    party = document.customer if receivable else document.vendor
+    account, counterparty = _control(party, receivable)
+    return key == (account, getattr(counterparty, "pk", None))
 
 
 def _line(account, side, amount, currency, functional, counterparty=None, description=""):
@@ -1862,12 +1933,15 @@ def _in_minor_units(amount, document):
 
 
 def _open_receivable(document):
-    """Open amount of a final invoice or debit note: gross minus allocations to it."""
-    return _in_minor_units(document.total_gross - _sum(ReceivableAllocation.objects.filter(target=document)), document)
+    """Open amount of a final invoice or debit note: gross minus allocations to it (R129: and settlements of migrated
+    credit notes and advances against it)."""
+    return _in_minor_units(document.total_gross - _sum(ReceivableAllocation.objects.filter(target=document))
+                           - _migrated_settled(document), document)
 
 
 def _open_payable(document):
-    return _in_minor_units(document.total_gross - _sum(PayableAllocation.objects.filter(target=document)), document)
+    return _in_minor_units(document.total_gross - _sum(PayableAllocation.objects.filter(target=document))
+                           - _migrated_settled(document), document)
 
 
 def _available(source):
@@ -1879,7 +1953,7 @@ def _available(source):
         amount = source.settled_amount - _sum(PayableAllocation.objects.filter(payment=source))
     else:
         amount = source.total_gross - _sum(PayableAllocation.objects.filter(vendor_credit_note=source))
-    return _in_minor_units(amount, source)
+    return _in_minor_units(amount - _migrated_settled(source), source)  # R129: used against migrated items
 
 
 def open_amount(document, *, user):
@@ -1897,13 +1971,16 @@ def payment_state(document, *, user):
     access.require(user, document.entity, "invoicing.view")
     is_sales = isinstance(document, SalesDocument)
     allocations = (ReceivableAllocation if is_sales else PayableAllocation).objects.filter(target=document)
-    allocated = _sum(allocations)
+    migrated = _live_settlements(MigratedSettlement.objects.filter(**{_MIGRATED_FIELD[type(document)]: document}))
+    allocated = _sum(allocations) + _sum(migrated)
     if allocated == ZERO:
         return "unpaid"
     if allocated < document.total_gross:
         return "partial"
     by_note = _sum(allocations.filter(credit_note__isnull=False) if is_sales else
                    allocations.filter(vendor_credit_note__isnull=False))
+    notes = ("credit_note", "vendor_credit_note")  # R129: a migrated credit note, on either side of the row
+    by_note += _sum(migrated.filter(Q(item__doc_type__in=notes) | Q(counter_item__doc_type__in=notes)))
     return "credited" if by_note == allocated else "paid"
 
 
@@ -1937,6 +2014,9 @@ def _allocation_problems(source, target, amount):
     elif source.currency_id != source.entity.base_currency_id:
         problems.append("Foreign-currency items are settled when the receipt, payment or note posts (ledger-fx R18). / "
                         "تُسوّى البنود بالعملة الأجنبية عند ترحيل السند أو الإشعار.")
+    source_key, target_key = _control_key(source), _control_key(target)  # reviews of 4986344 item 1, 07da401 item 5
+    if source_key is not None and target_key is not None and source_key != target_key:
+        problems.append(CONTROL_MISMATCH)
     booked = {"final", "posted"}
     if source.status not in booked or target.status not in booked:
         problems.append("Both sides must be final or posted (R44). / يجب أن يكون الطرفان نهائيين أو مرحّلين.")
@@ -2362,7 +2442,7 @@ def approve_purchase_document(document, *, user):
         doc._service_write = True
         doc.save(update_fields=["journal_entry", "requires_purification", "updated_at"])
         if targets:
-            amount = min(doc.total_gross, _open_payable(targets[0]))
+            amount = _vendor_note_settlement_amount(doc)
             if amount > ZERO:
                 _allocate_payable(entity, None, doc, targets[0], amount, doc.accounting_date, user,
                                   via_settlement=doc.currency_id != entity.base_currency_id)
@@ -2392,7 +2472,7 @@ def _purchase_document_lines(document):
     gross = document.total_gross
     settlements = []
     if note and document.original_document_id and cur != functional:
-        amount = min(gross, _open_payable(document.original_document))
+        amount = min(gross, _vendor_note_settlement_amount(document))
         item = _control_line(document.original_document)
         if amount > ZERO and item is not None:
             settlements.append((item, amount, f"{label} → {document.original_document.number}"))
@@ -2474,6 +2554,8 @@ def _application_problems(source, target, amount, receivable, planned=ZERO):
     if target.currency_id != source.currency_id:
         problems.append("A settlement is in the document's currency (cross-currency settlement is not built). / "
                         "تكون التسوية بعملة المستند.")
+    if not _same_control(source, target, receivable):  # review of 07da401, item 2: the receipt or payment posts on
+        problems.append(CONTROL_MISMATCH)               # its party's control account today; the target as booked
     if planned + amount > open_:
         problems.append(f"{planned + amount} planned for {target.number} is more than its open amount {open_}. / "
                         f"{planned + amount} المخطط للمستند {target.number} أكبر من المبلغ المفتوح {open_}.")
@@ -4382,7 +4464,7 @@ def reverse_document(document, *, user, date=None, reason=""):
             raise error("A posted vendor credit note references this bill; reverse the credit note first.",
                         "يشير إشعار دائن مرحّل من المورد إلى هذه الفاتورة؛ اعكس الإشعار أولًا.", code="has_credit_notes")
         own, others = _allocations_of(document)
-        if any(not a.via_settlement for a in own) or others:
+        if any(not a.via_settlement for a in own) or others or _migrated_settled(document):  # R129 too
             raise error("The document has allocations; un-allocate them first (R25, R33).",
                         "للمستند تخصيصات؛ ألغِها أولًا.", code="has_allocations")
         on = _reversal_date(document.entity, document.journal_entry.date, date)
@@ -4472,6 +4554,15 @@ def reconcile_subledger(entity, as_of, *, user):
     for p in booked(VendorPayment.objects.all()).select_related("vendor__group_entity"):
         add(*ctrl(p.vendor, False), p.currency_id,
             -p.amount if p.kind == VendorPayment.Kind.REFUND_RECEIVED else p.settled_amount)
+    # R115 / migration R23: open items migrated at the cut-over are on the control accounts through the migration
+    # opening entry, in the functional currency (OQ-13 default: SAR at the cut-over).
+    for item in MigratedOpenItem.objects.filter(entity=entity, cutover_date__lte=as_of).select_related("counterparty"):
+        add(item.control_account, item.counterparty.code if item.counterparty_id else None, entity.base_currency_id,
+            item.signed_sar)
+    # R129: a foreign-currency settlement of a migrated item moved the item's SAR carrying amount and the counter
+    # document's control line in the ledger (the realised FX difference went to 4700 / 5750)
+    for (account, counterparty, currency), amount in _migrated_settlement_subledger(entity, as_of).items():
+        add(account, counterparty, currency, amount)
     gl = {}
     lines = JournalLine.objects.filter(
         entry__entity=entity, entry__status__in=ledger.BOOKED, entry__date__lte=as_of,
@@ -5001,6 +5092,10 @@ def create_deferred_sale(source, *, approver, employee, purchase_bill, cost, pro
     invoice (new number) replaces the rejected one.
     """
     entity = Entity.objects.get(pk=source.entity_id)
+    if getattr(source, "pre_go_live", False) or getattr(source, "legacy_number", ""):  # review of aa856fa, item 10
+        raise error("A contract migrated from the legacy system is already sold; no sale invoice is created for it "
+                    "(migration W14).", "العقد المرحَّل من النظام السابق مبيع مسبقًا؛ لا تُنشأ له فاتورة بيع.",
+                    code="migrated_contract")
     system = access.system_user(DEFERRED_SALE_SYSTEM)
     access.require(system, entity, "invoicing.create_deferred_sale")
     if access_services.kind_of(approver) != Kind.HUMAN:  # payroll R38: people approve sales, never agents or systems
@@ -5017,6 +5112,10 @@ def create_deferred_sale(source, *, approver, employee, purchase_bill, cost, pro
         live = (DeferredSale.objects.select_for_update(of=("self",)).select_related("sales_document")
                 .filter(entity=entity, source_type=source_type, source_id=source_id, active=True).first())
         if live is not None:
+            if live.pre_go_live:  # migration W14: a migrated contract is already sold; it never gets an ERP invoice
+                raise error(f"Contract {live.reference} was migrated from the legacy system already sold; no sale "
+                            "invoice is created for it (migration W14).", f"العقد {live.reference} مرحَّل من النظام "
+                            "السابق مبيعًا؛ لا تُنشأ له فاتورة بيع.", code="migrated_contract")
             if live.sales_document.status != Status.REJECTED:
                 doc = live.sales_document
                 doc.warnings = []
@@ -5102,6 +5201,78 @@ def _live_deferred_sale(entity, source, *, lock=False):
     return qs.first()
 
 
+def register_migrated_deferred_sale(source, *, user, remaining_receivable, unearned_profit):
+    """Migration W14 (dry run gap 4): the bai' ajel sale of a contract migrated from the legacy system at the
+    cut-over. Called by payroll's ``load_migrated_deferred_sale`` through ``invoicing.payroll_port`` inside its
+    transaction; ``user`` is the person loading it (``payroll.create_deferred_sale``, a human).
+
+    No sale invoice or purchase bill exists in the ERP (pre-go-live), nothing goes to ZATCA and nothing is posted:
+    the remaining receivable is on 1240 and the profit still deferred on 1241 through the migration opening entry,
+    which posts only when these contracts tie out to it (migration R22). The row holds the figures still open at the
+    cut-over: ``profit_amount`` = ``unearned_profit``, ``cost`` = ``remaining_receivable`` less it, no VAT (charged
+    before the cut-over), so each later collection releases its pro-rata share of the deferred profit (R112, payroll
+    E12) and the last one releases the rest. Idempotent per contract; other figures are refused."""
+    entity = Entity.objects.get(pk=source.entity_id)
+    if access_services.kind_of(user) != Kind.HUMAN:
+        access.deny(user, entity, "payroll.create_deferred_sale", "agent_forbidden")
+    access.require(user, entity, "payroll.create_deferred_sale")
+    legacy = str(getattr(source, "legacy_number", "") or "").strip()[:40]
+    if not getattr(source, "pre_go_live", False) or not legacy:
+        raise error("Only a contract migrated from the legacy system is registered this way (W14).",
+                    "يُسجَّل بهذه الطريقة العقد المرحَّل من النظام السابق فقط.", code="not_migrated")
+    remaining = _money(remaining_receivable, "remaining receivable", positive=True, currency=SAR)
+    unearned = _money(unearned_profit, "unearned profit", currency=SAR)
+    if unearned >= remaining:
+        raise error(f"The unearned profit {unearned} must be less than the receivable still open {remaining}.",
+                    f"يجب أن يكون الربح غير المتحقق {unearned} أقل من الذمة المتبقية {remaining}.",
+                    code="unearned_above_receivable")
+    system = access.system_user(DEFERRED_SALE_SYSTEM)
+    source_type, source_id = source._meta.label_lower, source.pk
+    with transaction.atomic():
+        from . import migration_port
+
+        migration_port.refuse_after_opening(entity)  # migration R25: never after the opening entry is posted
+        live = _live_deferred_sale(entity, source, lock=True)
+        if live is not None:
+            if (live.pre_go_live, live.legacy_number, live.receivable, live.profit_amount) != (True, legacy, remaining,
+                                                                                          unearned):
+                raise error(f"Contract {legacy} was registered before with other figures.",
+                            f"سُجّل العقد {legacy} سابقًا بأرقام أخرى.", code="migrated_contract_changed")
+            return live
+        customer = _employee_customer(entity, source.employee, system)
+        sale = DeferredSale(
+            entity=entity, sales_document=None, customer=customer, purchase_bill=None, source_type=source_type,
+            source_id=source_id, cost=remaining - unearned, profit_amount=unearned, vat_amount=ZERO,
+            possession_date=getattr(source, "sale_date", None) or timezone.localdate(),
+            possession_evidence_ref=f"Legacy contract {legacy} / عقد سابق {legacy}"[:200], approved_by=user,
+            approved_at=timezone.now(), created_by=user, pre_go_live=True, legacy_number=legacy,
+        )
+        sale._service_write = True
+        try:
+            with transaction.atomic():
+                sale.save()
+        except IntegrityError:
+            raise error(f"Contract {legacy} is already registered in {entity.code}.",
+                        f"العقد {legacy} مسجل مسبقًا في {entity.code}.", code="migrated_contract_twice") from None
+    return sale
+
+
+def migrated_bai_ajel_balances(entity):
+    """The R22 source for 1240 / 1241 (migration W14): {("1240", ""): receivable still open, ("1241", ""): - profit
+    still deferred} of the contracts migrated into ``entity``, before any collection after the cut-over. Internal (no
+    access check): the migration posting gate calls it."""
+    receivable = profit = ZERO
+    for sale in DeferredSale.objects.filter(entity=entity, pre_go_live=True, active=True):
+        receivable += sale.receivable
+        profit += sale.profit_amount
+    out = {}
+    if receivable:
+        out[(EMPLOYEE_RECEIVABLE, "")] = receivable.quantize(CENT)
+    if profit:
+        out[(DEFERRED_PROFIT, "")] = -profit.quantize(CENT)
+    return out
+
+
 def deferred_sale_of(source):
     """The live bai' ajel sale approved in ``source`` (a payroll contract), or None. No right needed: payroll reads
     its own contract's sale through its port (``invoicing.payroll_port``)."""
@@ -5167,6 +5338,11 @@ def create_deferred_sale_adjustment(source, *, approver, source_ref, amount, rea
         if sale is None:
             raise error("No bai' ajel sale was invoiced for this contract (R112).",
                         "لم تصدر فاتورة بيع آجل لهذا العقد.", code="no_deferred_sale")
+        if sale.pre_go_live:  # no ERP invoice to credit: a rebate on a migrated contract is a human decision (W14)
+            raise error(f"Contract {sale.reference} was migrated from the legacy system; it has no ERP sale invoice to "
+                        "credit, so an ibra' rebate on it is not issued here (migration W14).",
+                        f"العقد {sale.reference} مرحَّل من النظام السابق وليس له فاتورة بيع في النظام لإصدار إشعار دائن "
+                        "عليها، فلا يصدر الإبراء عليه هنا.", code="migrated_contract")
         invoice = sale.sales_document
         if invoice.status != Status.FINAL or invoice.journal_entry_id is None:
             raise error(f"The sale invoice {invoice.number} is not posted yet; a rebate waits for it (R128).",
@@ -5328,10 +5504,10 @@ def recognise_deferred_profit(source, *, user, collected_amount, collected_on, s
                             "first.", f"سُجّل التحصيل {ref} بمبلغ {existing.collected_amount} لا {amount}؛ اعكسه أولًا.",
                             code="collection_changed")
             return existing
-        doc = sale.sales_document
-        if doc.status != Status.FINAL or doc.journal_entry_id is None:
-            raise error(f"The sale invoice {doc.number} is not posted yet (it waits for ZATCA reporting); its profit is "
-                        "recognised once it is posted (R41, R112).", f"فاتورة البيع {doc.number} لم تُرحَّل بعد (بانتظار "
+        number = sale.reference
+        if not sale.is_posted:
+            raise error(f"The sale invoice {number} is not posted yet (it waits for ZATCA reporting); its profit is "
+                        "recognised once it is posted (R41, R112).", f"فاتورة البيع {number} لم تُرحَّل بعد (بانتظار "
                         "الإبلاغ للهيئة)؛ تتحقق أرباحها بعد ترحيلها.", code="sale_not_posted")
         posted = DeferredProfitRelease.objects.filter(deferred_sale=sale, status=DeferredProfitRelease.Status.POSTED)
         collected_before = Decimal(posted.aggregate(t=Sum("collected_amount"))["t"] or ZERO).quantize(CENT)
@@ -5352,8 +5528,8 @@ def recognise_deferred_profit(source, *, user, collected_amount, collected_on, s
             grant = access.require(system, entity, "invoicing.post_deferred_profit", document=release)
             with _posting_as(system):
                 entry = ledger.create_entry(
-                    entity, collected_on, f"Bai' ajel profit {doc.number} / أرباح البيع الآجل {doc.number}", None,
-                    user=system, reference=doc.number, post=True, grant=grant, document=release,
+                    entity, collected_on, f"Bai' ajel profit {number} / أرباح البيع الآجل {number}", None,
+                    user=system, reference=number, post=True, grant=grant, document=release,
                 )
             release.journal_entry = entry
             release._service_write = True
@@ -5394,6 +5570,8 @@ def catch_up_deferred_profit(source, *, source_ref, on, approver):
         existing = posted.filter(source_ref=ref).first()
         if existing is not None:
             return existing
+        if sale.pre_go_live:  # no rebate is issued on a migrated contract, so nothing was held back
+            return None
         doc = sale.sales_document
         if doc.status != Status.FINAL or doc.journal_entry_id is None:
             return None
@@ -5477,7 +5655,7 @@ def _deferred_profit_lines(release):
     _require_posting_context(release, DeferredProfitRelease.Status.POSTED)
     if release.profit_amount <= ZERO:
         raise error("No profit to recognise.", "لا يوجد ربح للتحقق.", code="nothing_to_post")
-    number = release.deferred_sale.sales_document.number
+    number = release.deferred_sale.reference
     label = f"{number} {release.source_ref}"
     return [
         {"account": DEFERRED_PROFIT, "debit": release.profit_amount,
@@ -5489,3 +5667,475 @@ def _deferred_profit_lines(release):
 
 def _deferred_profit_reverse_guard(release):
     return _reversing_profit.get() == release.pk
+
+
+# --- settlement of migrated open items after go-live (R129, OQ-79; review of aa856fa item 11) ------------------------
+
+_MIGRATED_FIELD = {CustomerReceipt: "receipt", VendorPayment: "payment", SalesDocument: "sales_document",
+                   PurchaseDocument: "purchase_document"}
+# Review of 4986344, item 2: a foreign-currency settlement is its own approval activity (invoicing.migrated_settlement)
+# decided in the engine inbox; the approval posts its entry.
+MIGRATED_SETTLEMENT_APPROVAL = "invoicing.approve_migrated_settlement"
+_settling_migrated = ContextVar("invoicing_settling_migrated", default=None)
+_CONTROL_CODES = (AR, AR_GROUP, AP, AP_GROUP)
+
+
+def _live_settlements(qs):
+    return qs.filter(status__in=MigratedSettlement.LIVE)
+
+
+def _migrated_settled(document):
+    """Amount of an ERP document allocated against migrated items (live rows, R129)."""
+    field = _MIGRATED_FIELD.get(type(document))
+    if field is None or document.pk is None:
+        return ZERO
+    return _sum(_live_settlements(MigratedSettlement.objects.filter(**{field: document})))
+
+
+def _migrated_open(item):
+    """Open amount of a migrated item in its currency: the amount loaded less its live settlements (R129)."""
+    used = _sum(_live_settlements(MigratedSettlement.objects.filter(item=item)))
+    used += _sum(_live_settlements(MigratedSettlement.objects.filter(counter_item=item)))
+    return _in_minor_units(item.amount - used, item)
+
+
+def _migrated_open_sar(item):
+    """SAR carrying amount still open of a migrated item (the cut-over amount less the SAR its settlements cleared)."""
+    rows = _live_settlements(MigratedSettlement.objects.filter(item=item))
+    cleared = rows.aggregate(t=Sum("item_sar"))["t"] or ZERO
+    against = _live_settlements(MigratedSettlement.objects.filter(counter_item=item))
+    cleared += against.aggregate(t=Sum("counter_sar"))["t"] or ZERO
+    return (item.amount_sar - cleared).quantize(CENT)
+
+
+def migrated_open_amount(item, *, user):
+    """(open amount in the item's currency, SAR carrying amount still open) of a migrated item (``invoicing.view``)."""
+    access.require(user, item.entity, "invoicing.view")
+    return _migrated_open(item), _migrated_open_sar(item)
+
+
+def _control_sign(document):
+    """+1 when the document debits its control account (what the party owes), -1 when it credits it."""
+    if isinstance(document, MigratedOpenItem):
+        return MigratedOpenItem.SIGNS[document.doc_type]
+    if isinstance(document, CustomerReceipt):
+        return 1 if document.kind == CustomerReceipt.Kind.REFUND else -1
+    if isinstance(document, VendorPayment):
+        return -1 if document.kind == VendorPayment.Kind.REFUND_RECEIVED else 1
+    if isinstance(document, SalesDocument):
+        return -1 if document.doc_type == SalesDocument.DocType.CREDIT_NOTE else 1
+    return 1 if document.doc_type == PurchaseDocument.DocType.VENDOR_CREDIT_NOTE else -1
+
+
+def _counter_open(document):
+    if isinstance(document, MigratedOpenItem):
+        return _migrated_open(document)
+    if isinstance(document, SalesDocument) and document.doc_type != SalesDocument.DocType.CREDIT_NOTE:
+        return _open_receivable(document)
+    if isinstance(document, PurchaseDocument) and document.doc_type == PurchaseDocument.DocType.BILL:
+        return _open_payable(document)
+    if isinstance(document, CustomerReceipt) and document.kind == CustomerReceipt.Kind.REFUND:
+        return _in_minor_units(document.amount - _migrated_settled(document), document)
+    if isinstance(document, VendorPayment) and document.kind == VendorPayment.Kind.REFUND_RECEIVED:
+        return _in_minor_units(document.amount - _migrated_settled(document), document)
+    return _available(document)
+
+
+def _counter_label(document):
+    if isinstance(document, MigratedOpenItem):
+        return document.legacy_number
+    return document.number or f"#{document.pk}"
+
+
+def _booked_control_line(document):
+    """The control-account line (1200, 1210, 2100, 2110) that booked an ERP document, as it was booked (not as the
+    party's group entity says today): a normal line in the document's currency on its side of the account."""
+    if document.journal_entry_id is None:
+        return None
+    lines = JournalLine.objects.filter(entry_id=document.journal_entry_id, account__code__in=_CONTROL_CODES,
+                                       line_kind="normal", currency_id=document.currency_id)
+    lines = lines.filter(debit__gt=0) if _control_sign(document) > 0 else lines.filter(credit__gt=0)
+    return lines.select_related("account").order_by("pk").first()
+
+
+def _control_key(document):
+    """(control account code, counterparty entity id or None) a document sits on (review of 4986344, item 1)."""
+    if isinstance(document, MigratedOpenItem):
+        return document.control_account, document.counterparty_id
+    line = _booked_control_line(document)
+    return (line.account.code, line.counterparty_entity_id) if line is not None else None
+
+
+def _migrated_settlement_problems(item, counter, amount):
+    """R129: same entity, side, party, currency and control account (per counterparty); opposite sides of the
+    control account; booked; within both open amounts; the migration opening entry posted and not reversed."""
+    problems = []
+    receivable = item.side == MigratedOpenItem.Side.RECEIVABLE
+    party_id = item.customer_id if receivable else item.vendor_id
+    if counter.entity_id != item.entity_id:
+        problems.append("The documents belong to different entities. / المستندان يخصان كيانين مختلفين.")
+    if isinstance(counter, MigratedOpenItem):
+        if counter.pk == item.pk:
+            problems.append("An item is not settled against itself. / لا يُسوّى البند مع نفسه.")
+        if counter.side != item.side:
+            problems.append("A receivable and a payable are not netted here. / لا تُقاصّ ذمة مدينة مع دائنة هنا.")
+        counter_party = counter.customer_id if receivable else counter.vendor_id
+    elif receivable and isinstance(counter, (CustomerReceipt, SalesDocument)):
+        counter_party = counter.customer_id
+    elif not receivable and isinstance(counter, (VendorPayment, PurchaseDocument)):
+        counter_party = counter.vendor_id
+    else:
+        counter_party = None
+        problems.append("A receivable is settled by receipts and sales documents, a payable by payments and purchase "
+                        "documents. / تُسوّى الذمم المدينة بالمقبوضات ومستندات المبيعات والدائنة بالمدفوعات "
+                        "ومستندات المشتريات.")
+    if counter_party is not None and counter_party != party_id:
+        problems.append("The documents belong to different parties. / المستندان يخصان طرفين مختلفين.")
+    if counter.currency_id != item.currency_id:
+        problems.append(f"The item is in {item.currency_id}, the counter document in {counter.currency_id}. / البند "
+                        f"بعملة {item.currency_id} والمستند المقابل بعملة {counter.currency_id}.")
+    if _control_sign(counter) == _control_sign(item):
+        problems.append("Both documents are on the same side of the control account. / المستندان في الجانب نفسه من "
+                        "حساب المراقبة.")
+    booked = True
+    if isinstance(counter, SalesDocument):
+        if counter.status != Status.FINAL or counter.journal_entry_id is None or _is_deferred_sale(counter):
+            booked = False
+            problems.append("Only a final, posted sales document (not a bai' ajel one) is settled. / تُسوّى مستندات "
+                            "المبيعات النهائية المرحّلة فقط (لا البيع الآجل).")
+    elif isinstance(counter, (CustomerReceipt, VendorPayment, PurchaseDocument)):
+        if counter.status != "posted" or counter.journal_entry_id is None:
+            booked = False
+            problems.append("Only a posted document is settled. / تُسوّى المستندات المرحّلة فقط.")
+    if booked and counter.entity_id == item.entity_id:
+        key = _control_key(counter)
+        if key != (item.control_account, item.counterparty_id):  # review of 4986344, item 1
+            shown = f"{key[0]}{' / ' + str(key[1]) if key and key[1] else ''}" if key else "-"
+            problems.append(
+                f"The item is on {item.control_account}"
+                f"{' (' + item.counterparty.code + ')' if item.counterparty_id else ''}, {_counter_label(counter)} on "
+                f"{shown}: a settlement never moves a balance between control accounts or counterparties. / البند على "
+                f"الحساب {item.control_account} والمستند المقابل على حساب مراقبة أو كيان مقابل آخر؛ لا تنقل التسوية "
+                "رصيدًا بين حسابات المراقبة.")
+    if not ledger.migration_opening_posted(item.entity, booked=False):  # posted, not reversed (review item 5)
+        problems.append("The migration opening entry carrying the item is not posted (or was reversed; migration "
+                        "R22). / القيد الافتتاحي للترحيل الذي يحمل البند غير مرحّل أو معكوس.")
+    if not problems:
+        item_open, counter_open = _migrated_open(item), _counter_open(counter)
+        if amount > item_open or amount > counter_open:
+            problems.append(f"The amount {amount} is more than is open (item {item_open}, {_counter_label(counter)} "
+                            f"{counter_open}). / المبلغ {amount} أكبر من المفتوح.")
+    return problems
+
+
+def _cleared_sar(item, amount):
+    """SAR of the carrying amount ``amount`` of a migrated item clears: pro rata, the last settlement the rest."""
+    if amount == _migrated_open(item):
+        return _migrated_open_sar(item)
+    return _round(item.amount_sar * amount / item.amount)
+
+
+def _expected_counter_sar(counter, amount):
+    """SAR the counter document's control line clears for ``amount`` at its carrying rate (ledger-fx R18): its open
+    functional amount for the last part, else round(amount x rate). The posting prices it again."""
+    line = _booked_control_line(counter)
+    open_txn, open_func = ledger._open_item(line)
+    return open_func if amount == open_txn else fx.convert(amount, line.fx_rate)
+
+
+def _lock_counter(counter):
+    return type(counter).objects.select_for_update(of=("self",)).select_related("entity").get(pk=counter.pk)
+
+
+def _counter_field(counter):
+    return "counter_item" if isinstance(counter, MigratedOpenItem) else _MIGRATED_FIELD[type(counter)]
+
+
+def _pair_rows(row_or_item, counter=None):
+    """Live settlements of one (migrated item, counter document) pair (review of 07da401, item 3)."""
+    if counter is None:
+        row = row_or_item
+        name = next(n for n in MigratedSettlement.COUNTERS if getattr(row, f"{n}_id"))
+        return _live_settlements(MigratedSettlement.objects.filter(item_id=row.item_id,
+                                                                   **{f"{name}_id": getattr(row, f"{name}_id")}))
+    return _live_settlements(MigratedSettlement.objects.filter(item=row_or_item, **{_counter_field(counter): counter}))
+
+
+def allocate_migrated_item(item, counter, amount, *, user):
+    """R129 (OQ-79): allocate ``amount`` of a migrated open item against a counter document (``invoicing.allocate``).
+
+    Receivables: a posted receipt (or a refund paying out a migrated credit), a final invoice, debit or credit note,
+    or another migrated item; payables: a posted vendor payment (or refund received), bill or vendor credit note, or
+    another migrated item. Partial and full; credit notes and advances net against invoices and bills. Both sides
+    sit on the same control account and counterparty.
+
+    In SAR the allocation is effective at once with no GL effect (R35). In a foreign currency it is created
+    ``pending`` and submitted to the approval engine (activity ``invoicing.migrated_settlement``, measured on the SAR
+    cleared plus the expected FX difference); the approval posts its entry (:func:`post_migrated_settlement`).
+    Returns the row."""
+    access.require(user, item.entity, "invoicing.allocate")
+    with transaction.atomic():
+        if isinstance(counter, MigratedOpenItem):  # two migrated items: locked in one order (no deadlock)
+            list(MigratedOpenItem.objects.select_for_update(of=("self",)).filter(pk__in=[item.pk, counter.pk])
+                 .order_by("pk").values_list("pk", flat=True))
+        item = MigratedOpenItem.objects.select_for_update(of=("self",)).select_related("entity", "counterparty") \
+            .get(pk=item.pk)
+        counter = _lock_counter(counter)
+        amount = _money(amount, "allocation amount", positive=True, currency=item.currency_id)
+        problems = _migrated_settlement_problems(item, counter, amount)
+        if problems:
+            raise _problems_error(problems, "allocation_invalid")
+        if _pair_rows(item, counter).filter(status=MigratedSettlement.Status.PENDING).exists():
+            raise error(f"A settlement of {item.legacy_number} against {_counter_label(counter)} is waiting for "
+                        "approval; it is decided (or discarded) before another one is made (no split approvals).",
+                        f"توجد تسوية للبند {item.legacy_number} مقابل {_counter_label(counter)} بانتظار الاعتماد؛ "
+                        "يُبت فيها أو تُلغى قبل تسوية أخرى.", code="settlement_pending")
+        functional = item.currency_id == item.entity.base_currency_id
+        item_sar = amount if functional else _cleared_sar(item, amount)
+        if functional:
+            counter_sar = amount
+        elif isinstance(counter, MigratedOpenItem):
+            counter_sar = _cleared_sar(counter, amount)
+        else:
+            counter_sar = _expected_counter_sar(counter, amount)
+        debit_sar, credit_sar = (item_sar, counter_sar) if _control_sign(item) > 0 else (counter_sar, item_sar)
+        fx_difference = debit_sar - credit_sar
+        needs_entry = not functional and (fx_difference != ZERO or not isinstance(counter, MigratedOpenItem))
+        row = MigratedSettlement(
+            entity=item.entity, item=item, currency_id=item.currency_id, amount=amount, item_sar=item_sar,
+            counter_sar=counter_sar, fx_difference=fx_difference,
+            status=MigratedSettlement.Status.PENDING if needs_entry else MigratedSettlement.Status.POSTED,
+            date=_riyadh_now().date(), created_by=user,
+            **{_counter_field(counter): counter})
+        row._service_write = True
+        row.save()
+        if needs_entry:  # access R61: the matrix (or the code default, the CFO) decides it in the inbox
+            approval_engine.submit(row, user, submit_permission="invoicing.allocate")
+    return row
+
+
+def migrated_settlement_measure(row):
+    """The engine's band measure of a settlement (SAR, review of 4986344 item 2 and 07da401 item 3): over every
+    live settlement of the same (item, counter document) pair up to and including this one, |SAR cleared of the
+    item| + |FX difference|, so splitting one settlement never lowers the band."""
+    rows = _pair_rows(row).filter(pk__lte=row.pk) if row.pk else MigratedSettlement.objects.none()
+    totals = rows.exclude(pk=row.pk).aggregate(sar=Sum("item_sar"), fx=Sum("fx_difference"))
+    sar = (totals["sar"] or ZERO) + row.item_sar
+    diff = (totals["fx"] or ZERO) + row.fx_difference
+    return (abs(sar) + abs(diff)).quantize(CENT)
+
+
+def migrated_settlement_version(row):
+    """The engine's version of a settlement: what it settles, for how much and at which rates (review of 07da401,
+    item 7), never the figures its posting fills in."""
+    counter = row.counter if row.item_id else None
+    if counter is None or row.amount is None or row.item_sar is None:  # not a stored settlement: its key only
+        return f"settlement-{row.pk}"
+    if isinstance(counter, MigratedOpenItem):
+        rate = (counter.amount_sar / counter.amount).quantize(Decimal("0.000001"))
+    else:
+        line = _booked_control_line(counter)
+        rate = line.fx_rate if line is not None else ""
+    name = _counter_field(counter)
+    amount, sar = Decimal(row.amount).quantize(Decimal("0.001")), Decimal(row.item_sar).quantize(CENT)
+    return (f"{row.pk}|{row.item_id}|{name}:{counter.pk}|{amount}|{row.currency_id}|{sar}|"
+            f"{(row.item.amount_sar / row.item.amount).quantize(Decimal('0.000001'))}|{rate}")[:64]
+
+
+def _migrated_settlement_lines(row):
+    """Registered ``build_lines`` for MigratedSettlement (R129): the item's SAR carrying amount and the counter
+    document's control line (at its carrying rate) cleared, the difference to 4700 / 5750."""
+    if _settling_migrated.get() != row.pk or row.journal_entry_id is not None:
+        raise error("A migrated settlement posts only through invoicing.services.", "تُرحَّل تسوية البند المرحَّل من "
+                    "خلال خدمات الفوترة فقط.", code="post_through_services")
+    item, counter = row.item, row.counter
+    functional = row.entity.base_currency_id
+    label = f"{item.legacy_number} ↔ {_counter_label(counter)}"
+    item_side = "credit" if _control_sign(item) > 0 else "debit"
+    lines = [_line(item.control_account, item_side, row.item_sar, functional, functional, item.counterparty,
+                   f"Migrated {label} / بند مرحَّل")]
+    debit = row.item_sar if item_side == "debit" else ZERO
+    credit = row.item_sar if item_side == "credit" else ZERO
+    if isinstance(counter, MigratedOpenItem):
+        side = "credit" if _control_sign(counter) > 0 else "debit"
+        lines.append(_line(counter.control_account, side, row.counter_sar, functional, functional,
+                           counter.counterparty, f"Migrated {label} / بند مرحَّل"))
+        settled = row.counter_sar
+    else:
+        spec, settled = ledger._settlement_for_document(_booked_control_line(counter), row.amount, label)
+        lines.append(spec)
+        side = "credit" if _control_sign(counter) > 0 else "debit"
+    if side == "debit":
+        debit += settled
+    else:
+        credit += settled
+    diff = debit - credit
+    if diff > ZERO:
+        lines.append({"account": ledger.FX_GAIN_REALISED, "credit": diff, "line_kind": "realised_fx",
+                      "description": "Realised FX gain / أرباح فروقات العملة المحققة"})
+    elif diff < ZERO:
+        lines.append({"account": ledger.FX_LOSS_REALISED, "debit": -diff, "line_kind": "realised_fx",
+                      "description": "Realised FX loss / خسائر فروقات العملة المحققة"})
+    return lines
+
+
+def post_migrated_settlement(row, *, user):
+    """R129: the approval of a pending foreign-currency settlement (``invoicing.approve_migrated_settlement``,
+    decided in the engine inbox: the entity's matrix for ``invoicing.migrated_settlement``, else the CFO; never its
+    preparer) posts its entry. The entry is dated on the posting day (Riyadh), never before the counter document's
+    own entry; a closed period refuses it (review of 4986344, item 8)."""
+    row = MigratedSettlement.objects.select_related("entity", "item").get(pk=row.pk)
+    grant = access.require(user, row.entity, MIGRATED_SETTLEMENT_APPROVAL, document=row)
+    with transaction.atomic():
+        row = MigratedSettlement.objects.select_for_update(of=("self",)).select_related("entity", "item").get(pk=row.pk)
+        if row.status != MigratedSettlement.Status.PENDING:
+            raise error("Only a pending settlement is posted.", "تُرحَّل التسوية المعلقة فقط.", code="not_pending")
+        item, counter = row.item, _lock_counter(row.counter)
+        if not ledger.migration_opening_posted(row.entity, booked=False):
+            raise error("The migration opening entry is not posted, or was reversed (migration R22).",
+                        "القيد الافتتاحي للترحيل غير مرحّل أو معكوس.", code="opening_not_posted")
+        on = _riyadh_now().date()
+        if not isinstance(counter, MigratedOpenItem):
+            if counter.status not in ("posted", Status.FINAL):
+                raise error(f"{_counter_label(counter)} is no longer booked; discard this settlement.",
+                            f"المستند {_counter_label(counter)} لم يعد مرحّلًا؛ ألغِ هذه التسوية.",
+                            code="counter_not_booked")
+            if on < counter.journal_entry.date:
+                raise error(f"The settlement is not dated before {_counter_label(counter)} "
+                            f"({counter.journal_entry.date}).", f"لا تؤرَّخ التسوية قبل المستند "
+                            f"{_counter_label(counter)}.", code="settlement_date")
+        token = _settling_migrated.set(row.pk)
+        try:
+            with _posting_as(user):
+                entry = ledger.create_entry(
+                    row.entity, on, f"Settlement of migrated item {item.legacy_number} / تسوية بند مرحَّل "
+                    f"{item.legacy_number}", None, user=user, reference=f"MIG-{item.legacy_number}"[:60], post=True,
+                    grant=grant, document=row)
+        except LedgerError as exc:
+            raise _problems_error(exc.messages, getattr(exc, "code", None) or "posting_refused") from None
+        finally:
+            _settling_migrated.reset(token)
+        line = entry.lines.filter(line_kind="settlement").first()  # the counter's control line, at its carrying rate
+        if line is not None:
+            row.counter_sar = line.debit + line.credit
+        row.fx_difference = sum((l.debit - l.credit for l in entry.lines.filter(line_kind="realised_fx")), ZERO)
+        measure = migrated_settlement_measure(row)  # review of 07da401, item 7: the posted figures stay in the band
+        approval_engine.check_issued_band(grant, amount=measure, currency=row.entity.base_currency_id,
+                                          functional_amount=measure)
+        row.status, row.posted_by, row.posted_at = MigratedSettlement.Status.POSTED, user, timezone.now()
+        row.journal_entry = entry
+        row._service_write = True
+        row.save()  # once, from pending: only the posting's own fields change
+    return row
+
+
+def _drop_pending(row, user):
+    row = MigratedSettlement.objects.select_for_update(of=("self",)).get(pk=row.pk)
+    if row.status != MigratedSettlement.Status.PENDING:
+        raise error("Only a pending settlement is discarded.", "تُلغى التسوية المعلقة فقط.", code="not_pending")
+    row.status, row.discarded_by, row.discarded_at = MigratedSettlement.Status.DISCARDED, user, timezone.now()
+    row._service_write = True
+    row.save()
+    return row
+
+
+def discard_migrated_settlement(row, *, user):
+    """A pending settlement not posted is discarded (review of 07da401, item 4) by its preparer (still holding
+    ``invoicing.allocate``), an approver of settlements (``invoicing.approve_migrated_settlement``) or an access
+    admin (``core.grant_membership``) of the entity; who and when are kept on the row, its approval request leaves
+    the inbox and an ``approval_withdrawn`` row is logged. Nothing was booked."""
+    row = MigratedSettlement.objects.select_related("entity").get(pk=row.pk)
+    entity = row.entity
+    if user.pk == row.created_by_id:
+        access.require(user, entity, "invoicing.allocate")
+    elif not (access_services.has(user, entity, MIGRATED_SETTLEMENT_APPROVAL)
+              or access_services.has(user, entity, "core.grant_membership")):
+        access.deny(user, entity, MIGRATED_SETTLEMENT_APPROVAL, "no_membership")
+    with transaction.atomic():
+        row = _drop_pending(row, user)
+        approval_engine.withdraw(row, user, permission=MIGRATED_SETTLEMENT_APPROVAL)
+    return row
+
+
+def _reject_migrated_settlement(row, user, note):
+    """Engine return / reject hook: the approver sends a pending settlement back; it is discarded (nothing booked)."""
+    return _drop_pending(row, user)
+
+
+def unallocate_migrated_item(row, *, user, date=None, reason=""):
+    """R129 (R36): an effective settlement is undone by a new row with the negative amounts and ``reverses`` set;
+    a foreign-currency one also reverses its entry (``invoicing.reverse_document``). The original never changes."""
+    entity = row.entity
+    access.require(user, entity, "invoicing.allocate")
+    with transaction.atomic():
+        original = MigratedSettlement.objects.select_for_update(of=("self",)).select_related("entity").get(pk=row.pk)
+        if original.status != MigratedSettlement.Status.POSTED or original.amount <= ZERO \
+                or original.reverses_id is not None:
+            raise error("Only an effective settlement is un-allocated.", "يُلغى تخصيص التسوية النافذة فقط.",
+                        code="unallocate_invalid")
+        if MigratedSettlement.objects.filter(reverses=original).exists():
+            raise error("This settlement is already un-allocated.", "أُلغي تخصيص هذه التسوية مسبقًا.",
+                        code="unallocate_invalid")
+        reversal = None
+        if original.journal_entry_id is not None:
+            grant = access.require(user, entity, "invoicing.reverse_document", document=original)
+            on = _reversal_date(entity, original.journal_entry.date, date)
+            token = _settling_migrated.set(-original.pk)
+            try:
+                reversal = ledger.reverse_entry(original.journal_entry, grant, date=on, reason=reason)
+            except LedgerError as exc:
+                raise _problems_error(exc.messages, getattr(exc, "code", None) or "reversal_refused") from None
+            finally:
+                _settling_migrated.reset(token)
+        undo = MigratedSettlement(
+            entity=entity, item=original.item, currency_id=original.currency_id, amount=-original.amount,
+            item_sar=-original.item_sar, counter_sar=-original.counter_sar if original.counter_sar is not None else None,
+            fx_difference=-original.fx_difference, status=MigratedSettlement.Status.POSTED,
+            date=reversal.date if reversal is not None else _riyadh_now().date(), journal_entry=reversal,
+            reverses=original, created_by=user, posted_by=user, posted_at=timezone.now(),
+            **{name: getattr(original, name) for name in MigratedSettlement.COUNTERS if getattr(original, f"{name}_id")})
+        undo._service_write = True
+        undo.save()
+    return undo
+
+
+def _migrated_settlement_reverse_guard(row):
+    return _settling_migrated.get() == -row.pk
+
+
+def _money_reverse_guard(document):
+    """Registered ``reverse_guard`` of receipts and vendor payments (review of 4986344, item 7): never reversed, by
+    any path, while a live (pending or effective) migrated settlement uses it; un-allocate first (R25)."""
+    return not _migrated_settled(document)
+
+
+def migrated_settlements(user, entity=None):
+    """Settlements of migrated items ``user`` may see (``invoicing.view``, R3)."""
+    qs = access.scope(MigratedSettlement.objects.select_related("entity", "item"), user, "invoicing.view")
+    return qs.filter(entity=entity) if entity is not None else qs
+
+
+def _migrated_settlement_subledger(entity, as_of):
+    """R39: what the entries of foreign-currency migrated settlements moved on the control accounts, per (account,
+    counterparty code, currency): the item's SAR carrying amount, and the counter document's transaction amount or
+    SAR carrying amount, cleared. Both sides are on the item's control account and counterparty (item 1)."""
+    out = {}
+    rows = (MigratedSettlement.objects.filter(entity=entity, status=MigratedSettlement.Status.POSTED,
+                                              journal_entry__isnull=False, journal_entry__date__lte=as_of)
+            .select_related("item__counterparty", "counter_item__counterparty", "receipt", "payment",
+                            "sales_document", "purchase_document"))
+    functional = entity.base_currency_id
+
+    def add(key, amount):
+        out[key] = out.get(key, ZERO) + amount
+
+    for r in rows:
+        item = r.item
+        key = (item.control_account, item.counterparty.code if item.counterparty_id else None)
+        add((*key, functional), -_control_sign(item) * r.item_sar)
+        counter = r.counter
+        if isinstance(counter, MigratedOpenItem):
+            add((*key, functional), -_control_sign(counter) * r.counter_sar)
+        else:
+            add((*key, counter.currency_id), -_control_sign(counter) * r.amount)
+    return out

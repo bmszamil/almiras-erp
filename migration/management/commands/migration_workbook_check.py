@@ -2,9 +2,10 @@
 (migration.md §11, W12). Read-only.
 
 Checks a filled migration workbook: required values and types, balancing trial balances, mapping completeness and
-the sub-ledger tie-outs (open items, banks, end of service, fixed assets) against the trial balance. With ``--user``
-the ERP accounts are checked against each entity's chart in the ERP (right ``migration.view``); entities not set up
-yet, and every entity without ``--user``, against the group chart template. Exit status 1 when the report has an
+the sub-ledger tie-outs (open items, banks, end of service, fixed assets, bai' ajel contracts, purification, the
+intercompany mirrors across entities) against the trial balance. With ``--user`` the ERP accounts are checked
+against each entity's chart in the ERP (right ``migration.view``) and the workbook's Sharia flag against the ERP
+entity's; entities not set up yet, and every entity without ``--user``, against the group chart template. Exit status 1 when the report has an
 error. The workbook and the CSV report stay outside git (``exports/``).
 """
 from django.contrib.auth import get_user_model
@@ -29,7 +30,7 @@ class Command(BaseCommand):
     def handle(self, *args, **o):
         book = run(lambda: workbook.read_workbook(o["workbook"]))
         only = [code.upper() for code in o["entity"]] or None
-        charts, notes = {}, []
+        charts, notes, erp_entities = {}, [], {}
         if o["user"]:
             user = get_user_model().objects.filter(username=o["user"], is_active=True).first()
             if user is None:
@@ -42,7 +43,8 @@ class Command(BaseCommand):
                     continue
                 run(lambda entity=entity: access.require(user, entity, "migration.view"))
                 charts[code] = workbook_checks.entity_chart(entity)
-        report = workbook_checks.check_workbook(book, charts=charts, entities=only)
+                erp_entities[code] = entity.sharia_enforced  # the ERP's flag governs (W17, rule 5)
+        report = workbook_checks.check_workbook(book, charts=charts, entities=only, erp_entities=erp_entities)
         for line in notes + workbook_checks.render(report):
             self.stdout.write(line)
         if o["report"]:
