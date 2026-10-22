@@ -129,7 +129,7 @@ def test_r40_a_register_load_waits_for_the_opening_entry_lock():
             migration_port.load_opening_asset(
                 h, user=acc, legacy_code="FA-L-01", description_ar="سيارة", asset_class="vehicle", usage="own_use",
                 location="المقر", cost_account=vehicles, acquisition_date=date(2025, 1, 1), cost=D("1000.00"),
-                cutover=f.CUTOVER)
+                method="straight_line", remaining_life_months=24, cutover=f.CUTOVER)  # R40: a depreciable row
             result["ok"] = True
         except FixedAssetError as exc:
             result["code"] = exc.code
