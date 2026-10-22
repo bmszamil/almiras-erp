@@ -126,6 +126,10 @@ MESSAGES = {
     "settings_value": ("Setting {name}: {why}", "الإعداد {name}: {why_ar}"),
     "estimate_incomplete": ("Asset {asset} has no usable depreciation estimate: {why}",
                             "لا يوجد للأصل {asset} تقدير استهلاك صالح: {why_ar}"),
+    "void_reversed_bill": (
+        "The adjustment for the reversed bill {line} is not voided: the bill stays reversed, so the asset's cost must "
+        "stay without it.",
+        "لا تُلغى تسوية الفاتورة المعكوسة {line}: تبقى الفاتورة معكوسة، فتبقى تكلفة الأصل بدونها."),
     "setup_missing": ("{entity} has no fixed-asset settings; run the setup first (R31).",
                       "لا توجد إعدادات أصول ثابتة للكيان {entity}؛ شغّل الإعداد أولًا."),
 }

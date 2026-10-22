@@ -84,11 +84,10 @@ def test_item3_a_back_dated_impairment_is_refused(w1):
     assert code_of(exc) == "event_before_posted_run"
     imp = t.event(w, asset, "impairment", date(2027, 4, 10), recoverable_amount=D("2000.00"))
     assert imp.amount == D("1300.00")  # 3,600 - 300 posted - 2,000
-    for kind, values in (("impairment_reversal", {"recoverable_amount": D("3000.00")}), ("vat_use_change",
-                                                                                      {"new_vat_use": "exempt"})):
-        with pytest.raises(FixedAssetError) as exc:
-            services.draft_event(asset, user=w.a, kind=kind, event_date=date(2027, 3, 31), reason_ar="س", **values)
-        assert code_of(exc) == "event_before_posted_run", kind
+    with pytest.raises(FixedAssetError) as exc:  # (a VAT use change is exempt from the guard: follow-up P5)
+        services.draft_event(asset, user=w.a, kind="impairment_reversal", event_date=date(2027, 3, 31),
+                             reason_ar="س", recoverable_amount=D("3000.00"))
+    assert code_of(exc) == "event_before_posted_run"
 
 
 def test_item3_a_change_of_estimate_takes_the_first_open_month_without_a_posted_run(w1, clock):
@@ -370,3 +369,143 @@ def test_item9_the_line_is_locked_before_its_remaining_amount_is_read(w1, monkey
     e = services.record_cost_adjustment(asset, user=w.a, purchase_line=t.line_of(bill, 2), reason_ar="تكلفة")
     assert calls and all(calls) and e.amount == D("500.00")
     assert AssetCostComponent.objects.filter(asset=asset).count() == 1
+
+
+# --- follow-up review of acb5701 (probes_head test_probe_d, P1 to P5) ----------------------------------------------
+
+def _gaps(w, on):
+    return {r["account"]: r["difference"] for r in services.register_to_gl(w.alm, on, user=w.a) if r["difference"]}
+
+
+def _adjust(w, asset, line, **kw):
+    e = services.record_cost_adjustment(asset, user=w.a, purchase_line=line, reason_ar="تسوية", **kw)
+    services.submit_event(e, user=w.a)
+    t.decide(e, w.c, permission=services.KIND_PERMISSION[e.kind])
+    e.refresh_from_db()
+    return e
+
+
+def _void(w, e):
+    services.request_reversal(e, user=w.a, reason_ar="إلغاء")
+    t.decide(e, w.c, permission="fixed_assets.reverse_document")
+    e.refresh_from_db()
+    return e
+
+
+def _vehicle(w, cost="60000.00", on=date(2027, 1, 5)):
+    bill = t.bill(w, w.alm, [("1520", cost)], on=on)
+    return bill, t.capitalise(w, t.line_of(bill), available=on, residual_value=D("0.00"))
+
+
+def test_p1_a_voided_bill_line_is_unregistered_again_and_blocks_the_close(w1):
+    from ledger.services import LedgerError
+
+    w = w1
+    _bill, asset = _vehicle(w)
+    extra = t.bill(w, w.alm, [("1520", "6000.00")], on=date(2027, 2, 10))
+    _void(w, _adjust(w, asset, t.line_of(extra)))
+    t.run(w, w.alm, "2027-01")
+    t.run(w, w.alm, "2027-02")
+    t.close(w, w.alm, "2027-01")
+    assert _gaps(w, date(2027, 2, 28)) == {"1520": D("6000.00")}  # the line is out of the register again
+    with pytest.raises(LedgerError) as exc:  # R43: net of the void it is linked to nothing
+        t.close(w, w.alm, "2027-02")
+    assert f"{extra.number} line 1" in str(exc.value) and "غير مسجلة في سجل الأصول" in str(exc.value)
+    _adjust(w, asset, t.line_of(extra))  # linked again: booked on its date, depreciated from March
+    assert _gaps(w, date(2027, 2, 28)) == {}
+    assert t.close(w, w.alm, "2027-02").status == "closed"
+
+
+def test_p2_a_cost_adjustment_is_not_voided_after_a_disposal_or_a_later_event(w1):
+    w = w1
+    bill, asset = _vehicle(w)
+    note = t.bill(w, w.alm, [("1520", "6000.00")], on=date(2027, 1, 20), doc_type="vendor_credit_note", original=bill)
+    e = _adjust(w, asset, t.line_of(note))
+    bill2, other = _vehicle(w, "30000.00")
+    note2 = t.bill(w, w.alm, [("1520", "3000.00")], on=date(2027, 1, 20), doc_type="vendor_credit_note",
+                   original=bill2)
+    e2 = _adjust(w, other, t.line_of(note2))
+    t.run(w, w.alm, "2027-01")
+    t.event(w, asset, "write_off", date(2027, 2, 10))
+    t.event(w, other, "impairment", date(2027, 2, 10), recoverable_amount=D("20000.00"))
+    t.run(w, w.alm, "2027-02")
+    for event in (e, e2):  # a disposed asset; a later posted impairment
+        services.request_reversal(event, user=w.a, reason_ar="إلغاء")
+        with pytest.raises(FixedAssetError) as exc:
+            t.decide(event, w.c, permission="fixed_assets.reverse_document")
+        assert code_of(exc) == "reversal_order"
+        event.refresh_from_db()
+        assert event.status == "approved"
+    assert _gaps(w, date(2027, 2, 28)) == {}
+
+
+def test_p3_a_write_off_is_reversed_only_after_its_disposal_adjustments(w1):
+    w = w1
+    bill, asset = _vehicle(w, "1000.00")
+    t.run(w, w.alm, "2027-01")
+    off = t.event(w, asset, "write_off", date(2027, 2, 1))
+    t.run(w, w.alm, "2027-02")
+    credit = _adjust(w, asset, t.line_of(t.bill(w, w.alm, [("1520", "100.00")], on=date(2027, 2, 5),
+                                                doc_type="vendor_credit_note", original=bill)))
+    debit = _adjust(w, asset, t.line_of(t.bill(w, w.alm, [("1520", "50.00")], on=date(2027, 2, 6))))
+    assert (credit.kind, debit.kind) == ("disposal_adjustment", "disposal_adjustment")
+    services.request_reversal(off, user=w.a, reason_ar="شطب خاطئ")
+    with pytest.raises(FixedAssetError) as exc:
+        t.decide(off, w.c, permission="fixed_assets.reverse_document")
+    assert code_of(exc) == "reversal_order"
+    asset.refresh_from_db()
+    assert (asset.status, asset.cost) == ("disposed", D("950.00"))  # 1,000.00 - 100.00 + 50.00
+    _void(w, credit)
+    _void(w, debit)
+    assert (credit.status, debit.status) == ("reversed", "reversed")
+    t.decide(off, w.c, permission="fixed_assets.reverse_document")  # the request stayed open
+    off.refresh_from_db()
+    asset.refresh_from_db()
+    assert (off.status, asset.status, asset.cost) == ("reversed", "active", D("1000.00"))
+
+
+def test_p4_a_credit_note_entered_after_its_month_was_run_keeps_its_document_date(w1):
+    w = w1
+    bill, asset = _vehicle(w)
+    jan = t.run(w, w.alm, "2027-01")
+    feb = t.run(w, w.alm, "2027-02")
+    note = t.bill(w, w.alm, [("1520", "6000.00")], on=date(2027, 1, 20), doc_type="vendor_credit_note", original=bill)
+    e = _adjust(w, asset, t.line_of(note))  # the default date (the document's) is accepted
+    assert e.event_date == date(2027, 1, 20)
+    component = asset.components.get(source_event=e)
+    assert (component.accounting_date, component.effective_from) == (date(2027, 1, 20), date(2027, 3, 1))
+    for on in (date(2027, 1, 31), date(2027, 2, 28)):
+        assert _gaps(w, on) == {}, on
+    assert t.close(w, w.alm, "2027-01").status == "closed"
+    march = t.run(w, w.alm, "2027-03")
+    assert march.total < feb.total  # depreciated on 54,000.00 from March, never in a month already run
+    assert jan.total < feb.total  # (January from the 5th)
+
+
+def test_p4_the_adjustment_for_a_reversed_bill_is_never_voided(w1):
+    w = w1
+    bill, asset = _vehicle(w)
+    note = t.bill(w, w.alm, [("1520", "6000.00")], on=date(2027, 1, 20), doc_type="vendor_credit_note", original=bill)
+    e = _adjust(w, asset, t.line_of(note))
+    for allocation in PayableAllocation.objects.filter(vendor_credit_note=note, amount__gt=0):
+        inv.unallocate(allocation, user=w.a)
+    inv.reverse_document(note, user=w.a, reason="credit note withdrawn")
+    fix = services.record_cost_adjustment(asset, user=w.a, reverses_component=asset.components.get(source_event=e),
+                                          event_date=date(2027, 1, 25), reason_ar="إشعار معكوس")
+    services.submit_event(fix, user=w.a)
+    t.decide(fix, w.c, permission="fixed_assets.capitalise")
+    with pytest.raises(FixedAssetError) as exc:
+        services.request_reversal(fix, user=w.a, reason_ar="إلغاء")
+    assert code_of(exc) == "void_reversed_bill" and note.number in str(exc.value)
+    fix.refresh_from_db()
+    asset.refresh_from_db()
+    assert (fix.status, asset.cost) == ("approved", D("60000.00"))
+
+
+def test_p5_a_vat_use_change_may_be_dated_in_a_month_already_run(w1):
+    w = w1
+    _bill, asset = _vehicle(w)
+    t.run(w, w.alm, "2027-01")
+    e = t.event(w, asset, "vat_use_change", date(2027, 1, 20), new_vat_use="exempt")
+    assert e.status == "approved"
+    assert services.vat_use_on(asset, date(2027, 1, 25), user=w.a) == "exempt"

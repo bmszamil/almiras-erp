@@ -1015,7 +1015,7 @@ def _unregistered_lines(entity, start, end):
         return []
     out = []
     for line in port.posted_lines(entity, accounts, date_from=start, date_to=end):
-        if not AssetCostComponent.objects.filter(purchase_line=line).exists():
+        if not _linked(line.pk):  # follow-up P1: net of voided links
             booking = port.booking_of(line)
             if booking is not None and booking.amount:
                 out.append(port.document_label(line))
@@ -1384,7 +1384,7 @@ def _impairment_cap(asset):
 def _event_values(event):
     """Computed amounts of an event (R7, R19, R23, R44); raises on invalid values."""
     asset, kind, entity = event.asset, event.kind, event.entity
-    if kind not in (EK.CHANGE_OF_ESTIMATE, EK.DISPOSAL_ADJUSTMENT):
+    if kind not in UNGUARDED_KINDS:
         _check_event_date(asset, event.event_date)
         if kind == EK.CAPITALISE_CWIP and event.target_asset is not None:
             _check_event_date(event.target_asset, event.event_date)
@@ -1465,6 +1465,12 @@ def _event_values(event):
                         why_ar="حدد استخدامًا ضريبيًا جديدًا مختلفًا عن الحالي.")
         event.old_vat_use = asset.vat_use
     return event
+
+
+# Review items 1, 3 and the follow-up P4: kinds that never change a booked month. A change of estimate and a cost
+# adjustment take effect prospectively (``effective_from``); a disposal adjustment books against the disposal result;
+# a VAT use change has no depreciation effect.
+UNGUARDED_KINDS = (EK.CHANGE_OF_ESTIMATE, EK.DISPOSAL_ADJUSTMENT, EK.SUBSEQUENT_COST, EK.VAT_USE_CHANGE)
 
 
 EVENT_STATUSES = {
@@ -1705,11 +1711,16 @@ def _apply_event(event, asset, user):
         target.version += 1
         _save(target)
     elif kind in COST_ADJUSTMENT_KINDS:
+        # Follow-up P4: booked on the document date (it ties to invoicing's entry), depreciated from the month after
+        # it, never in a month a posted run has already depreciated.
+        effective = calc.next_month(event.event_date)
+        through = _last_posted_end(asset)
+        if through is not None and effective <= through:
+            effective = calc.next_month(through)
         _save(AssetCostComponent(
             entity=asset.entity, asset=asset, kind=AssetCostComponent.Kind.SUBSEQUENT_COST,
             purchase_line=event.purchase_line, reverses=event.reverses_component, amount=event.amount,
-            accounting_date=event.event_date, source_event=event, created_by=user,
-            effective_from=calc.next_month(event.event_date)))
+            accounting_date=event.event_date, source_event=event, created_by=user, effective_from=effective))
         _refresh_cost(asset)
     elif kind == EK.WRITE_OFF:
         asset.status, asset.disposal_date = AS.DISPOSED, event.event_date
@@ -1852,6 +1863,7 @@ def request_reversal(document, *, user, reason_ar, reason_en=""):
         document = _lock(type(document), document.pk)
         if not _reversible(document):
             raise error("not_posted")
+        _check_voidable(document)
         document.reversal_requested_by, document.reversal_requested_at = user, _now()
         document.reversal_reason_ar, document.reversal_reason_en = reason_ar.strip(), (reason_en or "").strip()
         _save(document)
@@ -1866,6 +1878,13 @@ def _reversible(document):
     return isinstance(document, AssetEvent) and document.status == ES.APPROVED and document.kind == EK.SUBSEQUENT_COST
 
 
+def _check_voidable(document):
+    """Follow-up P4: the adjustment that takes a reversed bill out of the cost is never voided (the bill stays
+    reversed; voiding it would change nothing in the register yet mark the event reversed)."""
+    if isinstance(document, AssetEvent) and document.journal_entry_id is None and document.reverses_component_id:
+        raise error("void_reversed_bill", line=port.document_label(document.reverses_component.purchase_line))
+
+
 def _later_dependants(document):
     if isinstance(document, DepreciationRun):
         return DepreciationRun.objects.filter(entity=document.entity, status=RS.POSTED,
@@ -1877,6 +1896,12 @@ def _later_dependants(document):
     if document.kind in (EK.IMPAIRMENT, EK.IMPAIRMENT_REVERSAL):
         return _posted_lines(asset).filter(run__period__start_date__gt=document.event_date).exists() or \
             asset.events.filter(status=ES.POSTED, event_date__gte=document.event_date).exclude(pk=document.pk).exists()
+    if document.kind == EK.WRITE_OFF:  # follow-up P3: its disposal adjustments are reversed first
+        return asset.events.filter(kind=EK.DISPOSAL_ADJUSTMENT, status=ES.POSTED).exists()
+    if document.kind == EK.SUBSEQUENT_COST:  # follow-up P2: a void never reaches past a disposal or a later event
+        later = asset.events.filter(status=ES.POSTED).exclude(pk=document.pk).filter(
+            Q(event_date__gte=document.event_date) | Q(posted_at__gt=document.posted_at))
+        return asset.status == AS.DISPOSED or later.exists()
     return False
 
 
@@ -1894,6 +1919,7 @@ def reverse_document(document, *, user, date=None):
             raise error("not_posted")
         if not document.reversal_reason_ar:
             raise error("reason_required")
+        _check_voidable(document)
         if _later_dependants(document):
             raise error("reversal_order")
         if document.journal_entry_id is None:  # an approved cost adjustment: voided, nothing to reverse in the GL
