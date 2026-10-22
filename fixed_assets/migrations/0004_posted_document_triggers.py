@@ -10,6 +10,8 @@
 Replaces the generic keep trigger of 0002 on these two tables (deletes and entity changes stay refused). Nothing runs
 on SQLite (the services and model guards apply there).
 """
+import importlib
+
 from django.db import migrations
 
 SQL = r"""
@@ -128,7 +130,8 @@ def forwards(apps, schema_editor):
 
 
 def backwards(apps, schema_editor):
-    _run(schema_editor, BACK)
+    original = importlib.import_module("fixed_assets.migrations.0002_keep_everything_triggers")
+    _run(schema_editor, BACK + original.FUNCTIONS)  # 0002's own fixed_assets_line_lock() body again
 
 
 class Migration(migrations.Migration):

@@ -226,3 +226,40 @@ def test_item10_a_posted_or_approved_event_only_becomes_reversed(w):
     off.refresh_from_db()
     assert off.status == "reversed"
     _refused(f"UPDATE {table} SET status = 'posted' WHERE id = %s", [off.pk], "R18")
+
+
+# --- follow-up review of acb5701: evidence and maker trail of posted runs and events --------------------------------
+
+@postgres_only
+@pytest.mark.django_db
+def test_followup_a_posted_run_keeps_its_maker_trail(w):
+    bill = t.bill(w, w.alm, [("1520", "60000.00")], on=date(2027, 1, 1))
+    t.capitalise(w, t.line_of(bill), available=date(2027, 1, 1))
+    run = t.run(w, w.alm, "2027-01")
+    table = "fixed_assets_depreciationrun"
+    for column, value in (("created_by_id", w.c.pk), ("created_at", "2020-01-01T00:00:00Z"),
+                          ("submitted_by_id", None), ("submitted_at", None)):
+        _refused(f"UPDATE {table} SET {column} = %s WHERE id = %s", [value, run.pk], "R18")
+
+
+@postgres_only
+@pytest.mark.django_db
+def test_followup_a_posted_or_approved_event_keeps_its_evidence_and_maker_trail(w):
+    bill = t.bill(w, w.alm, [("1520", "60000.00"), ("1520", "1000.00")], on=date(2027, 1, 1))
+    car = t.capitalise(w, t.line_of(bill, 1), available=date(2027, 1, 1))
+    off = t.event(w, car, "write_off", date(2027, 1, 20))
+    journal_line = off.journal_entry.lines.first().pk
+    table = "fixed_assets_assetevent"
+    for column, value in (("cash_cost_price", 1), ("financing_total", 1), ("financing_ref", "MUR-X"),
+                          ("recoverable_amount", 1), ("source_journal_line_id", journal_line), ("reason_ar", "x"),
+                          ("reason_en", "x"), ("evidence_ref", "x"), ("old_vat_use", "exempt"),
+                          ("created_by_id", w.c.pk), ("created_at", "2020-01-01T00:00:00Z"),
+                          ("submitted_by_id", None), ("submitted_at", None)):
+        _refused(f"UPDATE {table} SET {column} = %s WHERE id = %s", [value, off.pk], "R18")
+    other = t.capitalise(w, t.line_of(bill, 2), available=date(2027, 1, 1))
+    e = t.event(w, other, "vat_use_change", date(2027, 1, 20), new_vat_use="exempt")  # approved, no entry
+    _refused(f"UPDATE {table} SET old_vat_use = 'exempt' WHERE id = %s", [e.pk], "R18")
+    with connection.cursor() as cursor:  # previous_values is written once, while still empty
+        cursor.execute(f"UPDATE {table} SET previous_values = %s WHERE id = %s", ['{"method": "x"}', e.pk])
+    _refused(f"UPDATE {table} SET previous_values = '{{}}'::jsonb WHERE id = %s", [e.pk], "R18")
+    _refused(f"UPDATE {table} SET previous_values = %s WHERE id = %s", ['{"method": "y"}', e.pk], "R18")
