@@ -314,3 +314,19 @@ def test_r9_category_accounts_are_restricted_asset_accounts(w):
         services.create_category(w.alm, user=w.a, code="BAD", name_ar="خطأ", asset_class="other",
                                  cost_account="1500", accum_depr_account="1100")
     assert not AssetCategory.objects.filter(code="BAD").exists()
+
+
+def test_r29_the_origin_of_a_transferred_asset_shows_only_with_rights_in_both_entities(w):
+    sub_bill = t.bill(w, w.sub, [("1520", "2000.00")])
+    alm_bill = t.bill(w, w.alm, [("1520", "1000.00")])
+    origin = services.create_asset_from_line(t.line_of(sub_bill), user=w.sa, location=w.loc_sub)
+    asset = services.create_asset_from_line(t.line_of(alm_bill), user=w.a, location=w.loc)
+    asset.transferred_from = origin  # slice 2 sets it from the mirror bill (R24); set here as fixture data
+    asset._service_write = True
+    asset.save()
+    shown = services.asset_detail(asset, user=w.a2)["transferred_from"]
+    assert "Not visible" in shown and "غير ظاهر" in shown
+    both = make_user("both.view")
+    member(both, w.alm, "internal_auditor")
+    member(both, w.sub, "internal_auditor")
+    assert services.asset_detail(asset, user=both)["transferred_from"] == origin.code

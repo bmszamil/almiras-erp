@@ -46,6 +46,9 @@ BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'depreciation line % is never deleted (R42)', OLD.id;
     END IF;
+    IF NEW.entity_id <> OLD.entity_id OR NEW.run_id <> OLD.run_id OR NEW.asset_id <> OLD.asset_id THEN
+        RAISE EXCEPTION 'depreciation line % keeps its entity, run and asset (R30, R42)', OLD.id;
+    END IF;
     IF EXISTS (SELECT 1 FROM fixed_assets_depreciationrun r WHERE r.id = OLD.run_id
                AND r.status IN ('posted', 'reversed')) THEN
         RAISE EXCEPTION 'depreciation line % of a posted run never changes (R42)', OLD.id;

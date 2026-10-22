@@ -591,6 +591,8 @@ def create_asset_from_line(line, *, user, category=None, asset=None, amount=None
             raise error("active_through_event")
         elif asset.status != AS.DRAFT:
             raise error("not_draft")
+        if AssetCostComponent.objects.filter(purchase_line=line, asset=asset).exists():  # R4: once per asset
+            raise error("line_fully_linked", line=label, amount=booking.amount)
         settings = _settings(entity)
         share = value / booking.amount if booking.amount else ZERO
         component = AssetCostComponent(
@@ -990,12 +992,6 @@ def _compute_run(entity, period):
     opening_posted = None
     lines = []
     for asset in assets:
-        if asset.status == AS.DISPOSED and asset.disposal_date and calc.month_start(asset.disposal_date) < \
-                period.start_date and not _posted_events(asset, EK.WRITE_OFF).filter(
-                    depreciation_until__gte=period.start_date).exists():
-            months = _schedule(asset, period.end_date)
-            if calc.total_through(months, period.end_date) == _posted_depreciation(asset):
-                continue
         months = _schedule(asset, period.end_date)
         scheduled = sum((m.amount for m in months), ZERO)
         posted = _posted_depreciation(asset)
@@ -1338,7 +1334,7 @@ def _event_values(event):
             if booking is None or booking.status != port.POSTED or line.account_id != asset.category.cost_account_id:
                 raise error("line_not_capitalisable", line=port.document_label(line), entity=entity.code)
             remaining = _remaining(booking)
-            if not remaining:
+            if not remaining or AssetCostComponent.objects.filter(purchase_line=line, asset=asset).exists():
                 raise error("line_fully_linked", line=port.document_label(line), amount=booking.amount)
             event.amount = remaining
         else:
