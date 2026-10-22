@@ -46,7 +46,9 @@ in each entity separately):
      instalments).
    A second person approves the bank accounts in banking (before step 6: a bank draft on the opening entry's
    accounts stops the posting) and the opening leave balances in HR. Foreign-currency bank accounts are not loaded
-   (spec OQ-13); set them up in banking. Fixed assets are not loaded (no assets module yet). A bai' ajel contract
+   (spec OQ-13); set them up in banking. Fixed assets: the accountant runs `fixed_assets_setup --entity E --user u`
+   (categories; an asset class on another cost account needs its own category first), then the section
+   `fixed_assets` (the opening asset register; fixed-assets R40). A bai' ajel contract
    without the employee's signed consent reference loads with its deductions held (W14 warns) until the payroll
    officer records the consent in payroll. Only people run these sections; an agent is refused.
 6. **Second person posts.** `migration_post --entity E --user <approver> --kind opening` (dry run), then `--apply`.

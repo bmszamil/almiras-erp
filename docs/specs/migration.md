@@ -222,8 +222,11 @@ The validation report and profiles are not stored: they are printed and optional
     account loaded before with another bank, currency, GL account, opening statement balance or date, IBAN, account
     number, Sharia basis or purification flag is refused, not skipped; it is changed in banking with an approved
     change). Only people run a section (R19): an agent or system user is refused before anything is read
-    (`agent_forbidden`). Fixed assets are not loaded (no fixed-assets module; W11 ties them
-    in the workbook only). **[tests `test_subledgers.py`, `test_dry_run.py`]**
+    (`agent_forbidden`). ~~Fixed assets are not loaded (no fixed-assets module; W11 ties them
+    in the workbook only).~~ *Amended 2026-10-22 (fixed-assets R40, R41, as built):* section `fixed_assets` loads the
+    opening asset register through `fixed_assets.migration_port`, and the register is an R22 source on 1500, 1510,
+    1520, 1590 (and the proposed 15xx codes); the section is gated like the others. **[tests `test_subledgers.py`,
+    `test_dry_run.py`, `fixed_assets/test_migration.py`]**
 24. Each entity is loaded with the user's own membership in that entity (no cascade, M7); workbook, checks and
     messages are the same for every entity (new entities are data).
 25. *Added 2026-10-21.* The sections that feed the R22 gate (`receivables`, `payables`, `eosb`, `bai_ajel`) are
