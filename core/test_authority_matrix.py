@@ -1167,7 +1167,9 @@ def test_rv93_0029_carries_its_own_frozen_seed():
         else:
             assert frozen == expected, code
     later = importlib.import_module("core.migrations.0035_seed_access_v20_migrated_settlement")  # invoicing R129
-    assert {a[0] for a in mod.ACTIVITIES} | {later.ACTIVITY[0]} == set(authority_defaults.ACTIVITIES)
+    fixed_assets = importlib.import_module("core.migrations.0038_seed_access_v21_fixed_assets")  # fixed assets §7
+    assert {a[0] for a in mod.ACTIVITIES} | {later.ACTIVITY[0]} | {a[0] for a in fixed_assets.ACTIVITIES} == set(
+        authority_defaults.ACTIVITIES)
 
 
 def test_rv93_n8_only_the_proposer_or_the_top_authority_withdraws_a_version(g):

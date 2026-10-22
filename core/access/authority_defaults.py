@@ -189,6 +189,20 @@ _ACTIVITIES = [
     # migration
     _a("migration.account_map", "Legacy account maps", "خرائط حسابات النظام السابق", "migration.approve_account_map",
        basis=NONE),
+    # fixed assets, slice 1 (fixed-assets.md §7, R36): code default = holders in the entity (the CFO and the CEO; the
+    # managing partner in the group parent) until each entity enters its own rows (OQ-21). Measures in SAR.
+    _a("fixed_assets.policy", "Depreciation policies", "سياسات الاستهلاك", "fixed_assets.approve_policy", basis=NONE),
+    _a("fixed_assets.capitalisation", "Asset capitalisation, CWIP transfers and financed acquisitions",
+       "رسملة الأصول وتحويل المشروعات تحت التنفيذ والاقتناء الممول", "fixed_assets.capitalise", basis=AMOUNT),
+    _a("fixed_assets.depreciation_run", "Depreciation runs", "مسيرات الاستهلاك", "fixed_assets.run_depreciation",
+       basis=AMOUNT),
+    _a("fixed_assets.impairment", "Impairments and reversals", "هبوط القيمة وعكسه", "fixed_assets.impair",
+       basis=AMOUNT),
+    _a("fixed_assets.estimate_change", "Changes of estimate and of VAT use", "تغييرات التقديرات واستخدام الضريبة",
+       "fixed_assets.change_estimate", basis=NONE),
+    _a("fixed_assets.disposal", "Write-offs and disposals", "الشطب والاستبعاد", "fixed_assets.dispose", basis=AMOUNT),
+    _a("fixed_assets.reversal", "Reversals of runs and events", "عكس المسيرات والأحداث",
+       "fixed_assets.reverse_document", basis=AMOUNT),
     # access itself (R76; a dual-control request, shown in the inbox only, OQ-49)
     _a("core.authority_matrix", "Authority matrix versions", "إصدارات مصفوفة الصلاحيات", "core.approve_authority_matrix",
        basis=NONE, default=Default(note_en="R76: the top authority, or the chairman / board representative when the top "

@@ -462,8 +462,31 @@ ROLE_SEED_V20 = {
     **ROLE_SEED_V19,
     **{code: _plus(ROLE_SEED_V19, code, "invoicing.approve_migrated_settlement") for code in MIGRATED_SETTLEMENT_ROLES},
 }
+# V21 (migration core.0038, fixed-assets.md §7, slice 1): the fixed-asset rights. Staff (accountant, ceo) set up,
+# draft, submit and prepare; approvers (approver, ceo, managing_partner) decide; reversals by the approver and the ceo;
+# read-only for the auditors and the business analyst. No agent role is seeded (agents get Ag rights only, R35).
+_FA_VIEW = ("fixed_assets.view",)
+_FA_STAFF = ("fixed_assets.view", "fixed_assets.maintain_setup", "fixed_assets.maintain_policy",
+             "fixed_assets.create_asset", "fixed_assets.submit_asset", "fixed_assets.prepare_depreciation",
+             "fixed_assets.record_event")
+_FA_APPROVALS = ("fixed_assets.view", "fixed_assets.approve_policy", "fixed_assets.capitalise",
+                 "fixed_assets.run_depreciation", "fixed_assets.impair", "fixed_assets.change_estimate",
+                 "fixed_assets.dispose")
+FIXED_ASSET_RIGHTS_V21 = {
+    "accountant": _FA_STAFF,
+    "approver": (*_FA_APPROVALS, "fixed_assets.reverse_document"),
+    "ceo": (*_FA_STAFF, *_FA_APPROVALS, "fixed_assets.reverse_document"),
+    "managing_partner": _FA_APPROVALS,
+    "internal_auditor": _FA_VIEW,
+    "external_auditor": _FA_VIEW,
+    "business_analyst": _FA_VIEW,
+}
+ROLE_SEED_V21 = {
+    **ROLE_SEED_V20,
+    **{code: _plus(ROLE_SEED_V20, code, *perms) for code, perms in FIXED_ASSET_RIGHTS_V21.items()},
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V20
+ROLE_SEED = ROLE_SEED_V21
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {
