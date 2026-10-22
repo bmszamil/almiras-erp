@@ -5664,7 +5664,7 @@ def approve_settlement_correction(correction, *, user):
                                  f"today {c.due_date} (Labour Law Art. 88; the settlement's own period has run).",
                                  f"التصحيح {c.number} يضيف {c.net_change} إلى المخالصة النهائية لـ {code}: مستحق اليوم "
                                  f"{c.due_date} (المادة 88؛ انقضت مهلة المخالصة).", ("payroll_officer", "approver"))])
-    access_services.log(AccessLog.Event.DEDUCTION_CONSENT_RECORDED, actor=user, entity=c.entity,
+    access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=c.entity,
                         permission="payroll.approve_settlement_correction",
                         details={"action": "settlement_correction_approved", "correction": c.pk, "settlement": fs.pk,
                                  "net_change": str(c.net_change), "message_en": "Final settlement correction approved",

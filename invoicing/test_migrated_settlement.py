@@ -18,11 +18,13 @@ from django.utils import timezone
 from core.access import AccessDenied, engine, matrix
 from core.access import services as access_services
 from core.access.authority_models import ApprovalRequest
+from core.access.models import AccessLog
 from core.access.testing import make_user, member
 from invoicing import migration_port
 from invoicing import services as inv
 from invoicing.conftest import final, invoice, usd_rate
-from invoicing.models import InvoicingError, MigratedOpenItem, MigratedSettlement
+from invoicing.models import (InvoicingError, MigratedOpenItem, MigratedSettlement, PayableAllocation,
+                              ReceivableAllocation)
 from ledger.models import JournalLine
 from ledger.services_setup import create_monthly_periods
 from migration import readers
@@ -61,7 +63,8 @@ def _migrate(w, items, tb):
 def m(w, monkeypatch):
     """ALM migrated at 2026-12-31: C001 invoice 1,000.00 and credit note 200.00 in SAR, an invoice of USD 1,000.00
     carried at SAR 3,750.00 and a credit note of USD 400.00 carried at SAR 1,520.00; V001's bill of 500.00 and a
-    bill of USD 1,000.00 carried at SAR 3,750.00. The accountant loads, the CFO posts."""
+    bill of USD 1,000.00 carried at SAR 3,750.00 and a vendor credit note of 100.00. The accountant loads, the CFO
+    posts."""
     monkeypatch.setattr(inv, "_riyadh_now", lambda: DAY)
     c, v = w.customer, w.vendor
     return _migrate(w, [
@@ -71,7 +74,8 @@ def m(w, monkeypatch):
         ("r4", "receivable", c, "credit_note", "MIG-USD-CN", "USD", "400.00", "1520.00"),
         ("p1", "payable", v, "bill", "MIG-B-1", "SAR", "500.00", "500.00"),
         ("p2", "payable", v, "bill", "MIG-USD-B", "USD", "1000.00", "3750.00"),
-    ], {"1201": "3030.00", "2101": "-4250.00", "2601": "1220.00"})  # 1000 - 200 + 3750 - 1520; -500 - 3750
+        ("p3", "payable", v, "vendor_credit_note", "MIG-VCN-1", "SAR", "100.00", "100.00"),
+    ], {"1201": "3030.00", "2101": "-4150.00", "2601": "1120.00"})  # 1000 - 200 + 3750 - 1520; -500 - 3750 + 100
 
 
 def receipt(w, amount, currency="SAR", on=date(2027, 1, 20), user=None, customer=None, entity=None):
@@ -318,9 +322,30 @@ def test_r129_the_matrix_bands_route_a_settlement_by_its_sar_measure(m):
 
 # --- refusals ----------------------------------------------------------------------------------------------------
 
+def _regroup(party, entity):
+    """A party whose group entity changed while it had open items (legacy data, or before review 07da401 item 8):
+    written past the service on purpose, to prove every settlement path still refuses to move the balance."""
+    type(party).objects.filter(pk=party.pk).update(group_entity=entity)
+    party.refresh_from_db()
+    return party
+
+
+def test_r129_item8_a_party_with_open_items_keeps_its_group_entity(m):
+    w = m
+    with pytest.raises(InvoicingError) as exc:  # MIG-INV-1 is open on 1200
+        inv.update_customer(w.customer, user=w.clerk, group_entity=w.sub)
+    assert exc.value.code == "party_has_open_items" and "سوّها" in str(exc.value)
+    with pytest.raises(InvoicingError) as exc:
+        inv.update_vendor(w.vendor, user=w.ap, group_entity=w.sub)
+    assert exc.value.code == "party_has_open_items"
+    other = inv.create_customer(w.alm, user=w.clerk, code="C-NEW", name_ar="عميل جديد", customer_kind="business",
+                                country="SA")
+    assert inv.update_customer(other, user=w.clerk, group_entity=w.sub).group_entity == w.sub  # nothing open
+
+
 def test_r129_p3_a_settlement_never_moves_a_balance_between_control_accounts(m):
     w = m
-    inv.update_customer(w.customer, user=w.clerk, group_entity=w.sub)  # C001 becomes a group entity: 1210 (SUB)
+    _regroup(w.customer, w.sub)  # C001 now a group entity: 1210 (SUB)
     r = receipt(w, "300.00")  # booked Cr 1210 (SUB)
     with pytest.raises(InvoicingError) as exc:  # the item sits on 1200
         inv.allocate_migrated_item(w.r1, r, "300.00", user=w.clerk)
@@ -331,12 +356,125 @@ def test_r129_p3_a_settlement_never_moves_a_balance_between_control_accounts(m):
 
 def test_r129_erp_allocation_across_control_accounts_is_refused(w):
     old = final(w, invoice(w))  # Dr 1200
-    inv.update_customer(w.customer, user=w.clerk, group_entity=w.sub)
+    _regroup(w.customer, w.sub)
     r = inv.post_receipt(inv.create_receipt(w.alm, user=w.clerk, customer=w.customer, date=date(2027, 1, 20),
                                             amount="100.00"), user=w.clerk)  # Cr 1210 (SUB)
     with pytest.raises(InvoicingError) as exc:
         inv.allocate(r, old, "100.00", user=w.clerk)
     assert "different control accounts" in str(exc.value)
+
+
+def test_r129_q1_a_receipt_application_across_control_accounts_is_refused(w):
+    old = final(w, invoice(w))  # Dr 1200
+    _regroup(w.customer, w.sub)
+    r = inv.create_receipt(w.alm, user=w.clerk, customer=w.customer, date=date(2027, 1, 20), amount="100.00")
+    with pytest.raises(InvoicingError) as exc:  # would post Cr 1210 (SUB) and settle a 1200 invoice
+        inv.add_receipt_application(r, old, "100.00", user=w.clerk)
+    assert "different control accounts" in str(exc.value)
+    assert not ReceivableAllocation.objects.exists()
+
+
+def test_r129_a_payment_application_across_control_accounts_is_refused(w):
+    from invoicing.test_purchases import bill
+
+    old = inv.approve_purchase_document(bill(w), user=w.cfo)  # Cr 2100
+    _regroup(w.vendor, w.sub)
+    pay = inv.create_vendor_payment(w.alm, user=w.ap, vendor=w.vendor, date=date(2027, 1, 20), amount="100.00")
+    with pytest.raises(InvoicingError) as exc:
+        inv.add_payment_application(pay, old, "100.00", user=w.ap)
+    assert "different control accounts" in str(exc.value)
+
+
+def test_r129_r37_a_credit_note_on_another_control_account_is_not_auto_allocated(w):
+    from invoicing.test_sales import note
+
+    original = final(w, invoice(w, [("rent_commercial", "1", "10000.00")]))  # 11,500.00 on 1200
+    from invoicing.conftest import approve as approve_sales
+
+    issued = approve_sales(w, note(w, original))  # issued while C001 is not a group entity
+    _regroup(w.customer, w.sub)  # then regrouped before ZATCA reports it: it posts on 1210 (SUB)
+    cn = w.zatca.clear(issued) if issued.zatca_profile == "standard" else w.zatca.report(issued)
+    assert not ReceivableAllocation.objects.filter(credit_note=cn).exists()
+    assert inv.open_amount(original, user=w.clerk) == D("11500.00")
+    assert inv.open_amount(cn, user=w.clerk) == D("4600.00")  # stays open on its own account
+
+
+def test_r129_r37_a_vendor_credit_note_on_another_control_account_is_not_auto_allocated(w):
+    from invoicing.test_purchases import bill
+
+    original = inv.approve_purchase_document(bill(w), user=w.cfo)  # 1,150.00 on 2100
+    _regroup(w.vendor, w.sub)
+    vcn = inv.approve_purchase_document(
+        bill(w, [("5300", "1", "400")], number="CN-1b", doc_type="vendor_credit_note", original_document=original),
+        user=w.cfo)
+    assert not PayableAllocation.objects.filter(vendor_credit_note=vcn).exists()
+    assert inv.open_amount(original, user=w.ap) == D("1150.00")
+
+
+def test_r129_q3_who_may_discard_and_the_audit_trail(m):
+    w = m
+    usd_rate(w, "3.80", on=date(2027, 1, 20))
+    row = inv.allocate_migrated_item(w.r3, receipt(w, "100.00", currency="USD"), "100.00", user=w.clerk)
+    for user in (w.clerk2, w.sub_clerk):  # another clerk, another entity: neither preparer, approver nor admin
+        with pytest.raises(AccessDenied):
+            inv.discard_migrated_settlement(row, user=user)
+    assert MigratedSettlement.objects.get(pk=row.pk).status == "pending"
+    row = inv.discard_migrated_settlement(row, user=w.cfo)  # an approver of settlements
+    assert (row.status, row.discarded_by, row.discarded_at is not None) == ("discarded", w.cfo, True)
+    req = ApprovalRequest.objects.get(document_id=row.pk, document_type="invoicing.migratedsettlement")
+    assert req.status == "superseded"
+    assert AccessLog.objects.filter(event="approval_withdrawn", actor=w.cfo, details__request=req.pk).exists()
+    own = inv.allocate_migrated_item(w.r3, receipt(w, "50.00", currency="USD"), "50.00", user=w.clerk)
+    assert inv.discard_migrated_settlement(own, user=w.clerk).discarded_by == w.clerk  # the preparer
+
+
+def test_r129_q7_splitting_a_settlement_never_lowers_its_band(m):
+    w = m
+    w.aa, w.mp = make_user("aa"), make_user("mp")
+    member(w.aa, w.alm, "access_admin")
+    member(w.mp, w.alm, "managing_partner")
+    v = matrix.draft_version(w.alm, user=w.aa, effective_from=timezone.localdate(access_services.now()),
+                             summary_en="Settlement bands", summary_ar="نطاقات التسويات", copy_current=False)
+    matrix.add_rule(v, user=w.aa, activity="invoicing.migrated_settlement", approver_roles=["approver"],
+                    amount_to="1000.00")
+    matrix.add_rule(v, user=w.aa, activity="invoicing.migrated_settlement", approver_roles=["managing_partner"],
+                    amount_from="1000.01")
+    matrix.submit_version(v, user=w.aa)
+    matrix.decide_version(v, user=w.mp, approve=True)
+    usd_rate(w, "3.80", on=date(2027, 1, 20))
+    r = receipt(w, "1000.00", currency="USD")
+    first = inv.allocate_migrated_item(w.r3, r, "250.00", user=w.clerk)  # 937.50 + 12.50 = 950.00: the CFO
+    with pytest.raises(InvoicingError) as exc:  # one pending settlement per pair
+        inv.allocate_migrated_item(w.r3, r, "250.00", user=w.clerk)
+    assert exc.value.code == "settlement_pending"
+    assert approve(w, first).status == "posted"
+    for _ in range(3):  # each further split is measured with what the pair already settled: above 1,000.00
+        row = inv.allocate_migrated_item(w.r3, r, "250.00", user=w.clerk)
+        assert inv.migrated_settlement_measure(row) > D("1000.00")
+        with pytest.raises(AccessDenied):
+            approve(w, row)
+        assert approve(w, row, user=w.mp).status == "posted"
+    assert opened(w, w.r3) == (D("0.00"), D("0.00"))
+    req = ApprovalRequest.objects.filter(document_type="invoicing.migratedsettlement").order_by("pk").last()
+    assert "250.000" in req.document_version  # the version is what it settles, not just its key
+    ties(w)
+
+
+def test_r129_tax_c15_counts_effective_settlements_only(m):
+    """Review of 07da401, item 6: the 12-month unpaid-bill list counts a migrated vendor credit note settled against
+    the bill once the settlement is effective by the period end."""
+    from types import SimpleNamespace
+
+    from invoicing.test_purchases import bill
+    from tax import services as tax
+
+    w = m
+    doc = inv.approve_purchase_document(bill(w), user=w.cfo)  # 1,150.00, dated 2027-01-15
+    ret = SimpleNamespace(entity=w.alm, period_start=date(2028, 1, 1), period_end=date(2028, 1, 31))
+    assert [f["document"] for f in tax._unpaid_bills(ret, {})] == [doc.pk]
+    inv.allocate_migrated_item(w.p3, doc, "100.00", user=w.ap)  # the migrated vendor credit note, effective
+    inv.allocate(payment(w, "1050.00"), doc, "1050.00", user=w.ap)
+    assert tax._unpaid_bills(ret, {}) == []  # 1,050.00 paid + 100.00 settled
 
 
 def test_r129_p4_refusals(m):

@@ -1068,9 +1068,12 @@ def _unpaid_bills(ret, acks):
         accounting_date__gte=_add_months(ret.period_start, -12), accounting_date__lte=_add_months(ret.period_end, -12))
     for doc in bills.order_by("accounting_date", "pk"):
         paid = PayableAllocation.objects.filter(target=doc, date__lte=ret.period_end).aggregate(t=Sum("amount"))["t"]
-        # invoicing R129: a migrated vendor credit note or advance paid settled against the bill counts as paid
+        # invoicing R129: a migrated vendor credit note or advance paid settled against the bill counts as paid once
+        # the settlement is effective by the period end (SAR: its date; foreign currency: its posted entry's date);
+        # a pending one does not count (review of 07da401, item 6)
         paid = (paid or ZERO) + (MigratedSettlement.objects.filter(
-            purchase_document=doc, status__in=MigratedSettlement.LIVE, date__lte=ret.period_end)
+            Q(journal_entry__isnull=True, date__lte=ret.period_end) | Q(journal_entry__date__lte=ret.period_end),
+            purchase_document=doc, status=MigratedSettlement.Status.POSTED)
             .aggregate(t=Sum("amount"))["t"] or ZERO)
         if doc.total_gross - (paid or ZERO) > ZERO:
             ref = f"purchase:{doc.pk}"

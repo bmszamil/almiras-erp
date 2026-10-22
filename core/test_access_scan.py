@@ -101,6 +101,7 @@ ALLOW = {
     "core/access/engine.py:withdraw": "closes the open request of a document its own module drops; the module checks "
                                       "its caller's rights first (invoicing R129 discard)",
     "invoicing/services.py:migrated_settlement_measure": "the engine's band measure of a settlement; no data access",
+    "invoicing/services.py:migrated_settlement_version": "the engine's version of a settlement (its own content)",
     "ledger/services.py:register_post_check": "app wiring at ready() (a check added to every posting); no user action",
     "ledger/services.py:migration_opening_posted": "internal state read (is the opening entry posted) for services "
                                                    "that already checked their caller's rights (migration R25)",

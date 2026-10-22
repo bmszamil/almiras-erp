@@ -488,6 +488,7 @@ class AccessLog(models.Model):
         GOVERNANCE_CHANGE_REQUESTED = "governance_change_requested", "Top authority change requested"
         APPROVAL_SUBMITTED = "approval_submitted", "Approval request opened"
         APPROVAL_DECIDED = "approval_decided", "Approval step decided"
+        APPROVAL_WITHDRAWN = "approval_withdrawn", "Approval request withdrawn by its module"  # invoicing R129
         SELF_APPROVAL = "self_approval", "Top-authority self-approval"
         ASSISTANT_ASSIGNED = "assistant_assigned", "Personal assistant assigned"
         ASSISTANT_REVOKED = "assistant_revoked", "Personal assistant assignment ended"

@@ -495,17 +495,21 @@ def _save(obj):
     return obj
 
 
-def withdraw(document, *, permission=None, entity=None):
+def withdraw(document, user, *, permission=None, entity=None):
     """Close the open approval request of ``document`` when its own module drops the document before a decision
-    (e.g. a pending migrated settlement discarded by its preparer, invoicing R129): the request is marked superseded
-    and leaves every inbox. The module checks its caller's rights first; nothing is approved or rejected here."""
+    (e.g. a pending migrated settlement discarded, invoicing R129): the request is marked superseded and leaves every
+    inbox; an ``approval_withdrawn`` row records who did it (R27). The module checks its caller's rights first;
+    nothing is approved or rejected here."""
     entity = entity or document.entity
-    info = describe(document, permission or _main_permission(document), entity)
+    permission = permission or _main_permission(document)
+    info = describe(document, permission, entity)
     at = _now()
     for req in ApprovalRequest.objects.filter(entity=entity, document_type=info.label, document_id=info.pk,
                                               activity__code=info.activity, status=ApprovalRequest.Status.OPEN):
         req.status, req.closed_at = ApprovalRequest.Status.SUPERSEDED, at
         _save(req)
+        _services().log(AccessLog.Event.APPROVAL_WITHDRAWN, actor=user, entity=entity, permission=permission,
+                        details={"request": req.pk, "activity": info.activity, "document": [info.label, info.pk]})
 
 
 def find_request(entity, info):

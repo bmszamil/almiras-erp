@@ -78,7 +78,7 @@ def register():
         submit_permission="invoicing.allocate",
         amount=services.migrated_settlement_measure, currency=lambda d: d.entity.base_currency_id,
         functional_amount=services.migrated_settlement_measure,
-        version=lambda d: f"settlement-{d.pk}",
+        version=services.migrated_settlement_version,
         beneficiaries=lambda d: _employee_users(d.item.party),
         label=lambda d: (f"Migrated settlement {d.item.legacy_number}", f"تسوية بند مرحَّل {d.item.legacy_number}"),
         created_at=lambda d: d.created_at,

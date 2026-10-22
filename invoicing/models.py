@@ -2550,11 +2550,15 @@ class MigratedSettlement(models.Model):
     posted_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
                                   related_name="+", verbose_name=bi("Posted by", "رحّله"))
     posted_at = models.DateTimeField(bi("Posted at", "تاريخ الترحيل"), null=True, blank=True)
+    discarded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+                                     related_name="+", verbose_name=bi("Discarded by", "ألغاه"))
+    discarded_at = models.DateTimeField(bi("Discarded at", "تاريخ الإلغاء"), null=True, blank=True)
 
     objects = _MigratedSettlementQuerySet.as_manager()
 
     # set once, from pending, by the posting or the discard
-    _MUTABLE = ("status", "journal_entry", "counter_sar", "fx_difference", "posted_by", "posted_at")
+    _MUTABLE = ("status", "journal_entry", "counter_sar", "fx_difference", "posted_by", "posted_at", "discarded_by",
+                "discarded_at")
 
     class Meta:
         base_manager_name = "objects"
