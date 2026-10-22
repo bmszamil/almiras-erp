@@ -266,3 +266,17 @@ def approve_map(amap, *, approver, submitter=None):
     if amap.submitted_at is None:
         services.submit_account_map(amap, user=submitter or amap.modified_by or amap.created_by)
     return services.decide_account_map(amap, user=approver)
+
+
+def load_fixed_assets(entity, book, user):
+    """fixed-assets R40, R41: set up ``entity``'s asset categories and load its opening asset register from ``book``
+    (section ``fixed_assets``), so an opening entry with 15xx balances can tie out to it. ``user`` is a person with
+    ``fixed_assets.maintain_setup`` and ``migration.import`` in the entity (an accountant)."""
+    from fixed_assets import services as fixed_assets
+
+    from . import subledgers
+
+    fixed_assets.setup_entity(entity, user=user)
+    plan = subledgers.load_subledgers(entity, book, ["fixed_assets"], user=user, apply=True)
+    assert plan.applied, plan.problems
+    return plan

@@ -34,6 +34,7 @@ def _tie_out(w, wb):
     assert subledgers.load_subledgers(w.alm, wb, ["receivables", "payables"], user=w.a, apply=True).applied
     assert subledgers.load_subledgers(w.alm, wb, ["employees"], user=w.h, apply=True).applied
     assert subledgers.load_subledgers(w.alm, wb, ["eosb"], user=w.po, apply=True).applied
+    t.load_fixed_assets(w.alm, wb, w.a)  # fixed-assets R41: the opening entry's 1520 / 1590 tie to the register
 
 
 def _post_opening(w, wb):

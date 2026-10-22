@@ -221,6 +221,7 @@ def test_r22_the_opening_entry_posts_once_the_real_subledgers_tie_out(people):
     result = services.post_imported_entries(w.alm, user=w.p, kind="opening", apply=True)
     assert not result["posted"] and "no open items are loaded" in result["details"]["opening"][0]
     subledgers.load_subledgers(w.alm, wb, ["receivables", "payables"], user=w.a, apply=True)
+    t.load_fixed_assets(w.alm, wb, w.a)  # fixed-assets R41: the opening entry's 1520 / 1590 tie to the register
     result = services.post_imported_entries(w.alm, user=w.p, kind="opening", apply=True)
     assert not result["posted"]
     assert result["details"]["opening"] == [
