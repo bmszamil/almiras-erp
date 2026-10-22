@@ -19,6 +19,8 @@ section            what is loaded (owning module, service)                      
                    ``record_opening_leave_balance``; approved in hr)
 ``bai_ajel``       Bai' ajel contracts as migrated contracts (payroll                     payroll.create_deferred_sale
                    ``load_migrated_deferred_sale``, invoicing through the port)
+``fixed_assets``   The opening asset register (fixed assets                              migration.import
+                   ``migration_port.load_opening_asset``; fixed-assets R40, R41)
 =================  ====================================================================  ==========================
 
 The entity's part of the workbook must check without an error first (W4 to W17). Dry run unless ``apply``: the same
@@ -28,8 +30,10 @@ values. The sections that feed the R22 posting gate (receivables, payables, eosb
 entity's opening entry is posted: the sub-ledgers and the opening balances are tied out once, before posting.
 
 Employees are matched to hr by their ID number (hashed, never by name); the workbook's employee number links the
-Employees sheet to the Bai' ajel contracts sheet. Fixed assets are not loaded: there is no fixed-assets module yet
-(the register is tied out in the workbook only, W11). Messages never repeat a personal-data value (W3).
+Employees sheet to the Bai' ajel contracts sheet. Fixed assets are loaded into the register of the fixed-assets module
+(fixed-assets R40): each row's category is the entity's category of that asset class whose cost account is the ERP
+account the approved map gives the row's Falcon cost code; categories are set up before the load. Messages never
+repeat a personal-data value (W3).
 """
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -43,8 +47,8 @@ from . import workbook_checks
 from . import workbook_spec as spec
 from .readers import bi
 
-SECTIONS = ("receivables", "payables", "banks", "employees", "eosb", "leave", "bai_ajel")
-GATED = frozenset({"receivables", "payables", "eosb", "bai_ajel"})  # feed the R22 posting gate
+SECTIONS = ("receivables", "payables", "banks", "employees", "eosb", "leave", "bai_ajel", "fixed_assets")
+GATED = frozenset({"receivables", "payables", "eosb", "bai_ajel", "fixed_assets"})  # feed the R22 posting gate
 ANNUAL_LEAVE = "ANNUAL"
 AR_TYPES = {"invoice": "invoice", "debit_note": "debit_note", "credit_note": "credit_note", "advance": "advance_received"}
 AP_TYPES = {"bill": "bill", "vendor_credit_note": "vendor_credit_note", "advance": "advance_paid"}
@@ -366,6 +370,41 @@ def _bai_ajel(entity, book, user, result, *, cutover):
             _count(result, (contract, contract is not None and not known))
 
 
+# --- fixed assets (fixed-assets R40, R41; W11) ------------------------------------------------------------------------
+
+def _fixed_assets(entity, book, user, result, *, cutover, amap, source_system):
+    from fixed_assets import migration_port
+
+    if amap is None:
+        result.problems.append(bi("Fixed assets need the entity's approved account map (Falcon code → ERP GL).",
+                                  "تحتاج الأصول الثابتة إلى خريطة الحسابات المعتمدة للكيان."))
+        return
+    rows = {r.legacy_code: r for r in amap.rows.select_related("account")}
+    for r in book.records("fixed_assets", entity.code):
+        mapped = rows.get(r["cost_code"])
+        if mapped is None:
+            result.problems.append(bi(f"{_where('fixed_assets', r.row)}: Falcon {r['cost_code']} is not in the approved "
+                                      "account map.", f"{_where('fixed_assets', r.row)}: الكود {r['cost_code']} غير "
+                                      "موجود في خريطة الحسابات المعتمدة."))
+            continue
+        outcome = _attempt(result, "fixed_assets", r.row, lambda r=r, account=mapped.account:
+                           migration_port.load_opening_asset(
+                               entity, user=user, legacy_code=r["asset_code"], description_ar=r["description_ar"],
+                               description_en=r["description_en"] or "", asset_class=r["asset_class"],
+                               usage=r["usage"], location=r["location"], cost_account=account,
+                               acquisition_date=r["acquisition_date"],
+                               available_for_use_date=r["available_for_use_date"], cost=r["cost"],
+                               accumulated_depreciation=r["accumulated_depreciation"],
+                               residual_value=r["residual_value"], method=r["method"],
+                               useful_life_months=r["useful_life_months"],
+                               remaining_life_months=r["remaining_life_months"],
+                               serial_or_plate=r["serial_or_plate"] or "",
+                               custodian_ref=r["custodian_employee_no"] or "", cutover=cutover,
+                               source_system=source_system))
+        if outcome is not None:
+            _count(result, outcome)
+
+
 # --- the run ---------------------------------------------------------------------------------------------------------
 
 def _opening_posted(entity, *, lock=False):
@@ -426,6 +465,9 @@ def load_subledgers(entity, book, sections, *, user, apply=False, source_system=
                     _eosb(entity, book, user, result, cutover=cutover)
                 elif name == "leave":
                     _leave(entity, book, user, result, cutover=cutover)
+                elif name == "fixed_assets":
+                    _fixed_assets(entity, book, user, result, cutover=cutover,
+                                  amap=_approved_map(entity, source_system), source_system=source_system)
                 else:
                     _bai_ajel(entity, book, user, result, cutover=cutover)
             if not apply or plan.problems:

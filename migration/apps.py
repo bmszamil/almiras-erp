@@ -37,6 +37,12 @@ class MigrationConfig(AppConfig):
         services.register_open_items_source(payroll.opening_eosb_balances, codes={payroll.EOSB_PROVISION})
         services.register_open_items_source(invoicing.migrated_bai_ajel_balances,
                                             codes={invoicing.EMPLOYEE_RECEIVABLE, invoicing.DEFERRED_PROFIT})
+        # fixed-assets R41: the opening asset register (cost per category cost account, accumulated depreciation per
+        # accumulated account) on 1500, 1510, 1520, 1590 and the proposed 15xx codes once in a chart.
+        from fixed_assets import migration_port as fixed_assets
+
+        services.register_open_items_source(fixed_assets.opening_register_balances, codes=fixed_assets.GATED_CODES,
+                                            per_source_system=True)
 
         from . import approval_adapters
 
