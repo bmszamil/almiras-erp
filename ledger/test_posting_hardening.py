@@ -881,11 +881,12 @@ def test_concurrent_settlements_cannot_over_settle():
     member(cfo, alm, "approver")
     for d in (date(2027, 1, 15), date(2027, 2, 1), date(2027, 3, 1)):
         ExchangeRate.objects.create(date=d, from_currency_id="EUR", to_currency_id="SAR", rate=D("4.1"), created_by=clerk)
+    # A foreign item settled by manual journals: on 1230, since 1200 takes no manual journal (invoicing R97).
     inv = services.create_entry(alm, date(2027, 1, 15), "Invoice", [
-        {"account": "1200", "currency": "EUR", "txn_debit": "100.00"},
+        {"account": "1230", "currency": "EUR", "txn_debit": "100.00"},
         {"account": "4100", "currency": "EUR", "txn_credit": "100.00"}], user=clerk)
     services.post_entry(inv, access.require(cfo, alm, "ledger.post_entry", document=inv))
-    item = JournalLine.objects.get(entry=inv, account__code="1200")
+    item = JournalLine.objects.get(entry=inv, account__code="1230")
     feb, mar = (
         services.create_entry(alm, d, "Receipt", services.fx_settlement_lines(alm, d, item, "100.00", "1100", user=clerk),
                               user=clerk)

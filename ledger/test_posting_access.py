@@ -14,6 +14,7 @@ from ledger import services
 from ledger.models import JournalEntry, LedgerError
 from ledger.services_setup import create_monthly_periods, install_chart_of_accounts
 from testdocs.models import Bill, SalesDocument
+from testdocs.posting import post_document
 
 pytestmark = pytest.mark.django_db
 CASH = [{"account": "1100", "debit": 10}, {"account": "3100", "credit": 10}]
@@ -340,8 +341,8 @@ def _intercompany_world(w):
             {"account": "1210", "debit": 10, "counterparty": other} if entity == w.alm else {"account": "5200", "debit": 10},
             {"account": "4110", "credit": 10} if entity == w.alm else {"account": "2110", "credit": 10, "counterparty": other},
         ]
-        entry = draft(w, entity, lines)
-        services.post_entry(entry, access.require(w.cfo, entity, "ledger.post_entry", document=entry))
+        # 1210 / 2110 are control accounts: booked by sub-ledger documents, never manual journals (invoicing R97)
+        post_document(entity, date(2027, 1, 10), lines, user=w.clerk, approver=w.cfo)
     return mn
 
 

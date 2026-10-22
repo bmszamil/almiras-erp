@@ -9,6 +9,8 @@ from core.models import Entity
 from ledger import services
 from ledger.models import Account, JournalEntry, JournalLine, LedgerError
 from ledger.services_setup import create_monthly_periods, install_chart_of_accounts
+from testdocs.models import SalesDocument
+from testdocs.posting import post_document, reverse_document
 
 pytestmark = pytest.mark.django_db
 D = Decimal
@@ -63,19 +65,19 @@ def book(entity, entry_date, description, lines, post=True):
 
 def reverse(entry, **kw):
     clerk, _ = clerk_and_cfo()
+    if entry.document_type:  # a sub-ledger document's entry: its own reversal permission
+        return reverse_document(entry, user=clerk, **kw)
     return services.reverse_entry(entry, access.require(clerk, entry.entity, "ledger.reverse_entry", document=entry), **kw)
 
 
-def rent_invoice(entity, counterparty=None, post=True, amount="1000"):
-    return book(
-        entity, date(2027, 1, 15), "Warehouse rent Jan",
-        [
-            {"account": "1210", "debit": D(amount) * D("1.15"), "counterparty": counterparty},
-            {"account": "4110", "credit": amount},
-            {"account": "2200", "credit": D(amount) * D("0.15")},
-        ],
-        post=post,
-    )
+def rent_invoice(entity, counterparty=None, amount="1000"):
+    """An intercompany rent invoice on 1210: a control account, so booked as a sub-ledger document (invoicing R97)."""
+    clerk, cfo = clerk_and_cfo()
+    return post_document(entity, date(2027, 1, 15), [
+        {"account": "1210", "debit": D(amount) * D("1.15"), "counterparty": counterparty},
+        {"account": "4110", "credit": amount},
+        {"account": "2200", "credit": D(amount) * D("0.15")},
+    ], user=clerk, approver=cfo, model=SalesDocument, description="Warehouse rent Jan")
 
 
 def test_balanced_entry_posts_and_is_numbered(alm, sub):
@@ -181,10 +183,11 @@ def test_trial_balance_balances(alm, sub):
 
 def test_intercompany_balances_mirror(alm, sub):
     rent_invoice(alm, counterparty=sub)
-    book(
-        sub, date(2027, 1, 15), "Warehouse rent Jan from ALM",
-        [{"account": "5200", "debit": 1000}, {"account": "1310", "debit": 150}, {"account": "2110", "credit": 1150, "counterparty": alm}],
-    )
+    clerk, cfo = clerk_and_cfo()
+    post_document(sub, date(2027, 1, 15), [
+        {"account": "5200", "debit": 1000}, {"account": "1310", "debit": 150},
+        {"account": "2110", "credit": 1150, "counterparty": alm},
+    ], user=clerk, approver=cfo, description="Warehouse rent Jan from ALM")
     ic = services.intercompany_balances(date(2027, 1, 31), user=clerk_and_cfo()[0], group=alm)
     assert ic[("ALM", "LZM")] == -ic[("LZM", "ALM")] == D("1150.00")
 

@@ -178,7 +178,7 @@ def _control_codes(lines):
     return sorted({line.account.code for line in lines} & control_accounts.SUBLEDGER_CONTROL_CODES)
 
 
-def control_account_refusal(account):
+def _control_account_refusal(account):
     """The bilingual refusal of a line on sub-ledger control account ``account`` (an Account) that the entry may not
     post (R97)."""
     return _bi(
@@ -231,7 +231,7 @@ def _control_problems(entry, lines):
     for line in lines:
         if line.account.code in refused:
             accounts.setdefault(line.account.code, line.account)
-    return [control_account_refusal(accounts[code]) for code in sorted(accounts)]
+    return [_control_account_refusal(accounts[code]) for code in sorted(accounts)]
 
 
 def _refuse_control_draft(entity, lines, source):
@@ -245,7 +245,7 @@ def _refuse_control_draft(entity, lines, source):
         if line.account.code in control_accounts.SUBLEDGER_CONTROL_CODES:
             accounts.setdefault(line.account.code, line.account)
     if accounts:
-        raise _coded_error([control_account_refusal(accounts[code]) for code in sorted(accounts)], "control_account")
+        raise _coded_error([_control_account_refusal(accounts[code]) for code in sorted(accounts)], "control_account")
 
 
 def _coded_error(problems, code):
