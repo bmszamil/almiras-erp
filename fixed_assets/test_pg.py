@@ -144,3 +144,85 @@ def test_r40_a_register_load_waits_for_the_opening_entry_lock():
         assert thread.is_alive(), "the load should wait for the opening entry lock"
     thread.join(timeout=10)
     assert result == {"ok": True}
+
+
+# --- review of ccb9cef, item 9: two links of one bill line ------------------------------------------------------------
+
+@postgres_only
+@pytest.mark.django_db(transaction=True)
+def test_r4_two_links_of_one_line_run_one_after_the_other():
+    _seed()
+    w = t.world(entities=("ALM",))
+    bill = t.bill(w, w.alm, [("1520", "60000.00")], on=date(2027, 1, 1))
+    line = t.line_of(bill)
+    result = {}
+
+    def other():
+        try:
+            services.create_asset_from_line(line, user=w.a2, location=w.loc)
+            result["ok"] = True
+        except FixedAssetError as exc:
+            result["code"] = exc.code
+        finally:
+            connections.close_all()
+
+    with transaction.atomic():
+        first = services.create_asset_from_line(line, user=w.a, location=w.loc)  # holds the line row
+        thread = threading.Thread(target=other)
+        thread.start()
+        thread.join(timeout=1.5)
+        assert thread.is_alive(), "the second link should wait for the line lock"
+    thread.join(timeout=10)
+    assert result == {"code": "line_fully_linked"} and first.cost == D("60000.00")
+
+
+# --- review of ccb9cef, item 10: posted runs and events keep their values in SQL -------------------------------------
+
+def _refused(sql, params, needle):
+    with pytest.raises(Exception) as exc, transaction.atomic(), connection.cursor() as cursor:
+        cursor.execute(sql, params)
+    assert needle in str(exc.value), sql
+
+
+@postgres_only
+@pytest.mark.django_db
+def test_item10_a_posted_run_only_becomes_reversed(w):
+    bill = t.bill(w, w.alm, [("1520", "60000.00")], on=date(2027, 1, 1))
+    car = t.capitalise(w, t.line_of(bill), available=date(2027, 1, 1))
+    run = t.run(w, w.alm, "2027-01")
+    table = "fixed_assets_depreciationrun"
+    for column, value in (("status", "draft"), ("status", "discarded"), ("total", 1), ("journal_entry_id", None),
+                          ("fingerprint", "x"), ("number", "X-1"), ("posted_by_id", None)):
+        _refused(f"UPDATE {table} SET {column} = %s WHERE id = %s", [value, run.pk], "R18")
+    _refused("INSERT INTO fixed_assets_depreciationline (entity_id, run_id, asset_id, days, amount, catch_up, "
+             "opening_nbv) VALUES (%s, %s, %s, 1, 1, true, 1)", [w.alm.pk, run.pk, car.pk], "R42")
+    with connection.cursor() as cursor:  # the reversal request fields stay writable
+        cursor.execute(f"UPDATE {table} SET reversal_reason_en = 'test' WHERE id = %s", [run.pk])
+    services.request_reversal(run, user=w.a, reason_ar="خطأ")
+    t.decide(run, w.c, permission="fixed_assets.reverse_document")  # posted -> reversed is allowed
+    run.refresh_from_db()
+    assert run.status == "reversed"
+    _refused(f"UPDATE {table} SET status = 'posted' WHERE id = %s", [run.pk], "R18")
+    _refused(f"UPDATE {table} SET reversal_entry_id = NULL WHERE id = %s", [run.pk], "R18")
+
+
+@postgres_only
+@pytest.mark.django_db
+def test_item10_a_posted_or_approved_event_only_becomes_reversed(w):
+    bill = t.bill(w, w.alm, [("1520", "60000.00"), ("1520", "1000.00")], on=date(2027, 1, 1))
+    car = t.capitalise(w, t.line_of(bill, 1), available=date(2027, 1, 1))
+    off = t.event(w, car, "write_off", date(2027, 1, 20))
+    table = "fixed_assets_assetevent"
+    for column, value in (("status", "draft"), ("amount", 1), ("cost_derecognised", 1),
+                          ("depreciation_derecognised", 1), ("journal_entry_id", None), ("event_date", "2027-01-21"),
+                          ("depreciation_until", "2027-01-31")):
+        _refused(f"UPDATE {table} SET {column} = %s WHERE id = %s", [value, off.pk], "R18")
+    other = t.capitalise(w, t.line_of(bill, 2), available=date(2027, 1, 1))
+    e = t.event(w, other, "vat_use_change", date(2027, 1, 20), new_vat_use="exempt")  # approved, no entry
+    _refused(f"UPDATE {table} SET new_vat_use = 'mixed' WHERE id = %s", [e.pk], "R18")
+    _refused(f"UPDATE {table} SET status = 'submitted' WHERE id = %s", [e.pk], "R18")
+    services.request_reversal(off, user=w.a, reason_ar="شطب خاطئ")
+    t.decide(off, w.c, permission="fixed_assets.reverse_document")
+    off.refresh_from_db()
+    assert off.status == "reversed"
+    _refused(f"UPDATE {table} SET status = 'posted' WHERE id = %s", [off.pk], "R18")
