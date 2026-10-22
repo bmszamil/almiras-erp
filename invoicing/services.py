@@ -6020,8 +6020,7 @@ def post_migrated_settlement(row, *, user):
             row.counter_sar = line.debit + line.credit
         row.fx_difference = sum((l.debit - l.credit for l in entry.lines.filter(line_kind="realised_fx")), ZERO)
         measure = migrated_settlement_measure(row)  # review of 07da401, item 7: the posted figures stay in the band
-        approval_engine.check_issued_band(grant, amount=measure, currency=row.entity.base_currency_id,
-                                          functional_amount=measure)
+        approval_engine.check_issued_band(grant, row, amount=measure, currency=row.entity.base_currency_id)
         row.status, row.posted_by, row.posted_at = MigratedSettlement.Status.POSTED, user, timezone.now()
         row.journal_entry = entry
         row._service_write = True
