@@ -72,6 +72,17 @@ Optional SAMA tax-point hook (owner decision H2, ledger-fx R51):
   I2; with ``as_of``, among the rows recorded by then), and the tax point is not after the entry date. Accepted
   only for the types in ``SAMA_TAX_POINT_TYPES``.
 
+Optional control-account declaration (invoicing R97, policy A, D32(a), D33(e); banking R32 note B11(b)):
+
+- ``control_accounts`` names the sub-ledger control accounts (``ledger.control_accounts.SUBLEDGER_CONTROL_CODES``:
+  1200, 1210, 2100, 2110) the type's entries may post to: an iterable of codes, or a mapping ``{code: predicate}``
+  where ``predicate(document)`` receives the stored document and returns True to allow it (None: always). This is
+  the registry's per-account allow-list: an entry of a type that does not declare an account, or whose predicate
+  says no, is refused on it (``control_account``), as are manual journals (no document; the migration opening entry
+  is the one exception, decided in ``ledger.services``). Only control codes may be declared; the allow-list is fixed
+  at start-up like the rest of the registry, so no caller widens it. Until OQ-66 is answered, invoicing's types and
+  banking's ``intercompany_transfer`` (1210 / 2110) declare it.
+
 Optional period hook:
 
 - ``pending_documents(entity, start_date, end_date)`` returns descriptions of
@@ -92,6 +103,8 @@ from django.conf import settings
 from django.db import models
 
 from core.access import catalogue
+
+from .control_accounts import SUBLEDGER_CONTROL_CODES
 
 
 class DocumentRegistryError(RuntimeError):
@@ -133,6 +146,8 @@ class DocumentType:
     reverse_guard: Callable | None = None
     # H2 (ledger-fx R51): the tax point whose SAMA rate the document books at, or None.
     sama_tax_point: Callable | None = None
+    # invoicing R97 (policy A): ((code, predicate or None), ...) the sub-ledger control accounts it may post to.
+    control_accounts: tuple = ()
 
     def entity_id_of(self, document):
         return getattr(document, f"{self.entity_field}_id")
@@ -142,6 +157,18 @@ class DocumentType:
 
     def creator_id_of(self, document):
         return getattr(document, f"{self.creator_field}_id", None)
+
+    def control_codes(self):
+        """The sub-ledger control accounts this type declared (R97), whatever their predicates say."""
+        return frozenset(code for code, _predicate in self.control_accounts)
+
+    def may_post_control(self, code, document):
+        """R97: True if this type declared control account ``code`` and its predicate (if any) accepts the stored
+        ``document``."""
+        for declared, predicate in self.control_accounts:
+            if declared == code:
+                return predicate is None or predicate(document) is True
+        return False
 
     def self_post_allowed(self, document):
         """access R46: the people who made ``document`` may post it themselves (never for other types)."""
@@ -186,7 +213,8 @@ def _check_caller(model, module_name):
 
 def register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
              creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None,
-             creator_may_post=None, contract_approval=None, reverse_guard=None, sama_tax_point=None):
+             creator_may_post=None, contract_approval=None, reverse_guard=None, sama_tax_point=None,
+             control_accounts=()):
     """Register ``model`` as a document type that books journal entries. Idempotent for the same arguments.
 
     Call it from the ``AppConfig.ready()`` of the app that defines ``model``.
@@ -201,6 +229,7 @@ def register(model, *, post_permissions, reverse_permissions=(), entity_field="e
         changed_at_field=changed_at_field, creator_field=creator_field, build_lines=build_lines,
         validate_lines=validate_lines, pending_documents=pending_documents, creator_may_post=creator_may_post,
         contract_approval=contract_approval, reverse_guard=reverse_guard, sama_tax_point=sama_tax_point,
+        control_accounts=control_accounts,
     )
 
 
@@ -213,7 +242,8 @@ def _field(model, name, label):
 
 def _register(model, *, post_permissions, reverse_permissions=(), entity_field="entity", changed_at_field="modified_at",
               creator_field="created_by", build_lines=None, validate_lines=None, pending_documents=None,
-              creator_may_post=None, contract_approval=None, reverse_guard=None, sama_tax_point=None):
+              creator_may_post=None, contract_approval=None, reverse_guard=None, sama_tax_point=None,
+              control_accounts=()):
     """Validate and store one registration (no caller or freeze check; tests use it through the helpers below)."""
     if not (isinstance(model, type) and issubclass(model, models.Model)) or model._meta.abstract:
         raise DocumentRegistryError(f"{model!r} is not a concrete Django model.")
@@ -260,14 +290,32 @@ def _register(model, *, post_permissions, reverse_permissions=(), entity_field="
     if sama_tax_point is not None and build_lines is None:
         # The rate row and source come from the type's own build_lines, never from lines a caller passes.
         raise DocumentRegistryError(f"{label}: sama_tax_point needs build_lines.")
+    control = _control_declaration(label, control_accounts)
     doc_type = DocumentType(label, model, post, reverse, entity_field, changed_at_field, creator_field, build_lines,
                             validate_lines, pending_documents, creator_may_post, contract_approval, reverse_guard,
-                            sama_tax_point)
+                            sama_tax_point, control)
     existing = _REGISTRY.get(label)
     if existing is not None and existing != doc_type:
         raise DocumentRegistryError(f"{label} is already registered with other settings.")
     _REGISTRY[label] = doc_type
     return doc_type
+
+
+def _control_declaration(label, control_accounts):
+    """((code, predicate or None), ...) sorted by code, from an iterable of codes or a {code: predicate} mapping."""
+    if isinstance(control_accounts, str):
+        raise DocumentRegistryError(f"{label}: control_accounts is a collection of account codes, not one string.")
+    items = control_accounts.items() if hasattr(control_accounts, "items") else ((c, None) for c in control_accounts)
+    declared = {}
+    for code, predicate in items:
+        if code not in SUBLEDGER_CONTROL_CODES:
+            # Only the chart's control accounts are declared; anything else is a mistake in the registration.
+            raise DocumentRegistryError(f"{label}: {code!r} is not a sub-ledger control account "
+                                        f"{sorted(SUBLEDGER_CONTROL_CODES)}.")
+        if predicate is not None and not callable(predicate):
+            raise DocumentRegistryError(f"{label}: the control_accounts predicate for {code} must be callable.")
+        declared[code] = predicate
+    return tuple(sorted(declared.items()))
 
 
 def _unregister(model):

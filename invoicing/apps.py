@@ -25,6 +25,12 @@ class InvoicingConfig(AppConfig):
             VendorPayment,
         )
 
+        # R97 (policy A, D32(a)): the sub-ledger control accounts each type books (data in the registry; manual
+        # journals are refused on them). Receivables 1200 / 1210 for sales documents and receipts, payables 2100 /
+        # 2110 for bills and payments, all four for the settlement of migrated open items (R129, each on its own
+        # item's account). Purification transfers and bai' ajel profit releases book none.
+        receivable = (services.AR, services.AR_GROUP)
+        payable = (services.AP, services.AP_GROUP)
         # Sales documents post only on ZATCA clearance or reporting (R41); they are never reversed (R17, OQ-28).
         documents.register(
             SalesDocument, post_permissions={"invoicing.post_on_clearance"},
@@ -32,12 +38,14 @@ class InvoicingConfig(AppConfig):
             pending_documents=services._pending_sales_documents,
             contract_approval=services._contract_approval,  # billing R53 auto-issued invoices; R112 bai' ajel sales
             sama_tax_point=services._sama_tax_point,  # owner decision H2: booked at the SAMA tax-point rate
+            control_accounts=receivable,
         )
         documents.register(
             PurchaseDocument, post_permissions={"invoicing.approve_bill"},
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._purchase_document_lines, validate_lines=services._check_document_rate,
             reverse_guard=services._purchase_reverse_guard,  # R124: reversed only through reverse_document
+            control_accounts=payable,
         )
         # D26 / access R46: the person who records a customer receipt may post it; refunds keep a second person.
         documents.register(
@@ -46,12 +54,14 @@ class InvoicingConfig(AppConfig):
             build_lines=services._receipt_lines, validate_lines=services._check_document_rate,
             creator_may_post=services._receipt_creator_may_post,
             reverse_guard=services._money_reverse_guard,  # R129: not while a migrated settlement uses it
+            control_accounts=receivable,
         )
         documents.register(
             VendorPayment, post_permissions={"invoicing.approve_vendor_payment"},
             reverse_permissions={"invoicing.reverse_document"},
             build_lines=services._payment_lines, validate_lines=services._check_document_rate,
             reverse_guard=services._money_reverse_guard,  # R129: not while a migrated settlement uses it
+            control_accounts=payable,
         )
         # R54: E14 by a second person with invoicing.post_purification_transfer; the funding (owner decision C2) and
         # E15 approved by the CFO. All are corrected by reversal (reverse_purification_transfer) with
@@ -77,6 +87,7 @@ class InvoicingConfig(AppConfig):
             MigratedSettlement, post_permissions={services.MIGRATED_SETTLEMENT_APPROVAL},
             reverse_permissions={"invoicing.reverse_document"}, changed_at_field=None,
             build_lines=services._migrated_settlement_lines, reverse_guard=services._migrated_settlement_reverse_guard,
+            control_accounts=receivable + payable,
         )
         # D31b review fix 1 and 2: GL 1140 (the purification account) is posted only by purification fundings and
         # payouts, the banking kinds banking allows on it and migration openings (and their reversals); every such

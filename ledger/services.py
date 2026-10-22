@@ -30,7 +30,7 @@ from core.access.services import kind_of
 from core.access.services import log as access_log
 from core.models import Currency, Entity
 
-from . import documents, fx, restricted
+from . import control_accounts, documents, fx, restricted
 from .fx import ONE, error
 from .models import (
     Account,
@@ -132,6 +132,7 @@ def validate_entry(entry):
         problems += _reversal_problems(entry, lines)
     problems += _currency_problems(entry, lines)
     problems += _restricted_problems(entry, lines)
+    problems += _control_problems(entry, lines)
     return problems
 
 
@@ -169,6 +170,88 @@ def migration_opening_posted(entity, *, lock=False, booked=True):
         list(qs.select_for_update(of=("self",)).order_by("pk").values_list("pk", flat=True))
     statuses = BOOKED if booked else (JournalEntry.Status.POSTED,)
     return qs.filter(status__in=statuses).exists()
+
+
+# --- control accounts (invoicing R97, policy A, D32(a); D33(e); banking R32 note B11(b); migration M6, R8) -----
+
+def _control_codes(lines):
+    return sorted({line.account.code for line in lines} & control_accounts.SUBLEDGER_CONTROL_CODES)
+
+
+def control_account_refusal(account):
+    """The bilingual refusal of a line on sub-ledger control account ``account`` (an Account) that the entry may not
+    post (R97)."""
+    return _bi(
+        f"Account {account.code} ({account.name_en}) is a control account: only the documents that keep its "
+        "sub-ledger (invoicing, and banking intercompany transfers on 1210 / 2110) and the migration opening entry "
+        "post to it, never a manual journal (policy A).",
+        f"الحساب {account.code} ({account.name_ar}) حساب مراقبة: لا يُرحَّل إليه إلا من مستندات سجله الفرعي "
+        "(الفوترة، والتحويلات بين شركات المجموعة في البنوك على 1210 / 2110) والقيد الافتتاحي للترحيل، "
+        "ولا يُرحَّل إليه بقيد يدوي (السياسة أ).",
+    )
+
+
+def _is_migration_opening(entry):
+    """D33(e), migration M6 and R14: the migration opening entry (``source="import"``, no document, linked to an
+    ``ImportedEntry`` of kind ``opening``) is the one manual journal allowed on control accounts. Its tie-out to the
+    open items (migration R22, invoicing R115) is checked by migration's registered post check."""
+    return (entry.source == JournalEntry.Source.IMPORT and not entry.document_type and entry.pk is not None
+            and JournalEntry.objects.filter(pk=entry.pk, entity_id=entry.entity_id, legacy_import__kind="opening",
+                                            legacy_import__entity_id=entry.entity_id).exists())
+
+
+def _control_problems(entry, lines):
+    """R97: a line on a sub-ledger control account posts only when
+
+    - the entry reverses a posted entry (it only undoes what was booked; ``_reversal_problems`` proves it mirrors
+      its original line by line, rule 1),
+    - it is a revaluation run's entry and the line is a revaluation line (ledger-fx R21, policy C),
+    - it is a registered document's entry whose type declared the account (``ledger.documents``, ``control_accounts``)
+      and whose predicate accepts the stored document, or
+    - it is the migration opening entry (D33(e)).
+
+    Everything else, manual journals, replayed migration journals and imports not linked to an opening
+    ``ImportedEntry`` included, is refused (``control_account``, en/ar)."""
+    codes = _control_codes(lines)
+    if not codes or entry.reversal_of_id is not None:
+        return []
+    refused = set(codes)
+    if entry.document_type:
+        doc_type = documents.get(entry.document_type)
+        document = None
+        if doc_type is not None and entry.document_id is not None:
+            document = doc_type.model._default_manager.filter(pk=entry.document_id).first()
+        if document is not None:
+            refused = {code for code in codes if not doc_type.may_post_control(code, document)}
+    elif entry.pk is not None and _is_revaluation_entry(entry):
+        refused = {l.account.code for l in lines if l.account.code in refused and l.line_kind != Kind_.REVALUATION}
+    elif _is_migration_opening(entry):
+        refused = set()
+    accounts = {}
+    for line in lines:
+        if line.account.code in refused:
+            accounts.setdefault(line.account.code, line.account)
+    return [control_account_refusal(accounts[code]) for code in sorted(accounts)]
+
+
+def _refuse_control_draft(entity, lines, source):
+    """R97: a manual draft never carries a line on a control account; an import draft may (the migration opening
+    entry is linked to its ``ImportedEntry`` after the draft is created; every import draft is checked again when
+    posted, and replayed journals are refused then)."""
+    if source == JournalEntry.Source.IMPORT:
+        return
+    accounts = {}
+    for line in lines:
+        if line.account.code in control_accounts.SUBLEDGER_CONTROL_CODES:
+            accounts.setdefault(line.account.code, line.account)
+    if accounts:
+        raise _coded_error([control_account_refusal(accounts[code]) for code in sorted(accounts)], "control_account")
+
+
+def _coded_error(problems, code):
+    exc = LedgerError(problems)
+    exc.code = code
+    return exc
 
 
 def _restricted_codes(lines):
@@ -746,6 +829,8 @@ def _post(entry, posted_by):
         exc = LedgerError(problems + extra)
         if {restricted.refusal(code) for code in restricted.codes()} & set(problems):
             exc.code = "restricted_account"
+        elif _control_problems(entry, list(entry.lines.select_related("account"))):
+            exc.code = "control_account"
         elif not problems:  # the ledger's own refusal keeps its code; an app's code only when the ledger found none
             exc.code = extra_code
         raise exc
@@ -1007,6 +1092,7 @@ def _create(entity, date, description, lines, user, reference, post, posted_by, 
     built = _build_lines(entity, date, lines, user)
     if document_ref is None:
         _refuse_restricted_draft(entity, built, source)
+        _refuse_control_draft(entity, built, source)
     if check_lines is not None:  # the document type's own rule for its lines, before any write
         check_lines(built)
     entry = JournalEntry(
@@ -1075,6 +1161,7 @@ def _update_draft(entry, user, date, description, reference, lines):
         built = _build_lines(entry.entity, entry.date, lines, user)
         if entry.document_ref is None and entry.reversal_of_id is None:
             _refuse_restricted_draft(entry.entity, built, entry.source)
+            _refuse_control_draft(entry.entity, built, entry.source)
         entry.lines.all().delete()
         for line in built:
             line.entry = entry
