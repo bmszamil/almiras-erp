@@ -1,8 +1,9 @@
 """Admin follows memberships, not Django permissions (access.md R24, AT-22) and logs grants (R27)."""
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 
 import pytest
+from django.utils import timezone
 
 from core.access.models import AccessLog, Membership, Role
 from core.access.testing import make_user, member
@@ -70,14 +71,49 @@ def test_at22_status_is_read_only_in_admin(client, w):
     assert resp.status_code == 200 and 'name="status"' not in resp.content.decode()
 
 
+def _step_up_code(user):
+    """A confirmed authenticator for ``user`` (enrolled here if needed) and a fresh code for the next time step."""
+    import pyotp
+
+    from web import mfa
+    from web.models import MfaDevice
+
+    if mfa.device_of(user) is None:
+        device = mfa.start_enrolment(user)
+        mfa.confirm_enrolment(user, pyotp.TOTP(device.secret).now())
+    secret = MfaDevice.objects.get(user=user).secret
+    return pyotp.TOTP(secret).at(timezone.now() + timedelta(seconds=30))
+
+
+def _post_action(client, user, pk, action="post_selected"):
+    """The admin action as an approver runs it: confirmed with a step-up code (web.md R15)."""
+    return client.post("/admin/ledger/journalentry/", {"action": action, "_selected_action": [pk],
+                                                       "mfa_confirm": "1", "mfa_code": _step_up_code(user)})
+
+
 def test_admin_post_action_uses_grants(client, w):
     client.force_login(w.clerk)  # creator: no ledger.post_entry right
     client.post("/admin/ledger/journalentry/", {"action": "post_selected", "_selected_action": [w.alm_draft.pk]})
     assert JournalEntry.objects.get(pk=w.alm_draft.pk).status == "draft"
     client.force_login(w.cfo)
-    client.post("/admin/ledger/journalentry/", {"action": "post_selected", "_selected_action": [w.alm_draft.pk]})
+    _post_action(client, w.cfo, w.alm_draft.pk)
     posted = JournalEntry.objects.get(pk=w.alm_draft.pk)
     assert posted.status == "posted" and posted.posted_by == w.cfo
+
+
+def test_r15_admin_posting_needs_a_step_up_code(client, w):
+    """Final verification of 7a104f1, item 3: like the inbox, admin posting asks for a fresh code first."""
+    from core.access.models import AccessLog
+
+    client.force_login(w.cfo)
+    page = client.post("/admin/ledger/journalentry/", {"action": "post_selected", "_selected_action": [w.alm_draft.pk]})
+    assert page.status_code == 200 and 'name="mfa_code"' in page.content.decode()
+    assert JournalEntry.objects.get(pk=w.alm_draft.pk).status == "draft"  # nothing posted without the code
+    _step_up_code(w.cfo)  # enrol
+    wrong = client.post("/admin/ledger/journalentry/", {"action": "post_selected", "_selected_action": [w.alm_draft.pk],
+                                                        "mfa_confirm": "1", "mfa_code": "000000"})
+    assert wrong.status_code == 400 and JournalEntry.objects.get(pk=w.alm_draft.pk).status == "draft"
+    assert AccessLog.objects.filter(event="mfa_verify_failed", actor=w.cfo, details__purpose="step_up").exists()
 
 
 def _grant_form(user, entity, role, reason="Hired as AP clerk"):
@@ -220,7 +256,8 @@ def test_admin_posted_and_foreign_currency_entries_are_read_only(client, w):
     from ledger import services as ledger_services
 
     client.force_login(w.cfo)
-    client.post("/admin/ledger/journalentry/", {"action": "post_selected", "_selected_action": [w.alm_draft.pk]})
+    _post_action(client, w.cfo, w.alm_draft.pk)
+    assert JournalEntry.objects.get(pk=w.alm_draft.pk).status == "posted"
     client.force_login(w.clerk)
     page = client.get(f"/admin/ledger/journalentry/{w.alm_draft.pk}/change/").content.decode()
     assert 'name="lines-0-debit"' not in page and 'name="description"' not in page

@@ -15,6 +15,7 @@ from core.access import delegations, engine
 from core.access import services as access
 from core.access.authority_models import AccessAlert
 from core.access.models import AccessLog
+from core.access.testing import member
 from core.models import Entity
 from web import crypto, mfa
 from web.conftest import enrol, next_code, person
@@ -50,7 +51,25 @@ def test_item1_requires_mfa_is_one_query(w, django_assert_num_queries):
 
 # --- item 2: admin password of an MFA user ------------------------------------------------------------------------
 
-def test_item2_only_superusers_or_the_group_mp_set_an_mfa_users_password_in_admin(w):
+@pytest.fixture
+def atomic_requests(monkeypatch):
+    monkeypatch.setitem(connection.settings_dict, "ATOMIC_REQUESTS", True)
+
+
+def test_final_item1_the_admin_password_refusal_is_logged_under_atomic_requests(w, atomic_requests):
+    admin = person("alm_admin", (w.alm, "access_admin"))
+    admin.is_staff = True
+    admin.save(update_fields=["is_staff"])
+    client = Client()
+    client.force_login(admin)
+    assert client.get(f"/admin/auth/user/{w.cfo.pk}/password/").status_code == 403
+    row = AccessLog.objects.get(event="permission_denied", permission="admin.set_password")
+    assert row.actor == admin and row.subject_user == w.cfo
+
+
+@pytest.mark.parametrize("atomic", [False, True])  # True: as on PostgreSQL (ATOMIC_REQUESTS)
+def test_item2_only_superusers_or_the_group_mp_set_an_mfa_users_password_in_admin(w, monkeypatch, atomic):
+    monkeypatch.setitem(connection.settings_dict, "ATOMIC_REQUESTS", atomic)
     admin = person("alm_admin", (w.alm, "access_admin"))
     admin.is_staff = True
     admin.save(update_fields=["is_staff"])
@@ -128,6 +147,36 @@ def test_item5_a_managing_partner_of_another_group_resets_nobody_here(w):
 
 # --- item 8: a lock alert for a person without memberships --------------------------------------------------------
 
+def test_final_item2_a_second_lock_also_alerts_the_group_managing_partner(w, mfa_clock):
+    admin = person("alm_admin", (w.alm, "access_admin"))
+    mp = person("mp", (w.alm, "managing_partner"))
+    sub_admin = person("sub_admin", (w.sub, "access_admin"))
+    member(w.u, w.sub, "approver")  # accountant and approver in SUB, viewer in MIN: all under ALM
+    enrol(w.u)
+    for _ in range(2):
+        for _ in range(5):
+            mfa_clock.tick(60)
+            with pytest.raises(mfa.MfaError):
+                mfa.verify(w.u, "123456")
+        mfa_clock.tick(24 * 3600)
+    alerts = AccessAlert.objects.filter(kind="mfa_locked")
+    assert {w.u.pk, sub_admin.pk, mp.pk} <= set(alerts.values_list("recipient_id", flat=True))
+    assert admin.pk not in set(alerts.values_list("recipient_id", flat=True))  # ALM's admin: not their entity
+    text = alerts.first().message_en
+    assert "group managing partner" in text and "reset the device and review" not in text
+
+
+def test_final_item4_a_role_deciding_iban_changes_needs_mfa(w):
+    from core.access.models import Role, RolePermission
+
+    role = Role.objects.create(code="hr_clerk_x", name_en="HR clerk", name_ar="كاتب موارد بشرية", scope="entity",
+                               kind="human")
+    RolePermission.objects.create(role=role, codename="hr.manage_employee")
+    clerk = person("clerkx", (w.alm, "hr_clerk_x"))
+    assert "hr.manage_employee" in access.deciding_permissions()
+    assert mfa.requires_mfa(clerk)  # may decide hr.iban_change through the engine
+
+
 def test_item8_second_lock_of_a_person_without_memberships_alerts_the_operators(w, mfa_clock):
     operator = person("operator")
     operator.is_superuser = operator.is_staff = True
@@ -173,19 +222,20 @@ def test_item9_the_deploy_stack_generates_a_long_secret_key():
 # --- item 10: every adapter gives a real instance a non-empty version ---------------------------------------------
 
 def _instance(label):
+    """A minimal record as its module's submit would leave it (final verification of 7a104f1, item 6): the model's
+    own defaults, a primary key, what saving sets (``auto_now`` / ``auto_now_add``), ``submitted_at`` where the
+    model has one (set by submit) and the calculation hashes that payroll computes before submitting. Nothing
+    else: in particular no ``modified_at`` unless saving sets it."""
     model = django_apps.get_model(label)
     obj = model()
     obj.pk = 999_999
     now = timezone.now()
     for field in model._meta.concrete_fields:
-        if field.get_internal_type() == "DateTimeField" and getattr(obj, field.attname) is None:
+        saved = getattr(field, "auto_now", False) or getattr(field, "auto_now_add", False)
+        if field.get_internal_type() == "DateTimeField" and (saved or field.name == "submitted_at"):
             setattr(obj, field.attname, now)
-        elif field.get_internal_type() == "DateField" and getattr(obj, field.attname) is None:
-            setattr(obj, field.attname, now.date())
-        elif field.name in ("stored_hash", "inputs_hash") and not getattr(obj, field.attname):
+        elif field.name in ("stored_hash", "inputs_hash"):
             setattr(obj, field.attname, "h" * 16)
-        elif field.name == "version" and not getattr(obj, field.attname):
-            setattr(obj, field.attname, 1)
     return obj
 
 

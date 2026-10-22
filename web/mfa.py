@@ -201,25 +201,33 @@ def _lock_length(lock_count):
 
 
 def _alert_second_lock(device, now):
-    """OQ-30: on the second lock in a row the person and the access admins of every entity where they hold an active
-    membership get a bilingual in-app alert (written once per lock)."""
+    """OQ-30: on the second lock in a row a bilingual in-app alert (written once per lock) goes to the person, the
+    access admins of every entity where they hold an active membership, and the managing partner(s) of each of those
+    entities' group parents, who alone may reset the device or the password of a person who must use MFA (R16;
+    final verification of 7a104f1, item 2). People without memberships: the other active superusers (operators)."""
     from core.access import engine
 
     user = device.user
-    entities = {m.entity for m in Membership.objects.active(access_services.now()).filter(user=user)
-                .select_related("entity")}
+    at = access_services.now()
+    entities = {m.entity for m in Membership.objects.active(at).filter(user=user).select_related("entity")}
     key = f"mfa_locked:{device.pk}:{device.locked_until.isoformat()}"
-    en = (f"Two-step verification of {user.get_username()} was locked again after repeated wrong codes, until "
-          f"{timezone.localtime(device.locked_until):%Y-%m-%d %H:%M}. If this was not the person, reset the device "
-          "and review the account.")
-    ar = (f"قُفل التحقق بخطوتين للمستخدم {user.get_username()} مرة أخرى بعد رموز خاطئة متكررة، حتى "
-          f"{timezone.localtime(device.locked_until):%Y-%m-%d %H:%M}. إن لم يكن ذلك صاحب الحساب فأعد تعيين الجهاز "
-          "وراجع الحساب.")
+    until = f"{timezone.localtime(device.locked_until):%Y-%m-%d %H:%M}"
+    en = (f"Two-step verification of {user.get_username()} was locked again after repeated wrong codes, until {until}. "
+          "If the person did not make these attempts, their password may be known to someone else: the person should "
+          "change it, and their group managing partner (or, for people who do not need MFA, their access admin) "
+          "resets their device and password if needed.")
+    ar = (f"قُفل التحقق بخطوتين للمستخدم {user.get_username()} مرة أخرى بعد رموز خاطئة متكررة، حتى {until}. "
+          "إن لم يقم صاحب الحساب بهذه المحاولات فقد تكون كلمة مروره معروفة لغيره: عليه تغييرها، ويعيد الشريك المدير "
+          "لمجموعته (أو مسؤول الصلاحيات لمن لا يلزمه التحقق بخطوتين) تعيين الجهاز وكلمة المرور عند الحاجة.")
     recipients = {}
     for entity in entities:
-        admins = set(Membership.objects.active(access_services.now()).filter(entity=entity, role__code="access_admin")
+        admins = set(Membership.objects.active(at).filter(entity=entity, role__code="access_admin")
                      .values_list("user_id", flat=True))
-        recipients[entity] = admins | {user.pk}
+        recipients.setdefault(entity, set()).update(admins | {user.pk})
+        root = access_services.group_parent_of(entity)
+        group_mps = set(Membership.objects.active(at).filter(entity=root, role__code="managing_partner")
+                        .values_list("user_id", flat=True)) - {user.pk}
+        recipients.setdefault(root, set()).update(group_mps)
     if not entities:
         # Verification review item 8: a person without memberships (a superuser or a staff user) has no access admin;
         # the operators (active superusers other than the person) are told, on the group parent(s), and the person.

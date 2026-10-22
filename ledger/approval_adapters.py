@@ -22,7 +22,9 @@ def register():
 
     engine.register(JournalEntry, "ledger.manual_entry", permission="ledger.post_entry",
                     submit_permission="ledger.create_entry", amount=lambda d: None,
-                    version=lambda d: engine.version_text(d.modified_at) if d.modified_at else "",
+                    # Last change, else submission, else creation: an entry submitted without an edit still has a
+                    # version (web.md R7; found by the adapter-version test, final verification of 7a104f1, item 6).
+                    version=lambda d: engine.version_text(d.modified_at or d.submitted_at or d.created_at or ""),
                     label=lambda d: (f"Journal entry {d.number or '#' + str(d.pk)}",
                                      f"قيد يومية {d.number or '#' + str(d.pk)}"),
                     approve=_approve)

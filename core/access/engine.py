@@ -88,6 +88,11 @@ MESSAGES = {
         "المبلغ عند الإصدار {amount} خارج نطاق الصلاحية الذي وُجّه به هذا الاعتماد؛ ولم يُصدر شيء. يعاد المستند إلى مُعدّه "
         "ليُوجَّه من جديد وفق القاعدة الصحيحة.",
     ),
+    "band_amount_unknown": (
+        "The amount {amount} cannot be converted to {currency} (no exchange rate), so its authority band cannot be "
+        "checked; nothing was issued.",
+        "تعذّر تحويل المبلغ {amount} إلى {currency} (لا يوجد سعر صرف)، فلا يمكن التحقق من نطاق الصلاحية؛ ولم يُصدر شيء.",
+    ),
     "amount_decimals": (
         "{amount} has more decimals than {currency} allows ({places}).",
         "المبلغ {amount} يتجاوز عدد الخانات العشرية المسموح بها للعملة {currency} ({places}).",
@@ -316,12 +321,17 @@ def version_text(value):
 
 def document_version(adapter, document):
     """The version the engine binds a request to (web.md R7): the adapter's hook, else an integer ``version``, else
-    ``submitted_at`` / ``modified_at``. Empty means "no version": the inbox refuses to decide it."""
+    ``submitted_at`` / ``modified_at``, else (a record not changed since it was created) ``c:`` + ``created_at``;
+    any later change sets ``modified_at`` and so changes the version. Empty means "no version": the inbox refuses
+    to decide it."""
     if adapter.version:
         return str(adapter.version(document))
     value = getattr(document, "version", None)
     if not isinstance(value, int):
-        value = getattr(document, "submitted_at", None) or getattr(document, "modified_at", None) or ""
+        value = getattr(document, "submitted_at", None) or getattr(document, "modified_at", None)
+        if value is None:
+            created = getattr(document, "created_at", None)
+            return f"c:{version_text(created)}" if created is not None else ""
     return version_text(value)
 
 
@@ -1032,12 +1042,15 @@ def inbox(user, *, at=None):
     return out
 
 
-def check_issued_band(grant, *, amount, currency, functional_amount=None):
-    """After a module has computed the final amount of the document it is approving (e.g. a sales document's issued
-    total), check that it still lies in the band of every step of the request the grant was given under (R71, R73;
-    verification review of f95e1c8, item 6). Requests under code defaults, or without bands, pass. Refused
-    ``amount_outside_band`` (logged, en/ar): the caller's transaction rolls back and nothing is issued; the inbox
-    then returns the document to its preparer for re-routing (``core.access.inbox.decide``)."""
+def check_issued_band(grant, document, *, amount, currency):
+    """After a module has computed the final amount of ``document`` (e.g. a sales document's issued total), check that
+    it still lies in the band of every step of the request the grant was given under (R71, R73; verification review
+    of f95e1c8, item 6). Requests under code defaults, or without bands, pass. The functional-currency measure is
+    converted exactly as at submission (:func:`_to_functional`: the document's own rate, else the ledger rate of its
+    date), for any functional currency (final verification of 7a104f1, items 5 and 8); a measure that cannot be
+    converted is refused ``band_amount_unknown``. Refused ``amount_outside_band`` (logged, en/ar): the caller's
+    transaction rolls back and nothing is issued; the inbox then returns the document to its preparer for
+    re-routing (``core.access.inbox.decide``)."""
     request_id = getattr(grant, "approval_request_id", None)
     if request_id is None:
         return
@@ -1047,6 +1060,10 @@ def check_issued_band(grant, *, amount, currency, functional_amount=None):
     entity = req.entity
     rules = {r.pk: r for r in AuthorityRule.objects.filter(pk__in=req.rule_ids)}
     functional = entity.base_currency_id
+    if currency == functional:
+        functional_amount = amount
+    else:
+        functional_amount = _to_functional(entity, amount, currency, document)
     for step in req.steps:
         rows = [rules[rid] for rid in step["rule_ids"] if rid in rules]
         if not rows:
@@ -1056,12 +1073,13 @@ def check_issued_band(grant, *, amount, currency, functional_amount=None):
             if currency != functional and row.band_currency_id == currency:
                 measure = amount
             elif row.band_currency_id in (None, functional):
-                measure = functional_amount if functional_amount is not None else (
-                    amount if currency == functional else None)
+                measure = functional_amount
+                if measure is None:
+                    refuse("band_amount_unknown", grant.user, entity, grant.permission,
+                           {"request": req.pk, "amount": str(amount), "currency": currency},
+                           amount=f"{currency} {amount}", currency=functional)
             else:
                 return False
-            if measure is None:
-                return True  # no functional amount known: the submission-time measure stands
             return row.amount_from <= measure and (row.amount_to is None or measure <= row.amount_to)
 
         if not any(covers(r) for r in rows):

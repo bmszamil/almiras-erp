@@ -1315,3 +1315,23 @@ def test_an_issued_total_outside_the_routed_band_is_refused_and_returned_for_re_
     with pytest.raises(access.AccessDenied) as again:  # resubmitted: routed again on 1,150.00, no band covers it
         inv.submit_sales_document(doc, user=g.ac)
     assert again.value.code == "no_authority_rule"
+
+
+def test_the_band_at_issue_converts_like_submission_and_refuses_an_unknown_rate(g):
+    """Final verification of 7a104f1, items 5 and 8: any currency is converted to the functional one with the same
+    function as at submission (_to_functional); without a rate the band cannot be checked and nothing issues."""
+    approved_matrix(g, g.sub, [dict(activity="invoicing.sales_document", approver_roles=["approver"],
+                                    amount_from="1000.00", amount_to="2000.00")])
+    doc = _sales_draft(g, "1000.00")
+    inv.submit_sales_document(doc, user=g.ac)
+    req = ApprovalRequest.objects.get(document_type="invoicing.salesdocument", document_id=doc.pk, status="open")
+    grant = SimpleNamespace(approval_request_id=req.pk, user=g.cf, permission="invoicing.approve_sales_document")
+    engine.check_issued_band(grant, doc, amount=Decimal("1150.00"), currency="SAR")  # in the band
+    with pytest.raises(access.AccessDenied) as unknown:
+        engine.check_issued_band(grant, doc, amount=Decimal("400.00"), currency="USD")  # no USD rate on its date
+    assert unknown.value.code == "band_amount_unknown" and unknown.value.message_ar
+    rate(g, "USD", "3.75", on=date(2027, 3, 15))
+    engine.check_issued_band(grant, doc, amount=Decimal("400.00"), currency="USD")  # 1,500.00 SAR: in the band
+    with pytest.raises(access.AccessDenied) as outside:
+        engine.check_issued_band(grant, doc, amount=Decimal("1150.00"), currency="USD")  # 4,312.50 SAR
+    assert outside.value.code == "amount_outside_band"

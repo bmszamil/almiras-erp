@@ -1,0 +1,15 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p>A new 6-digit code from your authenticator app is needed (web.md R15). / يلزم رمز جديد من 6 أرقام من تطبيق المصادقة.</p>
+{% if error %}<p class="errornote" role="alert">{{ error }}</p>{% endif %}
+<ul>{% for obj in queryset %}<li>{{ obj }}</li>{% endfor %}</ul>
+<form method="post">
+  {% csrf_token %}
+  {% for obj in queryset %}<input type="hidden" name="{{ action_checkbox_name }}" value="{{ obj.pk }}">{% endfor %}
+  <input type="hidden" name="action" value="{{ action }}">
+  <label for="id_mfa_code">Code / الرمز</label>
+  <input type="text" name="mfa_code" id="id_mfa_code" inputmode="numeric" autocomplete="one-time-code" maxlength="16" dir="ltr" required>
+  <input type="submit" name="mfa_confirm" value="Confirm / تأكيد">
+</form>
+{% endblock %}

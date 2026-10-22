@@ -301,7 +301,7 @@ def log(event, *, actor=None, entity=None, subject_user=None, membership=None, r
     )
 
 
-def log_denial(*, actor, entity, permission, details):
+def log_denial(*, actor, entity, permission, details, subject_user=None):
     """Write a ``permission_denied`` row that survives the caller's rollback (R27, AT-1).
 
     A refusal raises AccessDenied, which usually rolls back the caller's
@@ -313,7 +313,7 @@ def log_denial(*, actor, entity, permission, details):
     still-open transaction and are not visible to it, or a lock times out),
     the row is written in the caller's transaction as before.
     """
-    fields = dict(actor=actor, entity=entity, permission=permission, details=details)
+    fields = dict(actor=actor, entity=entity, permission=permission, details=details, subject_user=subject_user)
     main = router.db_for_write(AccessLog)
     alias = getattr(settings, "ACCESS_LOG_DB", None)
     if alias and alias in settings.DATABASES and alias != main and connections[main].in_atomic_block:
@@ -1143,13 +1143,27 @@ def approval_permissions():
     return sorted(code for code, perm in catalogue.CATALOGUE.items() if perm.is_approval)
 
 
+def deciding_permissions():
+    """Every permission with which someone decides an approval request: the catalogue's **A** permissions plus the
+    permission of every registered engine adapter, e.g. ``hr.manage_employee`` for the second person of an IBAN
+    change (``through_engine``; final verification of 7a104f1, item 4). Read at call time, so an adapter registered
+    later counts."""
+    from . import authority_defaults, engine
+
+    perms = set(approval_permissions())
+    for adapter in engine.adapters().values():
+        perms.add(adapter.permission or authority_defaults.get(adapter.activity).permission)
+    return sorted(p for p in perms if p in catalogue.CATALOGUE)
+
+
 # web.md R13 (W-D6, OQ-3 default): roles whose holders need MFA. ``ceo`` (access §10): a subsidiary's top authority.
 MFA_ROLES = frozenset({"approver", "managing_partner", "chairman", "zatca_admin", "access_admin", "ceo"})
 
 
 def needs_mfa(user):
     """True if ``user`` must use MFA in the web UI (web.md R13; OQ-29; verification review of f95e1c8, item 1): a
-    superuser, or an active person who holds an MFA role or any approval (**A**) permission in any entity, or who is
+    superuser, or an active person who holds an MFA role or any permission that decides an approval request
+    (:func:`deciding_permissions`) in any entity, or who is
     the delegate of an approval delegation in its active window (R62: a delegate approves). One query; grants
     nothing. Shared by the web MFA gate and the admin password guard."""
     if not _is_active_human(user):
@@ -1162,7 +1176,7 @@ def needs_mfa(user):
 
     at = now()
     roles = Membership.objects.active(at).filter(
-        Q(role__code__in=list(MFA_ROLES)) | Q(role__permission_rows__codename__in=approval_permissions()),
+        Q(role__code__in=list(MFA_ROLES)) | Q(role__permission_rows__codename__in=deciding_permissions()),
         user_id=user.pk, role__kind=Kind.HUMAN)
     delegate = ApprovalDelegation.objects.filter(active_window_q(at), delegate_id=user.pk)
     from django.contrib.auth import get_user_model  # request.user is a lazy wrapper: never type(user)

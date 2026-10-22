@@ -1461,8 +1461,7 @@ def approve_sales_document(document, *, user):
         _issue_submitted(doc, rate_user=user, approved_by=user, approved_at=timezone.now())
         # Verification review of f95e1c8, item 6: the issued total must still fall in the band the request was
         # routed by (access R71, R73); otherwise refused (amount_outside_band) and nothing is issued.
-        approval_engine.check_issued_band(grant, amount=doc.total_gross, currency=doc.currency_id,
-                                 functional_amount=doc.total_gross_sar if doc.entity.base_currency_id == "SAR" else None)
+        approval_engine.check_issued_band(grant, doc, amount=doc.total_gross, currency=doc.currency_id)
         access.use_grant(grant, target=doc)  # a used, current approval: the clearance posting checks it (access R42)
         port = zatca_port.get_port()
         transaction.on_commit(lambda: port.submit_document(SalesDocument.objects.get(pk=doc.pk), user))

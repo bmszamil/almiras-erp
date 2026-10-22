@@ -1,7 +1,9 @@
 from django import forms
 from django.contrib import admin, messages
 from django.core.exceptions import PermissionDenied, ValidationError
+from django.contrib.admin import helpers
 from django.http import HttpResponseRedirect
+from django.template.response import TemplateResponse
 
 from core import access
 from core.admin import EntityScopedAdmin
@@ -165,8 +167,34 @@ class JournalEntryAdmin(EntityScopedAdmin):
         for formset in formsets:
             self.save_formset(request, form, formset, change)
 
+    def _step_up(self, request, queryset, action, title_en, title_ar):
+        """web.md R15 (final verification of 7a104f1, item 3): posting or reversing from admin needs a fresh
+        authenticator code from everyone who must use MFA, like approving in the inbox. The first call shows a
+        confirmation page with a code field; the confirmed POST checks the code (throttled, logged) before anything
+        is posted. Returns None when the code was accepted (or MFA does not apply), else the page to show."""
+        from web import mfa
+        from web.texts import both
+
+        if not mfa.must_verify(request.user):
+            return None
+        error = None
+        if "mfa_confirm" in request.POST:
+            try:
+                mfa.verify(request.user, request.POST.get("mfa_code", ""), purpose="step_up")
+                return None
+            except mfa.MfaError as exc:
+                error = " / ".join(both(f"mfa_err_{exc.code}"))
+        return TemplateResponse(request, "admin/ledger/journalentry/confirm_step_up.html", {
+            **self.admin_site.each_context(request), "opts": self.model._meta, "queryset": queryset,
+            "action": action, "title": f"{title_en} / {title_ar}", "error": error,
+            "action_checkbox_name": helpers.ACTION_CHECKBOX_NAME,
+        }, status=400 if error else 200)
+
     @admin.action(description="Post selected draft entries")
     def post_selected(self, request, queryset):
+        page = self._step_up(request, queryset, "post_selected", "Post entries", "ترحيل القيود")
+        if page is not None:
+            return page
         for entry in queryset:
             try:
                 grant = access.require(request.user, entry.entity, "ledger.post_entry", document=entry)
@@ -177,6 +205,9 @@ class JournalEntryAdmin(EntityScopedAdmin):
 
     @admin.action(description="Reverse selected posted entries")
     def reverse_selected(self, request, queryset):
+        page = self._step_up(request, queryset, "reverse_selected", "Reverse entries", "عكس القيود")
+        if page is not None:
+            return page
         for entry in queryset:
             try:
                 grant = access.require(request.user, entry.entity, "ledger.reverse_entry", document=entry)

@@ -965,6 +965,8 @@ Arabic labels of new roles, events and report sections are marked [AR-review] fo
     - `approver_roles` of a frozen row: the relation (add, remove, set, clear) is refused on every database. A direct write to the auto-created through table sends no Django signal, so on SQLite it is not caught; on PostgreSQL the core.0030 trigger refuses it.
     - OQ-42 (team default, for the owner to confirm): a change of a subsidiary's top-authority role or self-approval switch is decided in the group parent by its top authority (the managing partner), its chairman or its board representative, never by the subsidiary's own top authority whose powers change, nor by the requester.
 
+16. *Added 2026-10-22 (web slice 2 reviews):* **band re-check at issue.** A module that fixes the final amount at approval (sales documents) calls `engine.check_issued_band(grant, document, amount=, currency=)`: every step of the request must still have a covering row. Conversion basis (final verification of 7a104f1, item 8): both at submission and at issue the functional measure comes from `engine._to_functional(entity, amount, currency, document)`: the document's own `fx_rate` when it has one, else the ledger rate of its date. A draft has no pinned rate (ledger rate of its date); an issued sales document carries its booking rate, which normally is the same ledger rate, so the two measures differ only if the rate table changed in between. Without a rate the check refuses `band_amount_unknown`; outside the bands it refuses `amount_outside_band`, and the web inbox returns the document to its preparer for re-routing.
+
 ## Appendix: existing code that must change
 
 | File | Change |

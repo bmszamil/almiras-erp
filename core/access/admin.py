@@ -10,6 +10,7 @@ from django.contrib.admin.utils import unquote
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db.models import Q
+from django.http import HttpResponseForbidden
 
 from . import services
 from .models import AccessLog, DualControlRequest, Membership, Role, RolePermission, UserProfile
@@ -245,11 +246,15 @@ class UserAdmin(DjangoUserAdmin):
         take over an approver's account by password while the MFA reset stays out of reach. Refused and logged."""
         target = self.get_object(request, unquote(id))
         if target is not None and not services.may_set_password(request.user, target):
-            services.log(AccessLog.Event.PERMISSION_DENIED, actor=request.user, subject_user=target,
-                         permission="admin.set_password", details={"reason": "mfa_user_password"})
-            raise PermissionDenied(
+            # log_denial writes on the separate access-log connection (settings.ACCESS_LOG_DB), and the refusal is a
+            # response, not an exception: under ATOMIC_REQUESTS the row survives either way (final verification of
+            # 7a104f1, item 1).
+            services.log_denial(actor=request.user, entity=None, permission="admin.set_password", subject_user=target,
+                                details={"reason": "mfa_user_password"})
+            return HttpResponseForbidden(
                 "Only a superuser or the group managing partner sets the password of a person who must use MFA. / "
-                "لا يعيّن كلمة مرور من يلزمه التحقق بخطوتين إلا مستخدم أعلى أو الشريك المدير للمجموعة.")
+                "لا يعيّن كلمة مرور من يلزمه التحقق بخطوتين إلا مستخدم أعلى أو الشريك المدير للمجموعة.",
+                content_type="text/plain; charset=utf-8")
         return super().user_change_password(request, id, form_url)
 
     def get_readonly_fields(self, request, obj=None):
