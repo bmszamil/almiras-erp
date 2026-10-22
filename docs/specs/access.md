@@ -231,6 +231,7 @@ Flags: **A** = approval (creator ≠ approver, R14); **S!** = segregation that c
 | `zatca.close_late_notice` | | zatca_admin |
 | `zatca.grant_key_delegation` | G, S! | managing_partner. *Amended 2026-10-17 (A20):* delegates custody of a per-entity master key (zatca R-50); the `unseal` scope is withdrawn |
 | `zatca.view_key_events` | | zatca_admin; viewer, internal_auditor, external_auditor (read-only). *Added 2026-10-21 (zatca §7 as amended by D-19, as built; seed V19 on V18, migration core.0032 with its own frozen copy):* view secret-version retirement events and pending retirements. Not the accountant, not **Ag**. Retiring itself needs no permission: only the ZATCA system user does it |
+| `invoicing.approve_migrated_settlement` | A, P | approver, managing_partner, ceo (the holders of `invoicing.approve_vendor_payment`). *Added 2026-10-21 (invoicing R129, as built; seed V20 on V19, migration core.0035 with its own frozen copy):* approves and posts a foreign-currency settlement of a migrated open item (activity `invoicing.migrated_settlement`); never its preparer |
 | `ledger.create_entry` (draft) | Ag | accountant, agent (table rates only, ledger-fx) |
 | `ledger.post_entry` (manual journals) | A, P | approver; accountant pending OQ-5 |
 | `ledger.reverse_entry` (manual journals) | P | accountant (OQ-5) |
@@ -803,6 +804,7 @@ Every row becomes an `ApprovalActivity` with an engine adapter. "Default" = the 
 | `invoicing.sales_document` (incl. credit/debit notes, billing corrections, non-VAT documents) | `invoicing.services.approve_sales_document` | `invoicing.approve_sales_document` (`approve_non_vat_document`) | `approver` | Y (on clearance) | |
 | `invoicing.bill` (incl. vendor credit notes) | `approve_purchase_document` | `invoicing.approve_bill` | `approver` | Y | |
 | `invoicing.vendor_payment` | `approve_vendor_payment` | `invoicing.approve_vendor_payment` | `approver` | Y | |
+| `invoicing.migrated_settlement` *(added 2026-10-21, invoicing R129, review of 4986344 item 2; as built)* | `post_migrated_settlement` (a foreign-currency settlement of a migrated open item; submitted when the pending row is created, measured in SAR on the item's SAR cleared plus the expected FX difference) | `invoicing.approve_migrated_settlement` | `approver` only (code default); a matrix row may band it | Y | |
 | `invoicing.purification_funding` | (invoicing R54, C2) | `invoicing.approve_purification_funding` | `approver`; MP fallback | Y | rec. |
 | `invoicing.purification_payout` | (invoicing R54) | `invoicing.approve_purification_payout` | `approver` | Y | rec. |
 | `invoicing.charity_recipient` | `approve_charity_recipient` | `invoicing.approve_charity_recipient` (S!) | MP, with board minute | | Y |

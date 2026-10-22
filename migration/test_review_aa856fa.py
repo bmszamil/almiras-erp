@@ -95,9 +95,12 @@ def test_item1_the_loader_takes_the_opening_lock_inside_its_transaction(people, 
     def spy(entity, *, lock=False, booked=True):
         from django.db import connection
 
-        seen.append((lock, connection.in_atomic_block))
+        seen.append((lock, len(connection.savepoint_ids) > base))  # inside an atomic block of its own
         return real(entity, lock=lock, booked=booked)
 
+    from django.db import connection
+
+    base = len(connection.savepoint_ids)  # the test's own transaction
     monkeypatch.setattr(ledger, "migration_opening_posted", spy)
     subledgers.load_subledgers(w.alm, wb, ["receivables"], user=w.a, apply=True)
     assert (True, True) in seen  # locked, in the load's own atomic block, before anything is written
@@ -200,3 +203,24 @@ def test_item10_create_deferred_sale_refuses_a_migrated_contract(people):
                                        possession_evidence_ref="X", asset_description_ar="سيارة",
                                        asset_type="vehicle")
     assert exc.value.code == "migrated_contract"
+
+
+def test_review_4986344_item3_a_direct_port_call_takes_the_opening_lock_in_its_own_transaction(w, monkeypatch):
+    seen = []
+    real = ledger.migration_opening_posted
+
+    def spy(entity, *, lock=False, booked=True):
+        from django.db import connection
+
+        seen.append((lock, len(connection.savepoint_ids) > base))  # inside an atomic block of its own
+        return real(entity, lock=lock, booked=booked)
+
+    customer = _late_customer(w)
+    from django.db import connection
+
+    base = len(connection.savepoint_ids)
+    monkeypatch.setattr(ledger, "migration_opening_posted", spy)
+    migration_port.load_open_item(
+        w.alm, user=w.a, side="receivable", party=customer, doc_type="invoice", legacy_number="LOCK-1",
+        document_date=date(2025, 12, 1), currency="SAR", amount=D("1.00"), amount_sar=D("1.00"), cutover=CUTOVER)
+    assert seen == [(True, True)]

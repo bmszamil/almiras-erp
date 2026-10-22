@@ -131,6 +131,13 @@ def load_open_item(entity, *, user, side, party, doc_type, legacy_number, docume
     never an agent or system user). Returns (item, created). Nothing is sent to ZATCA and nothing is posted."""
     access.require(user, entity, "migration.import")
     _human(user, entity, "migration.import")
+    with transaction.atomic():  # R25: the opening lock is held until the item is written (review of 4986344, item 3)
+        return _load_open_item(entity, user, side, party, doc_type, legacy_number, document_date, currency, amount,
+                               amount_sar, cutover, due_date, description, source_system, file_sha256)
+
+
+def _load_open_item(entity, user, side, party, doc_type, legacy_number, document_date, currency, amount, amount_sar,
+                    cutover, due_date, description, source_system, file_sha256):
     currency = services._currency(currency, entity)
     amount = services._decimal(amount, "amount")
     amount_sar = services._decimal(amount_sar, "SAR amount")

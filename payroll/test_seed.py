@@ -3,7 +3,7 @@ from datetime import date
 
 from core.access import catalogue
 from core.access.models import Role
-from core.access.seed import ROLE_SEED, ROLE_SEED_V12, ROLE_SEED_V13, ROLE_SEED_V14, ROLE_SEED_V16, ROLE_SEED_V17, ROLE_SEED_V19
+from core.access.seed import ROLE_SEED, ROLE_SEED_V12, ROLE_SEED_V13, ROLE_SEED_V14, ROLE_SEED_V16, ROLE_SEED_V17, ROLE_SEED_V19, ROLE_SEED_V20
 from hr.models import StatutoryParameter
 from ledger.models import Account
 from payroll import statutory_seed
@@ -34,7 +34,8 @@ def test_v13_seed_payroll_rights(db):
     # Amended by access §10 (seed V18, R60, R70, OQ-41): the ``ceo`` role holds every approval an entity's matrix
     # may name for it; who approves is then the matrix or the code default (runs: hr_officer only; loans: the top
     # authority), not the role list.
-    assert ROLE_SEED is ROLE_SEED_V19  # V19 (zatca.view_key_events, core.0032) changes no payroll right
+    assert ROLE_SEED is ROLE_SEED_V20  # V19 (core.0032) and V20 (invoicing R129, core.0035) change no payroll right
+    assert ROLE_SEED_V19
     perms = {code: set(row[5]) for code, row in ROLE_SEED.items()}
     assert {c for c, p in perms.items() if "payroll.approve_run" in p} == {"hr_officer", "managing_partner", "ceo"}
     assert {c for c, p in perms.items() if "payroll.approve_loan" in p} == {"managing_partner", "ceo"}

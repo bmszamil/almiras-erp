@@ -98,6 +98,9 @@ ALLOW = {
     "migration/services.py:unregister_open_items_source": "app wiring (R22, R23 open-item source); no user action",
     # Migration sub-ledger loads (2026-10-21, migration R13, R16, R22, R23, W14):
     "core/access/engine.py:deciding": "a read of the engine's own context (inside engine.decide or not); no data",
+    "core/access/engine.py:withdraw": "closes the open request of a document its own module drops; the module checks "
+                                      "its caller's rights first (invoicing R129 discard)",
+    "invoicing/services.py:migrated_settlement_measure": "the engine's band measure of a settlement; no data access",
     "ledger/services.py:register_post_check": "app wiring at ready() (a check added to every posting); no user action",
     "ledger/services.py:migration_opening_posted": "internal state read (is the opening entry posted) for services "
                                                    "that already checked their caller's rights (migration R25)",

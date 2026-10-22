@@ -96,7 +96,8 @@ def test_item2_without_consent_the_deductions_are_held_until_a_person_records_it
     assert getattr(exc.value, "code", "") == "consent_required"
     c = payroll.record_deferred_sale_consent(c, user=w.p, consent_ref="SIGNED-M-1")
     assert c.consent_ref == "SIGNED-M-1"
-    assert AccessLog.objects.filter(actor=w.p, details__action="record_bai_ajel_consent",
+    assert AccessLog.objects.filter(actor=w.p, event="deduction_consent_recorded",  # its own event (review item 10)
+                                    details__action="record_bai_ajel_consent",
                                     details__consent_ref="SIGNED-M-1").exists()
     with pytest.raises(Exception) as exc:  # recorded once
         payroll.record_deferred_sale_consent(c, user=w.p, consent_ref="SIGNED-M-2")

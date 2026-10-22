@@ -888,7 +888,9 @@ def test_core_0032_carries_its_own_frozen_v19_seed_for_view_key_events():
     from core.access import catalogue
     from core.access.seed import ROLE_SEED, ROLE_SEED_V18, ROLE_SEED_V19
 
-    assert ROLE_SEED is ROLE_SEED_V19 and "zatca.view_key_events" in catalogue.CATALOGUE
+    assert "zatca.view_key_events" in catalogue.CATALOGUE  # V20 (core.0035) changes no zatca right
+    assert ({c for c, r in ROLE_SEED.items() if "zatca.view_key_events" in r[5]}
+            == {c for c, r in ROLE_SEED_V19.items() if "zatca.view_key_events" in r[5]})
     holders = {code for code, row in ROLE_SEED_V19.items() if "zatca.view_key_events" in row[5]}
     assert holders == {"zatca_admin", "viewer", "internal_auditor", "external_auditor"}
     assert not catalogue.CATALOGUE["zatca.view_key_events"].is_approval  # not routed through the authority engine

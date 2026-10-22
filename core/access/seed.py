@@ -454,8 +454,16 @@ ROLE_SEED_V19 = {
     **ROLE_SEED_V18,
     **{code: _plus(ROLE_SEED_V18, code, "zatca.view_key_events") for code in ZATCA_KEY_EVENT_ROLES},
 }
+# V20 (migration core.0035, invoicing R129, review of 4986344 item 2): ``invoicing.approve_migrated_settlement``
+# (the approval activity ``invoicing.migrated_settlement``, posting a foreign-currency settlement of a migrated open
+# item) for the roles that approve vendor payments: the approver (CFO), the managing partner and the CEO.
+MIGRATED_SETTLEMENT_ROLES = tuple(c for c, row in ROLE_SEED_V19.items() if "invoicing.approve_vendor_payment" in row[5])
+ROLE_SEED_V20 = {
+    **ROLE_SEED_V19,
+    **{code: _plus(ROLE_SEED_V19, code, "invoicing.approve_migrated_settlement") for code in MIGRATED_SETTLEMENT_ROLES},
+}
 # The current catalogue: what a fresh (or flushed test) database is seeded with.
-ROLE_SEED = ROLE_SEED_V19
+ROLE_SEED = ROLE_SEED_V20
 
 # One system user per system_code (R20): code -> (username, display_name_en, display_name_ar)
 SYSTEM_USERS_V1 = {

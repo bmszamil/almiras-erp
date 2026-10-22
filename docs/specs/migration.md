@@ -244,7 +244,7 @@ The validation report and profiles are not stored: they are printed and optional
     employee's written consent reference loads with its deductions **held**: no payroll run deducts its instalments
     and no final settlement recovers it (payroll R49) — W14 warns (`bai_ajel_consent`). A payroll officer records the
     consent later (`payroll.record_deferred_sale_consent(contract, user, consent_ref)`, `payroll.create_deferred_sale`,
-    migrated contracts only, once, logged with the reference); the next run deducts from then on, with the instalments
+    migrated contracts only, once; AccessLog event `deduction_consent_recorded` with the reference); the next run deducts from then on, with the instalments
     held so far caught up as for any held instalment. A balance left after exit is closed in payroll (write-off or
     recovery). **[tests `invoicing/test_deferred_sale_migrated.py`, `test_dry_run.py::test_w14_a_contract_without_consent_*`]**
 27. *Added 2026-10-21 (review of aa856fa, item 10).* **Service-level bounds.** `load_migrated_deferred_sale` refuses a

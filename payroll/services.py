@@ -3535,7 +3535,7 @@ def record_deferred_sale_consent(contract, *, user, consent_ref):
                     code="consent_recorded")
     c.consent_ref, c.modified_by, c.modified_at = ref, user, _now()
     _save(c)
-    access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=c.entity,
+    access_services.log(AccessLog.Event.DEDUCTION_CONSENT_RECORDED, actor=user, entity=c.entity,
                         permission="payroll.create_deferred_sale",
                         details={"action": "record_bai_ajel_consent", "contract": c.pk, "number": c.number,
                                  "legacy_number": c.legacy_number, "consent_ref": ref})
@@ -5664,7 +5664,7 @@ def approve_settlement_correction(correction, *, user):
                                  f"today {c.due_date} (Labour Law Art. 88; the settlement's own period has run).",
                                  f"التصحيح {c.number} يضيف {c.net_change} إلى المخالصة النهائية لـ {code}: مستحق اليوم "
                                  f"{c.due_date} (المادة 88؛ انقضت مهلة المخالصة).", ("payroll_officer", "approver"))])
-    access_services.log(AccessLog.Event.PERMISSION_GRANTED, actor=user, entity=c.entity,
+    access_services.log(AccessLog.Event.DEDUCTION_CONSENT_RECORDED, actor=user, entity=c.entity,
                         permission="payroll.approve_settlement_correction",
                         details={"action": "settlement_correction_approved", "correction": c.pk, "settlement": fs.pk,
                                  "net_change": str(c.net_change), "message_en": "Final settlement correction approved",

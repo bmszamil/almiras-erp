@@ -496,6 +496,8 @@ class AccessLog(models.Model):
         REPORT_EXPORTED = "governance_report_exported", "Governance report exported"
         REPORT_REVIEWED = "governance_report_reviewed", "Governance report reviewed"
         ALERT_SENT = "access_alert_sent", "Access alert sent"
+        # payroll R49, migration R26: an employee's written salary-deduction consent recorded for a migrated contract
+        DEDUCTION_CONSENT_RECORDED = "deduction_consent_recorded", "Salary-deduction consent recorded"
         LOGIN_SUCCEEDED = "login_succeeded", "Signed in to the web UI"  # web.md 3.4, R26
         LOGOUT = "logout", "Signed out of the web UI"  # web.md 3.4, R26
         # web.md 3.4, R16, R26 (slice 2): MFA events. Never the code, the secret or a recovery code.
