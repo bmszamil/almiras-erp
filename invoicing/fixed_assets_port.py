@@ -18,7 +18,7 @@ from datetime import date
 from decimal import Decimal
 
 from ledger import fx
-from ledger.models import JournalLine
+from ledger.models import JournalEntry, JournalLine
 
 from .models import PurchaseDocument, PurchaseDocumentLine
 
@@ -66,6 +66,15 @@ def posted_lines(entity, account_ids, *, include_reversed=False, date_from=None,
     if date_to is not None:
         qs = qs.filter(document__accounting_date__lte=date_to)
     return qs
+
+
+def booked_on(document):
+    """The date ``document`` was booked in the GL (its accounting date), and the date of its reversal entry once it
+    is reversed (None before): what a register cost adjustment is dated on (fixed-assets R4)."""
+    reversed_on = None
+    if document.status == REVERSED and document.reversal_entry_id is not None:
+        reversed_on = JournalEntry.objects.filter(pk=document.reversal_entry_id).values_list("date", flat=True).first()
+    return document.accounting_date, reversed_on
 
 
 def line_of(entity, pk, *, lock=False):

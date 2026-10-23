@@ -104,7 +104,7 @@ def test_r4_a_reversed_bill_needs_an_adjustment_before_the_next_run(w):
         services.prepare_depreciation(w.alm, t.period(w.alm, "2027-01"), user=w.a)
     assert code_of(exc) == "pending_adjustment" and "reversed" in str(exc.value)
     component = asset.components.get()
-    e = services.record_cost_adjustment(asset, user=w.a, reverses_component=component, event_date=date(2027, 1, 20),
+    e = services.record_cost_adjustment(asset, user=w.a, reverses_component=component,
                                         reason_ar="فاتورة معكوسة")
     services.submit_event(e, user=w.a)
     t.decide(e, w.c, permission="fixed_assets.capitalise")

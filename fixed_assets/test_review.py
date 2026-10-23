@@ -275,7 +275,7 @@ def test_item8_a_reversed_credit_note_is_flagged_and_an_approved_adjustment_can_
         services.prepare_depreciation(w.alm, t.period(w.alm, "2027-01"), user=w.a)
     assert code_of(exc) == "pending_adjustment" and "معكوسة" in str(exc.value)
     component = asset.components.get(source_event=e2, reverses__isnull=True)
-    fix = services.record_cost_adjustment(asset, user=w.a, reverses_component=component, event_date=date(2027, 1, 25),
+    fix = services.record_cost_adjustment(asset, user=w.a, reverses_component=component,
                                           reason_ar="إشعار معكوس")
     assert fix.amount == D("6000.00")
     services.submit_event(fix, user=w.a)
@@ -416,27 +416,85 @@ def test_p1_a_voided_bill_line_is_unregistered_again_and_blocks_the_close(w1):
     assert t.close(w, w.alm, "2027-02").status == "closed"
 
 
-def test_p2_a_cost_adjustment_is_not_voided_after_a_disposal_or_a_later_event(w1):
+def test_p2_a_cost_adjustment_is_not_voided_after_a_disposal(w1):
     w = w1
     bill, asset = _vehicle(w)
     note = t.bill(w, w.alm, [("1520", "6000.00")], on=date(2027, 1, 20), doc_type="vendor_credit_note", original=bill)
     e = _adjust(w, asset, t.line_of(note))
-    bill2, other = _vehicle(w, "30000.00")
-    note2 = t.bill(w, w.alm, [("1520", "3000.00")], on=date(2027, 1, 20), doc_type="vendor_credit_note",
-                   original=bill2)
-    e2 = _adjust(w, other, t.line_of(note2))
     t.run(w, w.alm, "2027-01")
     t.event(w, asset, "write_off", date(2027, 2, 10))
-    t.event(w, other, "impairment", date(2027, 2, 10), recoverable_amount=D("20000.00"))
     t.run(w, w.alm, "2027-02")
-    for event in (e, e2):  # a disposed asset; a later posted impairment
-        services.request_reversal(event, user=w.a, reason_ar="إلغاء")
-        with pytest.raises(FixedAssetError) as exc:
-            t.decide(event, w.c, permission="fixed_assets.reverse_document")
-        assert code_of(exc) == "reversal_order"
-        event.refresh_from_db()
-        assert event.status == "approved"
+    services.request_reversal(e, user=w.a, reason_ar="إلغاء")
+    with pytest.raises(FixedAssetError) as exc:
+        t.decide(e, w.c, permission="fixed_assets.reverse_document")
+    assert code_of(exc) == "reversal_order"
+    e.refresh_from_db()
+    assert e.status == "approved"
     assert _gaps(w, date(2027, 2, 28)) == {}
+
+
+def test_third_review_1_a_void_on_an_active_asset_is_not_blocked_by_a_later_event(w1):
+    """The impairment of February cannot be reversed once March is run, so it must not block the void forever: the
+    void is prospective (from the month after the last posted run)."""
+    w = w1
+    bill, asset = _vehicle(w)
+    note = t.bill(w, w.alm, [("1520", "6000.00")], on=date(2027, 1, 20), doc_type="vendor_credit_note", original=bill)
+    e = _adjust(w, asset, t.line_of(note))
+    t.run(w, w.alm, "2027-01")
+    t.event(w, asset, "impairment", date(2027, 2, 10), recoverable_amount=D("40000.00"))
+    t.run(w, w.alm, "2027-02")
+    march = t.run(w, w.alm, "2027-03")
+    _void(w, e)
+    assert e.status == "reversed"
+    undo = asset.components.get(source_event=e, reverses__isnull=False)
+    assert (undo.accounting_date, undo.effective_from) == (date(2027, 1, 20), date(2027, 4, 1))  # prospective
+    assert _gaps(w, date(2027, 3, 31)) == {"1520": D("-6000.00")}  # the credit note is out of the register again
+    with pytest.raises(FixedAssetError) as exc:
+        services.prepare_depreciation(w.alm, t.period(w.alm, "2027-04"), user=w.a)
+    assert code_of(exc) == "pending_adjustment"
+    again = _adjust(w, asset, t.line_of(note))  # the correct adjustment, on the credit note's date
+    assert again.event_date == date(2027, 1, 20)
+    for on in (date(2027, 1, 31), date(2027, 2, 28), date(2027, 3, 31)):
+        assert _gaps(w, on) == {}, on
+    april = t.run(w, w.alm, "2027-04")
+    assert april.total == march.total and not april.lines.filter(catch_up=True).exists()
+
+
+def test_third_review_2_a_cost_adjustment_is_dated_on_its_documents_booking_date(w1):
+    w = w1
+    bill, asset = _vehicle(w)
+    t.run(w, w.alm, "2027-01")
+    note = t.bill(w, w.alm, [("1520", "6000.00")], on=date(2027, 1, 20), doc_type="vendor_credit_note", original=bill)
+    for on in (date(2027, 3, 15), date(2027, 1, 10)):  # later and earlier than the credit note's accounting date
+        with pytest.raises(FixedAssetError) as exc:
+            services.record_cost_adjustment(asset, user=w.a, purchase_line=t.line_of(note), event_date=on,
+                                            reason_ar="تسوية")
+        assert code_of(exc) == "adjustment_date" and "2027-01-20" in str(exc.value) and "تاريخ قيد" in str(exc.value)
+    e = _adjust(w, asset, t.line_of(note), event_date=date(2027, 1, 20))  # the same date is accepted
+    component = asset.components.get(source_event=e)
+    assert (component.accounting_date, component.effective_from) == (date(2027, 1, 20), date(2027, 2, 1))
+    assert _gaps(w, date(2027, 1, 31)) == {}
+    assert t.close(w, w.alm, "2027-01").status == "closed"
+
+
+def test_third_review_2_a_reversed_bill_adjustment_is_dated_on_the_reversal_entry(w1):
+    w = w1
+    bill, asset = _vehicle(w, "30000.00")
+    inv.reverse_document(bill, user=w.a, reason="wrong vendor")
+    bill.refresh_from_db()
+    reversed_on = bill.reversal_entry.date
+    component = asset.components.get()
+    other_day = date(2027, 1, 5) if reversed_on != date(2027, 1, 5) else date(2027, 1, 6)
+    with pytest.raises(FixedAssetError) as exc:
+        services.record_cost_adjustment(asset, user=w.a, reverses_component=component, event_date=other_day,
+                                        reason_ar="فاتورة معكوسة")
+    assert code_of(exc) == "adjustment_date" and str(reversed_on) in str(exc.value)
+    e = services.record_cost_adjustment(asset, user=w.a, reverses_component=component, reason_ar="فاتورة معكوسة")
+    assert e.event_date == reversed_on
+    services.submit_event(e, user=w.a)
+    t.decide(e, w.c, permission="fixed_assets.capitalise")
+    assert asset.components.get(source_event=e).accounting_date == reversed_on
+    assert _gaps(w, reversed_on) == {}
 
 
 def test_p3_a_write_off_is_reversed_only_after_its_disposal_adjustments(w1):
@@ -491,7 +549,7 @@ def test_p4_the_adjustment_for_a_reversed_bill_is_never_voided(w1):
         inv.unallocate(allocation, user=w.a)
     inv.reverse_document(note, user=w.a, reason="credit note withdrawn")
     fix = services.record_cost_adjustment(asset, user=w.a, reverses_component=asset.components.get(source_event=e),
-                                          event_date=date(2027, 1, 25), reason_ar="إشعار معكوس")
+                                          reason_ar="إشعار معكوس")
     services.submit_event(fix, user=w.a)
     t.decide(fix, w.c, permission="fixed_assets.capitalise")
     with pytest.raises(FixedAssetError) as exc:

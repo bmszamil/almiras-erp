@@ -12,7 +12,7 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
-from django.db.models import Q, Sum
+from django.db.models import Sum
 from django.utils import timezone
 
 from core import access
@@ -1434,6 +1434,10 @@ def _event_values(event):
         else:
             raise error("event_values", why="A subsequent cost names its bill line (R2).",
                         why_ar="تحدد التكلفة اللاحقة بند فاتورتها.")
+        booked = _adjustment_date(event)
+        if event.event_date != booked:  # third review, item 2: the register ties to the GL on every date
+            source = event.reverses_component.purchase_line if component is not None else event.purchase_line
+            raise error("adjustment_date", on=event.event_date, booked=booked, document=port.document_label(source))
     elif kind == EK.IMPAIRMENT:
         carrying = _carrying_now(asset)
         if event.recoverable_amount is None or event.recoverable_amount >= carrying:
@@ -1465,6 +1469,16 @@ def _event_values(event):
                         why_ar="حدد استخدامًا ضريبيًا جديدًا مختلفًا عن الحالي.")
         event.old_vat_use = asset.vat_use
     return event
+
+
+def _adjustment_date(event):
+    """R4 (third review, item 2): a cost adjustment is booked in the register on the date its document was booked in
+    the GL: the bill's or credit note's accounting date, or the reversal entry's date for a reversed bill."""
+    if event.reverses_component_id is not None:
+        return port.booked_on(event.reverses_component.purchase_line.document)[1]
+    if event.purchase_line_id is not None:
+        return port.booked_on(event.purchase_line.document)[0]
+    return None
 
 
 # Review items 1, 3 and the follow-up P4: kinds that never change a booked month. A change of estimate and a cost
@@ -1572,8 +1586,13 @@ def record_cost_adjustment(asset, *, user, purchase_line=None, reverses_componen
     the GL side). On a disposed asset it is a ``disposal_adjustment`` (approved under ``fixed_assets.disposal``) that
     books the difference against the disposal result (review item 7)."""
     access.require(user, asset.entity, "fixed_assets.record_event")
-    when = event_date or (purchase_line.document.accounting_date if purchase_line is not None else _today())
     stored = FixedAsset.objects.get(pk=asset.pk)
+    line = reverses_component.purchase_line if reverses_component is not None else purchase_line
+    booked = None
+    if line is not None and line.entity_id == stored.entity_id:
+        accounting, reversed_on = port.booked_on(line.document)
+        booked = reversed_on if reverses_component is not None else accounting
+    when = event_date or booked or _today()
     kind = EK.DISPOSAL_ADJUSTMENT if stored.status == AS.DISPOSED else EK.SUBSEQUENT_COST  # review item 7
     return draft_event(stored, user=user, kind=kind, event_date=when, reason_ar=reason_ar,
                        reason_en=reason_en, purchase_line=purchase_line, reverses_component=reverses_component)
@@ -1720,7 +1739,7 @@ def _apply_event(event, asset, user):
         _save(AssetCostComponent(
             entity=asset.entity, asset=asset, kind=AssetCostComponent.Kind.SUBSEQUENT_COST,
             purchase_line=event.purchase_line, reverses=event.reverses_component, amount=event.amount,
-            accounting_date=event.event_date, source_event=event, created_by=user, effective_from=effective))
+            accounting_date=_adjustment_date(event), source_event=event, created_by=user, effective_from=effective))
         _refresh_cost(asset)
     elif kind == EK.WRITE_OFF:
         asset.status, asset.disposal_date = AS.DISPOSED, event.event_date
@@ -1898,10 +1917,8 @@ def _later_dependants(document):
             asset.events.filter(status=ES.POSTED, event_date__gte=document.event_date).exclude(pk=document.pk).exists()
     if document.kind == EK.WRITE_OFF:  # follow-up P3: its disposal adjustments are reversed first
         return asset.events.filter(kind=EK.DISPOSAL_ADJUSTMENT, status=ES.POSTED).exists()
-    if document.kind == EK.SUBSEQUENT_COST:  # follow-up P2: a void never reaches past a disposal or a later event
-        later = asset.events.filter(status=ES.POSTED).exclude(pk=document.pk).filter(
-            Q(event_date__gte=document.event_date) | Q(posted_at__gt=document.posted_at))
-        return asset.status == AS.DISPOSED or later.exists()
+    if document.kind == EK.SUBSEQUENT_COST:  # follow-up P2, third review item 1: never after a disposal; on an
+        return asset.status == AS.DISPOSED    # active asset the void is prospective, so later events do not block it
     return False
 
 

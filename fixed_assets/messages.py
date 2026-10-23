@@ -126,6 +126,9 @@ MESSAGES = {
     "settings_value": ("Setting {name}: {why}", "الإعداد {name}: {why_ar}"),
     "estimate_incomplete": ("Asset {asset} has no usable depreciation estimate: {why}",
                             "لا يوجد للأصل {asset} تقدير استهلاك صالح: {why_ar}"),
+    "adjustment_date": (
+        "A cost adjustment is dated {booked}, the date {document} was booked in the GL, not {on} (R4).",
+        "تُؤرَّخ تسوية التكلفة في {booked}، تاريخ قيد {document} في الأستاذ العام، وليس في {on}."),
     "void_reversed_bill": (
         "The adjustment for the reversed bill {line} is not voided: the bill stays reversed, so the asset's cost must "
         "stay without it.",
