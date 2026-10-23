@@ -120,6 +120,15 @@ The validation report and profiles are not stored: they are printed and optional
     basis: `closing` (default, no replay) or `opening` (when the year's journals are replayed after it). With
     `pl_to_opening_equity`, income and expense codes are not loaded to their accounts and their net goes to 3900
     (OQ-3). Any remaining net of the lines goes to 3900; a TB that does not balance is refused, never plugged.
+    *Amended 2026-10-23 (team default, owner: go with recommendations; invoicing R97 re-review N1; as built):* an
+    opening import whose entry is **reversed** is superseded by the next load for the same entity and source system:
+    the old `ImportedEntry` stays (keep everything) with `superseded_at` set, the new one gets a versioned key
+    (`opening-2`, `opening-3`, ...; reference `FALCON-OPENING-2`) and goes through R16, the R22 tie-out and the R25
+    gates again (`migration_opening_posted` reads only the live import). One live opening import per entity and
+    source system is a database constraint (`one_live_opening_import`, migration `migration/0003`); while it is live
+    (draft, posted, or reversed but not yet reloaded) the same balances are skipped and other balances refused as
+    before. This is the only way to book opening balances again on control accounts: reversing the reversal is
+    refused (invoicing R97). **[svc `load_opening_balances`; tests `migration/test_control_accounts_r97.py::test_n1_*`]**
 15. Replay: each Falcon entry becomes one draft, reference `FALCON-<entry number>`, description from its first
     line; line descriptions keep بيان, cost centre, source and source number. An entry already imported is skipped;
     the same entry number with different content is refused. All entries of one run are created in one transaction.

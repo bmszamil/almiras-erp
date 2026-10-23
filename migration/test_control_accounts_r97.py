@@ -9,6 +9,7 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from django.db import IntegrityError, transaction
 
 from core import access
 from ledger import services as ledger
@@ -106,3 +107,72 @@ def test_review_reversing_the_reversal_of_the_opening_entry_is_refused(w, open_i
     assert "Account 1210" in text and "Account 1200" in text and "Account 2100" in text
     assert JournalEntry.objects.get(pk=rev.pk).status == "posted"
     assert not JournalEntry.objects.filter(reversal_of=rev).exists()  # the refused reversal rolled back
+
+
+# --- re-review N1 (team default 2026-10-23, migration R14): a reversed opening entry is superseded by a reload ----
+
+def _post_opening(w, entry):
+    return ledger.post_entry(entry, access.require(w.p, w.alm, "ledger.post_entry", document=entry))
+
+
+def _reload(w, sub_balance="20000.00"):
+    balances = {**BALANCES, "1301": ("مستحق من شركة تابعة", sub_balance, "0", "0"),
+                "2501": ("رأس المال", str(D("-60000.00") - D(sub_balance)), "0", "0")}
+    return services.load_opening_balances(w.alm, tb_file(balances), user=w.a, cutover=YEAR_END, apply=True)
+
+
+@pytest.mark.parametrize("sub_balance", ["20000.00", "25000.00"])  # the same balances, and other balances
+def test_n1_reversed_opening_entry_is_superseded_by_a_reload_that_posts_after_its_tie_out(w, open_items, sub_balance):
+    old = _opening_with_1210(w)
+    open_items["ALM"] = {("1200", ""): D("20000.00"), ("1210", "SUB"): D("20000.00"), ("2100", ""): D("-15000.00")}
+    old = _post_opening(w, old)
+    assert ledger.migration_opening_posted(w.alm)
+    ledger.reverse_entry(old, access.require(w.a2, w.alm, "ledger.reverse_entry", document=old))
+    assert ledger.migration_opening_posted(w.alm)  # reversed, not yet superseded: the sub-ledger loads stay closed
+
+    plan = _reload(w, sub_balance)
+    assert plan.applied, [p.message for p in plan.report.errors]
+    new_imp = plan.created[0]
+    assert new_imp.legacy_key == "opening-2" and new_imp.journal_entry.reference == "FALCON-OPENING-2"
+    kept = ImportedEntry.objects.get(journal_entry=old)  # keep everything: the old import stays, superseded
+    assert kept.legacy_key == "opening" and kept.superseded_at is not None
+    assert not ledger.migration_opening_posted(w.alm)  # R25: loads are open again until the new entry posts
+
+    open_items["ALM"][("1210", "SUB")] = D("19000.00")
+    result = services.post_imported_entries(w.alm, user=w.p, kind="opening", apply=True)
+    assert result["problems"] == ["opening-2"] and result["already_posted"] == ["opening"]  # R22 again
+    open_items["ALM"][("1210", "SUB")] = D(sub_balance)
+    result = services.post_imported_entries(w.alm, user=w.p, kind="opening", apply=True)
+    posted = result["posted"][0]
+    assert posted.pk == new_imp.journal_entry_id and posted.lines.get(account__code="1210").debit == D(sub_balance)
+    assert ledger.migration_opening_posted(w.alm, booked=False)
+    assert ImportedEntry.objects.filter(entity=w.alm, kind="opening").count() == 2
+
+
+def test_n1_a_second_reload_while_the_new_opening_entry_is_live_is_refused(w, open_items):
+    old = _opening_with_1210(w)
+    open_items["ALM"] = {("1200", ""): D("20000.00"), ("1210", "SUB"): D("20000.00"), ("2100", ""): D("-15000.00")}
+    old = _post_opening(w, old)
+    ledger.reverse_entry(old, access.require(w.a2, w.alm, "ledger.reverse_entry", document=old))
+    assert _reload(w).applied
+    again = _reload(w)  # the same balances: skipped, as for any live opening import (R14)
+    assert again.skipped == ["opening-2"] and not again.created
+    other = _reload(w, "21000.00")
+    assert not other.applied and [p.code for p in other.report.errors] == ["already_imported"]
+    with pytest.raises(IntegrityError), transaction.atomic():  # the database keeps one live opening import
+        imp = ImportedEntry.objects.get(legacy_key="opening-2")
+        ImportedEntry.objects.create(entity=w.alm, source_system="falcon", kind="opening", legacy_key="opening-3",
+                                     journal_entry=JournalEntry.objects.create(entity=w.alm, date=YEAR_END,
+                                                                               description="x"),
+                                     account_map=imp.account_map, file_sha256="0" * 64, lines_hash="0" * 64,
+                                     created_by=w.a)
+    assert ImportedEntry.objects.filter(entity=w.alm, kind="opening", superseded_at__isnull=True).count() == 1
+
+
+def test_n1_a_posted_opening_entry_that_is_not_reversed_is_never_reloaded(w, open_items):
+    old = _opening_with_1210(w)
+    open_items["ALM"] = {("1200", ""): D("20000.00"), ("1210", "SUB"): D("20000.00"), ("2100", ""): D("-15000.00")}
+    _post_opening(w, old)
+    plan = _reload(w, "25000.00")
+    assert not plan.applied and [p.code for p in plan.report.errors] == ["already_imported"]
+    assert not ImportedEntry.objects.filter(superseded_at__isnull=False).exists()

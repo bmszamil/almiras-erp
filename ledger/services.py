@@ -164,12 +164,14 @@ def migration_opening_posted(entity, *, lock=False, booked=True):
     """True once ``entity``'s migration opening entry (a draft linked to an ``ImportedEntry`` of kind ``opening``,
     migration R14) is posted (``booked``: posted or reversed; else posted only). With ``lock`` the opening entries
     are locked first (``select_for_update``), so a sub-ledger load and the posting of the opening entry, which locks
-    the same row, run one after the other (migration R22, R25). Internal: callers check their own rights."""
+    the same row, run one after the other (migration R22, R25). Only the live opening import counts: one superseded
+    by a reload after its entry was reversed does not (migration R14, team default 2026-10-23), so the R25 gates
+    apply to the new opening entry again. Internal: callers check their own rights."""
     qs = JournalEntry.objects.filter(entity=entity, legacy_import__kind="opening")
     if lock:
         list(qs.select_for_update(of=("self",)).order_by("pk").values_list("pk", flat=True))
     statuses = BOOKED if booked else (JournalEntry.Status.POSTED,)
-    return qs.filter(status__in=statuses).exists()
+    return qs.filter(status__in=statuses, legacy_import__superseded_at__isnull=True).exists()
 
 
 # --- control accounts (invoicing R97, policy A, D32(a); D33(e); banking R32 note B11(b); migration M6, R8) -----
@@ -199,7 +201,13 @@ def _reversal_chain(entry):
     depth, current, seen = 0, entry, set()
     while current.reversal_of_id is not None and current.pk not in seen:
         seen.add(current.pk)
-        current = JournalEntry.objects.get(pk=current.reversal_of_id)
+        found = JournalEntry.objects.filter(pk=current.reversal_of_id).first()
+        if found is None:  # a broken chain proves nothing about what the entry undoes or books again
+            raise error(f"Entry {current.number or current.pk} reverses an entry that does not exist; it cannot be "
+                        "judged on a control account.",
+                        f"القيد {current.number or current.pk} يعكس قيدًا غير موجود؛ لا يمكن الحكم عليه في حساب مراقبة.",
+                        code="control_account")
+        current = found
         depth += 1
     return depth, current
 
@@ -210,7 +218,8 @@ def _is_migration_opening(entry):
     open items (migration R22, invoicing R115) is checked by migration's registered post check."""
     return (entry.source == JournalEntry.Source.IMPORT and not entry.document_type and entry.pk is not None
             and JournalEntry.objects.filter(pk=entry.pk, entity_id=entry.entity_id, legacy_import__kind="opening",
-                                            legacy_import__entity_id=entry.entity_id).exists())
+                                            legacy_import__entity_id=entry.entity_id,
+                                            legacy_import__superseded_at__isnull=True).exists())
 
 
 def _control_problems(entry, lines):
@@ -2425,6 +2434,9 @@ def reverse_revaluation(run, grant, *, reason):
     if not (reason or "").strip():
         raise error("A reason is required.", "السبب مطلوب.", code="reason_required")
     user = access.verify_grant(grant, run.entity, {"ledger.reverse_entry"}, document=run.entry, use=False)
+    if kind_of(user) != Kind.HUMAN:  # R26: revaluations are run, posted and reversed by people only
+        access.deny(user, run.entity, "ledger.reverse_entry",
+                    "agent_forbidden" if kind_of(user) == Kind.AGENT else "system_forbidden")
     with transaction.atomic():
         access.use_grant(grant, target=run.entry)
         return _reverse_revaluation(run, user, reason.strip()[:500])
