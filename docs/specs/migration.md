@@ -231,8 +231,11 @@ The validation report and profiles are not stored: they are printed and optional
     account loaded before with another bank, currency, GL account, opening statement balance or date, IBAN, account
     number, Sharia basis or purification flag is refused, not skipped; it is changed in banking with an approved
     change). Only people run a section (R19): an agent or system user is refused before anything is read
-    (`agent_forbidden`). Fixed assets are not loaded (no fixed-assets module; W11 ties them
-    in the workbook only). **[tests `test_subledgers.py`, `test_dry_run.py`]**
+    (`agent_forbidden`). ~~Fixed assets are not loaded (no fixed-assets module; W11 ties them
+    in the workbook only).~~ *Amended 2026-10-22 (fixed-assets R40, R41, as built):* section `fixed_assets` loads the
+    opening asset register through `fixed_assets.migration_port`, and the register is an R22 source on 1500, 1510,
+    1520, 1590 (and the proposed 15xx codes); the section is gated like the others. **[tests `test_subledgers.py`,
+    `test_dry_run.py`, `fixed_assets/test_migration.py`]**
 24. Each entity is loaded with the user's own membership in that entity (no cascade, M7); workbook, checks and
     messages are the same for every entity (new entities are data).
 25. *Added 2026-10-21.* The sections that feed the R22 gate (`receivables`, `payables`, `eosb`, `bai_ajel`) are
@@ -452,6 +455,9 @@ is the bilingual guide. Code: `migration/workbook_spec.py` (sheets, columns, lis
 - W11 *Fixed assets* (fixed-assets OQ-19). Accumulated depreciation ≤ cost; per Falcon cost code Σ cost = TB
   balance; per accumulated-depreciation code Σ accumulated = − TB balance; codes mapped to 1500, 1510, 1520 or 1590
   with a balance and no asset row are differences.
+  *Note 2026-10-22 (fixed-assets review of ccb9cef, item 4):* a depreciable row needs a method and a remaining
+  life (`depreciation_estimate`); `reducing_balance` rows are refused (`reducing_balance_rate`) until the sheet has
+  a rate column. The fixed-assets loader (R40) refuses the same rows (`opening_row`, en/ar).
 - W12 *Command* `migration_workbook_check --workbook f [--user u] [--entity E …] [--report out.csv]`: read-only,
   prints the report (summary per entity, problems, tie-outs), exit status 1 when it has an error.
 - W13 *Existing commands* accept `--workbook f` instead of `--tb` / `--import`: `migration_map` drafts the map from

@@ -4,8 +4,9 @@ Two invented entities shaped like a Falcon migration at the cut-over date 2026-1
 
 - ``DRYH``, a holding company that enforces Sharia: banks (SAR, USD and the purification account), customers and
   vendors with open items (one in USD, one unapplied advance, one credit note), an intercompany receivable from DRYS,
-  employees' end-of-service provisions and leave, fixed assets, two bai' ajel contracts behind 1240 / 1241 (and the
-  4610 profit of the year), VAT, equity and P&L.
+  employees' end-of-service provisions and leave, fixed assets (loaded into the fixed-asset register after
+  :func:`setup_fixed_assets`, fixed-assets R40, R41), two bai' ajel contracts behind 1240 / 1241 (and the 4610 profit
+  of the year), VAT, equity and P&L.
 - ``DRYS``, a subsidiary that does **not** enforce Sharia: a bank, one customer, the intercompany payable to DRYH and
   a conventional loan with its interest (2410, 5610: Sharia-prohibited accounts, allowed only because DRYS does not
   enforce Sharia).
@@ -256,10 +257,28 @@ def workbook_rows():
             contract(H, "BAJ-F-02", "F-002", "أجهزة وهمية مبيعة لموظف", "10000.00", "1250.00", "1500.00", 10,
                      "1150.00")],
         "fixed_assets": [
-            asset(H, "FA-F-01", "سيارة وهمية أولى", "vehicle", "150000.00", "60000.00", "1501", 60, 36),
-            asset(H, "FA-F-02", "سيارة وهمية ثانية", "vehicle", "90000.00", "31500.00", "1501", 60, 39),
+            # fixed-assets AT-32: one vehicle at cost 100,000.00, accumulated 40,000.00, residual 0, 36 months left
+            # (its first ERP month is 60,000.00 / 36 = 1,666.67); the sheet still ties to 1501 and 1591.
+            asset(H, "FA-F-01", "سيارة وهمية أولى", "vehicle", "100000.00", "40000.00", "1501", 60, 36),
+            asset(H, "FA-F-02", "سيارة وهمية ثانية", "vehicle", "140000.00", "51500.00", "1501", 60, 39),
             asset(H, "FA-F-03", "أجهزة حاسب وهمية", "it_equipment", "36000.00", "10000.00", "1502", 36, 26)],
     }
+
+
+def setup_fixed_assets(entity, user):
+    """The fixed-asset setup DRYH's register load needs (fixed-assets R31, R40), done by ``user`` (an accountant in
+    the entity): the group template's categories, and a category for IT equipment on 1500, where DRYH's Falcon 1502
+    maps (the IT account 1540 is still proposed, OQ-5). Returns the categories created."""
+    from fixed_assets import services
+    from fixed_assets.models import AssetCategory
+
+    created, _skipped = services.setup_entity(entity, user=user)
+    if not AssetCategory.objects.filter(entity=entity, code="ITF").exists():
+        services.create_category(entity, user=user, code="ITF", name_en="IT equipment (on 1500 until 1540 is approved)",
+                                 name_ar="أجهزة الحاسب (على 1500 حتى اعتماد 1540)", asset_class="it_equipment",
+                                 cost_account="1500", accum_depr_account="1590", depr_expense_account="5400")
+        created.append("ITF")
+    return created
 
 
 def open_items_by_control(book, entity_code):

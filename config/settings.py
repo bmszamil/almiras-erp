@@ -49,6 +49,7 @@ INSTALLED_APPS = [
     "migration",
     "tax",
     "payroll",
+    "fixed_assets",
     "web",
 ]
 

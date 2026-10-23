@@ -204,6 +204,8 @@ def test_dry_run_end_to_end_ties_out_to_the_halala(dry, wrong_load, monkeypatch,
         load(dry, H, "dry.acc", "employees")
     load(dry, H, "dry.hr", "employees", "leave")
     load(dry, H, "dry.pay", "eosb", "bai_ajel")
+    f.setup_fixed_assets(dry.h, dry.acc)  # fixed-assets R31, R40: categories first, then the opening register
+    assert "fixed_assets: created / أُنشئ 3" in load(dry, H, "dry.acc", "fixed_assets")
     rerun = load(dry, H, "dry.acc", "receivables", "payables")  # a re-run loads nothing twice
     assert "receivables: created / أُنشئ 0" in rerun and "payables: created / أُنشئ 0" in rerun
     items = {(i.entity.code, i.doc_type, i.legacy_number): i for i in MigratedOpenItem.objects.select_related("entity")}
@@ -249,7 +251,10 @@ def test_dry_run_end_to_end_ties_out_to_the_halala(dry, wrong_load, monkeypatch,
     assert {k: (r["ledger"], r["open_items"]) for k, r in rows.items()} == {
         ("1200", ""): (D("44250.50"), D("44250.50")), ("1210", "DRYS"): (D("12500.00"), D("12500.00")),
         ("1240", ""): (D("34500.00"), D("34500.00")), ("1241", ""): (D("-2875.00"), D("-2875.00")),
-        ("2100", ""): (D("-27000.00"), D("-27000.00")), ("2500", ""): (D("-58000.00"), D("-58000.00"))}
+        ("2100", ""): (D("-27000.00"), D("-27000.00")), ("2500", ""): (D("-58000.00"), D("-58000.00")),
+        # fixed-assets R41: the opening asset register (cost per cost account, accumulated depreciation on 1590)
+        ("1500", ""): (D("36000.00"), D("36000.00")), ("1520", ""): (D("240000.00"), D("240000.00")),
+        ("1590", ""): (D("-101500.00"), D("-101500.00"))}
 
     # 9. Post: by the approver (never the preparer), through the approval engine and ledger.services.post_entry.
     calls = []

@@ -361,6 +361,31 @@ _PERMS = [
     # approver (CFO), holding tax.maintain_rates, verifies it.
     _p("tax.propose_box_verification", "Propose VAT box definitions as checked against the ZATCA form",
        "اقتراح اعتماد تعريفات خانات الإقرار بعد مطابقتها لنموذج الهيئة"),
+    # fixed assets, slice 1 (fixed-assets.md §7, R35 to R38). Agents may read, draft assets from posted bills and
+    # prepare runs only (R35); every approval goes through the engine (R36). No fixed-asset permission is NSA (OQ-21).
+    _p("fixed_assets.view", "View the fixed-asset register", "عرض سجل الأصول الثابتة", AGENT_OK),
+    _p("fixed_assets.maintain_setup", "Maintain asset categories, locations and settings",
+       "إدارة فئات الأصول ومواقعها وإعداداتها"),
+    _p("fixed_assets.maintain_policy", "Draft and submit depreciation policies", "إعداد سياسات الاستهلاك وتقديمها"),
+    _p("fixed_assets.approve_policy", "Approve depreciation policies", "اعتماد سياسات الاستهلاك", APPROVAL),
+    _p("fixed_assets.create_asset", "Draft assets and link bill lines", "إعداد مسودات الأصول وربط بنود الفواتير",
+       AGENT_OK),
+    _p("fixed_assets.submit_asset", "Submit assets for capitalisation", "تقديم الأصول للرسملة"),
+    _p("fixed_assets.capitalise", "Capitalise assets, CWIP transfers and financed acquisitions",
+       "رسملة الأصول وتحويل المشروعات تحت التنفيذ والاقتناء الممول", APPROVAL, POSTS),
+    _p("fixed_assets.prepare_depreciation", "Prepare, submit and discard depreciation runs",
+       "إعداد مسيرات الاستهلاك وتقديمها وإلغاؤها", AGENT_OK),
+    _p("fixed_assets.run_depreciation", "Approve and post depreciation runs", "اعتماد مسيرات الاستهلاك وترحيلها",
+       APPROVAL, POSTS),
+    _p("fixed_assets.record_event", "Draft, submit and discard asset events; record fair values",
+       "إعداد أحداث الأصول وتقديمها وإلغاؤها؛ تسجيل القيم العادلة"),
+    _p("fixed_assets.impair", "Approve and post impairments and their reversals", "اعتماد هبوط القيمة وعكسه وترحيلهما",
+       APPROVAL, POSTS),
+    _p("fixed_assets.change_estimate", "Approve changes of estimate and of VAT use",
+       "اعتماد تغييرات التقديرات واستخدام الضريبة", APPROVAL),
+    _p("fixed_assets.dispose", "Approve and post write-offs", "اعتماد شطب الأصول وترحيله", APPROVAL, POSTS),
+    _p("fixed_assets.reverse_document", "Reverse depreciation runs and asset events", "عكس مسيرات الاستهلاك وأحداث الأصول",
+       POSTS),
 ]
 
 CATALOGUE = {p.codename: p for p in _PERMS}
@@ -431,7 +456,7 @@ SYSTEM_EXTRA = {
 #   Reversal grants only reverse: they never post a new entry.
 REVERSE_PERMISSIONS = frozenset({"ledger.reverse_entry", "invoicing.reverse_document",
                                  "banking.reverse_bank_transaction", "tax.reverse_document", "payroll.reverse_run",
-                                 "payroll.reverse_payment"})
+                                 "payroll.reverse_payment", "fixed_assets.reverse_document"})
 DRAFT_POST_PERMISSIONS = frozenset({"ledger.post_entry"})
 DOCUMENT_POST_PERMISSIONS = frozenset(c for c, p in CATALOGUE.items() if p.posts) - DRAFT_POST_PERMISSIONS - REVERSE_PERMISSIONS
 POST_PERMISSIONS = DRAFT_POST_PERMISSIONS | DOCUMENT_POST_PERMISSIONS

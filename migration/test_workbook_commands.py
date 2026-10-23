@@ -56,6 +56,11 @@ def test_at21_map_load_post_and_tie_out_from_the_workbook(w, wb_file, open_items
     # of service 8,000; the real loader is exercised in test_subledgers.py and test_dry_run.py)
     open_items["ALM"] = {("1200", ""): D("23000.00"), ("1210", "SUB"): D("5000.00"), ("2100", ""): D("-11500.00"),
                          ("2500", ""): D("-8000.00")}
+    with pytest.raises(CommandError):  # fixed-assets R41: 1520 / 1590 wait for the opening asset register
+        cmd("migration_post", "--entity", "ALM", "--user", "mig.p", "--kind", "opening", "--apply")
+    cmd("fixed_assets_setup", "--entity", "ALM", "--user", "mig.a")
+    assert "fixed_assets: created / أُنشئ 1" in cmd("migration_subledgers", *base, "--user", "mig.a", "--section",
+                                                    "fixed_assets", "--apply")
     cmd("migration_post", "--entity", "ALM", "--user", "mig.p", "--kind", "opening", "--apply")
     assert "ties out" in cmd("migration_tieout", *base, "--user", "mig.p", "--as-of", "2026-12-31", "--posted-only")
 

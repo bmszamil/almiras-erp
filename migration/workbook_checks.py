@@ -497,6 +497,16 @@ class _Checker:
             if r["method"] == "straight_line" and not r["useful_life_months"]:
                 self.error("useful_life", "Straight line needs the useful life.", "القسط الثابت يحتاج إلى العمر الإنتاجي.",
                            **where)
+            depreciable = r["asset_class"] and r["asset_class"] not in spec.NON_DEPRECIABLE_CLASSES
+            # fixed-assets R40 (review item 4): the legacy estimate is kept, so a depreciable row needs it complete;
+            # reducing balance waits for a rate column in the workbook.
+            if depreciable and r["method"] == "reducing_balance":
+                self.error("reducing_balance_rate", "Reducing balance needs an annual rate and the workbook has no rate "
+                           "column yet: give straight line with the remaining life.", "القسط المتناقص يحتاج إلى نسبة "
+                           "سنوية ولا يوجد في الملف عمود لها بعد: أدخل القسط الثابت مع العمر المتبقي.", **where)
+            elif depreciable and (not r["method"] or not r["remaining_life_months"]):
+                self.error("depreciation_estimate", "A depreciable asset needs its method and remaining life.",
+                           "يحتاج الأصل القابل للاستهلاك إلى طريقة الاستهلاك والعمر المتبقي.", **where)
             if r["useful_life_months"] and r["remaining_life_months"] and r["remaining_life_months"] > r["useful_life_months"]:
                 self.error("remaining_life", "The remaining life is longer than the useful life.",
                            "العمر المتبقي أطول من العمر الإنتاجي.", **where)

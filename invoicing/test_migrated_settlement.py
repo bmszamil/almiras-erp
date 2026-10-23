@@ -568,7 +568,9 @@ def test_r129_seed_v20_and_its_frozen_migration():
     from core.access import authority_defaults, catalogue
     from core.access.seed import ROLE_SEED, ROLE_SEED_V19, ROLE_SEED_V20
 
-    assert ROLE_SEED is ROLE_SEED_V20
+    # V21 (core.0038, fixed assets) only adds fixed-asset rights on top of V20
+    assert all(set(row[5]) - set(ROLE_SEED[c][5]) == set() for c, row in ROLE_SEED_V20.items())
+    assert {c for c, row in ROLE_SEED.items() if APPROVE in row[5]} == {c for c, row in ROLE_SEED_V20.items() if APPROVE in row[5]}
     assert catalogue.CATALOGUE[APPROVE].is_approval and catalogue.CATALOGUE[APPROVE].posts
     holders = {code for code, row in ROLE_SEED_V20.items() if APPROVE in row[5]}
     assert holders == {"approver", "managing_partner", "ceo"}
