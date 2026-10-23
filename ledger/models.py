@@ -685,14 +685,16 @@ class RevaluationRun(models.Model):
     """One period-end FX revaluation per entity and period (ledger-fx.md 3.6, R21 to R26, R43 to R45).
 
     ``draft`` after revalue_period, ``posted`` after post_revaluation,
-    ``discarded`` after discard_revaluation. A discarded run is kept for
-    audit and does not count toward one run per period (OQ-18 default).
+    ``discarded`` after discard_revaluation, ``reversed`` after reverse_revaluation (a posted run corrected while
+    its period is open: its entry and automatic reversal are undone by two correction entries, OQ-9 team default).
+    Discarded and reversed runs are kept for audit and do not count toward one run per period (OQ-18 default).
     """
 
     class Status(models.TextChoices):
         DRAFT = "draft", bi("Draft", "مسودة")
         POSTED = "posted", bi("Posted", "مرحّل")
         DISCARDED = "discarded", bi("Discarded", "ملغى")
+        REVERSED = "reversed", bi("Reversed", "معكوس")
 
     entity = models.ForeignKey(Entity, on_delete=models.PROTECT, related_name="revaluation_runs")
     period = models.ForeignKey(FiscalPeriod, on_delete=models.PROTECT, related_name="revaluation_runs")
@@ -718,6 +720,23 @@ class RevaluationRun(models.Model):
         verbose_name=bi("Discarded by", "ألغاه"),
     )
     discarded_at = models.DateTimeField(bi("Discarded at", "تاريخ الإلغاء"), null=True, blank=True)
+    # reverse_revaluation (OQ-9 team default): the entry undoing ``entry`` at the period end and the one undoing
+    # ``reversal`` on the first day of the next period.
+    correction_entry = models.OneToOneField(
+        JournalEntry, null=True, blank=True, on_delete=models.PROTECT, related_name="revaluation_correction_of",
+        verbose_name=bi("Correction entry", "قيد التصحيح"),
+    )
+    correction_reversal = models.OneToOneField(
+        JournalEntry, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="revaluation_correction_reversal_of",
+        verbose_name=bi("Correction of the automatic reversal", "تصحيح العكس التلقائي"),
+    )
+    reversed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+",
+        verbose_name=bi("Reversed by", "عكسه"),
+    )
+    reversed_at = models.DateTimeField(bi("Reversed at", "تاريخ العكس"), null=True, blank=True)
+    reversal_reason = models.CharField(bi("Reason for the reversal", "سبب العكس"), max_length=500, blank=True)
 
     objects = RevaluationRunQuerySet.as_manager()
 
@@ -726,10 +745,12 @@ class RevaluationRun(models.Model):
         verbose_name_plural = bi("FX revaluation runs", "تشغيلات إعادة تقييم العملات")
         constraints = [
             models.UniqueConstraint(
-                fields=["entity", "period"], condition=~models.Q(status="discarded"), name="one_revaluation_per_period"
+                fields=["entity", "period"], condition=~models.Q(status__in=["discarded", "reversed"]),
+                name="one_revaluation_per_period",
             ),
             models.CheckConstraint(
-                condition=models.Q(status__in=["draft", "posted", "discarded"]), name="revaluation_status_known"
+                condition=models.Q(status__in=["draft", "posted", "discarded", "reversed"]),
+                name="revaluation_status_known",
             ),
         ]
 
@@ -744,20 +765,29 @@ class RevaluationRun(models.Model):
         stored = None
         if self.pk is not None:
             stored = RevaluationRun.objects.filter(pk=self.pk).values_list("status", flat=True).first()
-            if stored is not None and stored != self.Status.DRAFT:
+            # A posted run changes once more, to reversed (reverse_revaluation); otherwise only drafts change.
+            if stored is not None and stored != self.Status.DRAFT and not (
+                    stored == self.Status.POSTED and allowed == (self.Status.POSTED, self.Status.REVERSED)):
                 raise LedgerError(REVALUATION_RUN_LOCK)
         before = stored or self.Status.DRAFT
-        # draft -> posted only from post_revaluation, draft -> discarded only from discard_revaluation.
+        # draft -> posted only from post_revaluation, draft -> discarded only from discard_revaluation,
+        # posted -> reversed only from reverse_revaluation.
         if before != self.status and allowed != (before, self.status):
             raise LedgerError(REVALUATION_RUN_LOCK)
         if stored is None and self.status != self.Status.DRAFT:
             raise LedgerError(REVALUATION_RUN_LOCK)
         posted = (self.posted_by_id, self.posted_at)
         discarded = (self.discarded_by_id, self.discarded_at)
+        corrected = (self.reversed_by_id, self.reversed_at, self.correction_entry_id, self.correction_reversal_id)
+        uncorrected = corrected == (None, None, None, None)
         required = {
-            self.Status.DRAFT: posted == (None, None) and discarded == (None, None),
-            self.Status.POSTED: None not in posted and discarded == (None, None) and self.reversal_id is not None,
-            self.Status.DISCARDED: None not in discarded and posted == (None, None) and self.entry_id is None,
+            self.Status.DRAFT: posted == (None, None) and discarded == (None, None) and uncorrected,
+            self.Status.POSTED: None not in posted and discarded == (None, None) and self.reversal_id is not None
+            and uncorrected,
+            self.Status.DISCARDED: None not in discarded and posted == (None, None) and self.entry_id is None
+            and uncorrected,
+            self.Status.REVERSED: None not in posted and discarded == (None, None) and self.reversal_id is not None
+            and None not in corrected,
         }
         if not required.get(self.status, False):
             raise LedgerError(
