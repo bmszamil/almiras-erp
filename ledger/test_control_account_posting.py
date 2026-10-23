@@ -474,3 +474,57 @@ def test_oq9_a_revaluation_is_reversed_only_while_its_period_is_open_and_nothing
     with pytest.raises(LedgerError, match="closed"):
         attempt()
     assert RevaluationRun.objects.get(pk=jan.pk).status == "posted"
+
+
+# --- re-review of d02fc9f: N2 to N4 ----------------------------------------------------------------------------
+
+def test_n2_reverse_revaluation_is_refused_to_agents_and_system_users(w):
+    from unittest import mock
+
+    from core.access.testing import make_agent
+
+    _eur_invoice(w)
+    _rate(date(2027, 1, 31), "4.0000")
+    run = _revalue(w)
+    grant = access.require(w.clerk, w.alm, "ledger.reverse_entry", document=run.entry)
+    for user, code in ((make_agent("fx_agent"), "agent_forbidden"), (access.system_user("fx_import"),
+                                                                       "system_forbidden")):
+        with mock.patch.object(services.access, "verify_grant", return_value=user):  # a grant of theirs, if any
+            with pytest.raises(access.AccessDenied) as exc:
+                services.reverse_revaluation(run, grant, reason="Wrong rate")
+        assert exc.value.code == code
+    from ledger.models import RevaluationRun
+
+    assert RevaluationRun.objects.get(pk=run.pk).status == "posted"
+    assert services.reverse_revaluation(run, grant, reason="Wrong rate").status == "reversed"  # a person may
+
+
+@pytest.mark.skipif(not __import__("django.db").db.connection.vendor == "postgresql",
+                    reason="PostgreSQL-only database guard")
+def test_n3_pg_trigger_requires_a_reason_and_four_distinct_entries_for_a_reversed_run(w):
+    from django.db import DatabaseError, connection, transaction
+
+    _eur_invoice(w)
+    _rate(date(2027, 1, 31), "4.0000")
+    run = _revalue(w)
+    k1, k2 = (services.create_entry(w.alm, date(2027, 1, 31), f"x{i}", [{"account": "1100", "debit": 1},
+                                                                       {"account": "3100", "credit": 1}],
+                                    user=w.clerk) for i in (1, 2))
+    sql = ("UPDATE ledger_revaluationrun SET status = 'reversed', reversed_by_id = %s, reversed_at = now(), "
+           "correction_entry_id = %s, correction_reversal_id = %s, reversal_reason = %s WHERE id = %s")
+    for k1_id, k2_id, reason in ((k1.pk, k2.pk, ""), (k1.pk, k2.pk, "   "), (k1.pk, k1.pk, "r"),
+                                 (run.entry_id, k2.pk, "r"), (k1.pk, run.reversal_id, "r")):
+        with pytest.raises(DatabaseError), transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute(sql, [w.clerk.pk, k1_id, k2_id, reason, run.pk])
+    with transaction.atomic(), connection.cursor() as cursor:  # the same write with a reason and distinct entries
+        cursor.execute(sql, [w.clerk.pk, k1.pk, k2.pk, "Wrong rate", run.pk])
+
+
+def test_n4_a_broken_reversal_chain_is_refused_with_control_account(w):
+    entry = services.create_entry(w.alm, ON, "Import", on_control(w, "1200"), user=w.clerk, source="import")
+    entry.reversal_of_id = 10 ** 9  # in memory only: a link to an entry that does not exist
+    with pytest.raises(LedgerError) as exc:
+        services.validate_entry(entry)
+    assert exc.value.code == "control_account"
+    text = " ".join(exc.value.messages)
+    assert "does not exist" in text and "غير موجود" in text

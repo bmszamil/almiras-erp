@@ -4,8 +4,9 @@ default, invoicing R97 review 2026-10-22).
 Replaces ``ledger_revaluation_run_lock`` of 0015 with the same rules plus one transition, the one
 ``reverse_revaluation`` writes:
 
-- posted -> reversed: reversed_by, reversed_at, correction_entry and correction_reversal are set; nothing but
-  status, those four columns and reversal_reason changes.
+- posted -> reversed: reversed_by, reversed_at, correction_entry and correction_reversal are set, the reason is
+  not blank, and the two correction entries differ from each other and from the run's entry and automatic
+  reversal; nothing but status, those four columns and reversal_reason changes.
 - INSERT and every other state keep the correction columns empty; reversed runs never change.
 
 On SQLite this migration does nothing; the model and queryset guards apply.
@@ -34,6 +35,10 @@ BEGIN
     IF OLD.status = 'posted' AND NEW.status = 'reversed' THEN
         IF NEW.reversed_by_id IS NULL OR NEW.reversed_at IS NULL OR NEW.correction_entry_id IS NULL
            OR NEW.correction_reversal_id IS NULL
+           OR btrim(COALESCE(NEW.reversal_reason, '')) = ''
+           OR NEW.correction_entry_id = NEW.correction_reversal_id
+           OR NEW.correction_entry_id IN (NEW.entry_id, NEW.reversal_id)
+           OR NEW.correction_reversal_id IN (NEW.entry_id, NEW.reversal_id)
            OR (to_jsonb(NEW) - ARRAY['status', 'reversed_by_id', 'reversed_at', 'correction_entry_id',
                                      'correction_reversal_id', 'reversal_reason'])
               IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['status', 'reversed_by_id', 'reversed_at', 'correction_entry_id',

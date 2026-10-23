@@ -787,7 +787,8 @@ class RevaluationRun(models.Model):
             self.Status.DISCARDED: None not in discarded and posted == (None, None) and self.entry_id is None
             and uncorrected,
             self.Status.REVERSED: None not in posted and discarded == (None, None) and self.reversal_id is not None
-            and None not in corrected,
+            and None not in corrected and bool((self.reversal_reason or "").strip())
+            and len({self.entry_id, self.reversal_id, self.correction_entry_id, self.correction_reversal_id}) == 4,
         }
         if not required.get(self.status, False):
             raise LedgerError(
