@@ -301,3 +301,176 @@ def test_r97_a_revaluation_entry_allows_only_its_revaluation_lines(w):
                                   run_by=w.clerk, entry=entry)
     assert JournalLine.objects.filter(entry=entry, account__code="1200", line_kind="normal").exists()
     assert any("Account 1200" in p for p in services.validate_entry(entry))
+
+
+# --- review of 3b4cb6e: reversal chains, predicates, import drafts, revaluation corrections ------------------------
+
+def _legacy_manual_journal(w, code="1200", on=ON):
+    """A manual journal on a control account posted before R97 existed (simulated by switching the check off)."""
+    from unittest import mock
+
+    entry = services.create_entry(w.alm, on, "Before R97", on_control(w, code), user=w.clerk, source="import")
+    with mock.patch.object(services, "_control_problems", return_value=[]):
+        return services.post_entry(entry, post_grant(w, entry))
+
+
+def _reverse(w, entry, on=None):
+    return services.reverse_entry(entry, access.require(w.clerk, w.alm, "ledger.reverse_entry", document=entry),
+                                  date=on)
+
+
+def test_review_reversal_of_a_manual_origin_entry_posts_also_at_a_new_date(w):
+    legacy = _legacy_manual_journal(w)
+    rev = _reverse(w, legacy, on=date(2027, 2, 3))
+    assert (rev.status, rev.date) == ("posted", date(2027, 2, 3))
+    assert rev.lines.get(account__code="1200").credit == D("100.00")
+
+
+def test_review_reversing_a_reversal_of_a_manual_origin_entry_is_refused(w):
+    """It would book the manual journal's 1200 line again, at any date."""
+    legacy = _legacy_manual_journal(w)
+    rev = _reverse(w, legacy)
+    with pytest.raises(LedgerError) as exc:
+        _reverse(w, rev, on=date(2027, 3, 1))
+    assert_control_refusal(exc.value, "1200")
+    text = " ".join(exc.value.messages)
+    assert "Reversing a reversal books the original lines again" in text and "عكس قيد العكس" in text
+    assert JournalEntry.objects.get(pk=rev.pk).status == "posted"
+    assert not JournalEntry.objects.filter(reversal_of=rev, status="posted").exists()
+
+
+def test_review_a_document_posting_may_be_booked_again_by_reversing_its_reversal(w):
+    entry = post_bill(w, on_control(w, "2100"))
+    bill = Bill.objects.get(pk=entry.document_id)
+
+    def reverse_doc(e):
+        return services.reverse_entry(e, access.require(w.clerk, w.alm, "invoicing.reverse_document", document=bill))
+
+    rev = reverse_doc(entry)
+    again = reverse_doc(rev)  # the declared type may book 2100; testdocs.bill has no reverse_guard
+    assert again.status == "posted" and again.lines.get(account__code="2100").credit == D("100.00")
+
+
+def test_review_the_documents_reverse_guard_still_decides_a_reversal_of_a_reversal(w):
+    allow = {"reverse": True}
+    with documents._registered_for_tests(Bill, post_permissions={"invoicing.approve_bill"},
+                                         reverse_permissions={"invoicing.reverse_document"},
+                                         validate_lines=validate_lines, control_accounts={"2100"},
+                                         reverse_guard=lambda d: allow["reverse"]):
+        entry = post_bill(w, on_control(w, "2100"))
+        bill = Bill.objects.get(pk=entry.document_id)
+        rev = services.reverse_entry(entry, access.require(w.clerk, w.alm, "invoicing.reverse_document", document=bill))
+        allow["reverse"] = False
+        with pytest.raises(access.AccessDenied) as exc:
+            services.reverse_entry(rev, access.require(w.clerk, w.alm, "invoicing.reverse_document", document=bill))
+        assert exc.value.code == "reverse_through_owner"
+
+
+@pytest.mark.parametrize("code", ["1210", "2110"])
+def test_review_a_registered_type_whose_predicate_says_no_is_refused_at_posting(w, code):
+    """End to end, as a non-intercompany bank transaction would be: the type declares 1210 / 2110 behind a predicate
+    and the predicate refuses this document."""
+    with documents._registered_for_tests(Bill, post_permissions={"invoicing.approve_bill"},
+                                         validate_lines=validate_lines,
+                                         control_accounts={"1210": lambda d: False, "2110": lambda d: False}):
+        bill = Bill.objects.create(entity=w.alm, created_by=w.clerk, amount=D("100.00"))
+        grant = access.require(w.cfo, w.alm, "invoicing.approve_bill", document=bill)
+        with pytest.raises(LedgerError) as exc:
+            services.create_entry(w.alm, ON, "Bill", on_control(w, code), user=w.clerk, post=True, grant=grant,
+                                  document=bill)
+    assert_control_refusal(exc.value, code)
+    assert "only the documents allowed on it post there" in " ".join(exc.value.messages)
+    assert not JournalEntry.objects.filter(entity=w.alm).exists()
+
+
+def test_review_an_import_draft_without_imported_entry_never_posts(w):
+    entry = services.create_entry(w.alm, ON, "Import", on_control(w, "1200"), user=w.clerk, source="import")
+    for _ in range(2):  # changed or not, it stays a draft (to be discarded)
+        with pytest.raises(LedgerError) as exc:
+            services.post_entry(entry, post_grant(w, entry))
+        assert exc.value.code == "control_account"
+        services.update_draft(entry, user=w.clerk, lines=on_control(w, "1200", "90.00"))
+    assert JournalEntry.objects.get(pk=entry.pk).status == "draft"
+
+
+# --- OQ-9 team default: a wrong revaluation of 1200 is corrected by reversing the run and running it again --------
+
+def _rate(on, value, source="manual"):
+    return ExchangeRate.objects.create(from_currency_id="EUR", to_currency_id="SAR", date=on, rate=D(value),
+                                       source=source, created_by=make_user())
+
+
+def _eur_invoice(w):
+    _rate(date(2027, 1, 15), "4.1000")
+    invoice = Bill.objects.create(entity=w.alm, created_by=w.clerk, amount=D("41000.00"))
+    return post_bill(w, [{"account": "1200", "currency": "EUR", "txn_debit": D("10000.00")},
+                         {"account": "4100", "currency": "EUR", "txn_credit": D("10000.00")}], bill=invoice,
+                     on=date(2027, 1, 15))
+
+
+def _revalue(w, period="2027-01"):
+    run = services.revalue_period(w.alm, w.alm.periods.get(name=period), user=w.clerk)
+    return services.post_revaluation(run, access.require(w.cfo, w.alm, "ledger.post_entry", document=run.entry))
+
+
+def _balance(w, code, on):
+    return sum((l.debit - l.credit for l in JournalLine.objects.filter(
+        entry__entity=w.alm, account__code=code, entry__date__lte=on, entry__status__in=["posted", "reversed"])), D("0"))
+
+
+def test_oq9_wrong_revaluation_of_1200_is_reversed_and_run_again_at_the_right_rate(w):
+    _eur_invoice(w)
+    _rate(date(2027, 1, 31), "4.0000", source="file")  # the wrong closing rate
+    wrong = _revalue(w)
+    assert _balance(w, "1200", date(2027, 1, 31)) == D("40000.00")
+    _rate(date(2027, 1, 31), "4.0800")  # the right one, entered as a new row (R11); manual wins on the date
+    with pytest.raises(LedgerError) as exc:  # the period is revalued: a second run waits for the correction
+        services.revalue_period(w.alm, w.alm.periods.get(name="2027-01"), user=w.clerk)
+    assert exc.value.code == "already_revalued"
+    with pytest.raises(LedgerError) as exc:  # not by reversing its entries one by one
+        _reverse(w, JournalEntry.objects.get(pk=wrong.reversal_id))
+    assert exc.value.code == "use_reverse_revaluation"
+
+    grant = access.require(w.clerk, w.alm, "ledger.reverse_entry", document=wrong.entry)
+    reversed_run = services.reverse_revaluation(wrong, grant, reason="Wrong closing rate / سعر إقفال خاطئ")
+    assert (reversed_run.status, reversed_run.reversed_by) == ("reversed", w.clerk)
+    k1, k2 = (JournalEntry.objects.get(pk=pk) for pk in (reversed_run.correction_entry_id,
+                                                         reversed_run.correction_reversal_id))
+    assert (k1.date, k1.status, k2.date, k2.status) == (date(2027, 1, 31), "posted", date(2027, 2, 1), "posted")
+    assert k1.lines.get(account__code="1200").line_kind == "revaluation"
+    assert _balance(w, "1200", date(2027, 1, 31)) == D("41000.00") == _balance(w, "1200", date(2027, 2, 28))
+
+    right = _revalue(w)
+    assert right.status == "posted"
+    assert _balance(w, "1200", date(2027, 1, 31)) == D("40800.00")
+    assert _balance(w, "5760", date(2027, 1, 31)) == D("200.00")
+    assert _balance(w, "1200", date(2027, 2, 28)) == D("41000.00")  # every revaluation is undone the next day
+    with pytest.raises(LedgerError) as exc:  # a reversed run is reversed once
+        services.reverse_revaluation(reversed_run, access.require(w.clerk, w.alm, "ledger.reverse_entry",
+                                                                  document=wrong.entry), reason="again")
+    assert exc.value.code == "run_not_posted"
+
+
+def test_oq9_a_revaluation_is_reversed_only_while_its_period_is_open_and_nothing_later_ran(w):
+    from ledger.models import FiscalPeriod, RevaluationRun
+
+    _eur_invoice(w)
+    _rate(date(2027, 1, 31), "4.0000")
+    jan = _revalue(w)
+    _rate(date(2027, 2, 28), "4.0500")
+    _revalue(w, "2027-02")
+
+    def attempt(reason="Wrong rate"):
+        grant = access.require(w.clerk, w.alm, "ledger.reverse_entry", document=jan.entry)
+        return services.reverse_revaluation(RevaluationRun.objects.get(pk=jan.pk), grant, reason=reason)
+
+    with pytest.raises(LedgerError) as exc:
+        attempt()
+    assert exc.value.code == "later_revaluation"
+    with pytest.raises(LedgerError) as exc:
+        attempt(reason=" ")
+    assert exc.value.code == "reason_required"
+    services.close_period(FiscalPeriod.objects.get(entity=w.alm, name="2027-01"), user=w.cfo)
+    with pytest.raises(LedgerError, match="closed"):
+        attempt()
+    assert RevaluationRun.objects.get(pk=jan.pk).status == "posted"

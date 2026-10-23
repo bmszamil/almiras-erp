@@ -178,17 +178,30 @@ def _control_codes(lines):
     return sorted({line.account.code for line in lines} & control_accounts.SUBLEDGER_CONTROL_CODES)
 
 
-def _control_account_refusal(account):
+def _control_account_refusal(account, *, rebooks=False):
     """The bilingual refusal of a line on sub-ledger control account ``account`` (an Account) that the entry may not
-    post (R97)."""
-    return _bi(
-        f"Account {account.code} ({account.name_en}) is a control account: only the documents that keep its "
-        "sub-ledger (invoicing, and banking intercompany transfers on 1210 / 2110) and the migration opening entry "
-        "post to it, never a manual journal (policy A).",
-        f"الحساب {account.code} ({account.name_ar}) حساب مراقبة: لا يُرحَّل إليه إلا من مستندات سجله الفرعي "
-        "(الفوترة، والتحويلات بين شركات المجموعة في البنوك على 1210 / 2110) والقيد الافتتاحي للترحيل، "
-        "ولا يُرحَّل إليه بقيد يدوي (السياسة أ).",
-    )
+    post (R97). ``rebooks``: the entry reverses a reversal, i.e. books its root entry's lines again."""
+    en = (f"Account {account.code} ({account.name_en}) is a control account: only the documents allowed on it post "
+          "there (and the migration opening entry), never a manual journal (policy A).")
+    ar = (f"الحساب {account.code} ({account.name_ar}) حساب مراقبة: لا يُرحَّل إليه إلا من المستندات المسموح لها "
+          "بذلك (والقيد الافتتاحي للترحيل)، ولا يُرحَّل إليه بقيد يدوي (السياسة أ).")
+    if rebooks:
+        en += (" Reversing a reversal books the original lines again, which only a document allowed on the account "
+               "may do; to restore a migration opening entry, run the migration load again.")
+        ar += (" عكس قيد العكس يعيد ترحيل البنود الأصلية، ولا يجوز ذلك إلا لمستند مسموح له بالحساب؛ ولإعادة القيد "
+               "الافتتاحي للترحيل أعد تشغيل تحميل الترحيل.")
+    return _bi(en, ar)
+
+
+def _reversal_chain(entry):
+    """(depth, root) of ``entry`` in its reversal chain: depth 0 for an entry that reverses nothing, 1 for a reversal,
+    2 for the reversal of a reversal, and so on; root is the first entry of the chain."""
+    depth, current, seen = 0, entry, set()
+    while current.reversal_of_id is not None and current.pk not in seen:
+        seen.add(current.pk)
+        current = JournalEntry.objects.get(pk=current.reversal_of_id)
+        depth += 1
+    return depth, current
 
 
 def _is_migration_opening(entry):
@@ -203,8 +216,12 @@ def _is_migration_opening(entry):
 def _control_problems(entry, lines):
     """R97: a line on a sub-ledger control account posts only when
 
-    - the entry reverses a posted entry (it only undoes what was booked; ``_reversal_problems`` proves it mirrors
-      its original line by line, rule 1),
+    - the entry reverses a posted entry that is not itself a reversal (it only undoes what was booked;
+      ``_reversal_problems`` proves it mirrors its original line by line, rule 1). Deeper in a chain, an entry at an
+      odd depth also only undoes the root's lines; one at an even depth (the reversal of a reversal) books the
+      root's lines again and is judged as the root: allowed only when the root is a declared document posting (the
+      document's ``reverse_guard`` applies in ``reverse_entry``), refused for the migration opening entry, a
+      revaluation and any manual-origin entry (review of 3b4cb6e, item 1),
     - it is a revaluation run's entry and the line is a revaluation line (ledger-fx R21, policy C),
     - it is a registered document's entry whose type declared the account (``ledger.documents``, ``control_accounts``)
       and whose predicate accepts the stored document, or
@@ -213,16 +230,25 @@ def _control_problems(entry, lines):
     Everything else, manual journals, replayed migration journals and imports not linked to an opening
     ``ImportedEntry`` included, is refused (``control_account``, en/ar)."""
     codes = _control_codes(lines)
-    if not codes or entry.reversal_of_id is not None:
+    if not codes:
         return []
+    rebooks = False
+    if entry.reversal_of_id is not None:
+        depth, root = _reversal_chain(entry)
+        if depth % 2 == 1:
+            return []
+        rebooks = True
     refused = set(codes)
-    if entry.document_type:
-        doc_type = documents.get(entry.document_type)
+    judged = root if rebooks else entry
+    if judged.document_type:
+        doc_type = documents.get(judged.document_type)
         document = None
-        if doc_type is not None and entry.document_id is not None:
-            document = doc_type.model._default_manager.filter(pk=entry.document_id).first()
+        if doc_type is not None and judged.document_id is not None:
+            document = doc_type.model._default_manager.filter(pk=judged.document_id).first()
         if document is not None:
             refused = {code for code in codes if not doc_type.may_post_control(code, document)}
+    elif rebooks:
+        pass  # the opening entry, a revaluation or a manual journal booked again: refused
     elif entry.pk is not None and _is_revaluation_entry(entry):
         refused = {l.account.code for l in lines if l.account.code in refused and l.line_kind != Kind_.REVALUATION}
     elif _is_migration_opening(entry):
@@ -231,7 +257,7 @@ def _control_problems(entry, lines):
     for line in lines:
         if line.account.code in refused:
             accounts.setdefault(line.account.code, line.account)
-    return [_control_account_refusal(accounts[code]) for code in sorted(accounts)]
+    return [_control_account_refusal(accounts[code], rebooks=rebooks) for code in sorted(accounts)]
 
 
 def _refuse_control_draft(entity, lines, source):
@@ -341,9 +367,11 @@ def _reversal_problems(entry, lines):
 
 
 def _is_revaluation_entry(entry):
-    """R10: entries created by revalue_period, or the automatic reversal of one."""
+    """R10: entries created by revalue_period, the automatic reversal of one, or the two correction entries of
+    reverse_revaluation."""
     ids = [entry.pk] + ([entry.reversal_of_id] if entry.reversal_of_id else [])
-    return RevaluationRun.objects.filter(entry_id__in=ids).exists()
+    return RevaluationRun.objects.filter(
+        Q(entry_id__in=ids) | Q(correction_entry_id=entry.pk) | Q(correction_reversal_id=entry.pk)).exists()
 
 
 def _currency_problems(entry, lines):
@@ -884,6 +912,10 @@ def reverse_entry(entry, grant=None, date=None, reason=""):
     entry = JournalEntry.objects.select_related("entity").get(pk=entry.pk)
     if not isinstance(grant, access.Grant):
         _deny_grant(grant, entry.entity, "grant_missing")
+    if _is_revaluation_entry(entry):  # its run would no longer match the ledger (OQ-9 team default)
+        raise error("A revaluation is corrected with reverse_revaluation, which reverses the whole run.",
+                    "تُصحَّح إعادة التقييم من خلال عكس إعادة التقييم، الذي يعكس التشغيل كله.",
+                    code="use_reverse_revaluation")
     if grant.permission == "ledger.reverse_entry":
         if entry.document_type and documents.get(entry.document_type) is not None:
             # Review item 5: a registered document's entry is reversed only through its own module and
@@ -2195,7 +2227,8 @@ def _revalue(entity, period, user):
     period = FiscalPeriod.objects.select_for_update().get(pk=period.pk)
     if period.entity_id != entity.pk:
         raise error("The period belongs to another entity.", "الفترة تخص كيانًا آخر.")
-    if RevaluationRun.objects.filter(entity=entity, period=period).exclude(status=RevaluationRun.Status.DISCARDED).exists():
+    if RevaluationRun.objects.filter(entity=entity, period=period).exclude(
+            status__in=[RevaluationRun.Status.DISCARDED, RevaluationRun.Status.REVERSED]).exists():
         raise error(
             f"{entity.code} {period.name} is already revalued.", f"تمت إعادة تقييم {period.name} للكيان {entity.code} مسبقًا.",
             code="already_revalued",
@@ -2369,6 +2402,79 @@ def discard_revaluation(run, *, user):
     if entry is not None:
         entry.delete()
     return run
+
+
+def reverse_revaluation(run, grant, *, reason):
+    """Reverse a posted revaluation run so its period can be revalued again (ledger-fx OQ-9 team default, invoicing
+    R97 review 2026-10-22: a wrong revaluation of a control account is not corrected by a manual journal).
+
+    ``grant`` is ``require(user, entity, "ledger.reverse_entry", document=run.entry)``. The run's period and the
+    next one must be open, and no later run of the entity may be draft or posted (it was computed on these
+    balances). Two correction entries undo the run: one dated the period end mirroring the revaluation entry, one
+    dated the first day of the next period mirroring its automatic reversal. The run becomes ``reversed`` (kept for
+    audit, with who, when and why) and no longer counts toward one run per period, so ``revalue_period`` can run
+    again at the right rate and ``post_revaluation`` posts it.
+    """
+    run = RevaluationRun.objects.select_related("entity", "period", "entry").get(pk=run.pk)
+    if getattr(grant, "permission", None) != "ledger.reverse_entry":
+        access.deny(getattr(grant, "user", None), run.entity, getattr(grant, "permission", ""),
+                    "grant_wrong_permission")
+    if run.status != RevaluationRun.Status.POSTED:
+        raise error(f"This revaluation is {run.status}; only a posted run is reversed.",
+                    f"حالة إعادة التقييم هذه {run.get_status_display()}؛ يُعكس التشغيل المرحّل فقط.", code="run_not_posted")
+    if not (reason or "").strip():
+        raise error("A reason is required.", "السبب مطلوب.", code="reason_required")
+    user = access.verify_grant(grant, run.entity, {"ledger.reverse_entry"}, document=run.entry, use=False)
+    with transaction.atomic():
+        access.use_grant(grant, target=run.entry)
+        return _reverse_revaluation(run, user, reason.strip()[:500])
+
+
+def _mirror_lines(source, target):
+    for line in JournalLine.objects.filter(entry=source).order_by("pk"):
+        copy = JournalLine(
+            entry=target, account_id=line.account_id, description=line.description, debit=line.credit,
+            credit=line.debit, counterparty_entity_id=line.counterparty_entity_id, currency_id=line.currency_id,
+            txn_amount=line.txn_amount, fx_rate=line.fx_rate, rate_source=line.rate_source,
+            exchange_rate_id=line.exchange_rate_id, line_kind=line.line_kind,
+        )
+        copy._service_write = True
+        copy.save()
+
+
+@transaction.atomic
+def _reverse_revaluation(run, user, reason):
+    run = RevaluationRun.objects.select_for_update(of=("self",)).select_related("entity", "period").get(pk=run.pk)
+    if run.status != RevaluationRun.Status.POSTED:
+        raise error("This revaluation is no longer posted.", "إعادة التقييم هذه لم تعد مرحّلة.", code="run_not_posted")
+    entity, period = run.entity, run.period
+    next_start = period.end_date + timedelta(days=1)
+    list(FiscalPeriod.objects.select_for_update(of=("self",)).filter(
+        entity=entity, start_date__lte=next_start).order_by("start_date"))
+    _find_open_period(entity, period.end_date, lock=True)
+    _find_open_period(entity, next_start, lock=True)
+    later = RevaluationRun.objects.filter(
+        entity=entity, period__start_date__gt=period.end_date,
+        status__in=[RevaluationRun.Status.DRAFT, RevaluationRun.Status.POSTED])
+    if later.exists():
+        raise error("A later revaluation was run on these balances; discard or reverse it first.",
+                    "أُجريت إعادة تقييم لاحقة على هذه الأرصدة؛ ألغها أو اعكسها أولًا.", code="later_revaluation")
+    label = f"Correction of FX revaluation {period.name} / تصحيح إعادة تقييم العملات {period.name}"
+    corrections = []
+    for source, on in ((run.entry_id, period.end_date), (run.reversal_id, next_start)):
+        entry = JournalEntry.objects.create(entity=entity, date=on, created_by=user,
+                                            reference=f"FXREV-{period.name}-X", description=f"{label}: {reason}"[:500])
+        _mirror_lines(source, entry)
+        corrections.append(entry)
+    run.correction_entry, run.correction_reversal = corrections
+    run.status = RevaluationRun.Status.REVERSED
+    run.reversed_by, run.reversed_at, run.reversal_reason = user, timezone.now(), reason
+    run._allow_transition(RevaluationRun.Status.POSTED, RevaluationRun.Status.REVERSED)
+    run.save(update_fields=["correction_entry", "correction_reversal", "status", "reversed_by", "reversed_at",
+                            "reversal_reason"])
+    for entry in corrections:  # linked to the run first, so they are recognised as revaluation entries
+        _post(entry, user)
+    return RevaluationRun.objects.select_related("correction_entry", "correction_reversal").get(pk=run.pk)
 
 
 # --- translation and functional currency (R4, R5, R30, R31) ------------------------

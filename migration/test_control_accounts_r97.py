@@ -88,3 +88,21 @@ def test_r97_an_opening_record_of_another_entity_does_not_open_the_exception(w, 
                                  journal_entry=entry, account_map=sub_map,
                                  lines_hash=services._entry_lines_hash(entry), created_by=w.s)
     assert any("Account 1200" in p for p in ledger.validate_entry(entry))
+
+
+def test_review_reversing_the_reversal_of_the_opening_entry_is_refused(w, open_items):
+    """Review of 3b4cb6e, item 1 (reviewer probe): O -> R1 -> R2 would book the opening entry's control lines again
+    without the R22 tie-out. To restore an opening entry, the migration load is run again."""
+    entry = _opening_with_1210(w)
+    open_items["ALM"] = {("1200", ""): D("20000.00"), ("1210", "SUB"): D("20000.00"), ("2100", ""): D("-15000.00")}
+    entry = ledger.post_entry(entry, access.require(w.p, w.alm, "ledger.post_entry", document=entry))
+    rev = ledger.reverse_entry(entry, access.require(w.a2, w.alm, "ledger.reverse_entry", document=entry))
+    open_items["ALM"] = {}  # the sub-ledger is empty now: a tie-out would refuse
+    with pytest.raises(LedgerError) as exc:
+        ledger.reverse_entry(rev, access.require(w.a2, w.alm, "ledger.reverse_entry", document=rev))
+    assert exc.value.code == "control_account"
+    text = " ".join(exc.value.messages)
+    assert "run the migration load again" in text and "أعد تشغيل تحميل الترحيل" in text
+    assert "Account 1210" in text and "Account 1200" in text and "Account 2100" in text
+    assert JournalEntry.objects.get(pk=rev.pk).status == "posted"
+    assert not JournalEntry.objects.filter(reversal_of=rev).exists()  # the refused reversal rolled back
