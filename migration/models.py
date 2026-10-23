@@ -159,13 +159,22 @@ class ImportedEntry(models.Model):
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+",
                                    verbose_name=bi("Imported by", "استوردها"))
     created_at = models.DateTimeField(bi("Imported at", "تاريخ الاستيراد"), default=timezone.now)
+    # R14 (team default 2026-10-23): an opening import whose entry was reversed is superseded when the opening
+    # balances are loaded again; it is kept (keep everything) and no longer counts as the entity's opening import.
+    superseded_at = models.DateTimeField(bi("Superseded at", "تاريخ الاستبدال"), null=True, blank=True)
 
     class Meta:
         verbose_name = bi("Imported legacy entry", "قيد مستورد من النظام السابق")
         verbose_name_plural = bi("Imported legacy entries", "قيود مستوردة من النظام السابق")
         ordering = ["entity", "kind", "legacy_key"]
-        constraints = [models.UniqueConstraint(fields=["entity", "source_system", "kind", "legacy_key"],
-                                               name="import_once_per_legacy_key")]
+        constraints = [
+            models.UniqueConstraint(fields=["entity", "source_system", "kind", "legacy_key"],
+                                    name="import_once_per_legacy_key"),
+            # one live opening import per entity and source system (R14); superseded ones are kept beside it
+            models.UniqueConstraint(fields=["entity", "source_system"],
+                                    condition=models.Q(kind="opening", superseded_at__isnull=True),
+                                    name="one_live_opening_import"),
+        ]
 
     def __str__(self):
         return f"{self.entity.code} {self.source_system} {self.kind} {self.legacy_key}"

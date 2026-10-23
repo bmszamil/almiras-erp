@@ -890,28 +890,37 @@ def load_opening_balances(entity, trial_balance, *, user, cutover, basis="closin
         report.problems.append(error("nothing_to_load", "The trial balance has no balances to load.",
                                      "لا توجد أرصدة لتحميلها في ميزان المراجعة."))
         return plan
-    existing = ImportedEntry.objects.filter(entity=entity, source_system=source_system, kind=ImportedEntry.Kind.OPENING,
-                                            legacy_key=OPENING_KEY).select_related("journal_entry").first()
-    if existing is not None:  # idempotent: the same balances are skipped, other balances refused
-        if existing.lines_hash == _lines_hash(specs):
-            plan.skipped.append(OPENING_KEY)
-            return plan
-        report.problems.append(error("already_imported", f"Other opening balances were already imported "
-                                     f"({existing.journal_entry.status}); discard the draft or reverse the entry first.",
-                                     "تم استيراد أرصدة افتتاحية أخرى سابقًا؛ احذف المسودة أو اعكس القيد أولًا."))
-        return plan
-    plan.entries.append({"legacy_key": OPENING_KEY, "date": cutover, "lines": len(specs),
-                         "debit": sum((s.get("debit", ZERO) for s in specs), ZERO)})
-    if not apply:
-        return plan
-    name_en, name_ar = _names(source_system)
     with transaction.atomic():
+        # R14: the entity's opening imports, locked so two loads never both create one; the live one decides.
+        openings = list(ImportedEntry.objects.select_for_update(of=("self",)).filter(
+            entity=entity, source_system=source_system, kind=ImportedEntry.Kind.OPENING).select_related(
+            "journal_entry").order_by("pk"))
+        live = next((imp for imp in openings if imp.superseded_at is None), None)
+        reloading = live is not None and live.journal_entry.status == JournalEntry.Status.REVERSED
+        if live is not None and not reloading:  # idempotent: the same balances are skipped, other balances refused
+            if live.lines_hash == _lines_hash(specs):
+                plan.skipped.append(live.legacy_key)
+                return plan
+            report.problems.append(error("already_imported", f"Other opening balances were already imported "
+                                         f"({live.journal_entry.status}); discard the draft or reverse the entry first.",
+                                         "تم استيراد أرصدة افتتاحية أخرى سابقًا؛ احذف المسودة أو اعكس القيد أولًا."))
+            return plan
+        # Team default 2026-10-23: an opening entry that was reversed is superseded by a new load, under a new key.
+        key = OPENING_KEY if not openings else f"{OPENING_KEY}-{len(openings) + 1}"
+        plan.entries.append({"legacy_key": key, "date": cutover, "lines": len(specs),
+                             "debit": sum((s.get("debit", ZERO) for s in specs), ZERO),
+                             "supersedes": live.legacy_key if reloading else None})
+        if not apply:
+            return plan
+        if reloading:  # kept for audit; it no longer counts as the opening import (constraint one_live_opening_import)
+            ImportedEntry.objects.filter(pk=live.pk).update(superseded_at=timezone.now())
+        name_en, name_ar = _names(source_system)
         entry = ledger.create_entry(
             entity, cutover, f"Opening balances from {name_en} at {cutover} / الأرصدة الافتتاحية من {name_ar} في {cutover}",
-            specs, user=user, reference=f"{_prefix(source_system)}-OPENING", source=JournalEntry.Source.IMPORT,
+            specs, user=user, reference=f"{_prefix(source_system)}-{key.upper()}", source=JournalEntry.Source.IMPORT,
         )
         plan.created.append(ImportedEntry.objects.create(
-            entity=entity, source_system=source_system, kind=ImportedEntry.Kind.OPENING, legacy_key=OPENING_KEY,
+            entity=entity, source_system=source_system, kind=ImportedEntry.Kind.OPENING, legacy_key=key,
             journal_entry=entry, account_map=amap, file_sha256=trial_balance.sha256, lines_hash=_entry_lines_hash(entry),
             created_by=user,
         ))

@@ -13,6 +13,7 @@ from core.access.testing import make_user, member
 from ledger import documents
 from ledger import services as ledger
 from ledger.models import FiscalPeriod, JournalEntry, JournalLine, LedgerError
+from testdocs.posting import post_document
 
 JAN1, JAN31 = date(2027, 1, 1), date(2027, 1, 31)
 
@@ -195,10 +196,11 @@ def test_at18_foreign_currency_charges_transfers_and_decimals(w, accounts):
 def test_at19_intercompany_settlement_books_realised_fx(w, accounts):
     rate(w, "USD", date(2027, 1, 15), "3.7500")
     rate(w, "USD", date(2027, 1, 20), "3.7600")
-    owed = journal(w, w.alm, date(2027, 1, 15), [
+    # 2110 is a control account (invoicing R97): the open item comes from a sub-ledger bill, not a manual journal
+    owed = post_document(w.alm, date(2027, 1, 15), [
         {"account": "5300", "currency": "USD", "txn_debit": D("10000.00")},
         {"account": "2110", "currency": "USD", "txn_credit": D("10000.00"), "counterparty": w.sub},
-    ])
+    ], user=w.a, approver=w.p)
     item = owed.lines.get(account__code="2110")
     assert item.credit == D("37500.00")
     txn = post(w, services.create_bank_transaction(

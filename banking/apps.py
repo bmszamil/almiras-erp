@@ -24,6 +24,9 @@ class BankingConfig(AppConfig):
             reverse_permissions={"banking.reverse_bank_transaction"},
             build_lines=services._bank_transaction_lines, validate_lines=services._check_bank_transaction_lines,
             pending_documents=services._submitted_bank_transactions,
+            # R32 note B11(b), invoicing R97: until OQ-27 / OQ-66 are answered, an intercompany transfer is the only
+            # bank transaction (and the only non-invoicing document) allowed on the control accounts 1210 / 2110.
+            control_accounts={code: services._intercompany_control_allowed for code in ("1210", "2110")},
         )
         # invoicing D31b review fix 1: the bank transactions that may touch the purification account's GL 1140
         restricted.allow(services.PURIFICATION_GL, document_type="banking.banktransaction",

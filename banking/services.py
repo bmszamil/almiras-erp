@@ -2006,6 +2006,11 @@ def _pinned(document, specs):
             for s in specs]
 
 
+def _intercompany_control_allowed(document):
+    """invoicing R97 allow-list (R32 note B11(b)): only an intercompany transfer posts to 1210 / 2110."""
+    return document.kind == BankTransaction.Kind.INTERCOMPANY_TRANSFER
+
+
 def _bank_transaction_lines(document):
     """Registered ``build_lines`` (§5 B1 to B8): the document's lines from its stored data only."""
     _require_posting_context(document)
