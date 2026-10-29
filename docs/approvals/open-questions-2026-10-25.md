@@ -112,11 +112,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
   2. Confirm that each advance needs its own prepayment tax invoice (within 15 days after the end of the month in which the money arrived) and that later invoices show the deduction.
   3. When a tenant forfeits a refundable deposit: (a) 15% VAT on the forfeited amount for commercial leases and exempt for residential leases (the suggestion in the decision pack), or (b) another treatment?
 - **What the system does now:** Contracts with an advance deducted from invoices are refused at approval. Deposits are recorded and applied to rent. Forfeiture is not built.
-- **Reference (for the team):** billing OQ-20 (partly resolved by D13(g), (i)); invoicing OQ-16 (deposit forfeiture); zatca OQ-29 / OQ-33 (prepayment invoice type 386); billing R30, R31, R68(b), AT-16, AT-47; invoicing R106.
-
----
-
-## Priority: Blocks go-live (Billing / tax / banking)
+- **Reference (for the team):** billing OQ-20 (partly resolved by D13(g), (i)); invoicing OQ-16 (deposit forfeiture); zatca OQ-29 / OQ-33 (prepayment invoice type 386); billing R30, R31, R68(b), AT-16, AT-47; invoicing R106. (Billing / tax / banking)
 - **Your answer:** 
 
 ### Q2. Bank statement files from each of the five banks
@@ -147,11 +143,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** The owner decided that each company has its own authority matrix: who may approve what, up to which amount. Fixed assets have seven approvable activities: capitalisation, policy, depreciation run, disposal or write-off, impairment, change of estimate, reversal. Consolidation has structure changes plus preparing, reviewing and approving a group consolidation (three different people).
 - **Question:** 1. For each company and activity: who approves, and in which amount bands (for example, write-offs above SAR 50,000 to the top authority)? 2. Should write-offs or depreciation-policy approvals be "never self-approved", even by the top authority? 3. For group consolidation in Almiras: who records ownership changes, who prepares, who reviews and who approves?
 - **What the system does now:** Where a company has no rows, the code default applies: CFO, CEO, and the Managing Partner in the group parent. No activity is marked "never self-approved". Consolidation proposes accountant prepares, CFO reviews, Managing Partner approves.
-- **Reference (for the team):** fixed-assets OQ-21; consolidation OQ-10 (principle answered by owner A2, A10: each company has its own authority matrix; everything goes through one approval engine); fixed-assets R37, §7; consolidation R4, R10, R11, §7; access R70, R71, R76.
-
----
-
-## Needed before a specific event (ZATCA / fixed assets / reporting)
+- **Reference (for the team):** fixed-assets OQ-21; consolidation OQ-10 (principle answered by owner A2, A10: each company has its own authority matrix; everything goes through one approval engine); fixed-assets R37, §7; consolidation R4, R10, R11, §7; access R70, R71, R76. (ZATCA / fixed assets / reporting)
 - **Your answer:** 
 
 ### Q5. Income tax on the share of foreign shareholders
@@ -161,11 +153,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Question:** 1. Which group companies have, or may have, foreign shareholders, and what percentage?
   2. Please confirm: rate 20%; one combined Zakat and income tax return; whether advance tax payments, tax losses carried forward and deferred tax must be handled.
 - **What the system does now:** Not built. Default design: rate 20%, combined return, no advance payments, losses or deferred tax.
-- **Reference (for the team):** tax-returns OQ-26, OQ-2 (income tax part); tax R50, R51 **[CC-verify]**; tax-returns R50, R51, T9, AT-42.
-
----
-
-## Priority: Needed before go-live (default in use) (Billing / tax / banking)
+- **Reference (for the team):** tax-returns OQ-26, OQ-2 (income tax part); tax R50, R51 **[CC-verify]**; tax-returns R50, R51, T9, AT-42. (Billing / tax / banking)
 - **Your answer:** 
 
 ### Q6. Locking Django admin to superusers (needs a membership screen first)
@@ -174,11 +162,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** The plan is that the technical "admin" pages are for superusers only. But today the only place where the MP and access admins grant and remove people's access is that admin page. Locking it before a proper access screen exists would leave nobody able to grant access.
 - **Question:** Confirm the default: build the access-management screen (grants, revocations, delegations, MFA reset) in the first release, and lock the admin pages to superusers only when that screen ships. Or (b) go live with staff access admins still using the admin pages (protected by MFA)?
 - **What the system does now:** Admin pages need an MFA-verified session; the superuser-only lock exists but is switched off.
-- **Reference (for the team):** web OQ-10; web W-D7, R19, J13, OQ-10; slice 2 "Admin".
-
----
-
-## Needed before a specific event (named in each entry) (Access / web / ledger / migration)
+- **Reference (for the team):** web OQ-10; web W-D7, R19, J13, OQ-10; slice 2 "Admin". (Access / web / ledger / migration)
 - **Your answer:** 
 
 ### Q7. Second approver for authority-matrix changes; naming the board representatives
@@ -296,11 +280,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** Prices in these currencies end in 0 (owner A8). A part-month, a VAT amount or a correction can still produce a non-zero third decimal, which ZATCA's format may not accept. Such invoices are held.
 - **Question:** For computed amounts with a non-zero third decimal: (a) hold the invoice until ZATCA confirms 3-decimal invoices (default), or (b) round to 2 decimals (ending in 0)?
 - **What the system does now:** (a): the period is held with a bilingual reason; a person releases it later.
-- **Reference (for the team):** billing OQ-35 (prices answered by D13(f): prices end in 0); billing R37, R54, R72, AT-45.
-
----
-
-## Priority: Low (default is safe) (Billing / tax / banking)
+- **Reference (for the team):** billing OQ-35 (prices answered by D13(f): prices end in 0); billing R37, R54, R72, AT-45. (Billing / tax / banking)
 - **Your answer:** 
 
 ### Q18. Remuneration staff: proof of working abroad, time in Saudi Arabia, terms
@@ -331,11 +311,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** The loader expects one export file per company.
 - **Question:** Confirm one Falcon company per file, and give the list Falcon company name → ERP company.
 - **What the system does now:** One company per file.
-- **Reference (for the team):** migration OQ-9; migration OQ-9, §10.
-
----
-
-## Low (default is safe) (Access / web / ledger / migration)
+- **Reference (for the team):** migration OQ-9; migration OQ-9, §10. (Access / web / ledger / migration)
 - **Your answer:** 
 
 ### Q21. Which companies may sell assets to employees by bai' ajel
@@ -391,11 +367,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** Until the tax adviser confirms the box definitions and rates, the return shows "unverified" next to them (see "Official VAT return form" above).
 - **Question:** May a return be approved while that mark is shown? (a) Yes, with the mark (default); (b) no, block approval until verified.
 - **What the system does now:** Allowed, with "unverified / غير متحقق منه" printed.
-- **Reference (for the team):** tax-returns OQ-6; tax-returns R6, AT-6.
-
----
-
-## Priority: Needed before another specific event (Billing / tax / banking)
+- **Reference (for the team):** tax-returns OQ-6; tax-returns R6, AT-6. (Billing / tax / banking)
 - **Your answer:** 
 
 ### Q27. Bai' ajel profit: recognised as instalments are paid, or evenly over time
@@ -497,11 +469,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** See "Answered elsewhere" below. The CFO already approved 2310 as a control account in the decision pack, so no new question is needed. The account is not in the chart yet; when it is added it will carry the flag.
 - **Question:** None, unless the CFO wants to change the approved policy.
 - **What the system does now:** 2310 is not in the chart. When it is added it will carry the control flag, so only invoicing documents (including the monthly deferred-income release) and the migration opening entry can post there.
-- **Reference (for the team):** invoicing OQ-81; invoicing R97, R99.
-
----
-
-## Low (default is safe) (Invoicing)
+- **Reference (for the team):** invoicing OQ-81; invoicing R97, R99. (Invoicing)
 - **Your answer:** 
 
 ### Q37. Depreciation in the month an asset starts or leaves
@@ -618,11 +586,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** When the group gains control of a company, loses control, or an associate becomes a subsidiary, the accounts need a purchase price allocation, goodwill (proposed account 1610), a measure of the minority shareholders' share (non-controlling interest, NCI), and a gain or loss on disposal. Today only a change in a stake without a change of control (for example 80% to 90%), effective on the first day of a month, is handled.
 - **Question:** 1. How is the purchase price allocated and goodwill measured? Who provides the fair values? 2. NCI: measured (a) at its share of net assets or (b) at fair value? Option (b) exists only under full IFRS. 3. A bargain purchase (price below fair value): how is it treated? 4. Is a company included from the exact date of the deal, or from the next month start? 5. On loss of control: how are the disposal gain or loss and the release of the translation reserve worked out?
 - **What the system does now:** A consolidation run that contains such an event is refused, with a message citing OQ-5.
-- **Reference (for the team):** consolidation OQ-5; consolidation R20, R24, R27, AT-19.
-
----
-
-## Blocks go-live (ZATCA / fixed assets / reporting)
+- **Reference (for the team):** consolidation OQ-5; consolidation R20, R24, R27, AT-19. (ZATCA / fixed assets / reporting)
 - **Your answer:** 
 
 ### Q49. Group consolidation: translating companies that keep their books in another currency (e.g. Egypt)
@@ -642,11 +606,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** In the approval inbox an approver can approve, or send a document back with a reason. For ten types (supplier bills, supplier payments, receipts, assignments, terminations, statutory parameters, bank accounts, bank transactions, bank reconciliations and manual journals) there is no "send back" yet, so the approver can only approve.
 - **Question:** 1. May the approver send these ten types back? 2. Back to which state: (a) draft, editable by the preparer (team proposal), or (b) another state? 3. Must the reason always be stored in the document's history? 4. Must the reason be written in Arabic (as today in billing and HR), or may an English-only user write it in English only?
 - **What the system does now:** Approve only for these types. Elsewhere the reason in Arabic is required, English optional.
-- **Reference (for the team):** web OQ-12; web R8, §4.1, OQ-12; access §10.10 (engine "return" purpose).
-
----
-
-## Blocks go-live (Access / web / ledger / migration)
+- **Reference (for the team):** web OQ-12; web R8, §4.1, OQ-12; access §10.10 (engine "return" purpose). (Access / web / ledger / migration)
 - **Your answer:** 
 
 ### Q51. Where the system gets exchange rates automatically
@@ -775,11 +735,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** When a company rents offices, land or cars from others, the standards may require a "right-of-use" asset and a lease liability. Full IFRS (IFRS 16) requires this for all material leases. IFRS for SMEs (section 20) differs, and the 2025 edition moved closer to IFRS 16.
 - **Question:** 1. Do any group companies rent property or vehicles as tenant? 2. If so, should the ERP record right-of-use assets and lease liabilities, or are they handled outside the ERP?
 - **What the system does now:** Out of scope. Rent paid is an expense.
-- **Reference (for the team):** fixed-assets OQ-17; fixed-assets §1 (scope).
-
----
-
-## Low (default is safe) (ZATCA / fixed assets / reporting)
+- **Reference (for the team):** fixed-assets OQ-17; fixed-assets §1 (scope). (ZATCA / fixed assets / reporting)
 - **Your answer:** 
 
 ### Q65. Load closing balances only, or replay the year's journals
@@ -971,11 +927,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
   4. A supplier resident in two countries (dual resident): which treaty certificate counts?
   5. Is there an overall cap on the WHT of one payment that covers several categories?
 - **What the system does now:** WHT is calculated at payment with the gross-up formula above. The rates are loaded but marked unverified. Foreign-supplier payments are blocked until the rates are verified.
-- **Reference (for the team):** invoicing OQ-8 (remainder); rule markers R62, R63, R105; invoicing R61 to R64, R105, E20 to E22, AT-54 to AT-56.
-
----
-
-## Needed before a specific event (Invoicing)
+- **Reference (for the team):** invoicing OQ-8 (remainder); rule markers R62, R63, R105; invoicing R61 to R64, R105, E20 to E22, AT-54 to AT-56. (Invoicing)
 - **Your answer:** 
 
 ### Q83. Withholding tax on remuneration of people working abroad
@@ -1282,11 +1234,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
   2. If yes, how is it documented? (a) Refuse it in the ERP. The employee pays the full price, or the rebate is handled outside the ERP. (b) The ERP issues a credit note that refers to the Falcon invoice number. This reduces VAT the same way as for ERP sales. (c) The ERP gives the rebate on the unearned profit only, with no credit note and no VAT reduction. The tax adviser must say whether that is allowed.
   3. If (b): who checks that the Falcon invoice was reported to ZATCA and gives the number to quote?
 - **What the system does now:** A rebate on a migrated contract is refused (code `migrated_contract`). Profit on these contracts is still recognised as instalments are collected.
-- **Reference (for the team):** invoicing OQ-80 (linked: payroll OQ-33, migration W14); invoicing R112, R128 (W14 amendment), R121; payroll OQ-33; migration W14.
-
----
-
-## Blocks go-live (Invoicing)
+- **Reference (for the team):** invoicing OQ-80 (linked: payroll OQ-33, migration W14); invoicing R112, R128 (W14 amendment), R121; payroll OQ-33; migration W14. (Invoicing)
 - **Your answer:** 
 
 ### Q114. Interest or a penalty charged by a bank to a Sharia-compliant company
@@ -1322,11 +1270,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** If a conventional bank account earns interest, it must never count as income. The ERP books it straight to "Charity payable (purification)" (2600), to be given to approved charities. The owner decided purification rules apply to all companies (C1).
 - **Question:** Confirm: (a) book interest received directly to the charity payable account (default); or (b) book it first to "non-compliant income" (4900), flagged, and then move it to charity. Also confirm the same treatment in companies that do not otherwise apply Sharia rules (default: yes).
 - **What the system does now:** (a), in every company. Islamic profit on the purification account also goes to charity (owner C5, built).
-- **Reference (for the team):** banking OQ-6; banking R28, §5 B4, AT-17.
-
----
-
-## Priority: Needed before the first VAT return (Billing / tax / banking)
+- **Reference (for the team):** banking OQ-6; banking R28, §5 B4, AT-17. (Billing / tax / banking)
 - **Your answer:** 
 
 ### Q117. Legacy balances on accounts Sharia does not allow
@@ -1423,11 +1367,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Question:** 1. What value should free company housing have in the EOSB wage: (a) 2 months of basic a year, the same as GOSI (team recommendation); (b) 3 months of basic a year; (c) the actual rental value or cost to the company; (d) another rule?
   2. Does the same value apply to leave paid out at exit and to pay in lieu of notice (the system uses one wage for all three)?
 - **What the system does now:** Counts zero with an English / Arabic warning on the termination, the provision payslip and the report line until the row is verified.
-- **Reference (for the team):** payroll OQ-62 (and `eosb.in_kind_housing` [verify: legal], §11.11 C4, §11.12 item 1); payroll R34, R76, §11.11 C4, §11.12 items 1 and 2; hr R39
-
----
-
-## Needed before first payroll (or the first event named) (Payroll / HR)
+- **Reference (for the team):** payroll OQ-62 (and `eosb.in_kind_housing` [verify: legal], §11.11 C4, §11.12 item 1); payroll R34, R76, §11.11 C4, §11.12 items 1 and 2; hr R39 (Payroll / HR)
 - **Your answer:** 
 
 ### Q126. Who may read the access log
@@ -1541,11 +1481,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** Egypt's Labour Law 14/2025 pays cash for untaken leave on exit. The system does not know which wage and day divisor to use.
 - **Question:** Which wage (basic or total) and which divisor (26, 30 or calendar days) value untaken leave at exit?
 - **What the system does now:** Leave days are shown but not valued.
-- **Reference (for the team):** payroll OQ-55 (`leave.encashment_basis` EG); payroll R76
-
----
-
-## Low (default is safe) (Payroll / HR)
+- **Reference (for the team):** payroll OQ-55 (`leave.encashment_basis` EG); payroll R76 (Payroll / HR)
 - **Your answer:** 
 
 ## HR / payroll manager
@@ -1641,11 +1577,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
   4. What codes does the bank's returned (processed) file use for success and for each kind of rejection?
   5. Is there any upload method other than the bank portal (for example a host-to-host link), and does Mudad offer any API, or is the upload always manual?
 - **What the system does now:** It writes a generic file with the Ministry fields, a `DEDUCTIONS` column and an unconfirmed bank-code table; no bank-specific file is produced. Files are kept forever (decided).
-- **Reference (for the team):** payroll OQ-10 (also the unverified `wps.format.<bank>` and `wps.bank_codes` parameters, payroll §10.5 WPS note, §11.10 bank return codes); decision pack B2; owner answer E3; payroll R31, R32, R51, R79, §10.5 (WPS), §11.10, hr 3.9 (`wps.format.<bank>`)
-
----
-
-## Blocks go-live (Payroll / HR)
+- **Reference (for the team):** payroll OQ-10 (also the unverified `wps.format.<bank>` and `wps.bank_codes` parameters, payroll §10.5 WPS note, §11.10 bank return codes); decision pack B2; owner answer E3; payroll R31, R32, R51, R79, §10.5 (WPS), §11.10, hr 3.9 (`wps.format.<bank>`) (Payroll / HR)
 - **Your answer:** 
 
 ## Other
@@ -1914,7 +1846,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Reference (for the team):** access OQ-28; access OQ-28; hr OQ-30. (Access / web / ledger / migration)
 - **Your answer:** 
 
-### Q172. Owner (Managing Partner)
+### Q172. Alerts: in the ERP only, or also by e-mail or SMS
 - **Who should answer:** Owner (Managing Partner)
 - **Priority:** Low (default is safe)
 - **Context:** Billing failures and tax deadlines raise alerts.
@@ -1968,9 +1900,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** First-release scope choices.
 - **Question:** Confirm: (1) free-text search is sent hidden (so searches cannot be bookmarked, to keep personal data out of web addresses); (2) payroll and purification payout screens come later; (3) report exports are CSV first, Excel later.
 - **What the system does now:** As stated.
-- **Reference (for the team):** web OQ-17, OQ-18, OQ-25; web R23, OQ-17, OQ-18, OQ-25.
-
---- (Access / web / ledger / migration)
+- **Reference (for the team):** web OQ-17, OQ-18, OQ-25; web R23, OQ-17, OQ-18, OQ-25. (Access / web / ledger / migration)
 - **Your answer:** 
 
 ### Q178. Selling real estate to an employee by bai' ajel
@@ -2086,7 +2016,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Reference (for the team):** reporting OQ-19; reporting R31, §3.9. (ZATCA / fixed assets / reporting)
 - **Your answer:** 
 
-### Q190. CFO
+### Q190. VAT returns for a company whose books are not in SAR
 - **Who should answer:** CFO
 - **Priority:** Low (default is safe; none planned)
 - **Context:** VAT returns are checked against SAR ledger balances.
@@ -2230,7 +2160,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Reference (for the team):** access OQ-8; access R38, OQ-8. (Access / web / ledger / migration)
 - **Your answer:** 
 
-### Q205. Accountant
+### Q205. Small choices in the VAT module: refunds and import VAT
 - **Who should answer:** Accountant
 - **Priority:** Low (default is safe)
 - **Context:** Small working choices in the VAT module.
@@ -2545,9 +2475,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** If a subsidiary itself owns subsidiaries, the group can consolidate in one step at the top, or first build sub-group accounts.
 - **Question:** 1. Do any intermediate parents exist or are any planned? 2. Do they need their own consolidated statements?
 - **What the system does now:** One step at the top parent, using effective ownership %.
-- **Reference (for the team):** consolidation OQ-21; consolidation R6.
-
---- (ZATCA / fixed assets / reporting)
+- **Reference (for the team):** consolidation OQ-21; consolidation R6. (ZATCA / fixed assets / reporting)
 - **Your answer:** 
 
 ### Q240. Unrealised profit on other intra-group sales, and transactions with associates
@@ -2653,7 +2581,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Reference (for the team):** invoicing OQ-71; invoicing R113, E7. (Invoicing)
 - **Your answer:** 
 
-### Q251. Tax adviser
+### Q251. Filing tax returns through a ZATCA API instead of by hand
 - **Who should answer:** Tax adviser; then IT / security lead
 - **Priority:** Low (default is safe)
 - **Context:** VAT figures are typed into the ZATCA portal by hand from the ERP's export.
@@ -2697,9 +2625,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** Egypt's insurance agency (NOSI) and tax authority (ETA) charge surcharges for late payment.
 - **Question:** Confirm that such surcharges are booked as a penalty expense, never as interest, with nothing to purify.
 - **What the system does now:** Default as stated; nothing posted yet.
-- **Reference (for the team):** payroll OQ-61; payroll OQ-61
-
---- (Payroll / HR)
+- **Reference (for the team):** payroll OQ-61; payroll OQ-61 (Payroll / HR)
 - **Your answer:** 
 
 ### Q256. Interest-bearing arrangements inside the group
@@ -2717,9 +2643,7 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Context:** Sharia allows no penalty income.
 - **Question:** Confirm: no late-payment charges are built. If a contract ever has one, it must be given to charity (booked to 2600) and never treated as income.
 - **What the system does now:** It has no late-charge feature.
-- **Reference (for the team):** invoicing OQ-15; invoicing D19 / OQ-15.
-
---- (Invoicing)
+- **Reference (for the team):** invoicing OQ-15; invoicing D19 / OQ-15. (Invoicing)
 - **Your answer:** 
 
 ### Q258. Selling a registered asset to an employee on deferred payment (bai' ajel)
@@ -2774,15 +2698,13 @@ By priority: 11 block building, 35 block go-live, 99 are needed before a specifi
 - **Reference (for the team):** payroll OQ-41 and hr OQ-41 (same question); payroll R55, R56; hr 3.2 (Payroll / HR)
 - **Your answer:** 
 
-### Q263. Legal adviser
+### Q263. Employee data on secondment invoices
 - **Who should answer:** Legal adviser (PDPL); HR manager
 - **Priority:** Low (default is safe)
 - **Context:** Secondment invoices to another company concern named employees.
 - **Question:** Confirm the invoice shows only the role title and a code for the employee (no name, ID number or pay details).
 - **What the system does now:** Role title and pseudonymous employee code only.
-- **Reference (for the team):** billing OQ-12; billing §3.6, R62, R71.
-
---- (Billing / tax / banking)
+- **Reference (for the team):** billing OQ-12; billing §3.6, R62, R71. (Billing / tax / banking)
 - **Your answer:** 
 
 ### Q264. Printing a B2C invoice shows the buyer's personal data
